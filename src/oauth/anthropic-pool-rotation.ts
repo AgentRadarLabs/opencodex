@@ -1,4 +1,3 @@
-import { classifyError, upstreamErrorMessageFromPayload } from "../lib/errors";
 import { readQuotaResetAt } from "../providers/key-failover";
 
 /**
@@ -12,17 +11,35 @@ import { readQuotaResetAt } from "../providers/key-failover";
 export type AnthropicPoolRotationTrigger = "429" | "quota-400";
 
 /**
- * Whether a 400 body says the account is out of quota. Reuses the shared classifier so the
- * wording lives in one place (src/lib/errors.ts); every other 400 (a malformed request) is a
- * request-shape failure that would fail the same way on any account and must not rotate.
+ * Anthropic's spent-extra-usage wordings, anchored at the start of `error.message`. Only the
+ * start counts: a validation 400 echoes client values (tool ids, model names, text) into its
+ * message, so a match anywhere else would let one crafted request cool every pool account.
+ */
+const EXTRA_USAGE_REFUSAL = /^(?:you['\u2019]re out of extra usage|third-party apps now draw from your extra usage)/i;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Whether a 400 body is Anthropic's out-of-extra-usage refusal. It must be Anthropic's JSON error
+ * envelope (`type: "error"`, `error.type: "invalid_request_error"`) whose `error.message` starts
+ * with one of the two wordings. Anything else, including a non-JSON body, is a request-shape
+ * failure that would fail the same way on any account and must not rotate.
  */
 export function isQuotaExhaustedBadRequest(status: number, body: string | null | undefined): boolean {
-  if (status !== 400 || !body?.trim()) return false;
-  let message = body;
+  if (status !== 400 || !body) return false;
+  let payload: unknown;
   try {
-    message = upstreamErrorMessageFromPayload(JSON.parse(body)) ?? body;
-  } catch { /* not JSON: classify the raw text */ }
-  return classifyError(400, "invalid_request_error", message).code === "insufficient_quota";
+    payload = JSON.parse(body);
+  } catch {
+    return false;
+  }
+  if (!isRecord(payload) || payload.type !== "error" || !isRecord(payload.error)) return false;
+  const { type, message } = payload.error;
+  return type === "invalid_request_error"
+    && typeof message === "string"
+    && EXTRA_USAGE_REFUSAL.test(message.trimStart());
 }
 
 /** The pool-rotation trigger for an upstream status and (for a 400) its body, or null. */

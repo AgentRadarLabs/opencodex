@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { saveConfig } from "../../../src/config";
@@ -20,12 +20,24 @@ import { removeTreeWithRetry } from "../../helpers/remove-tree";
 // Anthropic answers a spent plan whose extra usage is also spent with HTTP 400, not 429. The pool
 // used to rotate on 429 only, so one spent account failed the request while another sat idle.
 
+// No real "out of extra usage" 400 has been recorded yet (fixtures/external/anthropic/README.md),
+// so this wording stays typed until one is.
 const OUT_OF_EXTRA_USAGE = "You're out of extra usage. Add more at claude.ai/settings/usage and keep going.";
-const THIRD_PARTY_EXTRA_USAGE = "Third-party apps now draw from your extra usage, which you have run out of.";
+// The recorded third-party refusal: a gateway log line cut at 200 chars. The bytes after the log
+// prefix are Anthropic's raw envelope; only the closing quote and braces the cut removed are added.
+const RECORDED_THIRD_PARTY_LINE = readFileSync(
+  join(import.meta.dir, "../../../fixtures/external/anthropic/extra-usage-thirdparty-400.txt"),
+  "utf8",
+);
+const RECORDED_THIRD_PARTY_BODY = `${RECORDED_THIRD_PARTY_LINE.slice("Provider error 400: ".length)}"}}`;
 const ROLE_ORDER = "messages: roles must alternate between \"user\" and \"assistant\", but found multiple \"user\" roles in a row";
 
 function anthropicError(status: number, type: string, message: string, headers?: Record<string, string>): Response {
   return Response.json({ type: "error", error: { type, message } }, { status, headers });
+}
+
+function envelope(type: string, message: string): string {
+  return JSON.stringify({ type: "error", error: { type, message } });
 }
 
 function anthropicTextSse(text: string): Response {
@@ -72,11 +84,60 @@ describe("isPoolRotatableStatus", () => {
     expect(isPoolRotatableStatus(429)).toBe("429");
   });
 
-  test("the two extra-usage 400 wordings rotate, enveloped or raw", () => {
-    for (const message of [OUT_OF_EXTRA_USAGE, THIRD_PARTY_EXTRA_USAGE]) {
-      const body = JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } });
-      expect(isPoolRotatableStatus(400, body)).toBe("quota-400");
-      expect(isPoolRotatableStatus(400, message)).toBe("quota-400");
+  test("the recorded fixture is Anthropic's envelope, kept as recorded", () => {
+    expect(RECORDED_THIRD_PARTY_LINE.startsWith("Provider error 400: {\"type\":\"error\"")).toBe(true);
+    expect(RECORDED_THIRD_PARTY_BODY.startsWith(RECORDED_THIRD_PARTY_LINE.slice("Provider error 400: ".length))).toBe(true);
+    expect(JSON.parse(RECORDED_THIRD_PARTY_BODY)).toEqual({
+      type: "error",
+      error: {
+        type: "invalid_request_error",
+        message: "Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage and k",
+      },
+    });
+  });
+
+  test("the two extra-usage wordings rotate only inside Anthropic's envelope", () => {
+    expect(isPoolRotatableStatus(400, RECORDED_THIRD_PARTY_BODY)).toBe("quota-400");
+    expect(isPoolRotatableStatus(400, envelope("invalid_request_error", OUT_OF_EXTRA_USAGE))).toBe("quota-400");
+    // Curly apostrophe, any case, leading whitespace.
+    expect(isPoolRotatableStatus(400, envelope("invalid_request_error", "  You\u2019re out of extra usage."))).toBe("quota-400");
+    expect(isPoolRotatableStatus(400, envelope("invalid_request_error", "YOU'RE OUT OF EXTRA USAGE"))).toBe("quota-400");
+    // Not JSON: the raw wording, or the recorded gateway log line itself.
+    expect(isPoolRotatableStatus(400, OUT_OF_EXTRA_USAGE)).toBeNull();
+    expect(isPoolRotatableStatus(400, RECORDED_THIRD_PARTY_LINE)).toBeNull();
+  });
+
+  test("MUST-FAIL (a): a 400 that echoes a client value with quota words does not rotate", () => {
+    const echoed = "messages.1: `tool_use` ids were found without `tool_result` blocks immediately after: toolu_insufficient_quota";
+    expect(isPoolRotatableStatus(400, envelope("invalid_request_error", echoed))).toBeNull();
+    for (const value of ["toolu_out_of_extra_usage", "You're out of extra usage", "Third-party apps now draw from your extra usage"]) {
+      expect(isPoolRotatableStatus(400, envelope("invalid_request_error", `tool_use ids were found without tool_result blocks: ${value}`))).toBeNull();
+    }
+  });
+
+  test("MUST-FAIL (b): the wording anywhere but the start of the message does not rotate", () => {
+    for (const message of [
+      `messages.0.content.0.text: ${OUT_OF_EXTRA_USAGE}`,
+      "Invalid model: you're out of extra usage",
+      "The prompt says: Third-party apps now draw from your extra usage, not your plan limits",
+      "x You're out of extra usage",
+    ]) {
+      expect(isPoolRotatableStatus(400, envelope("invalid_request_error", message))).toBeNull();
+    }
+  });
+
+  test("MUST-FAIL (c): the right wording in the wrong envelope does not rotate", () => {
+    for (const body of [
+      envelope("rate_limit_error", OUT_OF_EXTRA_USAGE),
+      envelope("api_error", OUT_OF_EXTRA_USAGE),
+      JSON.stringify({ error: { type: "invalid_request_error", message: OUT_OF_EXTRA_USAGE } }),
+      JSON.stringify({ type: "invalid_request_error", error: { type: "invalid_request_error", message: OUT_OF_EXTRA_USAGE } }),
+      JSON.stringify({ type: "error", error: { message: OUT_OF_EXTRA_USAGE } }),
+      JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: [OUT_OF_EXTRA_USAGE] } }),
+      JSON.stringify({ type: "error", message: OUT_OF_EXTRA_USAGE }),
+      JSON.stringify([{ type: "error", error: { type: "invalid_request_error", message: OUT_OF_EXTRA_USAGE } }]),
+    ]) {
+      expect(isPoolRotatableStatus(400, body)).toBeNull();
     }
   });
 
@@ -216,9 +277,9 @@ describe("routed /v1/messages through the Anthropic pool", () => {
     expect(getAnthropicAccountHealthSnapshot("account-a")?.cooldownUntil).toBeGreaterThan(Date.now() + 9 * 60_000);
   });
 
-  test("third-party-apps extra-usage 400 rotates too", async () => {
+  test("the recorded third-party-apps extra-usage 400 rotates too", async () => {
     const { response, text, authorizations } = await send(
-      () => anthropicError(400, "invalid_request_error", THIRD_PARTY_EXTRA_USAGE),
+      () => new Response(RECORDED_THIRD_PARTY_BODY, { status: 400, headers: { "content-type": "application/json" } }),
     );
     expect(response.status).toBe(200);
     expect(text).toContain("rotated");
@@ -231,6 +292,16 @@ describe("routed /v1/messages through the Anthropic pool", () => {
     );
     expect(response.status).toBe(400);
     expect(text).toContain("roles must alternate");
+    expect(authorizations).toEqual(["Bearer synthetic-access-a"]);
+    expect(getAnthropicAccountHealthSnapshot("account-a")).toBeNull();
+  });
+
+  test("MUST-FAIL (a), routed: a 400 echoing toolu_insufficient_quota reaches the caller unchanged", async () => {
+    const message = "messages.1: `tool_use` ids were found without `tool_result` blocks immediately after: toolu_insufficient_quota";
+    const { response, text, authorizations } = await send(() => anthropicError(400, "invalid_request_error", message));
+    expect(response.status).toBe(400);
+    // Byte for byte what Anthropic sent: the gateway neither rotated nor rewrote it.
+    expect(text).toBe(envelope("invalid_request_error", message));
     expect(authorizations).toEqual(["Bearer synthetic-access-a"]);
     expect(getAnthropicAccountHealthSnapshot("account-a")).toBeNull();
   });
