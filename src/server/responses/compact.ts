@@ -1345,7 +1345,8 @@ export async function handleResponsesCompact(
     const bodyInferredQuota = !replayRefused
       && !buffered.ok
       && !explicitQuotaStatus
-      && isRateLimitOrQuotaFailureMessage(bufferedErrorText);
+      // With the real status, so an echoing 400/422 body is read by its fields, not its words.
+      && isRateLimitOrQuotaFailureMessage(`Provider error ${buffered.status}: ${bufferedErrorText}`);
     const quotaFailure = explicitQuotaStatus || bodyInferredQuota;
     // Record pool health only after the body is fully delivered (or definitively failed).
     // A premature 200 would clear soft-avoid while the client still sees a buffer 502.

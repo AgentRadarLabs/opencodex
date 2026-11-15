@@ -360,8 +360,30 @@ function isProviderScopedQuotaCap(
   ) {
     return true;
   }
+  // A 400 or 422 is a verdict on the request, and its body echoes client values, so there the
+  // free-tier cap counts only as a field (see hasFreePromptCapField). Other statuses keep words.
+  if (status === 400 || status === 422) return hasFreePromptCapField(message);
   return text.includes("err_free_prompt_cap")
     || (text.includes("free tier") && text.includes("single request"));
+}
+
+/**
+ * `err_free_prompt_cap` as the provider's own field: `error.code`, or `error.metadata.reason` as
+ * the OpenRouter-style free-tier refusal carries it, in a bounded JSON envelope after an optional
+ * `Provider error <status>: ` prefix. Never a word anywhere in the text.
+ */
+function hasFreePromptCapField(message: string): boolean {
+  if (message.length > 16_384) return false;
+  const text = message.trim().replace(/^Provider error \d{3}:\s*/, "");
+  let payload: unknown;
+  try { payload = JSON.parse(text); } catch { return false; }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+  const error = (payload as Record<string, unknown>).error;
+  if (!error || typeof error !== "object" || Array.isArray(error)) return false;
+  const { code, metadata } = error as Record<string, unknown>;
+  if (code === "err_free_prompt_cap") return true;
+  return !!metadata && typeof metadata === "object" && !Array.isArray(metadata)
+    && (metadata as Record<string, unknown>).reason === "err_free_prompt_cap";
 }
 
 /**
