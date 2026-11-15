@@ -206,8 +206,28 @@ function deferSupersededSpill(ref: ResponseSpillRef | undefined): void {
 }
 
 
+/**
+ * Optional environment tightening of a built-in bound. Values above the default are
+ * ignored: the defaults are part of the documented app-owned memory ceiling, and a
+ * small instance needs a lower bound, never a higher one. Read per call, like the
+ * test overrides, so a changed environment takes effect without a restart.
+ */
+function envBoundAtMost(name: string, defaultValue: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return defaultValue;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return defaultValue;
+  return Math.min(Math.floor(parsed), defaultValue);
+}
+
+/** Resident byte cap; OPENCODEX_RESPONSE_STATE_MAX_BYTES may lower it. */
 function byteCap(): number {
-  return byteCapOverride ?? MAX_STORED_RESPONSE_BYTES;
+  return byteCapOverride ?? envBoundAtMost("OPENCODEX_RESPONSE_STATE_MAX_BYTES", MAX_STORED_RESPONSE_BYTES);
+}
+
+/** Continuation retention; OPENCODEX_RESPONSE_STATE_TTL_MS may shorten it. */
+function responseTtlMs(): number {
+  return envBoundAtMost("OPENCODEX_RESPONSE_STATE_TTL_MS", RESPONSE_TTL_MS);
 }
 
 /** Test-only: lower/restore the in-memory byte cap (null restores the default). */
@@ -222,8 +242,9 @@ export function getStoredResponseBytesForTests(): number {
 
 let spillByteCapOverride: number | null = null;
 
+/** Durable spill cap; OPENCODEX_RESPONSE_STATE_MAX_SPILL_BYTES may lower it (a small temp disk). */
 function spillByteCap(): number {
-  return spillByteCapOverride ?? MAX_SPILLED_RESPONSE_BYTES;
+  return spillByteCapOverride ?? envBoundAtMost("OPENCODEX_RESPONSE_STATE_MAX_SPILL_BYTES", MAX_SPILLED_RESPONSE_BYTES);
 }
 
 /**
@@ -892,8 +913,9 @@ function enforceSpilledResponseBudget(): number {
 }
 
 function pruneResponses(at = now()): void {
+  const ttlMs = responseTtlMs();
   for (const [id, state] of states) {
-    if (at - state.createdAt > RESPONSE_TTL_MS) deleteEntry(id);
+    if (at - state.createdAt > ttlMs) deleteEntry(id);
   }
   while (states.size > MAX_STORED_RESPONSES) {
     const oldest = states.keys().next().value;
@@ -903,11 +925,19 @@ function pruneResponses(at = now()): void {
   // Unconditional RAM cap. Resident payloads demote durably; stubs/tombstones are
   // deleted only when even their bounded metadata cannot fit the override.
   while (storedResponseBytes > byteCap() && states.size > 0) {
-    const oldestResident = [...states].find(([id, entry]) => entry.kind === "resident"
-      && !spillQueueHoldsResidentCandidate(id, entry));
-    const hasPendingResident = !oldestResident && [...states].some(([id, entry]) => entry.kind === "resident"
-      && spillQueueHoldsResidentCandidate(id, entry));
-    if (hasPendingResident) break;
+    // One pass over the live map, no copy: this runs once per demotion while over the cap.
+    let oldestResident: [string, ResidentResponseState] | undefined;
+    let hasPendingResident = false;
+    for (const [id, entry] of states) {
+      if (entry.kind !== "resident") continue;
+      if (spillQueueHoldsResidentCandidate(id, entry)) {
+        hasPendingResident = true;
+        continue;
+      }
+      oldestResident = [id, entry];
+      break;
+    }
+    if (!oldestResident && hasPendingResident) break;
     const oldestId = oldestResident?.[0] ?? states.keys().next().value as string | undefined;
     if (!oldestId) break;
     const entry = states.get(oldestId)!;
@@ -939,8 +969,9 @@ function pruneResponses(at = now()): void {
 /** Periodic TTL-only sweep; count/byte eviction remains owned by mutation paths. */
 export function sweepExpiredResponseStates(at = now()): number {
   let removed = 0;
+  const ttlMs = responseTtlMs();
   for (const [id, state] of states) {
-    if (at - state.createdAt <= RESPONSE_TTL_MS) continue;
+    if (at - state.createdAt <= ttlMs) continue;
     deleteEntry(id);
     removed += 1;
   }
