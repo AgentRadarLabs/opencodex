@@ -8,6 +8,7 @@ import { withCors, type RequestPolicyView } from "./auth-cors";
 import { codexCompatibleUrl } from "../codex/context-compat";
 import { addFinalRequestLog, markLocalRequestLogRefusal } from "./request-log";
 import type { WorkflowRefusalLog } from "./workflow-refusal";
+import { logOversizedInbound } from "../lib/upstream-refusal-log";
 
 /** Admission units, not a bound on process RSS or the size of parsed object graphs. */
 export const MAX_CONCURRENT_INBOUND_BODY_BYTES = MAX_CONFIGURABLE_INBOUND_BODY_BYTES;
@@ -176,7 +177,12 @@ export function runAdmittedBodyWork(
   refusalLog?: WorkflowRefusalLog,
 ): Promise<Response> {
   const served = async () => withAgentRadarServedAccount(await work(), refusalLog?.logCtx.servedAccountId);
-  return withRaisedInboundBodyAdmission(req, codexCompatibleUrl(req.url).pathname, configuredLimit, served, refused => {
+  // The declared length only, before any body is read: a request near the 6 MB cap shows up here.
+  const pathname = codexCompatibleUrl(req.url).pathname;
+  if (req.method === "POST" && CONFIGURABLE_JSON_BODY_ROUTES.has(pathname)) {
+    logOversizedInbound(pathname, Number(req.headers.get("content-length") ?? NaN));
+  }
+  return withRaisedInboundBodyAdmission(req, pathname, configuredLimit, served, refused => {
     if (refusalLog) {
       markLocalRequestLogRefusal(refusalLog.logCtx, "server_busy");
       refusalLog.logCtx.errorCode = "server_busy";

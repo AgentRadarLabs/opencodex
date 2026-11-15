@@ -20,6 +20,7 @@ import {
   type TranslatorBudget,
 } from "../lib/translator-budget";
 import { sseFieldOffset, sseFieldValue } from "../lib/sse-decoder";
+import { logTranslationBufferLimit } from "../lib/upstream-refusal-log";
 import { decodeReasoningEnvelope, encodeReasoningEnvelope } from "../responses/reasoning-envelope";
 
 type Rec = Record<string, unknown>;
@@ -477,6 +478,7 @@ export function responsesSseToAnthropicSse(
         if (terminated && (code !== "translation_buffer_limit" || terminalDelivered)) return;
         terminated = true;
         if (code === "translation_buffer_limit") {
+          logTranslationBufferLimit("stream", { model, bytes: bufferBytes, limit: TRANSLATOR_MAX_TURN_BYTES });
           releaseThinkingBuffer(open);
           if (open?.callId) translatorBudget.closeCall(open.callId);
           open = null;

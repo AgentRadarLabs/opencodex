@@ -77,6 +77,7 @@ import { isCanonicalOpenAiForwardProvider } from "../providers/openai-tiers-dest
 import { resolveProviderTransport } from "../providers/xai-transport";
 import { resolveAdapter, resolveWireProtocolOverride } from "./adapter-resolve";
 import { providerFetch } from "./responses/fetch-helpers";
+import { logTranslationBufferLimit } from "../lib/upstream-refusal-log";
 import {
   getValidAccessTokenSnapshot,
   publicOAuthAuthenticationErrorMessage,
@@ -1170,9 +1171,10 @@ async function handleClaudeMessagesWithBudget(
     ?? metadataGoLane
     ?? getOrAllocateRequestSessionLane(req);
   let internalReq: Request;
+  let bodyBytes: number | undefined;
   try {
     // The UTF-16 JSON string and the Request's UTF-8 body coexist until dispatch.
-    const bodyBytes = jsonUtf8Bytes(internalBody);
+    bodyBytes = jsonUtf8Bytes(internalBody);
     const reservation = translatorBudget.reserveTransient(3 * bodyBytes, { kind: "request_copies" });
     try {
       internalReq = new Request("http://localhost/v1/responses", {
@@ -1187,6 +1189,7 @@ async function handleClaudeMessagesWithBudget(
     translatorBudget.chargeRetained(bodyBytes, { kind: "request_copies" });
   } catch (err) {
     if (!isTranslatorBudgetExceededError(err)) throw err;
+    logTranslationBufferLimit("request", { model: requestedModel, bytes: bodyBytes, limit: (err as { limitBytes?: number }).limitBytes });
     if (logIds) addFinalRequestLog(logIds.requestId, logIds.start, logCtx, 413, { closeReason: "non_stream" });
     return anthropicErrorResponse(413, "request translation buffer exceeded the safe limit", "request_too_large", "translation_buffer_limit");
   }
@@ -1475,6 +1478,7 @@ async function handleClaudeMessagesWithBudget(
     message = responsesJsonToAnthropicMessage(json, requestedModel, translatorBudget);
   } catch (err) {
     if (!isTranslatorBudgetExceededError(err)) throw err;
+    logTranslationBufferLimit("response", { model: requestedModel, limit: (err as { limitBytes?: number }).limitBytes });
     return anthropicErrorResponse(413, "upstream translation buffer exceeded the safe limit", "request_too_large", "translation_buffer_limit");
   }
   if ((message as Rec).type === "error") {

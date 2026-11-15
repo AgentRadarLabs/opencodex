@@ -1804,7 +1804,8 @@
     "zhipu-bigmodel-responses-quota.test.ts": "providers",
     "zz-ci-api-usage-isolation.test.ts": "ci-workflows",
     "zz-ci-storage-policy-isolation.test.ts": "ci-workflows",
-    "zz-pr-coderabbit-readiness-revalidation.test.ts": "ci-workflows"
+    "zz-pr-coderabbit-readiness-revalidation.test.ts": "ci-workflows",
+    "upstream-refusal-log.test.ts": "lib"
   },
   "migrated": [
     "adapters",
