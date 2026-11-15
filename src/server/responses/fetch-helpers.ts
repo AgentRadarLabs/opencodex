@@ -21,6 +21,7 @@ import {
   type ProviderEgressBinding,
 } from "../../lib/provider-egress";
 import { redactSecretString } from "../../lib/redact";
+import { observeUpstreamRefusal } from "../../lib/upstream-refusal-log";
 
 export { withUpstreamHttpVersion };
 
@@ -234,9 +235,16 @@ export function providerFetch(
   // `provider.fetch ?? execute`, and `execute` is this wrapper. It still carries the binding, so
   // an override that simply calls it gets the route decided rather than dropped; an override
   // that decided for itself has already marked the init and this pass defers to that decision.
+  //
+  // Every provider's HTTP answer passes through here, after any override has rebuilt the request, so
+  // this is the one place that sees the final outgoing body and the upstream status together. A 4xx
+  // gets one refusal-shape log line; the response itself is returned untouched.
   const dispatch = markEgressTransparentExecutor(Object.assign(
-    (input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) =>
-      sendWithConnectionPolicy(base, input, init, egressBinding),
+    async (input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
+      const response = await sendWithConnectionPolicy(base, input, init, egressBinding);
+      observeUpstreamRefusal(response, { provider: options.providerName, model: options.modelId, body: init?.body });
+      return response;
+    },
     { preconnect },
   ) as typeof globalThis.fetch);
   // `applyOverride` is false for exactly one caller: the HTTP fallback of a WS send that has

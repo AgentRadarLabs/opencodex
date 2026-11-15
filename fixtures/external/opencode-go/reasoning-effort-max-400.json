@@ -1,0 +1,1 @@
+{"param":"reasoning.effort","type":"invalid_request_error","message":"Error from provider (Console Go): Upstream request failed: [invalid_request_error] reasoning_effort max requires an active Muse Code subscription for model muse-spark-1.3-contributor."}

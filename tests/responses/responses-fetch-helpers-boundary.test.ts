@@ -49,6 +49,7 @@ describe("Responses fetch-helper import boundary", () => {
       "../../lib/proxy-env",
       "../../lib/redact",
       "../../lib/upstream-http-version",
+      "../../lib/upstream-refusal-log",
       "../../providers/request-pacing",
       "./ws-upstream",
     ]);
