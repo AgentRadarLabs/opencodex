@@ -1636,5 +1636,6 @@
   "command-code-tool-text-prose-split.test.ts": "providers",
   "cli-effort-slug.test.ts": "cli",
   "grok-47-build-fast-metadata.test.ts": "providers/xai",
-  "upstream-refusal-log.test.ts": "lib"
+  "upstream-refusal-log.test.ts": "lib",
+  "call-usage-line-log.test.ts": "lib"
 }
