@@ -11,7 +11,7 @@ import { removeTreeWithRetry } from "../helpers/remove-tree";
 // Shaped as test sentinels so the privacy scan knows they are fake.
 const PROMPT_TEXT = "DISTINCTIVE-PROMPT-TEXT-7731";
 const API_KEY_SECRET = "sk-test-9942distinctive";
-const AUTH_HEADER = "Bearer sk-test-header5531distinctive";
+const AUTH_HEADER = "Bearer access-token-5531distinctive";
 const KEY_ID = "key-record-1";
 
 const LINE_RE = /^\[usage\] status=\d+ provider="[^"]*" model="[^"]*" in=(?:\d+|-) out=(?:\d+|-) cached=(?:\d+|-) key=(?:[0-9a-f]{8}|-) ms=(?:\d+|-)$/;
@@ -83,6 +83,13 @@ describe("usage line", () => {
     expect(usageLogLine({ status: 200, provider: "xai-oabcdef" })).toContain('provider="xai"');
     expect(usageLogLine({ status: 200, provider: `acme-k${"a".repeat(32)}` })).toContain('provider="acme"');
     expect(usageLogLine({ status: 200, provider: "opencode-go" })).toContain('provider="opencode-go"');
+  });
+
+  test("a key-shaped token in a provider label is redacted, not logged", () => {
+    logUsageLine({ status: 200, provider: `relay-${API_KEY_SECRET}`, model: "gpt-test", apiKeyId: KEY_ID });
+    const line = usageLines()[0]!;
+    expect(line).not.toContain(API_KEY_SECRET);
+    expect(LINE_RE.test(line)).toBe(true);
   });
 
   test("is silent unless the AgentRadar mode is on", () => {
