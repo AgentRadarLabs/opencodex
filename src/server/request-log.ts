@@ -27,6 +27,7 @@ import type { RequestSpendSettlement } from "./responses/request-spend";
 import type { AdapterTierMetadata } from "../providers/fastwire";
 import { UPSTREAM_RESET_REPLAY_REFUSED_CODE } from "../lib/upstream-retry";
 import { redactSecretString, sanitizeLogMetadataString } from "../lib/redact";
+import { logUsageLine } from "../lib/usage-line-log";
 import {
   appendUsageEntry,
   classifyCacheTelemetryProvenance,
@@ -608,6 +609,9 @@ export function addRequestLog(entry: RequestLogEntry) {
   else if (retained !== entry) delete retained.claudeCompatibility;
   entry = retained;
   retainRequestLogEntry(entry);
+  // The one per-call usage line (model, tokens, hashed key id; no text). This is the single sink
+  // every finished request row passes through, on the same record the usage ledger persists below.
+  logUsageLine(entry);
   for (const observer of requestLogObserversForTests) {
     try { observer(entry); } catch { /* test observation must never fail request logging */ }
   }
