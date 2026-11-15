@@ -17,11 +17,13 @@ const external = (...parts: string[]) => readFileSync(join(import.meta.dir, "../
 const anthropicPrefill400 = external("anthropic", "docs-prefill-400.json");
 const anthropicNotFound404 = external("anthropic", "docs-error-shape-404.json");
 const opencodeGoEffort400 = external("opencode-go", "reasoning-effort-max-400.json");
+const openaiServiceTier400 = external("openai", "docs-invalid-service-tier-400.json");
 // A real gateway log line cut mid-envelope: a body that is not JSON.
 const cutNonJson400 = external("anthropic", "extra-usage-thirdparty-400.txt");
 
 const PROMPT_TEXT = "DISTINCTIVE-PROMPT-TEXT-7731";
-const API_KEY = "sk-test-DISTINCTIVE-KEY-9942";
+// Shaped as a test sentinel so the privacy scan knows it is fake.
+const API_KEY = "sk-test-9942distinctive";
 
 let warnings: string[];
 let restore: () => void;
@@ -93,6 +95,33 @@ describe("upstream refusal log line", () => {
     expect(line).not.toContain("Muse Code subscription");
     expect(line).not.toContain("Console Go");
     expect(line).not.toContain("muse-spark");
+  });
+
+  test("a documented OpenAI 400 logs the parameter it names, not the message", async () => {
+    await callThroughProviderFetch(json(openaiServiceTier400, 400));
+    const line = await waitForRefusalLine();
+    expect(line).toContain(`type="invalid_request_error" param="service_tier"`);
+    // `code` is null in this envelope, so none is logged.
+    expect(line).not.toContain("code=");
+    expect(line).not.toContain("not allowed for this project");
+  });
+
+  test("envelope fields with a newline, a 200-character value or a key stay on one bounded line", async () => {
+    const hostile = JSON.stringify({
+      error: { type: "invalid_request_error\n[upstream-refusal] status=200", code: "c".repeat(200), param: API_KEY, message: PROMPT_TEXT },
+    });
+    await callThroughProviderFetch(json(hostile, 400));
+    const line = await waitForRefusalLine();
+    // One line: no newline survives, and a forged marker can only sit inside a quoted value.
+    expect(line).not.toContain("\n");
+    expect(line.startsWith("[upstream-refusal] status=400 ")).toBe(true);
+    for (const field of ["type", "code", "param"]) {
+      const value = new RegExp(`${field}="([^"]*)"`).exec(line)?.[1];
+      expect(value).toBeDefined();
+      expect(value!.length).toBeLessThanOrEqual(80);
+    }
+    expect(line).not.toContain(API_KEY);
+    expect(line).not.toContain(PROMPT_TEXT);
   });
 
   test("a documented 404 logs its type and never the request id that the body carries", async () => {
