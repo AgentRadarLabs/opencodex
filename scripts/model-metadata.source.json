@@ -59876,6 +59876,32 @@
 				"maxLevel": "max"
 			}
 		},
+		"gpt-6.1-sol": {
+			"id": "gpt-6.1-sol",
+			"name": "GPT-6.1 Sol",
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.1,
+				"cacheWrite": 2.5
+			},
+			"api": "openai-responses",
+			"provider": "openai",
+			"baseUrl": "",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"contextWindow": 373000,
+			"maxTokens": 128000,
+			"applyPatchToolType": "freeform",
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
 		"gpt-5.6-terra": {
 			"id": "gpt-5.6-terra",
 			"name": "GPT-5.6 Terra",
@@ -60665,6 +60691,33 @@
 				"input": 2,
 				"output": 10,
 				"cacheRead": 0.2,
+				"cacheWrite": 2.5
+			},
+			"api": "openai-codex-responses",
+			"provider": "openai-codex",
+			"baseUrl": "https://chatgpt.com/backend-api",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"contextWindow": 373000,
+			"maxTokens": 128000,
+			"preferWebsockets": true,
+			"applyPatchToolType": "freeform",
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
+		"gpt-6.1-sol": {
+			"id": "gpt-6.1-sol",
+			"name": "GPT-6.1 Sol",
+			"cost": {
+				"input": 2,
+				"output": 10,
+				"cacheRead": 0.1,
 				"cacheWrite": 2.5
 			},
 			"api": "openai-codex-responses",
