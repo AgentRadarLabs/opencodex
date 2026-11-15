@@ -597,6 +597,7 @@
     "empty-completion-guard.test.ts": "responses",
     "empty-completion-hardening.test.ts": "responses",
     "empty-tool-output-annotation.test.ts": "adapters",
+    "enforce-pr-target-release-line.test.ts": "ci-workflows",
     "ensure-desired-integrations-race.test.ts": "cli",
     "error-fidelity.test.ts": "server",
     "errors-adapter-failure.test.ts": "server",

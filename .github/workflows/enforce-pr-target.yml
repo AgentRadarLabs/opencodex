@@ -531,7 +531,17 @@ jobs:
             let behindBase = 0;
             let aheadMain = 0;
             let ancestryLookupFailed = false;
-            const baseAllowed = ALLOWED_BASES.includes(pr.base.ref);
+            // This fork cuts tagged releases from release/<semver>-vadymhimself.<n>
+            // and fixes for a cut release target that line directly. Only a
+            // branch pushed to this same repository may target it; a fork PR
+            // into a release line still fails as wrong_base.
+            const FORK_RELEASE_LINE = /^release\/\d+\.\d+\.\d+-vadymhimself\.\d+$/;
+            const releaseLineBase =
+              FORK_RELEASE_LINE.test(pr.base.ref) &&
+              pr.head?.repo?.owner?.login === owner &&
+              pr.head?.repo?.name === repo;
+            const baseAllowed =
+              ALLOWED_BASES.includes(pr.base.ref) || releaseLineBase;
 
             // Stacked PR exception: base is another open PR's head branch (same
             // head repo as this PR's base repo). Closed/missing parent stays wrong_base.
@@ -640,7 +650,11 @@ jobs:
 
             let failures = collectPrQualityFailures({
               baseRef: pr.base.ref,
-              allowedBases: ALLOWED_BASES,
+              // pr-quality.cjs is checked out from dev; widen its allow-list
+              // here for an accepted release-line base only.
+              allowedBases: releaseLineBase
+                ? [...ALLOWED_BASES, pr.base.ref]
+                : ALLOWED_BASES,
               title: pr.title,
               body: pr.body,
               behindMain,
