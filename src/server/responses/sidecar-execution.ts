@@ -29,7 +29,7 @@ import {
   ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST,
   rotateAnthropicAccountOn429,
   getAnthropicPoolAccessSnapshot,
-  formatAnthropicProviderForLog,
+  stampAnthropicAccountForLog,
 } from "../../oauth/anthropic-routing";
 import type { AnthropicPoolRotationTrigger } from "../../oauth/anthropic-pool-rotation";
 import { resolveWireProtocolOverride } from "../adapter-resolve";
@@ -267,7 +267,7 @@ export async function executeResponsesSidecars(
         transportState.anthropicPoolAccountId = admitted.accountId;
         transportState.anthropicPoolFailovers += 1;
         route.provider = { ...route.provider, apiKey: admitted.accessToken };
-        logCtx.provider = formatAnthropicProviderForLog("anthropic", admitted.accountId, config);
+        stampAnthropicAccountForLog(logCtx, admitted.accountId, config);
       } catch {
         hop.permit?.release();
         return null;

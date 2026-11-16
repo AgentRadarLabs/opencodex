@@ -808,6 +808,45 @@ describe("routing analytics (RI-03)", () => {
     expect(result.warmedRoutes).toBe(0);
   });
 
+  test("an Anthropic account named by both provider and label is one route, counted once", async () => {
+    // The ledger names a served Anthropic account twice -- `anthropic-p<hex6>` and the same
+    // `p<hex6>` label -- and the plain active account only through the label. Every shape below
+    // is account X except the combo's serving attempt (account Y).
+    const x = "paaaaaa";
+    const y = "pbbbbbb";
+    const claude = (overrides: Partial<PersistedUsageAttempt>) =>
+      attempt({ adapter: "anthropic", model: "claude-opus-5", ...overrides });
+    // Written before the label existed: the provider suffix is the only account.
+    appendUsageEntry(entry("legacy-pooled", { timestamp: 1, status: 200, durationMs: 10,
+      provider: `anthropic-${x}`, model: "claude-opus-5",
+      attempts: [claude({ provider: `anthropic-${x}` })] }));
+    appendUsageEntry(entry("pooled", { timestamp: 2, status: 200, durationMs: 10,
+      provider: `anthropic-${x}`, model: "claude-opus-5", accountLogLabel: x,
+      attempts: [claude({ provider: `anthropic-${x}`, accountLogLabel: x })] }));
+    appendUsageEntry(entry("plain-active", { timestamp: 3, status: 200, durationMs: 10,
+      provider: "anthropic", model: "claude-opus-5", accountLogLabel: x,
+      attempts: [claude({ provider: "anthropic", accountLogLabel: x })] }));
+    // A combo row: the row label is the serving attempt's, and it must not be counted again.
+    appendUsageEntry(entry("combo", { timestamp: 4, status: 200, durationMs: 10,
+      provider: "combo", model: "combo/claude", accountLogLabel: y,
+      attempts: [
+        claude({ provider: `anthropic-${x}`, accountLogLabel: x, status: 429 }),
+        claude({ ordinal: 2, provider: `anthropic-${y}`, accountLogLabel: y }),
+      ] }));
+
+    const result = await computeRoutingAnalytics({});
+    const routes = result.physicalBreakdown
+      .map(route => ({ provider: route.provider, accountRef: route.accountRef,
+        requests: route.requests, physicalAttempts: route.physicalAttempts }))
+      .sort((a, b) => (a.accountRef ?? "").localeCompare(b.accountRef ?? ""));
+    expect(routes).toEqual([
+      { provider: "anthropic", accountRef: x, requests: 4, physicalAttempts: 4 },
+      { provider: "anthropic", accountRef: y, requests: 1, physicalAttempts: 1 },
+    ]);
+    // Five physical attempts in, five attributed out: nothing dropped, nothing doubled.
+    expect(result.physicalBreakdown.reduce((sum, route) => sum + route.physicalAttempts, 0)).toBe(5);
+  });
+
   test("emits route-sequential red alerts in timestamp and request-id order", async () => {
     const addAttemptRow = (
       requestId: string,

@@ -14,7 +14,7 @@ import {
   isAnthropicAccountPoolEnabled,
   getAnthropicPoolAccessSnapshot,
   commitAnthropicSelectionRouting,
-  formatAnthropicProviderForLog,
+  stampAnthropicAccountForLog,
   anthropicSessionKeyFromParts,
   resolveAnthropicAccountForSession,
   anthropicModelFamily,
@@ -263,7 +263,7 @@ export async function prepareResponsesTransport(
     stampOAuthAccountLabel(logCtx, route.providerName, route.provider, snapshot.accountId);
     if (route.providerName === "anthropic") {
       anthropicPoolAccountId = snapshot.accountId;
-      logCtx.provider = formatAnthropicProviderForLog("anthropic", snapshot.accountId, config);
+      stampAnthropicAccountForLog(logCtx, snapshot.accountId, config);
     } else {
       genericFailoverAccountId = snapshot.accountId;
     }
@@ -531,7 +531,7 @@ export async function prepareResponsesTransport(
         // The failover ids only let a 429 record the cooldown; the rotators return null under a pin.
         if (route.providerName === "anthropic") {
           anthropicPoolAccountId = admitted.accountId;
-          logCtx.provider = formatAnthropicProviderForLog("anthropic", admitted.accountId, config);
+          stampAnthropicAccountForLog(logCtx, admitted.accountId, config);
         } else genericFailoverAccountId = admitted.accountId;
         if (hasPassiveAccountQuota(route.providerName)) passiveQuotaWriterGeneration = captureConfigGeneration();
       } else if (route.providerName === "anthropic" && isAnthropicAccountPoolEnabled(config)) {
@@ -556,7 +556,7 @@ export async function prepareResponsesTransport(
         // no served account, so an expired subscription's 403 stands instead of moving on.
         replayOAuthCredentialSnapshot = { accountId: admitted.accountId, generation: admitted.generation };
         route.provider = { ...route.provider, apiKey: admitted.accessToken };
-        logCtx.provider = formatAnthropicProviderForLog("anthropic", admitted.accountId, config);
+        stampAnthropicAccountForLog(logCtx, admitted.accountId, config);
         const arHash = (v: string) => new Bun.CryptoHasher("sha256").update(v).digest("hex").slice(0, 8);
         if (process.env.OPENCODEX_AGENTRADAR === "1") console.error("[ar-acct] a=" + arHash(admitted.accountId) + " r=" + selection.reason + " s=" + (anthropicSessionKey ? arHash(anthropicSessionKey) : "none"));
       } else {

@@ -12,7 +12,7 @@ import type { AttemptRecoveryKind } from "../../usage/log";
 export { credentialRecoveryStatus } from "../../usage/log";
 import {
   ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST,
-  formatAnthropicProviderForLog,
+  stampAnthropicAccountForLog,
   getAnthropicPoolAccessSnapshot,
   rotateAnthropicAccountOnCredentialDenial,
 } from "../../oauth/anthropic-routing";
@@ -144,7 +144,7 @@ export async function rotateAnthropicProviderOnCredentialDenial(args: {
     );
     if (!admitted) return null;
     transportState.anthropicPoolFailovers += 1;
-    logCtx.provider = formatAnthropicProviderForLog("anthropic", admitted.accountId, config);
+    stampAnthropicAccountForLog(logCtx, admitted.accountId, config);
     const rotatedAdapter = transportState.resolveSelectionAdapter(
       resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
       config.cacheRetention,
