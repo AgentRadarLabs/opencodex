@@ -136,6 +136,15 @@ describe("responses-state environment bounds", () => {
     expect(getSpilledResponseBytesForTests()).toBeLessThanOrEqual(spillCap);
   });
 
+  test("a fraction below 1 is ignored rather than flooring to 0 and emptying the store", () => {
+    process.env[CAP_ENV] = "0.5";
+    process.env[TTL_ENV] = "0.5";
+    rememberForced("resp_fraction", [{ role: "user", content: "hello" }], [assistantItem(0)]);
+    expect(responseStateMetrics().count).toBe(1);
+    expect(getStoredResponseBytesForTests()).toBeGreaterThan(0);
+    expect(sweepExpiredResponseStates(Date.now() + 1_000)).toBe(0);
+  });
+
   test("a value above the built-in cap is ignored rather than raising it", () => {
     process.env[CAP_ENV] = String(Number.MAX_SAFE_INTEGER);
     process.env[TTL_ENV] = String(Number.MAX_SAFE_INTEGER);
