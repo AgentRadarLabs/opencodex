@@ -93,9 +93,15 @@ function readJournal(path: string): Journal {
 }
 
 function writeJournal(path: string, journal: Journal, now: number): void {
-  // Keep only entries whose credit could still matter: settled ones older than a week are noise.
-  const cutoff = now - 7 * 24 * 60 * 60_000;
-  journal.entries = journal.entries.filter(e => e.state !== "settled" || e.updatedAt > cutoff);
+  // Keep only entries whose credit could still matter: a settled entry stays until the later of
+  // a week after its last update and the credit's own expiry, so it is never dropped while the
+  // credit it records can still be listed. An unparseable expiry falls back to the week rule.
+  const week = 7 * 24 * 60 * 60_000;
+  journal.entries = journal.entries.filter(e => {
+    if (e.state !== "settled") return true;
+    const expiry = Date.parse(e.expiresAt);
+    return now < Math.max(e.updatedAt + week, Number.isNaN(expiry) ? 0 : expiry);
+  });
   atomicWriteFile(path, JSON.stringify(journal, null, 2));
 }
 
