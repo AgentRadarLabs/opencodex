@@ -323,7 +323,9 @@ setComboPoolEligibilityProbe((provider, now) =>
 const WEEKLY_READING_TIMEOUT_MS = 1_500;
 
 type WeeklyReadingProbe = (accountId: string) => Promise<unknown>;
-const defaultWeeklyReadingProbe: WeeklyReadingProbe = accountId => fetchAccountQuota(PROVIDER, accountId, false);
+/** OCX_DISABLE_POOL_WEEKLY_PROBE=1 (the test preload sets it) turns the live read off; an injected probe still runs. */
+const defaultWeeklyReadingProbe: WeeklyReadingProbe = accountId =>
+  process.env.OCX_DISABLE_POOL_WEEKLY_PROBE === "1" ? Promise.resolve(null) : fetchAccountQuota(PROVIDER, accountId, false);
 let weeklyReadingProbe: WeeklyReadingProbe = defaultWeeklyReadingProbe;
 const weeklyReadingInflight = new Map<string, Promise<void>>();
 

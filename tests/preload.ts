@@ -73,6 +73,8 @@ process.env.OCX_TEST_HOME_GUARD = "1";
 // Lets a test assert one preload per process rather than assuming Bun's scheduling.
 process.env.OCX_TEST_PRELOAD_PID = String(process.pid);
 process.env.OCX_DISABLE_UPDATE_CHECK = "1";
+// The pool's live weekly-usage read would otherwise spend a test's mocked fetch responses.
+process.env.OCX_DISABLE_POOL_WEEKLY_PROBE = "1";
 
 if (!isTestHomeGuardArmed() || !protectedHomeForTests()) {
   throw new Error("test home guard failed to arm; refusing to run tests unprotected");
