@@ -49,6 +49,25 @@ export const NATIVE_GPT6_LUNA_MODEL = "gpt-6-luna";
 export const NATIVE_GPT61_SOL_MODEL = "gpt-6.1-sol";
 
 /**
+ * GPT-6.1 Terra. Its row is pinned verbatim in `src/codex/data/roster-pinned-models.json` from the
+ * upstream opencodex roster (lidge-jun/opencodex v2.100.4, captured there 2026-10-27 from
+ * openai/codex `codex-rs/models-manager/models.json`): low..ultra, default effort low, a 500,000
+ * default / 872,000 maximum context pair. Self-described and ungated alongside GPT-5.6 Terra.
+ */
+export const NATIVE_GPT61_TERRA_MODEL = "gpt-6.1-terra";
+
+/**
+ * GPT-6.2 Astra and GPT-6.2 Sol, listed on the vendor's public models page (1.05M context, 128K
+ * max output). No upstream roster row exists for either yet, so each row in
+ * `src/codex/data/roster-pinned-models.json` is DERIVED from the GPT-6.1 Sol row (same ladder
+ * low..ultra, default effort low, 272,000 / 872,000 context pair) with only its id, name and
+ * description changed. Replace them with verbatim rows once a codex-rs bundle or roster carries
+ * them. Self-described and ungated for the same owner decision as Sol and Luna.
+ */
+export const NATIVE_GPT62_ASTRA_MODEL = "gpt-6.2-astra";
+export const NATIVE_GPT62_SOL_MODEL = "gpt-6.2-sol";
+
+/**
  * Unreleased GPT-6 Astra variant. No public row exists anywhere — neither the codex-rs bundle nor
  * the 2026-09-23 main-account roster probe carries it — so it is ACCOUNT-GATED: hidden and
  * request-refused until an authenticated `/models` roster lists it for that account. Absence is
@@ -66,6 +85,10 @@ export const NATIVE_GPT6_ASTRA_MINOR_MODEL = "gpt-6-astra-minor";
  */
 export const NATIVE_GPT6_CONTEXT: Readonly<{ contextWindow: number; maxContextWindow: number; maxInputTokens: number }> =
   Object.freeze({ contextWindow: 272_000, maxContextWindow: 872_000, maxInputTokens: 872_000 });
+
+/** GPT-6.1 Terra's pinned row ships a 500,000 default / 872,000 maximum pair (not the API window). */
+export const NATIVE_GPT61_TERRA_CONTEXT: Readonly<{ contextWindow: number; maxContextWindow: number; maxInputTokens: number }> =
+  Object.freeze({ ...NATIVE_GPT6_CONTEXT, contextWindow: 500_000 });
 
 /** Pinned row a configured native borrows its capability metadata from. */
 export const CONFIGURED_NATIVE_OPENAI_TEMPLATE_MODEL = NATIVE_GPT6_SOL_MODEL;
@@ -135,6 +158,9 @@ export const SELF_DESCRIBED_NATIVE_OPENAI_MODELS: ReadonlySet<string> = new Set(
   NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT6_LUNA_MODEL,
   NATIVE_GPT61_SOL_MODEL,
+  NATIVE_GPT61_TERRA_MODEL,
+  NATIVE_GPT62_ASTRA_MODEL,
+  NATIVE_GPT62_SOL_MODEL,
 ]);
 
 /**
@@ -236,6 +262,8 @@ const BUILT_IN_NATIVE_OPENAI_MODELS: readonly string[] = Object.freeze([
   NATIVE_GPT6_ASTRA_MODEL,
   NATIVE_GPT6_SOL_MODEL, NATIVE_GPT6_LUNA_MODEL,
   NATIVE_GPT61_SOL_MODEL,
+  NATIVE_GPT61_TERRA_MODEL,
+  NATIVE_GPT62_ASTRA_MODEL, NATIVE_GPT62_SOL_MODEL,
   NATIVE_GPT6_ASTRA_MINOR_MODEL,
 ]);
 
@@ -356,4 +384,7 @@ export const NATIVE_MAIN_DRAIN_SENTINEL_MODELS: ReadonlySet<string> = new Set([
   NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT6_LUNA_MODEL,
   NATIVE_GPT61_SOL_MODEL,
+  NATIVE_GPT61_TERRA_MODEL,
+  NATIVE_GPT62_ASTRA_MODEL,
+  NATIVE_GPT62_SOL_MODEL,
 ]);

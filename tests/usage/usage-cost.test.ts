@@ -418,13 +418,19 @@ describe("resolveMatchedPrice", () => {
     }
   });
 
-  test("16. shipped overlay membership: 145 keys, including canonical Fable 5.1, Opus 5, Opus 5.5, OpenCode Go and compatibility prices", () => {
-    expect(EXPECTED_PRICE_OVERLAYS.length).toBe(145);
+  test("16. shipped overlay membership: 151 keys, including canonical Fable 5.1, Opus 5, Opus 5.5, OpenCode Go and compatibility prices", () => {
+    expect(EXPECTED_PRICE_OVERLAYS.length).toBe(151);
     expect(EXPECTED_PRICE_OVERLAYS.some(row => row.status === "unverified")).toBe(false);
     const keys = new Set(EXPECTED_PRICE_OVERLAYS.map(row => `${row.provider}/${row.modelId}`));
     for (const expected of [
       "openai-apikey/gpt-6.1-sol",
       "openai/gpt-6.1-sol",
+      "openai-apikey/gpt-6.1-terra",
+      "openai/gpt-6.1-terra",
+      "openai-apikey/gpt-6.2-astra",
+      "openai/gpt-6.2-astra",
+      "openai-apikey/gpt-6.2-sol",
+      "openai/gpt-6.2-sol",
       "anthropic/claude-fable-5-1",
       "anthropic-apikey/claude-fable-5-1",
       "cursor/claude-fable-5-1",

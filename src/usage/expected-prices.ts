@@ -57,6 +57,19 @@ const GPT6_API_PRICING = "https://developers.openai.com/api/docs/changelog (2026
  */
 const GPT61_SOL: Cost4 = { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 };
 const GPT61_SOL_API_PRICING = "https://developers.openai.com/api/docs/pricing (2026-09-30: GPT-6.1 Sol $2 / $0.10 cached / $2.50 cache write / $10; >272K $4 / $0.20 / $5 / $15)";
+/** GPT-6.1 Terra API list prices (released 2026-10-26): $1 in, $0.05 cached, $1.25 cache write, $5 out. */
+const GPT61_TERRA: Cost4 = { input: 1, output: 5, cacheRead: 0.05, cacheWrite: 1.25 };
+const GPT61_TERRA_API_PRICING = "https://developers.openai.com/api/docs/models/gpt-6.1-terra (2026-10-27: GPT-6.1 Terra $1 / $0.05 cached / $1.25 cache write / $5; >272K $2 / $0.10 / $2.50 / $7.50)";
+/**
+ * GPT-6.2 Astra and Sol, from the vendor's public models page (2026-11-17; 1.05M context, 128K max
+ * output). Input and output are published for both, cached input only for Sol. Astra's cached
+ * input is not published, so it is rounded up to input / 10, as GPT-6 Astra's own $1 on $10 is, and
+ * both cache-write prices are assumed at 1.25x input, as every GPT-6 row is.
+ */
+const GPT62_ASTRA: Cost4 = { input: 8, output: 40, cacheRead: 0.8, cacheWrite: 10 };
+const GPT62_SOL: Cost4 = { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 };
+const GPT62_ASTRA_API_PRICING = "https://developers.openai.com/api/docs/models (2026-11-17: GPT-6.2 Astra $8 / $40; cached input not published, $0.80 assumed as input/10; cache write $10 assumed as 1.25x input)";
+const GPT62_SOL_API_PRICING = "https://developers.openai.com/api/docs/models (2026-11-17: GPT-6.2 Sol $2 / $0.10 cached / $10; cache write $2.50 assumed as 1.25x input)";
 /**
  * Daybreak aliases. `daybreak-*-latest` never appears in the pricing table itself — only its
  * current snapshot does — so these tuples are the snapshot's published rates and carry
@@ -257,9 +270,15 @@ export const EXPECTED_PRICE_OVERLAYS: readonly ExpectedPriceOverlay[] = [
   // Display estimates use API prices for both login and API-key routes, including cache writes.
   { provider: "openai", modelId: "gpt-6-astra", cost4: GPT6_ASTRA, source: `API-reference comparison estimate: ${ASTRA_API_PRICING}`, verifiedAt: "2026-09-05", status: "verified-derived" },
   { provider: "openai-apikey", modelId: "gpt-6.1-sol", cost4: GPT61_SOL, source: GPT61_SOL_API_PRICING, verifiedAt: "2026-09-30", status: "verified" },
+  { provider: "openai-apikey", modelId: "gpt-6.1-terra", cost4: GPT61_TERRA, source: GPT61_TERRA_API_PRICING, verifiedAt: "2026-10-27", status: "verified" },
+  { provider: "openai-apikey", modelId: "gpt-6.2-astra", cost4: GPT62_ASTRA, source: GPT62_ASTRA_API_PRICING, verifiedAt: "2026-11-17", status: "verified-derived" },
+  { provider: "openai-apikey", modelId: "gpt-6.2-sol", cost4: GPT62_SOL, source: GPT62_SOL_API_PRICING, verifiedAt: "2026-11-17", status: "verified-derived" },
   { provider: "openai-apikey", modelId: "gpt-6-sol", cost4: GPT6_SOL, source: GPT6_API_PRICING, verifiedAt: "2026-09-23", status: "verified" },
   { provider: "openai-apikey", modelId: "gpt-6-luna", cost4: GPT6_LUNA, source: GPT6_API_PRICING, verifiedAt: "2026-09-23", status: "verified" },
   { provider: "openai", modelId: "gpt-6.1-sol", cost4: GPT61_SOL, source: `API-reference comparison estimate: ${GPT61_SOL_API_PRICING}`, verifiedAt: "2026-09-30", status: "verified-derived" },
+  { provider: "openai", modelId: "gpt-6.1-terra", cost4: GPT61_TERRA, source: `API-reference comparison estimate: ${GPT61_TERRA_API_PRICING}`, verifiedAt: "2026-10-27", status: "verified-derived" },
+  { provider: "openai", modelId: "gpt-6.2-astra", cost4: GPT62_ASTRA, source: `API-reference comparison estimate: ${GPT62_ASTRA_API_PRICING}`, verifiedAt: "2026-11-17", status: "verified-derived" },
+  { provider: "openai", modelId: "gpt-6.2-sol", cost4: GPT62_SOL, source: `API-reference comparison estimate: ${GPT62_SOL_API_PRICING}`, verifiedAt: "2026-11-17", status: "verified-derived" },
   { provider: "openai", modelId: "gpt-6-sol", cost4: GPT6_SOL, source: `API-reference comparison estimate: ${GPT6_API_PRICING}`, verifiedAt: "2026-09-23", status: "verified-derived" },
   { provider: "openai", modelId: "gpt-6-luna", cost4: GPT6_LUNA, source: `API-reference comparison estimate: ${GPT6_API_PRICING}`, verifiedAt: "2026-09-23", status: "verified-derived" },
   // claude-fable-5-1 now HAS a generated jawcode row, so the two Anthropic surfaces resolve
@@ -686,6 +705,9 @@ const OPENAI_PRICING_DOC = "https://developers.openai.com/api/docs/pricing";
 const OPENAI_CONTEXT_MODELS = [
   "gpt-6-astra",
   "gpt-6.1-sol",
+  "gpt-6.1-terra",
+  "gpt-6.2-astra",
+  "gpt-6.2-sol",
   "gpt-6-sol",
   "gpt-6-luna",
   "gpt-5.6-sol",
