@@ -8,6 +8,7 @@ import { clearGenericFailoverHealth } from "../../src/oauth/generic-account-fail
 import * as accountFailover from "../../src/oauth/generic-account-failover";
 import * as oauth from "../../src/oauth";
 import { stampOAuthAccountLabel } from "../../src/providers/label";
+import { formatAnthropicProviderForLog } from "../../src/oauth/anthropic-routing";
 import { isCodexUsageAccountLogLabel, isCodexPoolAccountLogLabel } from "../../src/usage/log";
 import type { PersistedUsageEntry } from "../../src/usage/log";
 import { summarizeUsage } from "../../src/usage/summary";
@@ -133,14 +134,19 @@ describe("stampOAuthAccountLabel", () => {
     expect(ctx.accountLogLabel).toBe(oauthAccountLogLabel("acct-1", "xai"));
   });
 
-  test("skips the two providers that already have attribution", () => {
-    // openai produces its own p-labels; anthropic folds the account into the provider label.
-    // Stamping either would overwrite a working mechanism with a second, conflicting one.
-    for (const name of ["openai", "anthropic"]) {
-      const ctx: { accountLogLabel?: string } = {};
-      stampOAuthAccountLabel(ctx, name, oauth, "acct-1");
-      expect(ctx.accountLogLabel).toBeUndefined();
-    }
+  test("skips openai, which produces its own p-labels", () => {
+    const ctx: { accountLogLabel?: string } = {};
+    stampOAuthAccountLabel(ctx, "openai", oauth, "acct-1");
+    expect(ctx.accountLogLabel).toBeUndefined();
+  });
+
+  test("stamps anthropic with the same p-digest its account-qualified provider carries", () => {
+    // Not an o-label: the plain active account never rewrites the provider, so this label is its
+    // only attribution, and it must join the `anthropic-p<hex6>` rows of the same account.
+    const ctx: { accountLogLabel?: string } = {};
+    stampOAuthAccountLabel(ctx, "anthropic", oauth, "acct-1");
+    expect(ctx.accountLogLabel).toMatch(/^p[a-f0-9]{6}$/);
+    expect(formatAnthropicProviderForLog("anthropic", "acct-1")).toBe(`anthropic-${ctx.accountLogLabel}`);
   });
 
   test("skips a suffixed openai provider name too", () => {

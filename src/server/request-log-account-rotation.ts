@@ -11,10 +11,10 @@ import { isCodexUsageAccountLogLabel, type PersistedUsageAttempt } from "../usag
  * `isCodexUsageAccountLogLabel` (src/usage/log.ts) already persists those labels onto the
  * attempt through the broad pattern; this is the same pattern, read back at the split.
  *
- * The other axis a rotation can move: Anthropic's pool carries no label at all --
- * `stampOAuthAccountLabel` skips that base provider -- and keeps its account inside the
- * account-qualified log provider string (`anthropic-p<hex6>`), so the label test can never see an
- * Anthropic rotation. Comparing providers is safe because a sent attempt's provider is frozen by
+ * The other axis a rotation can move: Anthropic keeps its account inside the account-qualified
+ * log provider string (`anthropic-p<hex6>`) as well as in its `p<hex6>` label
+ * (`stampAnthropicAccountForLog`), and rows written before that label existed carry only the
+ * provider, so the provider comparison stays. Comparing providers is safe because a sent attempt's provider is frozen by
  * `sealRequestAttemptIdentity`: the only way the two diverge after a send is the account moving
  * underneath the row.
  */

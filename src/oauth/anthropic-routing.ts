@@ -969,6 +969,25 @@ export function formatAnthropicProviderForLog(
 }
 
 /**
+ * Name the Anthropic account that serves this attempt, in BOTH places the ledger reads it: the
+ * account-qualified provider (`anthropic-p<hex6>`, unchanged for every existing reader) and the
+ * row/attempt `accountLogLabel` (`p<hex6>`, the same six hex, so the two always join).
+ *
+ * Every site that moves a request onto an Anthropic account (pin, pool pick, each in-request
+ * rotation) calls this instead of assigning the provider alone; a site that set only the provider
+ * left the row without a label, which is how combo traffic -- nearly all of it -- lost its account.
+ * The label is a digest of the account id: never the id, a token or an email.
+ */
+export function stampAnthropicAccountForLog(
+  logCtx: { provider: string; accountLogLabel?: string },
+  accountId: string,
+  config?: OcxConfig,
+): void {
+  logCtx.provider = formatAnthropicProviderForLog("anthropic", accountId, config);
+  logCtx.accountLogLabel = formatAnthropicAccountOrdinal(accountId);
+}
+
+/**
  * Build a sticky session key from Claude/Responses headers.
  * Prefer true session/thread ids; do not use Desktop shared cache-cohort prompt_cache_key
  * alone (those collide across conversations).

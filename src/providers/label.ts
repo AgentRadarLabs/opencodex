@@ -1,4 +1,4 @@
-import { ACCOUNT_LOG_LABEL_RE, CODEX_ACCOUNT_LOG_LABEL_RE, KEY_ACCOUNT_LOG_LABEL_RE, apiKeyAccountLogLabel, oauthAccountLogLabel } from "../codex/account-label";
+import { ACCOUNT_LOG_LABEL_RE, CODEX_ACCOUNT_LOG_LABEL_RE, KEY_ACCOUNT_LOG_LABEL_RE, apiKeyAccountLogLabel, fallbackCodexAccountLogLabel, oauthAccountLogLabel } from "../codex/account-label";
 import type { OcxProviderConfig } from "../types";
 
 export function canonicalUsageProviderLabel(provider: string): string {
@@ -72,9 +72,13 @@ export function baseProviderLabel(provider: string): string {
  * label at all while every test still passed, which is the bug this fixes rather than a variant
  * of it.
  *
- * Two providers are skipped because they already have attribution:
- * - `openai` produces its own `p`-labels through `codexAuthContextLogLabel`.
- * - `anthropic` folds the account into the provider label (`formatAnthropicProviderForLog`).
+ * `openai` is skipped: it produces its own `p`-labels through `codexAuthContextLogLabel`.
+ *
+ * `anthropic` gets `p<hex6>` -- the SAME digest `formatAnthropicProviderForLog` appends to the
+ * provider (`anthropic-p<hex6>`), not an `o`-label. One account therefore carries one identity in
+ * both fields, so a reader that takes the label, or the provider suffix when the label is absent
+ * (older rows), lands on the same account exactly once. This is what labels the plain
+ * active-account path (pool off, no pin), which never rewrites the provider.
  *
  * It lives here rather than in `account-label.ts` because it needs `baseProviderLabel`, and this
  * module already imports from that one -- the reverse direction would be an import cycle. This
@@ -90,6 +94,8 @@ export function stampOAuthAccountLabel(
   if (!accountId) return;
   if (provider.authMode !== "oauth") return;
   const base = baseProviderLabel(providerName);
-  if (base === "openai" || base === "anthropic") return;
-  logCtx.accountLogLabel = oauthAccountLogLabel(accountId, base);
+  if (base === "openai") return;
+  logCtx.accountLogLabel = base === "anthropic"
+    ? fallbackCodexAccountLogLabel(accountId)
+    : oauthAccountLogLabel(accountId, base);
 }

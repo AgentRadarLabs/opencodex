@@ -714,6 +714,8 @@ export async function executeComboResponses(
         activeAttemptStartedAt: started,
         resolvedModel: childLog.resolvedModel ?? childLog.model,
       });
+      // The row's account is the serving attempt's, never one left over from before the ladder.
+      if (childLog.accountLogLabel === undefined) delete logCtx.accountLogLabel;
       options.onCodexAuthContextResolved?.(resolvedAuth);
       options.setTerminalOutcomeRecorder?.(terminalRecorder);
       // The other half of the suppression above: children never bind the lease, so the ACCEPTED

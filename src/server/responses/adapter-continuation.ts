@@ -37,7 +37,7 @@ import {
   ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST,
   rotateAnthropicAccountOn429,
   getAnthropicPoolAccessSnapshot,
-  formatAnthropicProviderForLog,
+  stampAnthropicAccountForLog,
 } from "../../oauth/anthropic-routing";
 import { peekAnthropicPoolRotation, type AnthropicPoolRotationTrigger } from "../../oauth/anthropic-pool-rotation";
 import {
@@ -425,7 +425,7 @@ export function createAdapterContinuations(
             };
             route.provider = { ...route.provider, apiKey: admitted.accessToken };
             invalidateSameTargetRequest();
-            logCtx.provider = formatAnthropicProviderForLog("anthropic", admitted.accountId, config);
+            stampAnthropicAccountForLog(logCtx, admitted.accountId, config);
             transportState.activeAdapter = resolveSelectionAdapter(
               resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire, route.staticPolicy),
               config.cacheRetention,

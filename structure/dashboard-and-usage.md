@@ -126,6 +126,18 @@ current physical response contribution, preserving prior sends on the same key w
 repeated inspections twice. Consumers sum the flat attempts once and keep subscription quota
 observations separate from token or API-equivalent cost totals.
 
+### Anthropic OAuth account attribution
+
+Every Anthropic OAuth attempt carries `accountLogLabel` `p` plus the first 6 hex of SHA-256 over
+the stored account id: the plain active account (`stampOAuthAccountLabel` in
+`src/providers/label.ts`), and every pin, pool pick and in-request rotation
+(`stampAnthropicAccountForLog` in `src/oauth/anthropic-routing.ts`, which also keeps the
+account-qualified provider `anthropic-p<hex6>` with the same digest). A combo row takes the label
+of its serving attempt, and each attempt in `attempts` keeps its own. `src/routing/analytics.ts`
+folds an Anthropic physical route to provider `anthropic` with the label, or the provider suffix
+on rows written before the label existed, as its single account, so one account is one route and
+each attempt is counted once.
+
 
 `src/server/hub-usage.ts` serves `GET /v1/usage` on hubs for an explicit configured data key. The authenticated key selects the aggregate; query parameters cannot select an API-key identity. Unscoped environment/admin credentials and loopback bypass are not admitted. The response projects only this client's numeric totals, provider/model/day rows and incomplete-history metadata through `src/remote/hub-usage.ts`; accounts, raw records and key IDs are omitted. Unknown fields are stripped at every object boundary and the serialized body is capped at 1 MiB.
 

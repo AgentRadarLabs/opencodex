@@ -286,7 +286,29 @@ const USAGE_STATUSES = new Set<UsageStatus>([
 ]);
 const HOUR_MS = 3_600_000;
 const ANTHROPIC_DEFAULT_PROMPT_CACHE_TTL_MS = 5 * 60_000;
-const ANTHROPIC_ACCOUNT_PROVIDER_RE = /^anthropic-p[a-f0-9]{6}$/;
+const ANTHROPIC_ACCOUNT_PROVIDER_RE = /^anthropic-(p[a-f0-9]{6})$/;
+
+/**
+ * One Anthropic account is one physical route, counted once.
+ *
+ * An Anthropic attempt names its account twice: in the account-qualified provider
+ * (`anthropic-p<hex6>`, pinned and pooled turns) and in `accountLogLabel` (`p<hex6>`, the same
+ * digest, on every OAuth turn including the plain active account whose provider stays
+ * `anthropic`). Keyed on the raw provider, one account would split into an `anthropic` route and
+ * an `anthropic-p<hex6>` route, and a reader summing by provider suffix AND by label would count
+ * it twice. So the route takes the account from exactly one source -- the stamped label, else the
+ * provider suffix for rows written before the label existed -- and the provider folds to
+ * `anthropic`.
+ */
+function physicalAccountRoute(
+  provider: string,
+  accountRef: string | undefined,
+): { provider: string; accountRef?: string } {
+  const suffix = ANTHROPIC_ACCOUNT_PROVIDER_RE.exec(provider)?.[1];
+  if (provider !== "anthropic" && suffix === undefined) return accountRef ? { provider, accountRef } : { provider };
+  const account = accountRef ?? suffix;
+  return { provider: "anthropic", ...(account ? { accountRef: account } : {}) };
+}
 
 function usesAnthropicCacheAlertPolicy(
   attempt: Pick<PhysicalAttempt, "provider" | "adapter">,
@@ -358,14 +380,13 @@ function physicalAttemptsFor(
     const physical = durable
       .map((attempt): PhysicalAttempt => {
         const cache = cacheDecomposition(attempt.usage);
-        const accountRef = attempt.accountLogLabel
-          ?? (attempt === legacyAccountAttempt ? entry.accountLogLabel : undefined);
+        const route = physicalAccountRoute(attempt.provider, attempt.accountLogLabel
+          ?? (attempt === legacyAccountAttempt ? entry.accountLogLabel : undefined));
         return {
           ordinal: attempt.ordinal,
-          provider: attempt.provider,
           model: attempt.model,
           ...(attempt.adapter ? { adapter: attempt.adapter } : {}),
-          ...(accountRef ? { accountRef } : {}),
+          ...route,
           sendCount: attempt.sendCount,
           recoveryKinds: attempt.recoveryKinds,
           recoveryCount: attempt.recoveryCount ?? attempt.recoveryKinds.length,
@@ -391,9 +412,8 @@ function physicalAttemptsFor(
   const cache = cacheDecomposition(entry?.usage);
   return [{
     ordinal: 1,
-    provider: row.provider,
     model: row.model,
-    ...(entry?.accountLogLabel ? { accountRef: entry.accountLogLabel } : {}),
+    ...physicalAccountRoute(row.provider, entry?.accountLogLabel || undefined),
     sendCount: 1,
     recoveryKinds: [],
     recoveryCount: 0,
