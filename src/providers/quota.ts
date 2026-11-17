@@ -414,8 +414,8 @@ async function fetchExplicitCurrentQuota(provider: string, config: OcxProviderCo
   return read.result;
 }
 
-
-async function fetchAccountQuota(
+/** One account's reading through the 10-minute cache and in-flight de-dup; routing reads a single account lazily. */
+export async function fetchAccountQuota(
   provider: string,
   accountId: string,
   forceRefresh: boolean,

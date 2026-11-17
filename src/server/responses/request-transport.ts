@@ -16,7 +16,7 @@ import {
   commitAnthropicSelectionRouting,
   stampAnthropicAccountForLog,
   anthropicSessionKeyFromParts,
-  resolveAnthropicAccountForSession,
+  resolveAnthropicAccountForSessionWithReading,
   anthropicModelFamily,
   getAnthropicPoolRetryAfterSeconds,
   hasAnthropicFailoverQuorum,
@@ -535,7 +535,7 @@ export async function prepareResponsesTransport(
         } else genericFailoverAccountId = admitted.accountId;
         if (hasPassiveAccountQuota(route.providerName)) passiveQuotaWriterGeneration = captureConfigGeneration();
       } else if (route.providerName === "anthropic" && isAnthropicAccountPoolEnabled(config)) {
-        const selection = resolveAnthropicAccountForSession(anthropicSessionKey, config, Date.now(), route.modelId);
+        const selection = await resolveAnthropicAccountForSessionWithReading(anthropicSessionKey, config, Date.now(), route.modelId);
         if (!selection.accountId) {
           if (selection.reason === "all-cooled") {
             const retryAfterSec = getAnthropicPoolRetryAfterSeconds(Date.now(), anthropicModelFamily(route.modelId));

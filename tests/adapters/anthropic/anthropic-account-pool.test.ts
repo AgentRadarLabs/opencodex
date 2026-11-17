@@ -15,6 +15,9 @@ import {
   normalizeAccountPoolQuotaWindow,
   parseAccountPoolQuotaWindow,
   resolveAnthropicAccountForSession,
+  resolveAnthropicAccountForSessionWithReading,
+  setAnthropicWeeklyReadingProbeForTests,
+  getAnthropicPoolRetryAfterSeconds,
   resetAnthropicRoutingForManualSelection,
   rotateAnthropicAccountOn429,
   getAnthropicPoolAccessSnapshot,
@@ -61,6 +64,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setAnthropicWeeklyReadingProbeForTests();
   clearAnthropicAccountPoolState();
   clearPoolRotationState();
   clearAccountQuotaCache("anthropic");
@@ -660,13 +664,14 @@ describe("anthropic account pool quota window scoring", () => {
     expect(resolveAnthropicAccountForSession("weekly-unknown-last", cfg(true, 80, { quotaWindow: "weekly" })).accountId).toBe(aId);
   });
 
-  test("weekly mode ranks known 100% before unknown weekly usage", async () => {
+  test("weekly mode ranks unknown weekly usage before a known 100%", async () => {
+    // Was "known 100% before unknown": a spent account outranking one that may have room is inverted.
     const { aId, bId } = await seedTwoAccounts();
     const updatedAt = Date.now();
     setCachedProviderAccountQuotaForTests("anthropic", aId, { fiveHourPercent: 90, weeklyPercent: 100, updatedAt });
     setCachedProviderAccountQuotaForTests("anthropic", bId, { fiveHourPercent: 0, updatedAt });
 
-    expect(resolveAnthropicAccountForSession("weekly-known-100-before-unknown", cfg(true, 80, { quotaWindow: "weekly" })).accountId).toBe(aId);
+    expect(resolveAnthropicAccountForSession("weekly-known-100-before-unknown", cfg(true, 80, { quotaWindow: "weekly" })).accountId).toBe(bId);
   });
 
   test("weekly tie breaks by lower five-hour usage", async () => {
@@ -779,13 +784,15 @@ describe("anthropic account pool quota window scoring", () => {
 
   test("429 failover never returns null while any eligible account remains", async () => {
     const { aId, bId } = await seedTwoAccounts();
+    // B is known spent for the week with its reset still ahead, so it is not eligible (was: still returned).
     setCachedProviderAccountQuotaForTests("anthropic", bId, {
       fiveHourPercent: 100,
       weeklyPercent: 100,
+      weeklyResetAt: Date.now() + 2 * 86_400_000,
       updatedAt: Date.now(),
     });
 
-    expect(rotateAnthropicAccountOn429(cfg(true, 80, { quotaWindow: "weekly" }), aId, "30", "weekly-never-null")).toBe(bId);
+    expect(rotateAnthropicAccountOn429(cfg(true, 80, { quotaWindow: "weekly" }), aId, "30", "weekly-never-null")).toBeNull();
   });
 
   test("fill-first threshold uses configured window", async () => {
@@ -854,5 +861,109 @@ describe("anthropic account pool quota window scoring", () => {
 
     expect(resolveAnthropicAccountForSession("weekly-empty-keep", config).accountId).toBe(aId);
     expect(rotateAnthropicAccountOn429(config, aId, "30", "weekly-empty-failover")).toBe(bId);
+  });
+});
+
+
+describe("weekly-spent accounts across fresh instances", () => {
+  const rrConfig = () => cfg(true, 80, { strategy: "round-robin" });
+  const dayAhead = () => Date.now() + 86_400_000;
+  /** What a new instance looks like: no cooldowns, affinity or ring, the stored selection admitted first. */
+  async function freshInstance() {
+    clearAnthropicAccountPoolState();
+    clearPoolRotationState();
+    await admitAnthropic("", cfg(false));
+  }
+
+  test("a fresh instance never picks an account whose weekly window is spent (hash, affinity, active)", async () => {
+    const { aId, bId } = await seedTwoAccounts();
+    // Admit the stored selection first: the gate (rightly) refuses to promote an account already known spent.
+    await freshInstance();
+    setCachedProviderAccountQuotaForTests("anthropic", aId, { weeklyPercent: 100, weeklyResetAt: dayAhead(), updatedAt: Date.now() });
+    setCachedProviderAccountQuotaForTests("anthropic", bId, { weeklyPercent: 20, weeklyResetAt: dayAhead(), updatedAt: Date.now() });
+
+    // Hash seats: without the gate about half of these keys land on A.
+    for (let i = 0; i < 40; i++) expect(resolveAnthropicAccountForSession(`s${i}`, rrConfig()).accountId).toBe(bId);
+    // Affinity bound to A (as a previous request in this process could have) is dropped, not honoured.
+    bindAnthropicSessionAffinity("bound", aId);
+    expect(resolveAnthropicAccountForSession("bound", cfg(true, 80)).accountId).toBe(bId);
+    // The stored active account is A: an unkeyed request must not stay on it.
+    expect(getAccountSet("anthropic")!.activeAccountId).toBe(aId);
+    expect(resolveAnthropicAccountForSession(null, rrConfig()).accountId).toBe(bId);
+  });
+
+  test("an account with no reading is read once, and a spent one is replaced, even for parallel picks", async () => {
+    const { aId, bId } = await seedTwoAccounts();
+    let key = "";
+    for (let i = 0; !key && i < 200; i++) {
+      if (resolveAnthropicAccountForSession(`probe-${i}`, rrConfig()).accountId === aId) key = `probe-${i}`;
+    }
+    expect(key).not.toBe("");
+    await freshInstance();
+    const calls: string[] = [];
+    setAnthropicWeeklyReadingProbeForTests(async id => {
+      calls.push(id);
+      await Bun.sleep(5);
+      setCachedProviderAccountQuotaForTests("anthropic", id, { weeklyPercent: 100, weeklyResetAt: dayAhead(), updatedAt: Date.now() });
+    });
+
+    const picks = await Promise.all([
+      resolveAnthropicAccountForSessionWithReading(key, rrConfig()),
+      resolveAnthropicAccountForSessionWithReading(key, rrConfig()),
+    ]);
+    expect(picks.map(pick => pick.accountId)).toEqual([bId, bId]);
+    expect(calls).toEqual([aId]);
+  });
+
+  test("with a single eligible account the probe is never called", async () => {
+    const { aId, bId } = await seedTwoAccounts();
+    expect(rotateAnthropicAccountOn429(cfg(true, 80), bId, "600", null)).toBe(aId);
+    let calls = 0;
+    setAnthropicWeeklyReadingProbeForTests(async () => { calls++; });
+    expect(getEligibleAnthropicAccounts()).toEqual([aId]);
+    expect((await resolveAnthropicAccountForSessionWithReading("solo", cfg(true, 80))).accountId).toBe(aId);
+    expect(calls).toBe(0);
+  });
+
+  test("a probe that throws or never answers fails open and does not throw", async () => {
+    const { aId } = await seedTwoAccounts();
+    let key = "";
+    for (let i = 0; !key && i < 200; i++) {
+      if (resolveAnthropicAccountForSession(`open-${i}`, rrConfig()).accountId === aId) key = `open-${i}`;
+    }
+    await freshInstance();
+    setAnthropicWeeklyReadingProbeForTests(async () => { throw new Error("usage endpoint down"); });
+    expect((await resolveAnthropicAccountForSessionWithReading(key, rrConfig())).accountId).toBe(aId);
+
+    setAnthropicWeeklyReadingProbeForTests(() => new Promise(() => {}));
+    const started = Date.now();
+    expect((await resolveAnthropicAccountForSessionWithReading(key, rrConfig())).accountId).toBe(aId);
+    expect(Date.now() - started).toBeLessThan(4_000);
+  }, 10_000);
+
+  test("a seven-day 429 with the only other account known spent surfaces the 429 with the earliest weekly reset", async () => {
+    const { aId, bId } = await seedTwoAccounts();
+    const now = Date.now();
+    const aReset = now + 2 * 86_400_000;
+    setCachedProviderAccountQuotaForTests("anthropic", aId, { weeklyPercent: 100, weeklyResetAt: aReset, updatedAt: now });
+    const bResetSec = Math.ceil(now / 1000) + 3_600;
+    const rejected = new Headers({
+      "anthropic-ratelimit-unified-status": "rejected",
+      "anthropic-ratelimit-unified-7d-status": "rejected",
+      "anthropic-ratelimit-unified-7d-reset": String(bResetSec),
+    });
+
+    expect(rotateAnthropicAccountOn429(rrConfig(), bId, null, "k", now, rejected)).toBeNull();
+    expect(getEligibleAnthropicAccounts(now)).toEqual([]);
+    expect(getAnthropicPoolRetryAfterSeconds(now)).toBe(Math.ceil((bResetSec * 1000 - now) / 1000));
+  });
+
+  test("Retry-After follows the earliest weekly reset when no cooldown is recorded", async () => {
+    const { aId, bId } = await seedTwoAccounts();
+    const now = Date.now();
+    setCachedProviderAccountQuotaForTests("anthropic", aId, { weeklyPercent: 100, weeklyResetAt: now + 5_000_000, updatedAt: now });
+    setCachedProviderAccountQuotaForTests("anthropic", bId, { weeklyPercent: 100, weeklyResetAt: now + 9_000_000, updatedAt: now });
+    expect(getAnthropicPoolRetryAfterSeconds(now)).toBe(5_000);
+    expect(resolveAnthropicAccountForSession("k", rrConfig(), now)).toEqual({ accountId: null, reason: "all-cooled" });
   });
 });

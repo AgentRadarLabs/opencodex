@@ -20,7 +20,8 @@
 import { createHash } from "node:crypto";
 import { captureOAuthAccountSelection, commitOAuthAccountSelection, credentialGeneration, getAccountSet, getAccountCredential, getAccountCredentialWithStatus, markAccountNeedsReauthIfGeneration } from "./store";
 import type { OAuthAccessSnapshot } from "./index";
-import { getCachedProviderAccountQuota } from "../providers/quota";
+import { fetchAccountQuota, getCachedProviderAccountQuota } from "../providers/quota";
+import { recordAnthropicWeeklyExhausted } from "../providers/quota/account-cache";
 import { fallbackCodexAccountLogLabel } from "../codex/account-label";
 import {
   normalizeAccountPoolStickyLimit,
@@ -212,6 +213,7 @@ export function clearAnthropicAccountPoolState(): void {
   sessionAffinity.clear();
   manualPreference = undefined;
   quorumCache = null;
+  weeklyReadingInflight.clear();
 }
 
 export function anthropicSessionAffinitySizeForTests(): number {
@@ -228,9 +230,27 @@ export function anthropicModelFamily(modelId: string | null | undefined): string
 
 const familyKey = (accountId: string, family: string) => `${accountId}\0${family}`;
 
+/**
+ * The reset of an account's spent seven-day window, when the cached reading says it is at 100% and the reset
+ * is still ahead. A reading with no reset proves nothing about when the account serves again, so it does not
+ * count: unknown stays unknown and fails open.
+ *
+ * The cooldown map above is per process, and a short-lived instance starts empty, so it cannot know a window a
+ * previous instance already saw spent. The quota cache can (response headers, the usage probe, the disk
+ * snapshot), which is why this lives beside the cooldown instead of in it.
+ */
+function weeklyExhaustedUntil(accountId: string, now: number): number | undefined {
+  const quota = getCachedProviderAccountQuota(PROVIDER, accountId);
+  const resetAt = quota?.weeklyResetAt;
+  return typeof quota?.weeklyPercent === "number" && quota.weeklyPercent >= 100
+    && typeof resetAt === "number" && resetAt > now ? resetAt : undefined;
+}
+
+/** Single gate for every pick: cooled (account or family) or known to have spent its seven-day window. */
 function isCooled(accountId: string, now: number, family?: string): boolean {
   return getAnthropicAccountHealthSnapshot(accountId, now) !== null
-    || (family !== undefined && getAnthropicAccountHealthSnapshot(familyKey(accountId, family), now) !== null);
+    || (family !== undefined && getAnthropicAccountHealthSnapshot(familyKey(accountId, family), now) !== null)
+    || weeklyExhaustedUntil(accountId, now) !== undefined;
 }
 
 function fiveHourKnown(accountId: string): boolean {
@@ -298,6 +318,70 @@ function isPoolCredentialUsable(accountId: string, now: number): boolean {
 
 setComboPoolEligibilityProbe((provider, now) =>
   provider === PROVIDER && getEligibleAnthropicAccounts(now).length > 0);
+
+/** Longest a pick waits for a usage reading. A slow or failing probe must never hold a request. */
+const WEEKLY_READING_TIMEOUT_MS = 1_500;
+
+type WeeklyReadingProbe = (accountId: string) => Promise<unknown>;
+/** OCX_DISABLE_POOL_WEEKLY_PROBE=1 (the test preload sets it) turns the live read off; an injected probe still runs. */
+const defaultWeeklyReadingProbe: WeeklyReadingProbe = accountId =>
+  process.env.OCX_DISABLE_POOL_WEEKLY_PROBE === "1" ? Promise.resolve(null) : fetchAccountQuota(PROVIDER, accountId, false);
+let weeklyReadingProbe: WeeklyReadingProbe = defaultWeeklyReadingProbe;
+const weeklyReadingInflight = new Map<string, Promise<void>>();
+
+/** Test seam: replace the per-account usage probe; call with no argument to restore it. */
+export function setAnthropicWeeklyReadingProbeForTests(probe?: WeeklyReadingProbe): void {
+  weeklyReadingProbe = probe ?? defaultWeeklyReadingProbe;
+  weeklyReadingInflight.clear();
+}
+
+/**
+ * Give an account with no cached weekly reading one chance to get one, so a fresh instance does not route onto
+ * an account whose seven-day window is already spent. Lazy by design: only the account about to be picked is
+ * read, never the roster, so a cold start costs at most one usage call per account per cache TTL (the probe's
+ * own 10-minute cache and in-flight de-duplication apply, and parallel callers share one promise here too).
+ * Waits at most WEEKLY_READING_TIMEOUT_MS and never throws: on timeout or error the reading stays unknown and
+ * the account stays pickable (a probe that outlives the wait still fills the cache for the next pick).
+ */
+export async function ensureAnthropicWeeklyReading(_config: OcxConfig, accountId: string): Promise<void> {
+  if (weeklyKnown(accountId)) return;
+  let flight = weeklyReadingInflight.get(accountId);
+  if (!flight) {
+    flight = (async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          Promise.resolve().then(() => weeklyReadingProbe(accountId)),
+          new Promise<void>(resolve => { timer = setTimeout(resolve, WEEKLY_READING_TIMEOUT_MS); }),
+        ]);
+      } catch { /* fail open: unknown stays unknown */ }
+      finally { if (timer) clearTimeout(timer); }
+    })().finally(() => { if (weeklyReadingInflight.get(accountId) === flight) weeklyReadingInflight.delete(accountId); });
+    weeklyReadingInflight.set(accountId, flight);
+  }
+  await flight;
+}
+
+/**
+ * `resolveAnthropicAccountForSession` for async callers: if the picked account has no weekly reading, read it
+ * once, and if it turns out spent, resolve once more (the gate now excludes it). At most one extra probe per pick.
+ */
+export async function resolveAnthropicAccountForSessionWithReading(
+  sessionKey: string | null | undefined,
+  config: OcxConfig,
+  now = Date.now(),
+  modelId?: string | null,
+): Promise<AnthropicAccountSelection> {
+  let selection = resolveAnthropicAccountForSession(sessionKey, config, now, modelId);
+  if (!selection.accountId || !isAnthropicAccountPoolEnabled(config) || weeklyKnown(selection.accountId)) return selection;
+  // With fewer than two eligible accounts a re-pick has nowhere else to go, so the probe would be wasted.
+  if (getEligibleAnthropicAccounts(now, anthropicModelFamily(modelId)).length < 2) return selection;
+  await ensureAnthropicWeeklyReading(config, selection.accountId);
+  if (weeklyExhaustedUntil(selection.accountId, Date.now()) !== undefined) {
+    selection = resolveAnthropicAccountForSession(sessionKey, config, Date.now(), modelId);
+  }
+  return selection;
+}
 
 export function getEligibleAnthropicAccounts(now = Date.now(), family?: string): string[] {
   const set = getAccountSet(PROVIDER);
@@ -383,15 +467,17 @@ export function forgetAnthropicFailoverQuorum(): void {
   quorumCache = null;
 }
 
-/** Earliest remaining cooldown among cooled Anthropic accounts, for client Retry-After. */
+/** Earliest remaining cooldown or weekly reset among unavailable Anthropic accounts, for client Retry-After. */
 export function getAnthropicPoolRetryAfterSeconds(now = Date.now(), family?: string): number | null {
   const set = getAccountSet(PROVIDER);
   if (!set) return null;
   let earliest: number | null = null;
   for (const account of set.accounts) {
     // An account serves again only once both its own and its family's cooldown are over.
+    // A spent seven-day window counts the same way: the account serves again at its weekly reset.
     const until = Math.max(getAnthropicAccountHealthSnapshot(account.id, now)?.cooldownUntil ?? 0,
-      family ? getAnthropicAccountHealthSnapshot(familyKey(account.id, family), now)?.cooldownUntil ?? 0 : 0);
+      family ? getAnthropicAccountHealthSnapshot(familyKey(account.id, family), now)?.cooldownUntil ?? 0 : 0,
+      weeklyExhaustedUntil(account.id, now) ?? 0);
     if (!until) continue;
     if (earliest === null || until < earliest) earliest = until;
   }
@@ -406,6 +492,8 @@ interface ScoredAccount {
   fiveHourTieBreak: number;
   /** True only under the opt-in weekly window; see compareScoredAccounts. */
   knownFirst: boolean;
+  /** Weekly window only: a known 100% is a spent account and ranks behind an unknown reading. */
+  spentLast: boolean;
 }
 
 function compareScoredAccounts(a: ScoredAccount, b: ScoredAccount): number {
@@ -414,6 +502,12 @@ function compareScoredAccounts(a: ScoredAccount, b: ScoredAccount): number {
   // never opted in: an account measured at 100% would sort ahead of an unmeasured one purely
   // because it had a reading. The accepted scope preserves the five-hour default exactly.
   if (a.knownFirst && b.knownFirst && a.hasKnownUsage !== b.hasKnownUsage) {
+    // Under the weekly window a known 100% is a spent account, not a preferred one: an unknown reading
+    // (it may well have room) ranks before it. Every other known reading still outranks unknown.
+    if (a.spentLast && b.spentLast) {
+      const known = a.hasKnownUsage ? a : b;
+      if (known.score >= 100) return a.hasKnownUsage ? 1 : -1;
+    }
     return a.hasKnownUsage ? -1 : 1;
   }
   return a.score - b.score || a.fiveHourTieBreak - b.fiveHourTieBreak;
@@ -433,6 +527,7 @@ function pickLowestUsage(config: OcxConfig, excludeId: string | undefined, now: 
     // Every window EXCEPT the legacy five-hour default is an explicit opt-in, so
     // known-before-unknown applies to all of them and to none of the default path.
     knownFirst: window !== "five-hour",
+    spentLast: window === "weekly",
   }));
   let best = scored[0]!;
   for (let i = 1; i < scored.length; i++) {
@@ -815,6 +910,12 @@ export function rotateAnthropicAccountOn429(
   if (limited) {
     upstreamHealth.set(family ? familyKey(failedAccountId, family) : failedAccountId, { cooldownUntil: now + cooldownMs, cooldownSource });
     sweepExpiredOnWrite(now);
+    // A rejected seven-day window also goes into the quota cache as 100% until its reset: the cooldown above is
+    // per process, the cache is what every pick (and a restarted instance, via the disk snapshot) consults.
+    const weeklyReset = Number(header("7d-reset"));
+    if (!family && header("7d-status") === "rejected" && Number.isFinite(weeklyReset) && weeklyReset > 0) {
+      recordAnthropicWeeklyExhausted(failedAccountId, weeklyReset * 1000, now);
+    }
   }
   // Unbind only the session that hit the 429; others on the account move on their own next call.
   const key = normalizeAffinityComponent(sessionKey);
