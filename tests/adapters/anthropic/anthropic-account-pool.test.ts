@@ -877,9 +877,10 @@ describe("weekly-spent accounts across fresh instances", () => {
 
   test("a fresh instance never picks an account whose weekly window is spent (hash, affinity, active)", async () => {
     const { aId, bId } = await seedTwoAccounts();
+    // Admit the stored selection first: the gate (rightly) refuses to promote an account already known spent.
+    await freshInstance();
     setCachedProviderAccountQuotaForTests("anthropic", aId, { weeklyPercent: 100, weeklyResetAt: dayAhead(), updatedAt: Date.now() });
     setCachedProviderAccountQuotaForTests("anthropic", bId, { weeklyPercent: 20, weeklyResetAt: dayAhead(), updatedAt: Date.now() });
-    await freshInstance();
 
     // Hash seats: without the gate about half of these keys land on A.
     for (let i = 0; i < 40; i++) expect(resolveAnthropicAccountForSession(`s${i}`, rrConfig()).accountId).toBe(bId);
@@ -912,6 +913,16 @@ describe("weekly-spent accounts across fresh instances", () => {
     ]);
     expect(picks.map(pick => pick.accountId)).toEqual([bId, bId]);
     expect(calls).toEqual([aId]);
+  });
+
+  test("with a single eligible account the probe is never called", async () => {
+    const { aId, bId } = await seedTwoAccounts();
+    expect(rotateAnthropicAccountOn429(cfg(true, 80), bId, "600", null)).toBe(aId);
+    let calls = 0;
+    setAnthropicWeeklyReadingProbeForTests(async () => { calls++; });
+    expect(getEligibleAnthropicAccounts()).toEqual([aId]);
+    expect((await resolveAnthropicAccountForSessionWithReading("solo", cfg(true, 80))).accountId).toBe(aId);
+    expect(calls).toBe(0);
   });
 
   test("a probe that throws or never answers fails open and does not throw", async () => {

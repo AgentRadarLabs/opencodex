@@ -371,6 +371,8 @@ export async function resolveAnthropicAccountForSessionWithReading(
 ): Promise<AnthropicAccountSelection> {
   let selection = resolveAnthropicAccountForSession(sessionKey, config, now, modelId);
   if (!selection.accountId || !isAnthropicAccountPoolEnabled(config) || weeklyKnown(selection.accountId)) return selection;
+  // With fewer than two eligible accounts a re-pick has nowhere else to go, so the probe would be wasted.
+  if (getEligibleAnthropicAccounts(now, anthropicModelFamily(modelId)).length < 2) return selection;
   await ensureAnthropicWeeklyReading(config, selection.accountId);
   if (weeklyExhaustedUntil(selection.accountId, Date.now()) !== undefined) {
     selection = resolveAnthropicAccountForSession(sessionKey, config, Date.now(), modelId);
