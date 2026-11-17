@@ -20,7 +20,8 @@
 import { createHash } from "node:crypto";
 import { captureOAuthAccountSelection, commitOAuthAccountSelection, credentialGeneration, getAccountSet, getAccountCredential, getAccountCredentialWithStatus, markAccountNeedsReauthIfGeneration } from "./store";
 import type { OAuthAccessSnapshot } from "./index";
-import { fetchProviderAccountQuota, getCachedProviderAccountQuota, recordAnthropicWeeklyExhausted } from "../providers/quota";
+import { fetchAccountQuota, getCachedProviderAccountQuota } from "../providers/quota";
+import { recordAnthropicWeeklyExhausted } from "../providers/quota/account-cache";
 import { fallbackCodexAccountLogLabel } from "../codex/account-label";
 import {
   normalizeAccountPoolStickyLimit,
@@ -322,7 +323,7 @@ setComboPoolEligibilityProbe((provider, now) =>
 const WEEKLY_READING_TIMEOUT_MS = 1_500;
 
 type WeeklyReadingProbe = (accountId: string) => Promise<unknown>;
-const defaultWeeklyReadingProbe: WeeklyReadingProbe = accountId => fetchProviderAccountQuota(PROVIDER, accountId);
+const defaultWeeklyReadingProbe: WeeklyReadingProbe = accountId => fetchAccountQuota(PROVIDER, accountId, false);
 let weeklyReadingProbe: WeeklyReadingProbe = defaultWeeklyReadingProbe;
 const weeklyReadingInflight = new Map<string, Promise<void>>();
 

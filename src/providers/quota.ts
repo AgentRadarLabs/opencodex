@@ -86,7 +86,6 @@ export {
   providerOAuthAccountQuotaMode,
   readPassiveProviderAccountQuotas,
   recordAnthropicAccountQuotaFromHeaders,
-  recordAnthropicWeeklyExhausted,
   recordPassiveAccountQuota,
   reconcileProviderAccountQuotaRows,
   resetProviderQuotaReconcileStateForTests,
@@ -415,8 +414,8 @@ async function fetchExplicitCurrentQuota(provider: string, config: OcxProviderCo
   return read.result;
 }
 
-
-async function fetchAccountQuota(
+/** One account's reading through the 10-minute cache and in-flight de-dup; routing reads a single account lazily. */
+export async function fetchAccountQuota(
   provider: string,
   accountId: string,
   forceRefresh: boolean,
@@ -524,16 +523,6 @@ async function fetchAccountQuota(
   });
   accountQuotaInflight.set(key, probe);
   return probe;
-}
-
-/**
- * One account's usage, through the same per-account cache and in-flight de-duplication as the roster read
- * (10-minute TTL; a failed probe is negative-cached for the same TTL). Routing uses it to read a single
- * account lazily instead of probing the whole roster.
- */
-export async function fetchProviderAccountQuota(provider: string, accountId: string, forceRefresh = false): Promise<ProviderQuota | null> {
-  const entry = await fetchAccountQuota(provider, accountId, forceRefresh);
-  return provider === "anthropic" ? normalizeAnthropicQuota(entry.quota, Date.now()) : entry.quota;
 }
 
 /**
