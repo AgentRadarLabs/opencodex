@@ -620,11 +620,13 @@ function reasoningBudget(effort: string): number {
  * Haiku 4.5, Sonnet 4.x through 4.5, and Opus through 4.5 reject `adaptive`; Opus 4.6 and
  * Sonnet 4.6 accept both wire shapes. Verified against api.anthropic.com: sonnet-5,
  * fable-5, opus-4-7 and opus-4-8 require adaptive; haiku-4-5 and sonnet-4-5 reject it.
+ * Haiku 5.5 is adaptive per its models overview page (read 2026-11-17).
  */
 const ADAPTIVE_THINKING_FAMILY_MINIMUMS: Record<string, readonly [major: number, minor: number]> = {
   sonnet: [5, 0],
   opus: [4, 7],
   fable: [0, 0],
+  haiku: [5, 0],
 };
 
 /**
@@ -668,9 +670,7 @@ function meetsFamilyMinimum(
 }
 
 const ADAPTIVE_THINKING_ACCEPTANCE_FAMILY_MINIMUMS: Record<string, readonly [major: number, minor: number]> = {
-  sonnet: [4, 6],
-  opus: [4, 6],
-  fable: [0, 0],
+  sonnet: [4, 6], opus: [4, 6], fable: [0, 0], haiku: [5, 0],
 };
 
 function acceptsAdaptiveThinking(modelId: string): boolean {
