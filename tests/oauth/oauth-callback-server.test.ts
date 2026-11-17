@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { AntigravityOAuthFlow } from "../../src/oauth/google-antigravity";
 import { OAuthCallbackFlow, type OAuthCallbackFlowOptions } from "../../src/oauth/callback-server";
 import type { OAuthController, OAuthCredentials } from "../../src/oauth/types";
 
@@ -87,6 +88,12 @@ describe("OAuth callback server defaults", () => {
     } finally {
       blocker.stop(true);
     }
+  });
+
+  test("Google Antigravity sign-in waits 20 minutes for the pasted redirect URL, not the 5-minute default", () => {
+    // A person without a local browser copies the redirect URL from the address bar and pastes it back by hand.
+    const flow = new AntigravityOAuthFlow({ onAuth: () => {} } as unknown as OAuthController);
+    expect(flow.timeoutMs).toBe(20 * 60 * 1000);
   });
 
   test("manual-input loop rejects a code#state paste with a foreign suffix and re-prompts", async () => {
