@@ -86,6 +86,7 @@ export {
   providerOAuthAccountQuotaMode,
   readPassiveProviderAccountQuotas,
   recordAnthropicAccountQuotaFromHeaders,
+  recordAnthropicWeeklyExhausted,
   recordPassiveAccountQuota,
   reconcileProviderAccountQuotaRows,
   resetProviderQuotaReconcileStateForTests,
@@ -523,6 +524,16 @@ async function fetchAccountQuota(
   });
   accountQuotaInflight.set(key, probe);
   return probe;
+}
+
+/**
+ * One account's usage, through the same per-account cache and in-flight de-duplication as the roster read
+ * (10-minute TTL; a failed probe is negative-cached for the same TTL). Routing uses it to read a single
+ * account lazily instead of probing the whole roster.
+ */
+export async function fetchProviderAccountQuota(provider: string, accountId: string, forceRefresh = false): Promise<ProviderQuota | null> {
+  const entry = await fetchAccountQuota(provider, accountId, forceRefresh);
+  return provider === "anthropic" ? normalizeAnthropicQuota(entry.quota, Date.now()) : entry.quota;
 }
 
 /**

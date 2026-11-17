@@ -90,7 +90,7 @@ import {
   getAnthropicPoolRetryAfterSeconds,
   isAnthropicAccountPoolEnabled,
   promoteAnthropicActiveAccount,
-  resolveAnthropicAccountForSession,
+  resolveAnthropicAccountForSessionWithReading,
 } from "../oauth/anthropic-routing";
 import type { OcxConfig } from "../types";
 import { readJsonRequestBody, resolveInboundBodyLimitBytes } from "./request-decompress";
@@ -1774,7 +1774,7 @@ export async function handleClaudeCountTokens(
                 : null,
               promptCacheKeyIsSharedCohort: translated.cacheKeySource === "system",
             });
-            const selection = resolveAnthropicAccountForSession(sessionKey, config, Date.now(), route.modelId);
+            const selection = await resolveAnthropicAccountForSessionWithReading(sessionKey, config, Date.now(), route.modelId);
             if (!selection.accountId) {
               if (selection.reason === "all-cooled") {
                 const retryAfter = getAnthropicPoolRetryAfterSeconds(Date.now(), anthropicModelFamily(route.modelId));

@@ -251,6 +251,27 @@ export function recordAnthropicAccountQuotaFromHeaders(
 }
 
 /**
+ * A seven-day 429 names the reset of the window it just spent. Record the account's weekly reading as 100%
+ * until that reset, so routing (which reads this cache) stops picking it, in this process and, through the
+ * disk snapshot, in a restarted one. The header recorder above does this too whenever upstream sends the
+ * utilization header; a rejected 429 may omit it, which is the case this covers. Keeps every other window.
+ */
+export function recordAnthropicWeeklyExhausted(accountId: string, weeklyResetAt: number, now = Date.now()): void {
+  if (!accountId || !Number.isFinite(weeklyResetAt) || weeklyResetAt <= now) return;
+  hydrateAccountQuotaCache();
+  const key = accountCacheKey("anthropic", accountId);
+  const previous = accountQuotaCache.get(key);
+  accountQuotaCache.set(key, {
+    ...previous,
+    ts: previous?.ts ?? 0,
+    quota: normalizeAnthropicQuota({
+      ...normalizeAnthropicQuota(previous?.quota, now), weeklyPercent: 100, weeklyResetAt, updatedAt: now,
+    }, now),
+  });
+  persistAccountQuotaCache();
+}
+
+/**
  * Providers whose per-account quota is OBSERVED in-band, never probed.
  *
  * Deliberately separate from `supportsPerAccountQuota` rather than folded into it. That
