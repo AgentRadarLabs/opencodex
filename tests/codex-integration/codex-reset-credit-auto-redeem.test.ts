@@ -545,6 +545,23 @@ describe("reset-credit auto-redeemer runtime (#822)", () => {
     expect(entries[0].updatedAt).toBe(start + 20 * MIN);
   });
 
+  test("a settled entry is kept until its credit expires, even past the one-week age", async () => {
+    const DAY = 24 * 60 * MIN;
+    const journalFile = join(dir, "j.json");
+    const seeded = (grantedAt: string, expiresAt: string) => ({
+      accountKey: "seeded", grantedAt, expiresAt, redeemRequestId: `id-${grantedAt}`, state: "settled", updatedAt: T0 - 8 * DAY,
+    });
+    writeFileSync(journalFile, JSON.stringify({ version: 1, entries: [
+      seeded("2026-08-01T00:00:00Z", new Date(T0 + 30 * DAY).toISOString()), // old update, credit not expired yet
+      seeded("2026-08-02T00:00:00Z", new Date(T0 - 1 * DAY).toISOString()), // old update, credit expired
+    ] }));
+    const h = harness({ journalFile, credits: () => [credit(30)] });
+    h.setNow(T0 + 20 * MIN);
+    expect((await h.redeemer.tick()).kind).toBe("dispatched");
+    const entries = JSON.parse(readFileSync(journalFile, "utf8")).entries as Array<{ grantedAt: string }>;
+    expect(entries.map(e => e.grantedAt).sort()).toEqual(["2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z"]);
+  });
+
   test("a persistent reservation write failure uses the idle retry interval", async () => {
     const journalFile = join(dir, "journal-directory");
     mkdirSync(journalFile);
