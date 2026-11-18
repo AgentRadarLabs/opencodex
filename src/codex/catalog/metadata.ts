@@ -42,12 +42,16 @@ import { RESERVE_METADATA_SOURCE_FIELD } from "./reserve";
 import {
   ACCOUNT_GATED_NATIVE_OPENAI_MODELS,
   NATIVE_GPT6_CONTEXT,
+  NATIVE_GPT61_TERRA_CONTEXT,
   NATIVE_DAYBREAK_BLUE_MODEL,
   NATIVE_GPT6_ASTRA_MINOR_MODEL,
   NATIVE_GPT6_ASTRA_MODEL,
   NATIVE_GPT6_LUNA_MODEL,
   NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT61_SOL_MODEL,
+  NATIVE_GPT61_TERRA_MODEL,
+  NATIVE_GPT62_ASTRA_MODEL,
+  NATIVE_GPT62_SOL_MODEL,
   NATIVE_RESERVE_MODEL,
   NATIVE_OPENAI_CAPABILITY_ALIAS_MODELS,
   NATIVE_OPENAI_MODELS,
@@ -72,6 +76,9 @@ export {
   NATIVE_GPT6_LUNA_MODEL,
   NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT61_SOL_MODEL,
+  NATIVE_GPT61_TERRA_MODEL,
+  NATIVE_GPT62_ASTRA_MODEL,
+  NATIVE_GPT62_SOL_MODEL,
   NATIVE_OPENAI_CAPABILITY_ALIAS_MODELS,
   NATIVE_OPENAI_MODELS,
   SELF_DESCRIBED_NATIVE_OPENAI_MODELS,
@@ -93,6 +100,8 @@ export const DOCUMENTED_NATIVE_OPENAI_ADDITIONS = [
   NATIVE_GPT6_SOL_MODEL, NATIVE_GPT6_LUNA_MODEL,
   // GPT-6.1 Sol needs client_version >= 0.153.0 upstream; older installed catalogs lack it.
   NATIVE_GPT61_SOL_MODEL,
+  // GPT-6.1 Terra and the GPT-6.2 rows come from the roster pin alone; older installed catalogs lack them.
+  NATIVE_GPT61_TERRA_MODEL, NATIVE_GPT62_ASTRA_MODEL, NATIVE_GPT62_SOL_MODEL,
 ];
 
 export function configuredNativeAliasSlugs(
@@ -202,6 +211,12 @@ export const NATIVE_OPENAI_CONTEXT_OVERRIDES: Record<string, { contextWindow?: n
   [NATIVE_GPT6_LUNA_MODEL]: { ...NATIVE_GPT6_CONTEXT },
   // GPT-6.1 Sol's row (openai/codex models.json after #49318) ships the same 272,000 / 872,000 pair.
   [NATIVE_GPT61_SOL_MODEL]: { ...NATIVE_GPT6_CONTEXT },
+  // GPT-6.1 Terra's pinned row ships a 500,000 default window against the same 872,000 ceiling.
+  [NATIVE_GPT61_TERRA_MODEL]: { ...NATIVE_GPT61_TERRA_CONTEXT },
+  // The GPT-6.2 rows are derived from the GPT-6.1 Sol row, so they carry its 272,000 / 872,000 pair
+  // until a verbatim upstream row says otherwise. Unmeasured: this is inheritance, not a probe.
+  [NATIVE_GPT62_ASTRA_MODEL]: { ...NATIVE_GPT6_CONTEXT },
+  [NATIVE_GPT62_SOL_MODEL]: { ...NATIVE_GPT6_CONTEXT },
   // Astra Minor borrows Astra's row, so it inherits Astra's numbers. No account we hold can reach
   // it, so this is inheritance, not a measurement.
   [NATIVE_GPT6_ASTRA_MINOR_MODEL]: { ...NATIVE_GPT6_CONTEXT },
