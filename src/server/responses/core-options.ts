@@ -113,6 +113,8 @@ export interface DirectRequestOption {
 }
 
 export interface HandleResponsesOptions {
+  /** Trusted AgentRadar bridge authority; never changes the global account selection. */
+  agentRadarAccount?: import("../../lib/agentradar-account-pin").AgentRadarAccountPin;
   /** Original caller label, carried through synthetic children without route substitution. */
   clientModelLabel?: ClientFacingModelLabel;
   /** Original client envelope label when a combo was selected by a synthetic rewrite. */
@@ -226,6 +228,8 @@ export interface HandleResponsesOptions {
   droidDefaultEffort?: string;
   /** The Chat or Messages source a combo child may send natively; set only by that ingress. */
   protocolSource?: import("./core-combo-native").ComboProtocolSource;
+  /** AgentRadar: a random combo picks from this request correlation seed, as its count_tokens did. */
+  comboRandomSeed?: string;
   /** Internal transport identity for route-scoped upstream compatibility policy. */
   inboundTransport?: "websocket";
   /**

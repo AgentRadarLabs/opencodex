@@ -14,6 +14,7 @@ import {
   CYBER_POLICY_ERROR_CODE,
   isCyberPolicyCode,
   isModelNotInPlanRefusal,
+  isQuotaBadRequestMessage,
   markVerifiedModelNotInPlanResponse,
   MODEL_NOT_IN_PLAN_CODE,
   REQUIRED_TOOL_CONTRACT_CODE,
@@ -33,6 +34,26 @@ export function upstreamCodeForComboFailure(response: Response, bodyCode: string
   return bodyCode === "insufficient_quota" && formattedQuotaSources.has(response)
     ? formattedQuotaSources.get(response) ?? undefined
     : bodyCode;
+}
+
+// AgentRadar hosted gateways: a canonical Anthropic combo child's final error is relayed as Anthropic sent it.
+const verbatimComboFailures = new WeakMap<Response, () => Response>();
+/** Register the exact client response a combo returns if this child failure ends the ladder. */
+export function markVerbatimComboFailure(response: Response, build: () => Response): Response {
+  verbatimComboFailures.set(response, build);
+  return response;
+}
+/** The registered exact response for a consumed combo child failure, if any. */
+export function verbatimComboFailure(response: Response): Response | undefined {
+  return verbatimComboFailures.get(response)?.();
+}
+/** Classification keeps the formatted failure; only the client presentation is the registered one. */
+export function carryVerbatimComboFailure(source: Response, target: Response): void {
+  const build = verbatimComboFailures.get(source);
+  if (build) verbatimComboFailures.set(target, build);
+}
+export function hasVerbatimComboFailure(response: Response): boolean {
+  return verbatimComboFailures.has(response);
 }
 
 /** Preserve formatted quota-code provenance when lifecycle helpers rebuild a response. */
@@ -119,7 +140,10 @@ export function formatErrorResponse(
     status: finalStatus,
     headers,
   });
-  if (validationStatus && error.code === "insufficient_quota") {
+  // AgentRadar hosted gateways keep the .27 contract: a field-anchored quota verdict (insufficient_quota
+  // field, recorded extra-usage or spend-limit opening) is combo evidence on its own; echoed words never are.
+  if (validationStatus && error.code === "insufficient_quota"
+    && !(process.env.OPENCODEX_AGENTRADAR === "1" && isQuotaBadRequestMessage(message))) {
     formattedQuotaSources.set(response, options?.upstreamCode !== undefined
       ? options.upstreamCode : options?.classified ? null : options?.code ?? null);
   }

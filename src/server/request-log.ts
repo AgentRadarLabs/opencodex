@@ -3,12 +3,13 @@ import { randomBytes } from "node:crypto";
 import { normalizeRecordedClient, type UsageClient } from "../usage/client";
 import { anthropicAccountTagField, stampApiKeyAccountLabel, usesApiKeyAccount } from "../providers/label";
 import { finalizeProviderCacheAffinity } from "./request-log-cache-affinity";
-import { aggregateAttemptUsage } from "./request-log-attempt-usage";
-export { aggregateAttemptUsage } from "./request-log-attempt-usage";
+import { aggregateAttemptUsage, usageFromResponsesPayload } from "./request-log-attempt-usage";
+export { aggregateAttemptUsage, usageFromResponsesPayload } from "./request-log-attempt-usage";
 
 import { KEY_ACCOUNT_LOG_LABEL_RE } from "../codex/account-label";
 import { attemptAccountChanged, sealRequestAttemptIdentity } from "./request-log-account-rotation";
 export { sealRequestAttemptIdentity };
+import { credentialRecoveryStatus } from "./request-log-attempt-recovery";
 export { noteAttemptRecoveryWithheld } from "./request-log-attempt-recovery";
 import { bareVerdictRowErrorCode, captureUpstreamTerminalDiagnostics, guardedRowCopy, linkLogField, notifyLinkTurnFinal, upstreamDiagnosticLogFields, type LinkRequestLogCarrier, type UpstreamErrorDiagnostics, type UpstreamErrorPayload } from "./request-log-terminal-status";
 export { noteUpstreamRequestId } from "./request-log-terminal-status";
@@ -36,6 +37,7 @@ import type { RequestSpendSettlement } from "./responses/request-spend";
 import type { AdapterTierMetadata } from "../providers/fastwire";
 import { UPSTREAM_RESET_REPLAY_REFUSED_CODE } from "../lib/upstream-retry";
 import { redactSecretString, sanitizeLogMetadataString } from "../lib/redact";
+import { logUsageLine } from "../lib/usage-line-log";
 import type { UpstreamCondition } from "../lib/upstream-condition";
 import { boundedServiceTier, errorDetailFor, projectErrorDetail } from "../usage/error-detail";
 import { incompleteReasonDetail, upstreamErrorIsLocal, type FailureDetail } from "./request-log-failure-detail";
@@ -60,6 +62,7 @@ import {
   normalizeRequestFailureAttribution,
   normalizeRequestSpend,
   normalizedAttempts,
+  physicalUsageAttempts,
   readRecentUsageEntries,
   modelIdentityLogFields, recordObservedServedModel,
   usageForFinalLog,
@@ -187,6 +190,10 @@ export interface RequestLogContext extends UpstreamErrorDiagnostics, LinkRequest
   localTerminalReason?: string;
   /** Stable non-PII Codex Pool account identity for durable usage attribution. */
   accountLogLabel?: string;
+  /** Set by the combo ladder when this logical request moved to another target. */
+  comboTargetAdvanced?: true;
+  /** Root usage spans several physical sends (a sidecar total), so it is never one attempt's usage. */
+  usageIsRequestAggregate?: boolean;
   requestedModel?: string;
   /** User-facing alias selector when routing resolved one; native model remains `model`. */
   requestedAlias?: string;
@@ -366,6 +373,7 @@ export interface RequestLogEntry extends UpstreamErrorDiagnostics, LinkRequestLo
   accountLogLabel?: string;
   /** Anthropic pool account of `provider` (#8383): its p-label, beside the unchanged `accountLogLabel`. */
   accountTag?: `p${string}`;
+  comboTargetAdvanced?: true;
   /** Best-effort chat/session correlation for Logs grouping (#330). */
   conversationId?: string;
   requestedModel?: string;
@@ -540,6 +548,7 @@ export function requestLogEntryFromPersistedUsage(entry: PersistedUsageEntry): R
       ? { accountLogLabel: entry.accountLogLabel }
       : {}),
     ...(isAnthropicAccountTag(entry.accountTag) ? { accountTag: entry.accountTag } : {}),
+    ...(entry.comboTargetAdvanced === true ? { comboTargetAdvanced: true } : {}),
     ...(entry.requestedModel ? { requestedModel: entry.requestedModel } : {}),
     ...(entry.requestedAlias ? { requestedAlias: entry.requestedAlias } : {}),
     ...(entry.shadowCallRewrittenFrom
@@ -558,7 +567,7 @@ export function requestLogEntryFromPersistedUsage(entry: PersistedUsageEntry): R
       ? { modelSupportsServiceTier: entry.modelSupportsServiceTier }
       : {}),
     ...(entry.responseServiceTier ? { responseServiceTier: entry.responseServiceTier } : {}),
-    ...(entry.tierOutcome ? { tierOutcome: entry.tierOutcome } : {}),
+    ...tierOutcomeField(finalPhysicalTierOutcome(entry.attempts, entry.tierOutcome)),
     ...modelIdentityLogFields(entry),
     status: entry.status,
     durationMs: entry.durationMs,
@@ -716,6 +725,8 @@ export function addRequestLog(entry: RequestLogEntry) {
   else if (retained !== entry) delete retained.jevDecision;
   entry = retained;
   retainRequestLogEntry(entry);
+  // AgentRadar `[usage]` line: one per finished request record, never text or secrets.
+  logUsageLine(entry);
   for (const observer of requestLogObserversForTests) {
     try { observer(entry); } catch { /* test observation must never fail request logging */ }
   }
@@ -750,6 +761,7 @@ export function addRequestLog(entry: RequestLogEntry) {
         ? { accountLogLabel: entry.accountLogLabel }
         : {}),
       ...(isAnthropicAccountTag(entry.accountTag) ? { accountTag: entry.accountTag } : {}),
+      ...(entry.comboTargetAdvanced === true ? { comboTargetAdvanced: true } : {}),
       ...(entry.conversationId ? { conversationId: entry.conversationId } : {}),
       ...(entry.resolvedModel ? { resolvedModel: entry.resolvedModel } : {}),
       ...(entry.servedModel ? { servedModel: entry.servedModel } : {}),
@@ -867,6 +879,10 @@ export function recordAdapterReasoning(
     delete attempt.effectiveEffort;
     delete attempt.reasoningWireField;
     delete attempt.reasoningWireValue;
+    delete attempt.promptCacheTtlMs;
+    if (request.promptCacheTtlMs === 300_000 || request.promptCacheTtlMs === 3_600_000) {
+      attempt.promptCacheTtlMs = request.promptCacheTtlMs;
+    }
   }
   recordAttemptRequestedEffort(logCtx);
 
@@ -1063,63 +1079,6 @@ export function applyResponseLogMetadata(logCtx: RequestLogContext, payload: unk
     // counts carry is recorded as synthesized rather than as an observed miss.
     logCtx.usageWireParsed = true;
   }
-}
-
-export function usageFromResponsesPayload(usage: unknown): OcxUsage | undefined {
-  if (!usage || typeof usage !== "object") return undefined;
-  const raw = usage as {
-    input_tokens?: unknown;
-    output_tokens?: unknown;
-    input_tokens_details?: { cached_tokens?: unknown; cache_write_tokens?: unknown; cache_write_1h_tokens?: unknown };
-    output_tokens_details?: { reasoning_tokens?: unknown };
-    total_tokens?: unknown;
-    prompt_tokens?: unknown;
-    completion_tokens?: unknown;
-    prompt_tokens_details?: { cached_tokens?: unknown; cache_write_tokens?: unknown };
-    completion_tokens_details?: { reasoning_tokens?: unknown };
-  };
-  if (typeof raw.input_tokens === "number" && typeof raw.output_tokens === "number") {
-    return {
-      inputTokens: raw.input_tokens,
-      outputTokens: raw.output_tokens,
-      ...(typeof raw.total_tokens === "number" ? { totalTokens: raw.total_tokens } : {}),
-      ...(typeof raw.input_tokens_details?.cached_tokens === "number"
-        ? {
-            cachedInputTokens: raw.input_tokens_details.cached_tokens,
-            cacheReadInputTokens: raw.input_tokens_details.cached_tokens,
-          }
-        : {}),
-      ...(typeof raw.input_tokens_details?.cache_write_tokens === "number"
-        ? { cacheCreationInputTokens: raw.input_tokens_details.cache_write_tokens }
-        : {}),
-      ...(typeof raw.input_tokens_details?.cache_write_1h_tokens === "number"
-        ? { cacheCreation1hInputTokens: raw.input_tokens_details.cache_write_1h_tokens }
-        : {}),
-      ...(typeof raw.output_tokens_details?.reasoning_tokens === "number"
-        ? { reasoningOutputTokens: raw.output_tokens_details.reasoning_tokens }
-        : {}),
-    };
-  }
-  if (typeof raw.prompt_tokens === "number" && typeof raw.completion_tokens === "number") {
-    return {
-      inputTokens: raw.prompt_tokens,
-      outputTokens: raw.completion_tokens,
-      ...(typeof raw.total_tokens === "number" ? { totalTokens: raw.total_tokens } : {}),
-      ...(typeof raw.prompt_tokens_details?.cached_tokens === "number"
-        ? {
-            cachedInputTokens: raw.prompt_tokens_details.cached_tokens,
-            cacheReadInputTokens: raw.prompt_tokens_details.cached_tokens,
-          }
-        : {}),
-      ...(typeof raw.prompt_tokens_details?.cache_write_tokens === "number"
-        ? { cacheCreationInputTokens: raw.prompt_tokens_details.cache_write_tokens }
-        : {}),
-      ...(typeof raw.completion_tokens_details?.reasoning_tokens === "number"
-        ? { reasoningOutputTokens: raw.completion_tokens_details.reasoning_tokens }
-        : {}),
-    };
-  }
-  return undefined;
 }
 
 /**
@@ -1441,8 +1400,8 @@ export function recordKeyWireAttemptUsage(logCtx: RequestLogContext, usage: OcxU
   const current = { ...usage };
   attempt.usage = baseline
     ? aggregateAttemptUsage([
-      { ...attempt, usage: baseline, usageStatus: baseline.estimated ? "estimated" : "reported" },
-      { ...attempt, usage: current, usageStatus: current.estimated ? "estimated" : "reported" },
+      usageSnapshotAttempt(attempt, 1, baseline),
+      usageSnapshotAttempt(attempt, 2, current),
     ]).usage
     : current;
   logCtx.usage = attempt.usage;
@@ -1510,7 +1469,9 @@ function writeFinalRequestLog(
       logCtx.activeAttempt,
       attemptStatus ?? effectiveStatus,
       Date.now() - (logCtx.activeAttemptStartedAt ?? start),
-      keyUsageOwners.has(logCtx.activeAttempt)
+      // Request usage describes this one send only when it is not a key-owned snapshot or a
+      // multi-send aggregate; otherwise the attempt keeps only its own usage.
+      keyUsageOwners.has(logCtx.activeAttempt) || logCtx.usageIsRequestAggregate
         ? logCtx.activeAttempt.usage
         : logCtx.usage,
     );
@@ -1562,12 +1523,12 @@ function writeFinalRequestLog(
   // A key or account rotation splits the attempt and clears `logCtx.usage`, so a multi-attempt
   // request totals from its attempts, combo or not. One attempt keeps the request-level usage
   // (and its input estimate); a locally answered row sent nothing and keeps its own.
-  const aggregate = isCombo || ((attempts?.length ?? 0) > 1 && logCtx.localTerminalReason === undefined)
+  // An explicit attempt list with no physical send keeps no stale request usage either.
+  const aggregate = isCombo || (attempts !== undefined && logCtx.localTerminalReason === undefined
+    && (attempts.length > 1 || physicalUsageAttempts(attempts).length === 0))
     ? aggregateAttemptUsage(attempts ?? [])
     : null;
-  const loggedUsage = aggregate?.usage ?? existing.usage;
-  const usageStatus = aggregate?.status ?? existing.status;
-  const totalTokens = aggregate?.totalTokens ?? existing.totalTokens;
+  const { usage: loggedUsage, status: usageStatus, totalTokens } = aggregate ?? existing;
   const spend = requestSpendRecord(logCtx, attempts);
   const durationMs = Date.now() - start;
   logCtx.requestMetricsRecorder?.recordFinalRequest({
@@ -1640,6 +1601,7 @@ function writeFinalRequestLog(
       ? { accountLogLabel: logCtx.accountLogLabel }
       : {}),
     ...anthropicAccountTagField(isCombo ? undefined : logCtx.provider),
+    ...(logCtx.comboTargetAdvanced === true ? { comboTargetAdvanced: true } : {}),
     ...(logCtx.conversationId ? { conversationId: logCtx.conversationId } : {}),
     ...(logCtx.requestedModel ? { requestedModel: logCtx.requestedModel } : {}),
     ...(logCtx.requestedAlias ? { requestedAlias: logCtx.requestedAlias } : {}),
@@ -1655,9 +1617,7 @@ function writeFinalRequestLog(
     ...(logCtx.configuredSpeedLabel ? { configuredSpeedLabel: logCtx.configuredSpeedLabel } : {}),
     ...(logCtx.modelSupportsServiceTier !== undefined ? { modelSupportsServiceTier: logCtx.modelSupportsServiceTier } : {}),
     ...(logCtx.responseServiceTier ? { responseServiceTier: logCtx.responseServiceTier } : {}),
-    ...((attempts?.at(-1)?.tierOutcome ?? logCtx.tierOutcome)
-      ? { tierOutcome: attempts?.at(-1)?.tierOutcome ?? { ...logCtx.tierOutcome! } }
-      : {}),
+    ...tierOutcomeField(finalPhysicalTierOutcome(attempts, logCtx.tierOutcome)),
     ...modelIdentityLogFields(logCtx),
     status: effectiveStatus,
     durationMs,
@@ -1837,8 +1797,7 @@ export function recordKeyAttemptUsage(logCtx: RequestLogContext, usage: OcxUsage
   const attempt = logCtx.activeAttempt;
   if (!attempt || !usage) return;
   attempt.usage = attempt.usage
-    ? aggregateAttemptUsage([{ ...attempt, usageStatus: attempt.usage.estimated ? "estimated" : "reported" },
-      { ...attempt, usage, usageStatus: usage.estimated ? "estimated" : "reported" }]).usage
+    ? aggregateAttemptUsage([usageSnapshotAttempt(attempt, 1, attempt.usage), usageSnapshotAttempt(attempt, 2, usage)]).usage
     : { ...usage };
   logCtx.usage = attempt.usage;
 }
@@ -1858,14 +1817,14 @@ export function noteProviderAttemptSend(
   stampApiKeyAccountLabel(logCtx, providerName, provider);
   const next = logCtx.accountLogLabel;
   if (attempt && usesApiKeyAccount(provider)) keyUsageOwners.add(attempt);
-  if (attempt && attempt.sendCount > 0 && (attemptAccountChanged(previous, next, attempt.provider, logCtx.provider)
+  const recoveryStatus = credentialRecoveryStatus(recovery);
+  if (attempt && attempt.sendCount > 0 && (recoveryStatus !== undefined || attemptAccountChanged(previous, next, attempt.provider, logCtx.provider)
     || resolved && (attempt.model !== resolved.model || attempt.adapter !== resolved.adapter))) {
     // An input estimate is not evidence that a failed send used that many tokens.
     delete attempt.inputTokenEstimate;
     // An account-scoped recovery kind names the status the sealed account answered.
     finishRequestAttempt(attempt, attempt.status >= 100 ? attempt.status
-      : recovery === "key-401" || recovery === "oauth-401" ? 401 : recovery === "oauth-account-403" ? 403
-        : recovery === "oauth-account-402" ? 402 : recovery?.includes("429") ? 429 : 502,
+      : recoveryStatus ?? (recovery === "rate-limit-429" ? 429 : 502),
     Date.now() - (logCtx.activeAttemptStartedAt ?? Date.now()), attempt.usage);
     // This attempt is being sealed because a NAMED recovery rejected it, so the recovery kind
     // is direct evidence here rather than an inference from history. Without this the sealed
@@ -1882,9 +1841,11 @@ export function noteProviderAttemptSend(
     else attempts.push(completed, attempt);
     const fresh = beginRequestAttempt(completed.ordinal + 1, providerName, completed.model, completed.adapter);
     // Effort/tier metadata describes the request and is captured before the physical send.
-    for (const key of ["requestedEffort", "effectiveEffort", "reasoningWireField", "reasoningWireValue", "tierOutcome"] as const) {
+    for (const key of ["requestedEffort", "effectiveEffort", "reasoningWireField", "reasoningWireValue"] as const) {
       if (completed[key] !== undefined) Object.assign(fresh, { [key]: completed[key] });
     }
+    // The response observer owns this live object; the sealed row keeps its snapshot.
+    if (attempt.tierOutcome) fresh.tierOutcome = attempt.tierOutcome;
     for (const key of Object.keys(attempt)) delete (attempt as unknown as Record<string, unknown>)[key];
     Object.assign(attempt, fresh);
     delete logCtx.usage;
@@ -1932,8 +1893,16 @@ export function noteAttemptSend(
   attempt: PersistedUsageAttempt | undefined,
   inputTokenEstimate: number | undefined,
   recovery?: AttemptRecoveryKind,
+  now = performance.timeOrigin + performance.now(),
 ): void {
   if (!attempt) return;
+  // A new send reopens a finalized attempt; its earlier terminal no longer describes it.
+  if (finalizedAttempts.delete(attempt)) {
+    attempt.status = 0;
+    attempt.durationMs = 0;
+    delete attempt.errorCode;
+  }
+  if (attempt.sendCount === 0 && Number.isFinite(now) && now >= 0) attempt.firstSendAt = now;
   attempt.sendCount += 1;
   if (typeof inputTokenEstimate === "number"
     && Number.isFinite(inputTokenEstimate)
@@ -1945,10 +1914,13 @@ export function noteAttemptSend(
       contextWindowForModel(attempt.adapter, attempt.model),
     );
   }
-  if (recovery && !attempt.recoveryKinds.includes(recovery)) {
-    attempt.recoveryKinds.push(recovery);
+  if (recovery) {
+    attempt.recoveryCount = (attempt.recoveryCount ?? 0) + 1;
+    if (!attempt.recoveryKinds.includes(recovery)) attempt.recoveryKinds.push(recovery);
   }
 }
+
+const finalizedAttempts = new WeakSet<PersistedUsageAttempt>();
 
 export function finishRequestAttempt(
   attempt: PersistedUsageAttempt,
@@ -1956,6 +1928,9 @@ export function finishRequestAttempt(
   durationMs: number,
   usage?: OcxUsage,
 ): PersistedUsageAttempt {
+  // Reopened only by `noteAttemptSend`: a later terminal belongs to the next send and must not
+  // relabel tokens this attempt already accounted.
+  if (finalizedAttempts.has(attempt)) return attempt;
   const finalized = finalizedUsage(
     attempt.adapter,
     usage ?? attempt.usage,
@@ -1973,7 +1948,27 @@ export function finishRequestAttempt(
   const errorCode = requestLogErrorCode(status);
   if (errorCode) attempt.errorCode = errorCode;
   else delete attempt.errorCode;
+  finalizedAttempts.add(attempt);
   return attempt;
+}
+
+/** The last real upstream attempt's tier outcome, else the request's. */
+function finalPhysicalTierOutcome(
+  attempts: readonly PersistedUsageAttempt[] | undefined,
+  fallback: AttemptTierOutcome | undefined,
+): AttemptTierOutcome | undefined {
+  return physicalUsageAttempts(attempts ?? []).findLast(attempt => attempt.tierOutcome)?.tierOutcome ?? fallback;
+}
+
+function tierOutcomeField(outcome: AttemptTierOutcome | undefined): { tierOutcome?: AttemptTierOutcome } {
+  return outcome ? { tierOutcome: { ...outcome } } : {};
+}
+
+/** One wire snapshot of an attempt, shaped as its own physical send so the aggregate counts it once. */
+function usageSnapshotAttempt(attempt: PersistedUsageAttempt, ordinal: number, usage: OcxUsage): PersistedUsageAttempt {
+  const snapshot: PersistedUsageAttempt = { ...attempt, ordinal, sendCount: 1, usage, usageStatus: usage.estimated ? "estimated" : "reported" };
+  delete snapshot.locallyAnswered;
+  return snapshot;
 }
 
 export function getRequestLogEntries(): RequestLogEntry[] { return requestLog; }

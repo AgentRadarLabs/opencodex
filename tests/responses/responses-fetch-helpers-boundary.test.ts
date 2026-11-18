@@ -221,6 +221,8 @@ describe("Responses fetch-helper import boundary", () => {
       "../../lib/proxy-env",
       "../../lib/redact",
       "../../lib/upstream-http-version",
+      // AgentRadar-gated 4xx refusal-shape line; runtime imports are node:crypto and ./redact only.
+      "../../lib/upstream-refusal-log",
       // Import-free plugin rewrite slot (src/plugins/upstream-hooks.ts).
       "../../plugins/upstream-hooks",
       "../../providers/request-pacing",

@@ -268,7 +268,8 @@ describe("ocx provider", () => {
 
   // `--headless` is the OAuth code-display mode. Codex has none; its headless path is the
   // device-code login, so the CLI points there instead of forwarding the flag.
-  test.each([["--headless", "codex"], ["codex", "--headless"], ["--headless", "openai"]])(
+  // `--code` is the flag's earlier name and must stay its alias rather than be silently ignored.
+  test.each([["--headless", "codex"], ["codex", "--headless"], ["--headless", "openai"], ["codex", "--code"], ["--code", "openai"]])(
     "login %s %s refuses code mode for Codex and points at --device",
     (a, b) => {
       const { dir } = freshConfig({});

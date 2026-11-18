@@ -541,12 +541,9 @@ describe("request log metadata", () => {
   });
 
   test("folds partial and unsupported attempt measurement honestly", () => {
-    const reported = finishRequestAttempt(
-      beginRequestAttempt(1, "a", "m1", "openai-chat"),
-      200,
-      1,
-      { inputTokens: 4, outputTokens: 1 },
-    );
+    const sentReported = beginRequestAttempt(1, "a", "m1", "openai-chat");
+    noteAttemptSend(sentReported, undefined);
+    const reported = finishRequestAttempt(sentReported, 200, 1, { inputTokens: 4, outputTokens: 1 });
     const sent = beginRequestAttempt(2, "b", "m2", "openai-chat");
     noteAttemptSend(sent, undefined);
     const unreported = finishRequestAttempt(sent, 503, 1);
@@ -579,6 +576,7 @@ describe("request log metadata", () => {
         wireValue: 0,
       },
     });
+    noteAttemptSend(a, undefined);
     finishRequestAttempt(
       a,
       503,

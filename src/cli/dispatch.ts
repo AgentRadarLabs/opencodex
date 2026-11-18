@@ -384,9 +384,12 @@ const commandRunners: Record<string, CommandRunner> = {
     const loginArgs = deps.args.slice(1);
     // `--headless` is the only flag this command takes; the provider is the first bare word, so
     // `ocx login --headless anthropic` and `ocx login anthropic --headless` mean the same thing.
-    // It is deliberately not `--code`: that name carries a secret value everywhere else in the
+    // It is deliberately not named `--code`: that name carries a secret value everywhere else in the
     // CLI (`ocx account login <provider> --code <value>`) and its operand is scrubbed from stderr.
-    const codeMode = loginArgs.includes("--headless");
+    // A bare `--code` is still accepted as its alias, because it was this flag's earlier name and
+    // ignoring it silently starts a browser login on a host that has none. No value is read, and an
+    // unknown provider word prints the usage text, never the word.
+    const codeMode = loginArgs.includes("--headless") || loginArgs.includes("--code");
     const acceptAntigravityRisk = loginArgs.includes("--accept-antigravity-risk");
     const positional = loginArgs.filter(arg => !arg.startsWith("--"));
     // 'ocx login codex' is the command people type first, and until now it answered with

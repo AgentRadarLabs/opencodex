@@ -3,14 +3,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { ProviderAdapter, IncomingMeta } from "../../src/adapters/base";
-import type { AdapterEvent, OcxParsedRequest } from "../../src/types";
+import type { AdapterEvent, OcxParsedRequest, OcxProviderConfig } from "../../src/types";
 import type { AttemptRecoveryKind } from "../../src/usage/log";
 import type { ImageBridgePlan, ImageCallResult } from "../../src/images/types";
 import type { ImageBridgeDeps } from "../../src/images/loop";
 import { createTestTranslatorBudget } from "../helpers/translator-budget";
 import { PROVIDER_INPUT_TOO_LARGE_MESSAGE } from "../../src/server/responses/context-overflow";
 import { markResponseNonReplayable } from "../../src/lib/upstream-retry";
-import { RequestPacingQueueOverloadError } from "../../src/providers/request-pacing";
+import {
+  providerRequestPacingStatus,
+  RequestPacingQueueOverloadError,
+  resetProviderRequestPacingForTest,
+  waitForProviderRequestSlot,
+  type ProviderRequestSlot,
+} from "../../src/providers/request-pacing";
+import { providerFetch } from "../../src/server/responses/fetch-helpers";
 import { bridgeToResponsesSSE as realBridgeToResponsesSSE } from "../../src/bridge";
 import { parseStreamWithProgress, WebSearchConsumerInactivityError, type ParseStreamWithProgressOptions } from "../../src/web-search/progress-stream";
 import { TRANSLATOR_MAX_CALL_ARGUMENT_BYTES, TRANSLATOR_MAX_TURN_BYTES, translatorLiveBudgetCountForTests } from "../../src/lib/translator-budget";
@@ -453,6 +460,39 @@ describe("runWithImageBridge", () => {
     expect(sse).toContain("event: response.failed");
     expect(sse).toContain('"code":"translation_buffer_limit"');
     expect(sse).not.toContain("event: response.completed");
+  });
+
+  test("usage-bearing translator overflow reaches request and wire without image dispatch", async () => {
+    // The real collector folds the overflow event's usage (onErrorUsage) before it throws.
+    useRealProgressStream = true;
+    const aggregate: unknown[] = [];
+    streamQueue = [[
+      { type: "tool_call_start", id: "call_1", name: "image_gen" },
+      { type: "tool_call_delta", arguments: '{"prompt":"a cat"}' },
+      { type: "tool_call_end" },
+      {
+        type: "error",
+        status: 502,
+        errorType: "upstream_error",
+        code: "translation_buffer_limit",
+        message: "upstream translation buffer exceeded the safe limit",
+        usage: { inputTokens: 7, outputTokens: 1 },
+      },
+    ]];
+    const response = await runWithImageBridge({
+      parsed: makeParsed(),
+      adapter: mockAdapter,
+      plan,
+      onUsage: usage => aggregate.push(usage),
+    });
+    const sse = await response.text();
+
+    expect(sse).toContain("event: response.failed");
+    expect(sse).toContain('"code":"translation_buffer_limit"');
+    expect(sse).toContain('"usage":{"input_tokens":7,"output_tokens":1,"total_tokens":8');
+    expect(sse).not.toContain("event: response.completed");
+    expect(aggregate).toEqual([{ inputTokens: 7, outputTokens: 1 }]);
+    expect(fulfillCallCount).toBe(0);
   });
 
   test("no image tool call → passthrough text + done", async () => {
@@ -1219,6 +1259,54 @@ describe("runWithImageBridge — runTurn adapter", () => {
     const response = await runWithImageBridge({ parsed: makeParsed(), adapter: runTurnAdapter, plan });
     const sse = await response.text();
     expect(sse).toContain("hello from runTurn");
+  });
+
+  test("runTurn adapter paces every physical dispatch inside its turn lease", async () => {
+    // A capped provider: the turn's own lease must not block its BidiAppend sends.
+    let transportSends = 0;
+    let recordedSends = 0;
+    let turnSlot: ProviderRequestSlot | undefined;
+    const configured: OcxProviderConfig = {
+      adapter: "cursor", baseUrl: "https://cursor.test", requestPacing: { enabled: true, maxConcurrentRequests: 1 },
+      fetch: Object.assign(async () => {
+        transportSends += 1;
+        return new Response("ok");
+      }, { preconnect() {} }) as typeof globalThis.fetch,
+    };
+    const dispatchingAdapter: ProviderAdapter = {
+      ...mockAdapter,
+      runTurn: async (_parsed, incoming, emit) => {
+        if (!incoming.providerFetch) throw new Error("missing provider fetch");
+        for (const url of ["https://cursor.test/run-sse", "https://cursor.test/bidi-append", "https://cursor.test/bidi-append"]) {
+          await (await incoming.providerFetch(url, { signal: AbortSignal.timeout(1_000) })).text();
+        }
+        expect(providerRequestPacingStatus("cursor", configured).inFlight).toBe(1);
+        emit({ type: "text_delta", text: "sent" });
+        emit({ type: "done" });
+      },
+    };
+    try {
+      const response = await runWithImageBridge({
+        parsed: makeParsed(),
+        adapter: dispatchingAdapter,
+        plan,
+        waitForRequestSlot: async signal => (turnSlot = await waitForProviderRequestSlot("cursor", configured, "model-a", signal)),
+        runTurnFetch: pacingSlot => providerFetch(configured, undefined, {
+          providerName: "cursor", modelId: "model-a", pacingSlotAcquired: true, pacingSlot, turnScopedPacing: true,
+        }),
+        onAttemptSend: () => { recordedSends += 1; },
+      });
+
+      expect(await response.text()).toContain("sent");
+      expect(transportSends).toBe(3);
+      // One attempt per runTurn, as on the normal runTurn lane; the lease ends with the turn.
+      expect(recordedSends).toBe(1);
+      expect(turnSlot?.released).toBe(true);
+      expect(providerRequestPacingStatus("cursor", configured).inFlight).toBe(0);
+    } finally {
+      turnSlot?.release();
+      resetProviderRequestPacingForTest();
+    }
   });
 
   test("runTurn adapter → error event surfaces as upstream failure", async () => {

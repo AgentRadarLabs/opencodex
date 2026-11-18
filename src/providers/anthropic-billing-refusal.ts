@@ -43,7 +43,12 @@ export function isAnthropicBillingFailure(status: number, message: string, code?
 
 /** Inspect a clone, never the terminal body; the shared reader owns interruption/cleanup. */
 export async function readAnthropicBillingRefusal(response: Response, signal?: AbortSignal): Promise<boolean> {
-  if (signal?.aborted || (response.status !== 400 && response.status !== 402)) return false;
+  return (response.status === 400 || response.status === 402)
+    && readAnthropicErrorEnvelope(response, signal, payload => isAnthropicBillingRefusal(response.status, payload));
+}
+
+async function readAnthropicErrorEnvelope(response: Response, signal: AbortSignal | undefined, accepts: (payload: unknown) => boolean): Promise<boolean> {
+  if (signal?.aborted) return false;
   const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
   if (!contentType || !/^application\/(?:json|[a-z0-9.+-]+\+json)$/.test(contentType)) return false;
   try {
@@ -54,7 +59,7 @@ export async function readAnthropicBillingRefusal(response: Response, signal?: A
       totalTimeoutMs: BILLING_REFUSAL_DEADLINE_MS,
     });
     if (signal?.aborted || !body.displaySafe || body.truncated || body.timedOut || body.oversized) return false;
-    return isAnthropicBillingRefusal(response.status, JSON.parse(body.text));
+    return accepts(JSON.parse(body.text));
   } catch {
     // Untrusted malformed, unreadable and invalid UTF-8 bodies confer no authority.
     return false;
@@ -69,11 +74,25 @@ export function isAnthropicExtraUsageFailure(status: number, message: string, co
   if (status !== 400 || Buffer.byteLength(message, "utf8") > MAX_BILLING_REFUSAL_BYTES) return false;
   if (code != null && code !== "invalid_request_error") return false;
   const text = withoutProviderPrefix(status, message);
-  try {
-    const payload: unknown = JSON.parse(text);
-    return record(payload) && payload.type === "error" && record(payload.error)
-      && payload.error.type === "invalid_request_error" && payload.error.code == null
-      && typeof payload.error.message === "string" && EXTRA_USAGE_REFUSAL.test(payload.error.message.trim());
-  } catch { /* Exact prose needs a structured type. */ }
+  try { return isAnthropicExtraUsageRefusal(JSON.parse(text)); } catch { /* Exact prose needs a structured type. */ }
   return code === "invalid_request_error" && EXTRA_USAGE_REFUSAL.test(text);
+}
+
+function isAnthropicExtraUsageRefusal(payload: unknown, wording = EXTRA_USAGE_REFUSAL): boolean {
+  return record(payload) && payload.type === "error" && record(payload.error)
+    && payload.error.type === "invalid_request_error" && payload.error.code == null
+    && typeof payload.error.message === "string" && wording.test(payload.error.message.trim());
+}
+
+// Pool rotation keeps the hosted fork's start-anchored match: Anthropic has changed the suffix
+// before, and an echoed client value can only appear after the message's own start.
+export const EXTRA_USAGE_ROTATION = /^(?:You['\u2019]re out of extra usage|Third-party apps now draw from your extra usage)/i;
+// Anthropic's spend limit (https://platform.claude.com/docs/en/api/rate-limits#setting-your-own-spend-limit), same anchoring.
+export const ANTHROPIC_SPEND_LIMIT = /^you have reached your specified (?:workspace )?api usage limits/i;
+
+/** Account-scoped spent extra-usage or spend-limit evidence for pool rotation; same bounded clone read as billing. */
+export async function readAnthropicExtraUsageRefusal(response: Response, signal?: AbortSignal): Promise<boolean> {
+  return response.status === 400
+    && readAnthropicErrorEnvelope(response, signal, payload => isAnthropicExtraUsageRefusal(payload, EXTRA_USAGE_ROTATION)
+      || isAnthropicExtraUsageRefusal(payload, ANTHROPIC_SPEND_LIMIT));
 }

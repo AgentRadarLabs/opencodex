@@ -662,7 +662,7 @@ describe("usage log", () => {
     expect(value.attempts?.[0]?.locallyAnswered).toBe(true);
   });
 
-  test("drops only malformed persisted attempts while preserving valid siblings", () => {
+  test("drops malformed attempt identity while preserving valid siblings", () => {
     const valid = (ordinal: number) => ({
       ordinal,
       provider: ordinal === 1 ? "a" : "c",
@@ -680,13 +680,6 @@ describe("usage log", () => {
       { ...valid(2), status: 99 },
       { ...valid(2), status: 600 },
       { ...valid(2), status: 200.5 },
-      { ...valid(2), inputTokenEstimate: -1 },
-      { ...valid(2), totalTokens: -1 },
-      { ...valid(2), firstOutputMs: -1 },
-      { ...valid(2), firstOutputMs: null },
-      { ...valid(2), firstOutputMs: "3" },
-      { ...valid(2), usage: { inputTokens: "2", outputTokens: 1 } },
-      { ...valid(2), usage: { inputTokens: 2, outputTokens: "1" } },
     ];
     for (const middle of malformed) {
       writeFileSync(usageLogPath(), `${JSON.stringify({

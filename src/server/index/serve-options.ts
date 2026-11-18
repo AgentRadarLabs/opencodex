@@ -275,6 +275,10 @@ export function createServeOptions(ctx: ServeOptionsContext) {
       // #8338: the kernel-observed peer, so the configured standalone dashboard proxy can be verified.
       else if (ingress === "public" && config.dashboardTrustedProxy !== undefined) markDashboardProxyPeer(req, requestServer.requestIP(req)?.address);
       const requestUrl = codexCompatibleUrl(req.url);
+      if ((req.headers.has("x-agentradar-account-id") || req.headers.has("x-agentradar-account-provider"))
+        && !["/v1/messages", "/v1/messages/count_tokens", "/v1/chat/completions"].includes(requestUrl.pathname)) {
+        return formatErrorResponse(400, "invalid_request_error", "AgentRadar account pin is only honoured on /v1/messages, /v1/messages/count_tokens and /v1/chat/completions");
+      }
       const linkPolicyView = ingress === "hub-link" ? linkPolicy() : undefined;
       // The unauthenticated loopback listener (#1102) serves a fixed allowlist and nothing
       // else. Rejecting here, before any handler runs, is what keeps the surface from growing
@@ -1513,7 +1517,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
           return withCors(anthropicErrorResponse(403, "cross-origin data-plane request blocked", "permission_error"), req, policy);
         }
         return runAdmittedHttpTurn(req, policy, async () => withCors(
-          await handleClaudeCountTokens(req, config, policy, { claudeIntercept: ingress === "claude-intercept" }),
+          await handleClaudeCountTokens(req, config, policy, { claudeIntercept: ingress === "claude-intercept", admission }),
           req,
           policy,
         ));

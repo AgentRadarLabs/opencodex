@@ -12,6 +12,12 @@ Native steering follows [the shared WebSocket contract](../transports/streaming-
 xAI uses the same shared credential and delivery policies through the Responses
 [core module ownership](../transports/responses.md#core-module-ownership). This surface retains its existing behavior.
 
+The `xai-apikey` registry row is the `xai` row's key-auth lane under its own provider identity, for
+hosted deployments that store an xAI API key under that id. `xaiApiKeyEntry` in
+`src/providers/registry/entries-core.ts` derives it from the `xai` row at load, applying
+`keyAuthServiceTier` and dropping the OAuth-only `oauthId`, `allowKeyAuthOverride` and `featured`
+fields, so a capability fix to `xai` reaches it without a second copy. Grok OAuth stays on `xai`.
+
 One Responses capability is seeded for xAI alone: `requiresPairedResponsesToolResults`, which
 answers a replayed tool call whose output never arrived. It is deliberately not the same flag as
 `requiresAdjacentResponsesToolResults`, which xAI also carries and shares with the Kimi presets.

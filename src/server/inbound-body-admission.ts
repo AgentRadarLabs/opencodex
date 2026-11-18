@@ -3,6 +3,8 @@ import {
   MAX_DECOMPRESSED_BODY_BYTES,
   resolveInboundBodyLimitBytes,
 } from "./request-decompress";
+import { withAgentRadarServedAccount } from "../lib/agentradar-account-pin";
+import { logOversizedInbound } from "../lib/upstream-refusal-log";
 import { withCors, type RequestPolicyView } from "./auth-cors";
 import { codexCompatibleUrl } from "../codex/context-compat";
 import { addFinalRequestLog, markLocalRequestLogRefusal } from "./request-log";
@@ -219,7 +221,16 @@ export function runAdmittedBodyWork(
   mapRefusal?: (response: Response) => Response,
   onAdmissionError?: (error: unknown) => Response,
 ): Promise<Response> {
-  return withRaisedInboundBodyAdmission(req, codexCompatibleUrl(req.url).pathname, configuredLimit, work, refused => {
+  const served = async () => {
+    const response = await work();
+    return refusalLog ? withAgentRadarServedAccount(response, refusalLog.logCtx) : response;
+  };
+  // The declared length only, before any body is read: a request near the cap shows up here.
+  const pathname = codexCompatibleUrl(req.url).pathname;
+  if (req.method === "POST" && CONFIGURABLE_JSON_BODY_ROUTES.has(pathname)) {
+    logOversizedInbound(pathname, Number(req.headers.get("content-length") ?? NaN));
+  }
+  return withRaisedInboundBodyAdmission(req, pathname, configuredLimit, served, refused => {
     if (refusalLog) {
       markLocalRequestLogRefusal(refusalLog.logCtx, "server_busy");
       refusalLog.logCtx.errorCode = "server_busy";

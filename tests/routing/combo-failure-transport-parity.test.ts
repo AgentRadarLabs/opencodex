@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { formatErrorResponse } from "../../src/bridge";
+import { markVerbatimComboFailure, verbatimComboFailure } from "../../src/bridge/errors";
 import { comboFailureCooldownScope, comboFailureDecision, isProviderModerationRefusal } from "../../src/combos/failover";
 import { consumeComboFailure } from "../../src/server/responses/core-combo-failure";
 import { preflightComboStreamResponse } from "../../src/server/responses/combo-stream-preflight";
@@ -502,4 +504,16 @@ describe("every prose field beside a coded verdict must describe the moderation 
     expect(isProviderModerationRefusal(400, body, undefined, true)).toBe(false);
     expect(performance.now() - started).toBeLessThan(250);
   });
+});
+
+test("AgentRadar hosted: a verbatim child failure is classified by its formatted status, presented by its own bytes", async () => {
+  // An SSE pre-output error arrives as HTTP 200; deciding the hop on that status would end the ladder.
+  const formatted = formatErrorResponse(529, "overloaded_error", "Overloaded");
+  markVerbatimComboFailure(formatted, () => new Response("event: error\ndata: {}\n\n", { status: 200 }));
+  const failure = await consumeComboFailure(formatted);
+  expect(failure.response.status).toBe(529);
+  expect(comboFailureDecision(failure.response.status, failure.classificationText, { code: failure.upstreamCode })).toBe("hop");
+  const presented = verbatimComboFailure(failure.response);
+  expect(presented?.status).toBe(200);
+  expect(await presented!.text()).toBe("event: error\ndata: {}\n\n");
 });

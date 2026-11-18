@@ -176,7 +176,7 @@ function anthropicOAuthEntry(id: AnthropicInstanceId, label: string): ProviderRe
   });
 }
 
-export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
+const CORE_ENTRIES: readonly ProviderRegistryEntry[] = [
   {
     id: "openai",
     label: "OpenAI (Codex login)",
@@ -1514,3 +1514,22 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     note: "Serverless Inference subscription API. Live discovery exposes only kimi-k2-instruct because Vultr documents it as the sole tool-calling model.",
   },
 ];
+
+// AgentRadar hosted gateways store an xAI API key under "xai-apikey" and regenerate their key-provider
+// list from this registry, so the row must exist. It is the xai row's key-auth lane under its own
+// identity, derived so capability fixes to xai reach it; Grok OAuth stays on "xai".
+function xaiApiKeyEntry(xai: ProviderRegistryEntry): ProviderRegistryEntry {
+  const { allowKeyAuthOverride: _override, keyAuthServiceTier, oauthId: _oauthId, featured: _featured, ...shared } = xai;
+  return {
+    ...shared,
+    ...keyAuthServiceTier,
+    id: "xai-apikey",
+    label: "xAI Grok (API key)",
+    authKind: "key",
+    dashboardUrl: "https://console.x.ai",
+    note: "Direct xAI API billing — no Grok subscription",
+  };
+}
+
+export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = CORE_ENTRIES.flatMap(entry =>
+  entry.id === "xai" ? [entry, xaiApiKeyEntry(entry)] : [entry]);

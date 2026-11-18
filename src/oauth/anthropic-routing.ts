@@ -1,3 +1,5 @@
+import { agentRadarPin } from "../lib/agentradar-account-pin";
+import { setComboPoolEligibilityProbe } from "../combos/failover";
 import { clearAllAnthropicFamilyQuota, anthropicModelQuotaFor, anthropicModelPercents, anthropicModelRankPercent, anthropicModelWeeklyPercent } from "./anthropic-model-quota";
 /**
  * Opt-in Anthropic OAuth account pool (#294).
@@ -22,6 +24,8 @@ import { REFRESH_SKEW_MS } from "./refresh-policy";
 import { captureOAuthAccountSelection, commitOAuthAccountSelection, credentialGeneration, getAccountSet, getAccountCredential, getAccountCredentialWithStatus } from "./store";
 import type { OAuthAccessSnapshot } from "./index";
 import { getCachedProviderAccountQuota } from "../providers/quota";
+import { recordAnthropicAccountQuotaFromHeadersForInstance } from "../providers/quota/account-cache";
+import { captureConfigGeneration } from "../lib/state-store-sweeper";
 import { fallbackCodexAccountLogLabel } from "../codex/account-label";
 import {
   normalizeAccountPoolStickyLimit,
@@ -54,6 +58,8 @@ import { AnthropicSessionAffinityStore, anthropicAffinityDigest, AFFINITY_IDLE_T
  * hand it a plain `new Headers({...})`.
  */
 export type AnthropicRateLimitHeaders = Pick<Headers, "get">;
+/** 400 is Anthropic's exact spent-extra-usage refusal: quota evidence without a 429 classification. */
+export type AnthropicAccountRefusalStatus = 429 | 403 | 400;
 
 /** Backoff only when upstream supplies no usable deadline. */
 const DEFAULT_COOLDOWN_MS = 60_000;
@@ -122,6 +128,8 @@ interface AccountHealth {
    * Retry-After set the deadline. A usage-limit answer reports this, never an admission deadline.
    */
   quotaResetAt?: number;
+  /** AgentRadar: a 429 with no unified status cools and rotates, but is not evidence of spent quota. */
+  headerless?: boolean;
 }
 
 /** See `anthropicAccountHold`: the latest hold on one account and its known window reset. */
@@ -219,6 +227,8 @@ interface ScoredAccount {
   fiveHourTieBreak: number;
   /** True only under the opt-in weekly window; see compareScoredAccounts. */
   knownFirst: boolean;
+  /** Weekly window only: a known 100% is a spent account and ranks behind an unknown reading. */
+  spentLast: boolean;
 }
 
 function compareScoredAccounts(a: ScoredAccount, b: ScoredAccount): number {
@@ -227,6 +237,8 @@ function compareScoredAccounts(a: ScoredAccount, b: ScoredAccount): number {
   // never opted in: an account measured at 100% would sort ahead of an unmeasured one purely
   // because it had a reading. The accepted scope preserves the five-hour default exactly.
   if (a.knownFirst && b.knownFirst && a.hasKnownUsage !== b.hasKnownUsage) {
+    // A known 100% is a spent account, not a preferred one: an unknown reading may have room.
+    if (a.spentLast && (a.hasKnownUsage ? a : b).score >= 100) return a.hasKnownUsage ? 1 : -1;
     return a.hasKnownUsage ? -1 : 1;
   }
   return a.score - b.score || a.fiveHourTieBreak - b.fiveHourTieBreak;
@@ -257,6 +269,17 @@ export function formatAnthropicAccountOrdinal(accountId: string): string {
   return fallbackCodexAccountLogLabel(accountId);
 }
 
+/**
+ * Name the serving Anthropic account in the account-qualified provider and, on AgentRadar gateways,
+ * also in the row/attempt `accountLogLabel` (`p<hex6>`, the same digest), so per-account usage joins.
+ */
+export function stampAnthropicAccountForLog(
+  logCtx: { provider: string; accountLogLabel?: string }, instance: string, accountId: string, config?: OcxConfig,
+): void {
+  logCtx.provider = formatAnthropicProviderForLog(instance, accountId, config);
+  if (process.env.OPENCODEX_AGENTRADAR === "1") logCtx.accountLogLabel = formatAnthropicAccountOrdinal(accountId);
+}
+
 export function formatAnthropicProviderForLog(
   providerName: string,
   accountId: string | null | undefined,
@@ -283,6 +306,7 @@ export type AnthropicCooldownRecoverySettlement = "cleared" | "retained" | "supe
 export type AnthropicAccountSelectionReason =
   | "pool-disabled"
   | "affinity"
+  | "hash"
   | "active"
   | "lowest-usage"
   | "only-eligible"
@@ -376,6 +400,7 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
   // Undefined means this runtime has not admitted a selection yet; null means consumed.
   // The startup baseline comes from the authoritative store, never a second persisted pin.
   let manualPreference: OAuthAccountSelection | null | undefined;
+  let manualPreferenceIsBaseline = true;
   let manualSelectionGeneration = 0;
   let manualResetPending = false;
   /** Automatic pointer moves preserve affinity; manual selection revokes older bindings. */
@@ -536,6 +561,7 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
     clearAnthropicCooldownGenerations();
     sessionAffinity.resetMemory();
     manualPreference = undefined;
+    manualPreferenceIsBaseline = true;
     manualSelectionGeneration++;
     manualResetPending = false;
     quorumCache = null;
@@ -546,7 +572,21 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
   }
 
   function isCooled(accountId: string, now: number): boolean {
-    return getAnthropicAccountHealthSnapshot(accountId, now) !== null;
+    return getAnthropicAccountHealthSnapshot(accountId, now) !== null || weeklySpentUntil(accountId, now) !== undefined;
+  }
+
+  /**
+   * AgentRadar gateways only: a cached seven-day reading at 100% with its reset still ahead is a hard
+   * hold, so a fresh process (empty cooldown map, persisted quota cache) never seats a session on a
+   * spent account and an all-spent pool answers a usage limit instead of sending. Ordinary installs
+   * keep upstream's soft headroom preference. A reading without a reset proves nothing and fails open.
+   */
+  function weeklySpentUntil(accountId: string, now: number): number | undefined {
+    if (process.env.OPENCODEX_AGENTRADAR !== "1") return undefined;
+    const quota = getCachedProviderAccountQuota(PROVIDER, accountId);
+    const resetAt = quota?.weeklyResetAt;
+    return typeof quota?.weeklyPercent === "number" && quota.weeklyPercent >= 100
+      && typeof resetAt === "number" && resetAt > now ? resetAt : undefined;
   }
 
   function fiveHourKnown(accountId: string): boolean {
@@ -743,8 +783,10 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
       latest.quota = quota;
     };
     const entry = getAnthropicAccountHealthSnapshot(accountId, now) ? upstreamHealth.get(accountId) : undefined;
-    consider(entry?.cooldownUntil, entry?.refusalStatus === 429, entry?.quotaResetAt);
+    consider(entry?.cooldownUntil, entry?.refusalStatus === 429 && !entry.headerless, entry?.quotaResetAt);
     consider(anthropicRatePauseUntil(accountId, now), false);
+    const weeklyReset = weeklySpentUntil(accountId, now);
+    consider(weeklyReset, true, weeklyReset);
     const family = anthropicFamilyHoldState(accountId, model);
     consider(anthropicFamilyRetryAt(accountId, model, now), family?.revalidating === false, family?.resetAt);
     if (latest.until === 0) return null;
@@ -819,6 +861,7 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
       // Every window EXCEPT the legacy five-hour default is an explicit opt-in, so
       // known-before-unknown applies to all of them and to none of the default path.
       knownFirst: window !== "five-hour",
+      spentLast: window === "weekly",
     }));
     let best = scored[0]!;
     for (let i = 1; i < scored.length; i++) {
@@ -878,7 +921,7 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
     model?: string,
     excludedAccountIds?: ReadonlySet<string>,
   ): string | null {
-    if (!admitted(config)) return null;
+    if (!admitted(config) || agentRadarPin(config)) return null;
     const strategy = isAnthropicAccountPoolEnabled(config) ? anthropicPoolStrategy(config) : "quota";
     const eligible = routeCandidates(getEligibleAnthropicAccounts(now, model), decision).filter(id => id !== excludeId && !excludedAccountIds?.has(id));
     if (strategy === "round-robin") {
@@ -964,6 +1007,24 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
     return null;
   }
 
+  /** AgentRadar gateways only: a keyed round-robin session is placed by rendezvous hash, not by process state. */
+  function agentRadarHashSession(sessionKey: string | null | undefined, config: OcxConfig): boolean {
+    return process.env.OPENCODEX_AGENTRADAR === "1" && !!normalizeAffinityComponent(sessionKey)
+      && anthropicPoolStrategy(config) === "round-robin";
+  }
+
+  /** Highest sha256(key \0 account) among candidates with headroom, else among all candidates. */
+  function agentRadarHashSeat(sessionKey: string | null | undefined, candidates: string[], model?: string): string | null {
+    const headroom = model ? candidates.filter(id => !anthropicModelExhausted(id, model)) : candidates;
+    let winner: string | null = null;
+    let score = "";
+    for (const id of headroom.length ? headroom : candidates) {
+      const candidate = new Bun.CryptoHasher("sha256").update(`${normalizeAffinityComponent(sessionKey)}\0${id}`).digest("hex");
+      if (candidate > score) { winner = id; score = candidate; }
+    }
+    return winner;
+  }
+
   /**
    * Resolve which Anthropic OAuth account should serve this session.
    * When the pool is disabled, retain the active account unless the operator paused it.
@@ -1010,9 +1071,11 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
       return { accountId: set.activeAccountId, reason: "pool-disabled" };
     }
 
+    const deterministicSession = agentRadarHashSession(sessionKey, config);
     // A manual choice is a one-dispatch preference, not a lower-priority quota hint.
     // Consume it only after admission commits, so a failed token lookup cannot spend it.
-    if (manualPreference && !sessionAffinity.get(affinityKey(sessionKey), set, now)) {
+    if (manualPreference && !(deterministicSession && manualPreferenceIsBaseline)
+      && !sessionAffinity.get(affinityKey(sessionKey), set, now)) {
       if (manualPreference.accountId !== set.activeAccountId || manualPreference.revision !== set.selectionRevision) {
         manualPreference = null;
       } else {
@@ -1026,6 +1089,8 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
     }
 
     const key = affinityKey(sessionKey);
+    const seat = deterministicSession ? agentRadarHashSeat(sessionKey, eligible, model) : null;
+    if (seat) return { accountId: seat, reason: sessionAffinity.get(key, set, now)?.accountId === seat ? "affinity" : "hash", routePosition: decision?.position };
     if (key) {
       const affined = sessionAffinity.get(key, set, now);
       if (affined && now - affined.lastUsedAt <= AFFINITY_IDLE_TTL_MS) {
@@ -1169,7 +1234,7 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
   function rotateAnthropicAccountOnRefusal(
     config: OcxConfig,
     failedAccountId: string,
-    status: 429 | 403,
+    status: AnthropicAccountRefusalStatus,
     retryAfterHeader: string | null | undefined,
     sessionKey?: string | null,
     now = Date.now(),
@@ -1178,13 +1243,17 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
     model?: string,
     excludedAccountIds?: ReadonlySet<string>,
   ): string | null {
-    if (!recordAnthropicAccountRefusal(config, failedAccountId, status, retryAfterHeader, now, rateLimitHeaders)) return null;
+    if (!recordAnthropicAccountRefusal(config, failedAccountId, status, retryAfterHeader, now, rateLimitHeaders) || agentRadarPin(config)) return null;
 
     // The pool's strategy is a PROACTIVE policy. When the pool is disabled, reactive
     // presence-only recovery must not silently reactivate round-robin/fill-first merely
     // because those dormant values remain in config. The quota picker is the neutral
     // recovery policy already used by the default strategy.
-    const next = isAnthropicAccountPoolEnabled(config)
+    // A hashed session fails over to its hash runner-up, so warm and fresh processes agree on it.
+    const next = isAnthropicAccountPoolEnabled(config) && agentRadarHashSession(sessionKey, config)
+      ? agentRadarHashSeat(sessionKey, routeCandidates(getEligibleAnthropicAccounts(now, model), decision)
+        .filter(id => id !== failedAccountId && !excludedAccountIds?.has(id)), model)
+      : isAnthropicAccountPoolEnabled(config)
       ? pickAlternateAnthropicAccount(config, failedAccountId, now, decision, model, excludedAccountIds)
       : pickLowestUsage(config, failedAccountId, now, null, model, excludedAccountIds);
     if (!next) {
@@ -1194,7 +1263,7 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
 
     console.warn(status === 403
       ? `[${instance}-pool] ${decision ? `route:#${decision.position} ` : ""}account unavailable (403); failing over`
-      : `[${instance}-pool] ${decision ? `route:#${decision.position} ` : ""}429 on ${formatAnthropicAccountOrdinal(failedAccountId)}; failing over to ${formatAnthropicAccountOrdinal(next)}`);
+      : `[${instance}-pool] ${decision ? `route:#${decision.position} ` : ""}${status} on ${formatAnthropicAccountOrdinal(failedAccountId)}; failing over to ${formatAnthropicAccountOrdinal(next)}`);
 
     return next;
   }
@@ -1214,7 +1283,7 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
   function recordAnthropicAccountRefusal(
     config: OcxConfig,
     failedAccountId: string,
-    status: 429 | 403,
+    status: AnthropicAccountRefusalStatus,
     retryAfterHeader: string | null | undefined,
     now = Date.now(),
     rateLimitHeaders?: AnthropicRateLimitHeaders | null,
@@ -1245,9 +1314,10 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
     // without that fallback such a refusal cools for the 60s default and the exhausted
     // account is back in the rotation a minute later.
     const parsedRetry = parseRetryAfterMs(retryAfterHeader, now);
-    const resetDerived = status === 429 && parsedRetry === undefined ? parseRateLimitReset(rateLimitHeaders, now) : undefined;
-    const quotaResetAt = status === 429 ? rejectedWindowsResetAt(rateLimitHeaders, now) : undefined;
-    const cooldownMs = parsedRetry ?? resetDerived?.delayMs ?? (status === 403 ? ACCOUNT_REFUSAL_COOLDOWN_MS : DEFAULT_COOLDOWN_MS);
+    const resetDerived = status !== 403 && parsedRetry === undefined ? parseRateLimitReset(rateLimitHeaders, now) : undefined;
+    const quotaResetAt = status !== 403 ? rejectedWindowsResetAt(rateLimitHeaders, now) : undefined;
+    // A spent-extra-usage 400 names no reset of its own: keep the account out as long as an entitlement refusal.
+    const cooldownMs = parsedRetry ?? resetDerived?.delayMs ?? (status === 429 ? DEFAULT_COOLDOWN_MS : ACCOUNT_REFUSAL_COOLDOWN_MS);
     const cooldownGeneration = noteAnthropicCooldownMutation(failedAccountId);
     upstreamHealth.set(failedAccountId, {
       cooldownUntil: now + cooldownMs,
@@ -1257,11 +1327,22 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
       ...(resetDerived ? { rejectedQuotaWindows: resetDerived.rejectedQuotaWindows } : {}),
       cooldownGeneration,
       recordedAt: now,
-      refusalStatus: status,
-      refusedQuotaWindows: status === 429 ? rejectedQuotaWindowsIn(rateLimitHeaders) : [],
+      refusalStatus: status === 403 ? 403 : 429,
+      refusedQuotaWindows: status !== 403 ? rejectedQuotaWindowsIn(rateLimitHeaders) : [],
       ...(quotaResetAt !== undefined ? { quotaResetAt } : {}),
+      ...(status === 429 && !rateLimitHeaders?.get("anthropic-ratelimit-unified-status")
+        && rejectedQuotaWindowsIn(rateLimitHeaders).length === 0 ? { headerless: true } : {}),
     });
     sweepExpiredOnWrite(now);
+    // The cooldown is per process; the quota cache (and its disk snapshot) is what a fresh
+    // AgentRadar process reads. A rejected 429 may omit the utilization header, so state it.
+    const weeklyReset = rateLimitHeaders?.get("anthropic-ratelimit-unified-7d-reset");
+    if (process.env.OPENCODEX_AGENTRADAR === "1" && status !== 403 && weeklyReset
+      && rateLimitHeaders?.get("anthropic-ratelimit-unified-7d-status") === "rejected") {
+      recordAnthropicAccountQuotaFromHeadersForInstance(instance, failedAccountId, new Headers({
+        "anthropic-ratelimit-unified-7d-utilization": "1", "anthropic-ratelimit-unified-7d-reset": weeklyReset,
+      }), captureConfigGeneration());
+    }
     clearAnthropicSessionAffinityForAccount(failedAccountId);
     notePoolRotationFailure(poolKey, failedAccountId);
     // The refused account changed the eligible roster even when no retry send remains.
@@ -1300,7 +1381,7 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
     const current = captureOAuthAccountSelection(PROVIDER);
     if (current?.accountId !== committed.accountId || current.revision !== committed.revision) return false;
     if (isAnthropicAccountPoolEnabled(options.config)) {
-      if (anthropicPoolStrategy(options.config) === "round-robin" && options.reason !== "affinity") {
+      if (anthropicPoolStrategy(options.config) === "round-robin" && options.reason !== "affinity" && options.reason !== "hash") {
         const limit = stickyLimitForPool(options.config);
         const picked = pickRoundRobinAccount(poolKey, routeCandidates(getEligibleAnthropicAccounts(Date.now(), options.model), options.routeDecision ?? null), limit);
         if (picked !== accountId) seedPoolRotationAccount(poolKey, accountId);
@@ -1342,6 +1423,7 @@ function createAnthropicRouting(instance: AnthropicInstanceId): AnthropicRouting
   function resetAnthropicRoutingForManualSelection(accountId: string): void {
     requestAnthropicSessionAffinityReset();
     manualPreference = captureOAuthAccountSelection(PROVIDER);
+    manualPreferenceIsBaseline = false;
     seedPoolRotationAccount(poolKey, accountId);
     // A manual account selection is an operator statement about the roster; do not answer the
     // next activation question from a count read before it.
@@ -1489,6 +1571,10 @@ export function anthropicRoutingFor(instance: AnthropicInstanceId): AnthropicRou
   if (!routing) { routing = createAnthropicRouting(instance); instances.set(instance, routing); }
   return routing;
 }
+// A 429/402 combo cooldown on the pool target outlives the pool state it described: lift it once another
+// account can serve (a failover quorum with an eligible account); a lone account keeps the target cooled.
+setComboPoolEligibilityProbe((provider, now) => (provider === "anthropic" || provider === "anthropic2")
+  && anthropicRoutingFor(provider).hasAnthropicFailoverQuorum(now) && anthropicRoutingFor(provider).getEligibleAnthropicAccounts(now).length > 0);
 export function sweepAllAnthropicRoutingHealth(now = Date.now()): number {
   let removed = 0;
   for (const routing of instances.values()) removed += routing.sweepExpiredAnthropicRoutingHealth(now);
@@ -1656,7 +1742,7 @@ export function rotateAnthropicAccountOn429(
 export function rotateAnthropicAccountOnRefusal(
   config: OcxConfig,
   failedAccountId: string,
-  status: 429 | 403,
+  status: AnthropicAccountRefusalStatus,
   retryAfterHeader: string | null | undefined,
   sessionKey?: string | null,
   now = Date.now(),
@@ -1681,7 +1767,7 @@ export function recordAnthropicAccount429(
 export function recordAnthropicAccountRefusal(
   config: OcxConfig,
   failedAccountId: string,
-  status: 429 | 403,
+  status: AnthropicAccountRefusalStatus,
   retryAfterHeader: string | null | undefined,
   now = Date.now(),
   rateLimitHeaders?: AnthropicRateLimitHeaders | null,

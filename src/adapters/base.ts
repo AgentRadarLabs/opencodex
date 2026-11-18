@@ -137,6 +137,8 @@ export interface AdapterRequest {
     method: string;
     headers: Record<string, string>;
     body: string;
+    /** Effective Anthropic prompt-cache lifetime of the final wire body (5 min or 1 h). */
+    promptCacheTtlMs?: number;
     /** Caller tool identities replaced by hosted tools in this exact build; empty clears prior builds. */
     hostedToolSubstitutions?: ReadonlyArray<{ name: string; namespace?: string; callType: string }>;
     /** Exact final wire model, captured before serialization for model-scoped transport gates. */

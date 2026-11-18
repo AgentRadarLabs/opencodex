@@ -210,6 +210,19 @@ describe("rotateKeyOn429", () => {
     expect(getKeyCooldownUntil("p", "k1", now)).toBe(now + 10 * 60_000);
   });
 
+  test("AgentRadar hosted: caps absurd Retry-After at the max cooldown", () => {
+    const previous = process.env.OPENCODEX_AGENTRADAR;
+    process.env.OPENCODEX_AGENTRADAR = "1";
+    try {
+      const config = makeConfig({ apiKey: "key-alpha-000111222333", apiKeyPool: pool3() });
+      const now = 1_000_000;
+      rotateKeyOn429(config, "p", "86400", now);
+      expect(getKeyCooldownUntil("p", "k1", now)).toBe(now + 60_000);
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODEX_AGENTRADAR; else process.env.OPENCODEX_AGENTRADAR = previous;
+    }
+  });
+
   test("skips keys already in cooldown and wraps around the pool", () => {
     const config = makeConfig({ apiKey: "key-alpha-000111222333", apiKeyPool: pool3() });
     const now = 1_000_000;

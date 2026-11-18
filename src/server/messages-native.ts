@@ -7,7 +7,7 @@ import { attachComboFailureEvidence, isProxyError, markProxyError } from "../lib
 import { captureAccountAutoPauseAttempt, wasAccountAutoPaused } from "../oauth/account-auto-pause";
 import { createPhysicalSendReporter, reportDispatchSends, type RequestExecutionBudget, type SingleUseDispatchPermit } from "../lib/request-execution-budget";
 import { createInferenceSendBudget, expandInferenceOAuthSendBudget } from "./inference/context";
-import { GENERIC_OAUTH_MAX_ACCOUNTS_PER_REQUEST } from "../oauth/generic-account-failover";
+import { oauthMaxAccountsPerRequest } from "../oauth/generic-account-failover";
 /**
  * Managed native Messages lane (PF-08, behind `protocols.rollout.managedMessagesNative`).
  *
@@ -39,16 +39,18 @@ import { ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST } from "../oauth/anthropic-rou
 import { enforceAnthropicImageLimits } from "../adapters/anthropic-image-guard";
 import { normalizeAnthropicImages } from "../adapters/anthropic-image-normalize";
 import { formatAnthropicErrorBody, resolveAnthropicMessagesUrl } from "../adapters/anthropic";
+import { anthropicPromptCacheTtlMs } from "../adapters/anthropic/cache-retention";
 import {
   anthropicMessagesNativeWireBody,
   buildAnthropicMessagesPassthroughRequest,
+  isCanonicalAnthropicMessagesUrl,
   type AnthropicMessagesPassthroughRequest,
 } from "../adapters/anthropic/passthrough";
 import { effortFromOutputConfig, nativeAnthropicProjection, resolveInboundModel } from "../claude/inbound";
 import { anthropicErrorBody, claudeOverflowSsePayload, claudePromptTooLongMessage, collectAnthropicMessage, isContextOverflowText, isThroughputLimitText } from "../claude/outbound";
 import type { AdmissionLease } from "../lib/admission";
-import { readBoundedResponseBody } from "../lib/bounded-body";
-import { classifyError } from "../lib/errors";
+import { readBoundedResponseBody, readBoundedResponseBytes } from "../lib/bounded-body";
+import { classifyError, httpStatusFromTerminalError } from "../lib/errors";
 import { relaySseWithPayloadRewrite } from "./sse-payload-rewrite";
 import { redactSecretString } from "../lib/redact";
 import { formatClientRetryAfter, resolveClientRetryAfter } from "../lib/retry-after";
@@ -89,7 +91,7 @@ import {
 import { stampApiKeyAccountLabel } from "../providers/label";
 import { affinityLaneFromRequest } from "./request-log-conversation";
 import { publicOAuthErrorPresentation, OAuthAccountPausedError, OAuthLoginRequiredError, publicOAuthAuthenticationErrorMessage } from "../oauth";
-import { AnthropicAccountCooldownError, formatAnthropicProviderForLog, anthropicRoutingFor } from "../oauth/anthropic-routing";
+import { AnthropicAccountCooldownError, anthropicRoutingFor, stampAnthropicAccountForLog } from "../oauth/anthropic-routing";
 import { configuredAnthropicInstance } from "../providers/anthropic-instance";
 import { resolveProtocolSettings } from "../protocols/settings";
 import { addProtocolEntryReason, markProtocolBlocked } from "../protocols/trace";
@@ -136,12 +138,15 @@ import {
   recordKeyWireAttemptUsage,
   type RequestLogContext,
 } from "./request-log";
+import { noteAgentRadarAccountDispatch } from "../lib/agentradar-account-pin";
 import { fetchWithHeaderTimeout, physicalSendObserverInit, providerFetch, safeHostLabel, sendWithConnectionPolicy } from "./responses/fetch-helpers";
 import { isLocalUpstream } from "../lib/local-upstream";
 import { resolveConnectTimeoutMs, resolveJsonBodyReadTimeoutMs } from "../stall-timeout";
 import { anthropicBillingPhysicalFetch } from "../providers/anthropic-billing-ownership";
 import { rotateAnthropicBillingKeyOnResponse } from "../providers/anthropic-billing-recovery";
 import { linkAbortSignal } from "./responses/core-lifetime";
+import { markVerbatimComboFailure } from "../bridge/errors";
+import { markClientWire } from "./inference/client-wire";
 import { attachRequestSpendTracker } from "./responses/request-spend";
 import { carryWorkflowRefusal, workflowRefusalResponse, workflowSendCeilingRefusalResponse } from "./workflow-refusal";
 import { sseFieldValue } from "../lib/sse-decoder";
@@ -363,6 +368,30 @@ function messageAsSse(message: Rec): string {
   return frames.join("");
 }
 
+/** A complete Messages result, as the hosted .27 contract validated it before relaying the bytes. */
+function isAnthropicMessageResponse(value: unknown): value is Rec {
+  return isRec(value) && typeof value.id === "string" && value.type === "message" && value.role === "assistant"
+    && Array.isArray(value.content) && value.content.every(isRec) && typeof value.model === "string"
+    && (typeof value.stop_reason === "string" || value.stop_reason === null)
+    // Looser than .27 by design: an absent stop_sequence is not evidence of a cut body.
+    && (typeof value.stop_sequence === "string" || value.stop_sequence === null || value.stop_sequence === undefined)
+    && isRec(value.usage) && [value.usage.input_tokens, value.usage.output_tokens]
+      .every(tokens => typeof tokens === "number" && Number.isInteger(tokens) && tokens >= 0);
+}
+
+/**
+ * The upstream headers a hosted relay carries, as .27 did: Content-Type and a bounded Retry-After.
+ * Organization ids, request ids and pool rate-limit state stay with the gateway.
+ */
+function relayedHeaders(headers: Headers): Headers {
+  const out = new Headers();
+  const contentType = headers.get("content-type");
+  if (contentType) out.set("content-type", contentType);
+  const retryAfter = formatClientRetryAfter(headers.get("retry-after"));
+  if (retryAfter !== undefined) out.set("retry-after", retryAfter);
+  return out;
+}
+
 /** Reject a body the Messages API cannot carry before anything is sent. */
 async function prepareNativeBody(body: Rec, signal: AbortSignal): Promise<void> {
   if (!Array.isArray(body.messages)) return;
@@ -564,14 +593,14 @@ async function runNativeMessagesAttempt(options: NativeMessagesExecution, attemp
   }
   let activeProvider: OcxProviderConfig = oauthBinding ? oauthProvider(oauthBinding) : route.provider;
   stampApiKeyAccountLabel(logCtx, route.providerName, activeProvider);
-  if (oauthBinding) logCtx.provider = formatAnthropicProviderForLog(route.providerName, oauthBinding.snapshot.accountId, config);
+  if (oauthBinding) stampAnthropicAccountForLog(logCtx, route.providerName, oauthBinding.snapshot.accountId, config);
   const spendTracker = options.sendBudget ? undefined : attachRequestSpendTracker(req, logCtx);
   const physicalBudget = options.sendBudget ?? createInferenceSendBudget(req, logCtx);
   // Freeze funding before any refusal cools an account; selection still checks live eligibility.
   const fundedAccounts = oauthBinding ? Math.min(new Set([
     oauthBinding.snapshot.accountId,
     ...anthropicRoutingFor(oauthBinding.instance).getEligibleAnthropicAccounts(Date.now(), route.modelId),
-  ]).size, GENERIC_OAUTH_MAX_ACCOUNTS_PER_REQUEST) : 0;
+  ]).size, oauthMaxAccountsPerRequest()) : 0;
   const oauthFailoverLimit = Math.max(ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST, fundedAccounts - 1);
   if (oauthBinding) expandInferenceOAuthSendBudget(physicalBudget, fundedAccounts);
   // Observe-only spend is already booked by the tracker; count billing sends without booking again.
@@ -593,6 +622,9 @@ async function runNativeMessagesAttempt(options: NativeMessagesExecution, attemp
   // credential, header or stripped block from an earlier build reaches the next one, and a build
   // for another credential domain decides opaque state from the full source again.
   const rejectUnrepresentable = resolveProtocolSettings(config).unrepresentable === "reject";
+  // AgentRadar hosted gateways keep the .27 source-replay contract for canonical Anthropic only:
+  // caller bytes out, upstream bytes back. Other Messages-compatible destinations keep upstream's lane.
+  const hosted = process.env.OPENCODEX_AGENTRADAR === "1" && isCanonicalAnthropicMessagesUrl(route.provider);
   const buildActiveRequest = () => {
     recordAttemptCredentialSource(attempt, route.providerName, activeProvider, "anthropic");
     // Exact combo replay preserves TTL-less breakpoints; an explicit operator TTL still wins.
@@ -602,6 +634,7 @@ async function runNativeMessagesAttempt(options: NativeMessagesExecution, attemp
       providerAccountUuid: oauthBinding?.providerAccountUuid,
       clientIdentity: options.clientIdentity,
       sessionKey: oauthBinding?.sessionKey ?? options.sessionKey,
+      exactSource: hosted,
     });
     if (built.strippedOpaqueState && rejectUnrepresentable) throw new NativeOpaqueStateRefusal();
     if (built.droppedBetas) {
@@ -609,6 +642,10 @@ async function runNativeMessagesAttempt(options: NativeMessagesExecution, attemp
       logDroppedAnthropicBetas({ droppedNames: built.droppedBetaNames, droppedUnrecognized: built.droppedUnrecognizedBetas });
     }
     if (built.strippedOpaqueState) addProtocolEntryReason(logCtx, "opaque-state-stripped");
+    // The wire's effective cache lifetime, as the adapter stamps it, for cache-break attribution.
+    delete attempt.promptCacheTtlMs;
+    const promptCacheTtlMs = anthropicPromptCacheTtlMs(built.wireBody);
+    if (promptCacheTtlMs !== undefined) attempt.promptCacheTtlMs = promptCacheTtlMs;
     return built;
   };
   const rebuildFor = (provider: OcxProviderConfig) => {
@@ -673,7 +710,7 @@ async function runNativeMessagesAttempt(options: NativeMessagesExecution, attemp
     record?.();
   };
   /** Send the native Messages request under the transient retry policy, re-validating the selected OAuth account or API key at the dispatch boundary. */
-  const send = async (recovery?: "rate-limit-429" | "oauth-401" | "oauth-account-403" | "key-429" | "key-401"): Promise<Response> => {
+  const send = async (recovery?: "rate-limit-429" | "anthropic-oauth-429" | "oauth-401" | "oauth-account-403" | "key-429" | "key-401" | "image-413"): Promise<Response> => {
     const remaining = remainingTransientSends();
     if (oauthBinding && !oauthPhysicalSendAvailable()) throw new SendBudgetExhaustedError();
     if (options.sendBudget && remaining <= 0) throw new SendBudgetExhaustedError();
@@ -714,7 +751,7 @@ async function runNativeMessagesAttempt(options: NativeMessagesExecution, attemp
                   throw new NativeOAuthSelectionChangedError();
                 }
                 rebuildFor(oauthProvider(oauthBinding));
-                logCtx.provider = formatAnthropicProviderForLog(route.providerName, oauthBinding.snapshot.accountId, config);
+                stampAnthropicAccountForLog(logCtx, route.providerName, oauthBinding.snapshot.accountId, config);
               }
             } else {
               for (let attempt = 0; !providerApiKeySelectionIsCurrent(config, route.providerName, activeProvider); attempt++) {
@@ -791,7 +828,7 @@ async function runNativeMessagesAttempt(options: NativeMessagesExecution, attemp
               localUpstream = isLocalUpstream(wire.url);
               dispatched = await fetchWithHeaderTimeout(
                 wire.url,
-                applyUpstreamRecoveryInit({ ...init, method: "POST", headers, body: wire.body, ...physicalSendObserverInit(observeAutoPause, wire.url) }, transportRecovery),
+                applyUpstreamRecoveryInit({ ...init, method: "POST", headers, body: wire.body, ...physicalSendObserverInit(observeAutoPause, wire.url, snapshot ? () => noteAgentRadarAccountDispatch(logCtx, snapshot.accountId, "native", options.sessionKey) : undefined) }, transportRecovery),
                 init.signal ?? upstream.signal,
                 resolveConnectTimeoutMs(config.connectTimeoutMs, { localUpstream }),
                 requestedStream, physicalFetch,
@@ -847,6 +884,15 @@ async function runNativeMessagesAttempt(options: NativeMessagesExecution, attemp
   let response: Response;
   try {
     response = await send();
+    // A 413 on a turn carrying images is rebuilt once with every image one tier smaller, as the
+    // bridge's adapter retries (imageTierBias); only the images change.
+    if (response.status === 413 && Array.isArray(body.messages) && JSON.stringify(body.messages).includes('"type":"image"')) {
+      discard(response);
+      await normalizeAnthropicImages(body.messages, { tierBias: 1, abortSignal: req.signal });
+      enforceAnthropicImageLimits(body.messages);
+      rebuildFor(activeProvider);
+      response = await send("image-413");
+    }
     let retryPolicy: ReturnType<typeof rateLimitRetryPolicyFor> | undefined;
     let retries = 0;
     let billingRecoveryActive = false;
@@ -936,7 +982,7 @@ async function runNativeMessagesAttempt(options: NativeMessagesExecution, attemp
     const oauthRetryKey = {};
     const triedAccountIds = new Set<string>();
     let oauthFailovers = 0;
-    while (oauthBinding && (response.status === 429 || response.status === 403 || response.status === 401)) {
+    while (oauthBinding && [429, 403, 401, 400].includes(response.status)) {
       const sendingBinding = oauthBinding;
       const expectedRecoverySelection = sendingBinding.selection;
       triedAccountIds.add(sendingBinding.snapshot.accountId);
@@ -954,7 +1000,9 @@ async function runNativeMessagesAttempt(options: NativeMessagesExecution, attemp
         canRetry: transientSendAvailable() && oauthFailovers < oauthFailoverLimit && oauthPhysicalSendAvailable(),
       });
       if (!nextAccountId) break;
-      const recovery = response.status === 401 ? "oauth-401" : response.status === 403 ? "oauth-account-403" : "rate-limit-429";
+      // Hosted gateways label a pool 429 hop as the bridge's OAuth rotation does (.27, adapter-dispatch).
+      const recovery = response.status === 401 ? "oauth-401" : response.status === 403 ? "oauth-account-403"
+        : hosted ? "anthropic-oauth-429" : "rate-limit-429";
       discard(response);
       oauthBinding = await resolveNativeOAuthBindingForInstance(nativeInstance!, config, { routeTarget,
         sessionKey: options.sessionKey, model: route.modelId, candidateAccountId: nextAccountId,
@@ -962,7 +1010,7 @@ async function runNativeMessagesAttempt(options: NativeMessagesExecution, attemp
       });
       oauthFailovers++;
       rebuildFor(oauthProvider(oauthBinding));
-      logCtx.provider = formatAnthropicProviderForLog(route.providerName, oauthBinding.snapshot.accountId, config);
+      stampAnthropicAccountForLog(logCtx, route.providerName, oauthBinding.snapshot.accountId, config);
       response = await send(recovery);
     }
   } catch (error) {
@@ -1018,6 +1066,26 @@ async function runNativeMessagesAttempt(options: NativeMessagesExecution, attemp
     logCtx.errorCode = "usage_limit_reached";
     return retainUpstreamMessagesRequestId(localOAuthFailure(poolUsageLimit)!, response.headers);
   }
+  if (!response.ok && hosted && !isReplayRefusalResponse(response)) {
+    // Hosted .27 contract: the client (and a combo, which judges and may return it) gets Anthropic's
+    // own error status, headers and bytes.
+    let read: Awaited<ReturnType<typeof readBoundedResponseBytes>>;
+    try { read = await readBoundedResponseBytes(response, { signal: upstream.signal, maxBytes: MAX_NATIVE_MESSAGES_JSON_BYTES }); }
+    catch (error) {
+      cleanupAbort(); upstream.abort();
+      if (req.signal.aborted) return fail(499, "Client cancelled request", "api_error");
+      return failEvidence(502, error instanceof Error ? error.message : String(error), "api_error", "transport_failed");
+    }
+    cleanupAbort();
+    if (read.oversized) return fail(502, "upstream response exceeded the safe limit", "api_error", "translation_buffer_limit");
+    const text = new TextDecoder().decode(read.bytes.subarray(0, MAX_NATIVE_MESSAGES_ERROR_BYTES));
+    finishLog(response.status, text);
+    const init = { status: response.status, statusText: response.statusText, headers: relayedHeaders(response.headers) };
+    const relayed = attachComboFailureEvidence(new Response(read.bytes, init), text);
+    // A combo rebuilds a consumed child failure; this keeps Anthropic's bytes if it ends the ladder.
+    return options.sendBudget
+      ? markVerbatimComboFailure(relayed, () => markClientWire(new Response(read.bytes.slice(), init), "messages")) : relayed;
+  }
   if (!response.ok) {
     let bodyText = "";
     try {
@@ -1033,21 +1101,29 @@ async function runNativeMessagesAttempt(options: NativeMessagesExecution, attemp
   }
 
   const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+  // Hosted .27 contract: each caller transport gets its own; the other is an invalid answer.
+  if (hosted && !requestedStream && !contentType.includes("application/json")) {
+    discard(response);
+    cleanupAbort();
+    return fail(502, "canonical Anthropic response was not valid JSON", "api_error");
+  }
   if (contentType.includes("text/event-stream") && response.body) {
     // `upstream` follows req.signal and is also what shutdown and turn release abort, so both
     // the client leaving and this lane's own abort read as a cancel, not as a failed stream.
     const bodyGuard = {
       ...resolvePassthroughBodyGuard(config, upstream.signal),
       ...(activeProvider.anthropicEofTolerance === true ? { eofTolerant: true } : {}),
+      // Only a canonical Anthropic relay keeps the .27 strict contract; other destinations keep upstream's.
+      strictRelay: hosted,
     };
     const replay = { committed: false, pending: false };
-    const raw = options.sendBudget ? observeNativeMessagesReplayBoundary(response.body, logCtx, replay) : response.body;
+    const raw = options.sendBudget ? observeNativeMessagesReplayBoundary(response.body, logCtx, replay, hosted) : response.body;
     const observed = logIds && onFirstOutput ? observeFirstChunk(raw, onFirstOutput) : raw;
     const renamed = activeRequest.oauthToolNames
       ? restoreOAuthToolNamesInSse(observed, activeRequest.oauthToolNames, translatorBudget)
       : observed;
     const frames = new MessagesSseFrameContext();
-    const echoed = echoRequestedModel(renamed, options.echoModel ?? requestedModel, frames);
+    const echoed = hosted ? renamed : echoRequestedModel(renamed, options.echoModel ?? requestedModel, frames);
     let toolRefusal: string | undefined;
     const source = clientDeclaredEmptyToolCatalog
       ? guardNativeMessagesEmptyToolCatalog(echoed, translatorBudget, message => {
@@ -1069,19 +1145,20 @@ async function runNativeMessagesAttempt(options: NativeMessagesExecution, attemp
           releaseStreamTurn();
           if (toolRefusal || meta.closeReason !== "terminal") upstream.abort();
         }
-      }, bodyGuard, frames, nativeInstance ? clientFilter : undefined);
+      }, bodyGuard, frames, nativeInstance && !hosted ? clientFilter : undefined);
       // A configured Messages provider words an oversized-input refusal its own way; Claude Code
       // compacts only on Anthropic's wording (devlog/_plan/261009_claude_1m_default/010). The
       // rewrite buffers whole frames, so it sits after the tap: stall detection keeps timing raw
       // upstream bytes. Real Anthropic pools refuse pre-stream in that wording and keep one relay.
-      const clientStream = nativeInstance ? relayed : relaySseWithPayloadRewrite(relayed, claudeOverflowSsePayload, translatorBudget, messagesSseFrameHooks(frames), clientFilter);
+      const clientStream = nativeInstance || hosted ? relayed : relaySseWithPayloadRewrite(relayed, claudeOverflowSsePayload, translatorBudget, messagesSseFrameHooks(frames), clientFilter);
       let delivered = retainUpstreamMessagesRequestId(new Response(clientStream, {
         status: 200,
-        headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", Connection: "keep-alive" },
+        headers: hosted ? { "Content-Type": response.headers.get("content-type") ?? "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" }
+          : { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", Connection: "keep-alive" },
       }), response.headers);
       if (options.sendBudget) {
         try {
-          const preflight = await preflightNativeMessagesResponse(delivered, logCtx, translatorBudget, replay);
+          const preflight = await preflightNativeMessagesResponse(delivered, logCtx, translatorBudget, replay, hosted);
           if (preflight.kind === "failed") { bindUsage(logCtx.usage); return preflight.response; }
           delivered = new Response(watchFirstOutput(preflight.response.body!), { status: preflight.response.status, headers: preflight.response.headers });
         } catch (error) {
@@ -1103,7 +1180,7 @@ async function runNativeMessagesAttempt(options: NativeMessagesExecution, attemp
     const collectorVerdictSink: MessagesFailureVerdictSink = {};
     try {
       if (options.sendBudget) {
-        const preflight = await preflightNativeMessagesResponse(new Response(tapped, { headers: response.headers }), logCtx, translatorBudget, replay);
+        const preflight = await preflightNativeMessagesResponse(new Response(tapped, { headers: response.headers }), logCtx, translatorBudget, replay, hosted);
         if (preflight.kind === "failed") {
           cleanupAbort(); upstream.abort(); bindUsage(logCtx.usage);
           finishLog(preflight.response.status, logCtx.upstreamError);
@@ -1176,31 +1253,61 @@ async function runNativeMessagesAttempt(options: NativeMessagesExecution, attemp
     }
   }
 
+  // Hosted .27 contract: a streaming caller is answered in SSE or not at all; a JSON answer must be
+  // exact UTF-8 and a complete Messages result (or an Anthropic error, relayed with its status).
+  const invalidJson = "canonical Anthropic response was not valid JSON";
+  if (hosted && requestedStream) {
+    discard(response);
+    cleanupAbort();
+    return fail(502, "canonical Anthropic returned JSON for a streaming request", "api_error");
+  }
   let read;
   try {
     const jsonBodyReadMs = resolveJsonBodyReadTimeoutMs(config.stallTimeoutSec, { localUpstream }, config.connectTimeoutMs);
     read = await readBoundedResponseBody(response, {
       signal: upstream.signal,
-      maxBytes: MAX_NATIVE_MESSAGES_JSON_BYTES,
+      maxBytes: hosted ? resolvePassthroughBodyGuard(config, upstream.signal).maxBytes || MAX_NATIVE_MESSAGES_JSON_BYTES : MAX_NATIVE_MESSAGES_JSON_BYTES,
       totalTimeoutMs: localUpstream ? 0 : jsonBodyReadMs,
       inactivityTimeoutMs: jsonBodyReadMs,
+      fatalUtf8: hosted,
     });
   } catch (error) {
     cleanupAbort();
     upstream.abort();
     if (req.signal.aborted) return fail(499, "Client cancelled request", "api_error");
+    if (hosted) return fail(502, invalidJson, "api_error");
     return failEvidence(502, error instanceof Error ? error.message : String(error), "api_error", "transport_failed");
   }
   cleanupAbort();
   if (read.oversized) {
     upstream.abort();
+    if (hosted) return fail(502, "canonical Anthropic response exceeded the configured body limit", "api_error");
     return fail(502, "upstream response exceeded the safe limit", "api_error", "translation_buffer_limit");
   }
+  if (hosted && read.truncated) return fail(502, invalidJson, "api_error");
   let parsedMessage: unknown;
   try {
     parsedMessage = JSON.parse(read.text);
   } catch {
-    return fail(502, "upstream returned malformed Messages JSON", "api_error");
+    return fail(502, hosted ? invalidJson : "upstream returned malformed Messages JSON", "api_error");
+  }
+  if (hosted && isRec(parsedMessage) && parsedMessage.type === "error" && isRec(parsedMessage.error)) {
+    const error = parsedMessage.error;
+    // Anthropic's own HTTP status for overloaded_error is 529.
+    const status = error.type === "overloaded_error" ? 529 : httpStatusFromTerminalError({
+      type: typeof error.type === "string" ? error.type : undefined,
+      code: error.code === null || typeof error.code === "string" ? error.code : undefined,
+      message: typeof error.message === "string" ? error.message : undefined,
+    });
+    finishLog(status, typeof error.message === "string" ? error.message : undefined, { closeReason: "terminal", terminalStatus: "failed" });
+    const init = { status, ...(status === response.status ? { statusText: response.statusText } : {}), headers: relayedHeaders(response.headers) };
+    const relayed = attachComboFailureEvidence(new Response(read.text, init), read.text);
+    if (committed) markResponseNonReplayable(relayed);
+    return options.sendBudget
+      ? markVerbatimComboFailure(relayed, () => markClientWire(new Response(read.text, init), "messages")) : relayed;
+  }
+  if (hosted && !isAnthropicMessageResponse(parsedMessage)) {
+    return fail(502, "canonical Anthropic returned an invalid JSON response", "api_error");
   }
   if (!isRec(parsedMessage) || parsedMessage.type !== "message") {
     return fail(502, "upstream response was not a Messages result", "api_error");
@@ -1223,9 +1330,9 @@ async function runNativeMessagesAttempt(options: NativeMessagesExecution, attemp
     }
     throw error;
   }
-  // The client's selector, not the wire id, as the translated lane answers.
-  message.model = options.echoModel ?? requestedModel;
-  const serialized = JSON.stringify(message);
+  // The client's selector, not the wire id, as the translated lane answers; hosted relays upstream bytes.
+  if (!hosted) message.model = options.echoModel ?? requestedModel;
+  const serialized = hosted && message === parsedMessage ? read.text : JSON.stringify(message);
   finishLog(200);
   if (requestedStream) {
     return retainUpstreamMessagesRequestId(new Response(messageAsSse(message), {
@@ -1233,7 +1340,8 @@ async function runNativeMessagesAttempt(options: NativeMessagesExecution, attemp
       headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache" },
     }), response.headers);
   }
-  return retainUpstreamMessagesRequestId(new Response(serialized, { status: 200, headers: { "Content-Type": "application/json" } }), response.headers);
+  return retainUpstreamMessagesRequestId(new Response(serialized, { status: 200,
+    headers: hosted ? relayedHeaders(response.headers) : { "Content-Type": "application/json" } }), response.headers);
 }
 
 /** A folded stream error that refuses an oversized input (same gate as the SSE rewrite). */

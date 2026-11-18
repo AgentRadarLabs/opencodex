@@ -652,6 +652,35 @@ describe("prompt cache key provenance (devlog 130 B3)", () => {
       .toBe(createHash("sha256").update(raw).digest("hex"));
   });
 
+  test("every call of one Claude Code session shares one key, whatever else its user_id carries", () => {
+    const key = (meta: object) => anthropicToResponsesTranslation({
+      model: "m", max_tokens: 1, messages, metadata: { user_id: JSON.stringify(meta) },
+    }).body.prompt_cache_key;
+    const base = { device_id: "d".repeat(64), account_uuid: "acct", session_id: "sess-1" };
+    // A side call with a different agent token (`tk`) is the same session.
+    expect(key({ ...base, tk: "agent-a" })).toBe(key({ ...base, tk: "agent-b" }));
+    expect(key({ ...base, tk: "agent-a" })).toBe(key(base));
+    // A fork keys on its parent, so it lands where the parent's cache is.
+    expect(key({ ...base, session_id: "fork-1", parent_session_id: "sess-1" })).toBe(key(base));
+    expect(key({ ...base, session_id: "sess-2" })).not.toBe(key(base));
+  });
+
+  test("an AgentRadar hosted gateway keys a Claude Code session on its (parent) session id alone (.27)", () => {
+    const prior = process.env.OPENCODEX_AGENTRADAR;
+    process.env.OPENCODEX_AGENTRADAR = "1";
+    try {
+      const key = (meta: object) => anthropicToResponsesTranslation({
+        model: "m", max_tokens: 1, messages, metadata: { user_id: JSON.stringify(meta) },
+      }).body.prompt_cache_key;
+      const sessionKey = createHash("sha256").update("s".repeat(36)).digest("hex").slice(0, 32);
+      expect(key({ device_id: "d".repeat(64), account_uuid: "", session_id: "s".repeat(36) })).toBe(sessionKey);
+      expect(key({ device_id: "e".repeat(64), account_uuid: "acct", session_id: "s".repeat(36), tk: "t" })).toBe(sessionKey);
+      expect(key({ device_id: "d".repeat(64), session_id: "fork", parent_session_id: "s".repeat(36) })).toBe(sessionKey);
+    } finally {
+      if (prior === undefined) delete process.env.OPENCODEX_AGENTRADAR; else process.env.OPENCODEX_AGENTRADAR = prior;
+    }
+  });
+
   test("metadata.user_id boundary: exactly 64 chars forwarded, 65 chars hashed", () => {
     const atLimit = "u".repeat(64);
     const overLimit = "u".repeat(65);

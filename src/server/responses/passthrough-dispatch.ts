@@ -1,3 +1,5 @@
+import { noteAgentRadarAccountDispatch } from "../../lib/agentradar-account-pin";
+import { logCodexMain401Skip } from "./codex-main-401-log";
 import { clientFacingModelText } from "../../lib/error-destination";
 import { providerAffinityGenerationIsCurrent } from "../../providers/api-key-selection";
 import { markProxyError } from "../../lib/client-error-body";
@@ -770,7 +772,8 @@ export async function preparePassthroughExchange(
       parsed,
       currentRequest: () => request,
     });
-    const recordPhysicalSend = replayGuard.sendHandler;
+    const recordPhysicalSend = (next?: () => void) => replayGuard.sendHandler(() => { next?.();
+      if (admissionState.authCtx.kind === "pool") noteAgentRadarAccountDispatch(logCtx, admissionState.authCtx.accountId); });
     /**
      * The operator's replacement grant for THIS logical request.
      *
@@ -1207,7 +1210,7 @@ export async function preparePassthroughExchange(
         if ("failed" in recovered) return recovered.failed;
         upstreamResponse = recovered; continue passthroughRecovery;
       }
-
+    if (upstreamResponse.status === 401 && !wasPermanentAccountRefusal(upstreamResponse) && codex401ReplayKind === null) logCodexMain401Skip(req, config, route, admissionState.authCtx, options.admission);
     if (
       upstreamResponse.status === 401 && !wasPermanentAccountRefusal(upstreamResponse)
       && (admissionState.authCtx.kind === "main-pool" || admissionState.authCtx.kind === "pool")
@@ -1284,13 +1287,14 @@ export async function preparePassthroughExchange(
         const replayGuard = isCanonicalOpenAiForwardProvider(route.provider)
           ? createCodexAuthDispatchGuard(admissionState.authCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined;
         let replayNotified = false;
+        let replayRecovery: AttemptRecoveryKind | undefined;
         const oauthReplayExecutor = providerFetch(route.provider, options.codexWsRuntimeIdentity, {
             httpOnly: canonicalBufferedJson,
             nativeControl: nativeResponseControlEligible(route.provider, options.nativeControl) && options.inboundTransport === "websocket" && !options.comboAttempt
               && responseEffects.plaintextV2AgentMessageToolNames.size === 0
               ? options.nativeControl : undefined,
             dispatchOverride: oauthDispatch(request, parsed, "passthrough"),
-            onPhysicalDispatch: recordPhysicalSend(),
+            onPhysicalDispatch: recordPhysicalSend(() => transportState.noteRoutedAttemptSend(passthroughEstimate, replayRecovery ?? "oauth-401")),
             providerName: route.providerName,
             modelId: route.modelId,
             onContinuationDispatch,
@@ -1311,7 +1315,7 @@ export async function preparePassthroughExchange(
         // have run it.
         upstreamResponse = await fetchWithTransientRetry(
           recovery => {
-            transportState.noteRoutedAttemptSend(passthroughEstimate, recovery ?? "oauth-401");
+            replayRecovery = recovery;
             return fetchWithHeaderTimeout(
               request.url,
               applyUpstreamRecoveryInit({

@@ -26,6 +26,7 @@ import {
 } from "../lib/claude-request-projection";
 import { redactSecretString } from "../lib/redact";
 import { sseFieldValue } from "../lib/sse-decoder";
+import { BoundedSseFrameBuffer, EMPTY_BYTES, joinSseFrameBytes } from "./sse-frame-buffer";
 import { estimateTokens } from "../lib/token-estimate";
 import { isTranslatorBudgetExceededError } from "../lib/translator-budget";
 import { httpStatusFromTerminalError } from "../lib/errors";
@@ -89,6 +90,8 @@ export interface PassthroughBodyGuard {
   maxBytes: number;
   /** Client request signal for deterministic cancel classification. */
   reqSignal?: AbortSignal;
+  /** The .27 strict relay (validated frames, first terminal ends it). Production callers set it; tests default to the flag. */
+  strictRelay?: boolean;
   /**
    * The routed provider opted into anthropicEofTolerance: a content-only clean EOF (no
    * message_stop, no stop_reason, nothing cut) stays a completed turn, as it always was.
@@ -97,7 +100,7 @@ export interface PassthroughBodyGuard {
 }
 
 export type PassthroughCloseReason = "terminal" | "client_cancel" | "body_stall" | "body_overflow";
-export type PassthroughFinalizeMeta = { closeReason: PassthroughCloseReason; terminalStatus?: "failed" | "incomplete" };
+export type PassthroughFinalizeMeta = { closeReason: PassthroughCloseReason; terminalStatus?: "completed" | "failed" | "incomplete" };
 
 /**
  * Tap an Anthropic-vocabulary SSE stream for the request log (usage + terminal),
@@ -148,6 +151,8 @@ export function tapAnthropicSseForLog(
   // message_stop or an upstream error event: the turn's own terminal already went through.
   let terminalSeen = false;
   let errorSeen = false;
+  // The first terminal ends the relay: nothing after message_stop or a root error reaches the client.
+  let terminalWasError = false;
   // stop_reason of the latest message event the client received as a complete SSE event. Any
   // later message event (resumed content) clears it; pings and comments do not.
   let lastDeliveredStop: string | null = null;
@@ -180,6 +185,7 @@ export function tapAnthropicSseForLog(
       usageAcc = { ...usageAcc, ...data.usage };
     }
     if (named(event, data, "message_stop") || named(event, data, "error")) {
+      if (!terminalSeen) terminalWasError = data.type === "error";
       terminalSeen = true;
       if (data.type === "error") {
         errorSeen = true;
@@ -270,6 +276,13 @@ export function tapAnthropicSseForLog(
   const recordUsage = () => {
     logCtx.usage = anthropicUsageToOcx(Object.keys(usageAcc).length > 0 ? usageAcc : undefined);
   };
+  // AgentRadar hosted gateways keep the .27 strict relay (validated frames up to the first terminal);
+  // everywhere else the relay keeps upstream's byte-for-byte contract.
+  const strict = guard?.strictRelay ?? process.env.OPENCODEX_AGENTRADAR === "1";
+  // A root error terminal is a failed turn, however cleanly it was delivered.
+  const finalizeTerminal = () => !strict ? finalize(200, { closeReason: "terminal" })
+    : terminalWasError ? finalize(502, { closeReason: "terminal", terminalStatus: "failed" })
+      : finalize(200, { closeReason: "terminal", terminalStatus: "completed" });
   const closeWithErrorFrame = (errType: string, message: string, origin: MessagesSseLocalOrigin) => {
     const payload = JSON.stringify({ type: "error", error: { type: errType, message } });
     try {
@@ -292,7 +305,7 @@ export function tapAnthropicSseForLog(
       // The turn already ended (message_stop or an upstream error event): an upstream that then
       // idles or keeps sending did not cut it short. Same rule as the read-error branch,
       // including the restored blank line for a terminal found only in the tail.
-      finalize(200, { closeReason: "terminal" });
+      finalizeTerminal();
       try {
         if (terminalInTail) enqueue(encoder.encode("\n\n"));
         close();
@@ -303,7 +316,8 @@ export function tapAnthropicSseForLog(
       // row with no terminalStatus also lost its failure diagnostics in usage.jsonl.
       recordLocalFailureDetail(logCtx, message, closeReason === "body_stall"
         ? { code: "body_stall", value: guard?.stallMs ?? 0 } : { code: "body_overflow", value: guard?.maxBytes ?? 0 });
-      finalize(502, { terminalStatus: "incomplete", closeReason });
+      // The .27 hosted contract records a stall as a gateway timeout.
+      finalize(strict && closeReason === "body_stall" ? 504 : 502, { terminalStatus: strict ? "failed" : "incomplete", closeReason });
       closeWithErrorFrame(errType, message, closeReason === "body_stall" ? "stall" : "cap");
     }
     reader.cancel(new DOMException(message, closeReason === "body_stall" ? "TimeoutError" : "QuotaExceededError")).catch(() => {});
@@ -341,6 +355,38 @@ export function tapAnthropicSseForLog(
     return () => signal.removeEventListener("abort", onClientAbort);
   })();
 
+  // Relay one validated SSE frame per pull. A frame that is not UTF-8 JSON-object data (or is the
+  // Responses `[DONE]` sentinel) never reaches the client: the turn fails before it, as a reset does.
+  const framer = new BoundedSseFrameBuffer();
+  const strictText = new TextDecoder("utf-8", { fatal: true });
+  const MALFORMED = new Uint8Array(0);
+  let pendingFrames: Uint8Array[] = [];
+  let pendingIndex = 0;
+  const validFrame = (block: Uint8Array): boolean => {
+    let text: string;
+    try { text = strictText.decode(block); } catch { return false; }
+    const data = text.split(/\r\n|\r|\n/).map(line => sseFieldValue(line, "data")).filter(value => value !== null);
+    if (data.length === 0) return true;
+    try { return isRec(JSON.parse(data.join("\n"))); } catch { return false; }
+  };
+  const failProtocol = () => {
+    if (settled) return;
+    settled = true;
+    idle.cancel();
+    detachAbort();
+    pendingFrames = [];
+    framer.dispose();
+    recordUsage();
+    const message = "anthropic passthrough protocol error";
+    logCtx.transportPhase = "mid_stream";
+    logCtx.terminalSource = "synthetic";
+    recordLocalFailureDetail(logCtx, message, { code: "stream_failed" });
+    if (logCtx.activeAttempt) logCtx.activeAttempt.streamAborted = true;
+    finalize(502, { terminalStatus: "failed", closeReason: "terminal" });
+    closeWithErrorFrame("api_error", message, "read");
+    reader.cancel(new Error(message)).catch(() => {});
+  };
+
   return new ReadableStream<Uint8Array>({
     start(controller) {
       tapController = controller;
@@ -349,11 +395,37 @@ export function tapAnthropicSseForLog(
       if (settled) return;
       try {
         for (;;) {
+          const frame = pendingFrames[pendingIndex++];
+          if (frame !== undefined) {
+            if (frame === MALFORMED) { failProtocol(); return; }
+            inspect(frame);
+            if (terminalSeen) {
+              settled = true;
+              idle.cancel();
+              detachAbort();
+              pendingFrames = [];
+              framer.dispose();
+              recordUsage();
+              finalizeTerminal();
+              enqueue(frame);
+              close();
+              reader.cancel().catch(() => {});
+              return;
+            }
+            if (enqueue(frame) > 0) return;
+            continue;
+          }
           idle.reset();
           const { done, value } = await reader.read();
           idle.pause();
           if (settled) return; // stall/overflow/abort won the race while we awaited
           if (done) {
+            const tail = strict ? framer.finish() : EMPTY_BYTES;
+            if (tail.byteLength > 0) {
+              if (!validFrame(tail)) { failProtocol(); return; }
+              inspect(tail);
+              enqueue(tail);
+            }
             // Bun can resolve a cancelled read as done before the abort listener runs: a client
             // that left is a cancel, not a cut upstream.
             if (guard?.reqSignal?.aborted) {
@@ -379,7 +451,7 @@ export function tapAnthropicSseForLog(
                     ? null
                     : "anthropic passthrough upstream stream ended before message_stop";
             if (failure === null) {
-              finalize(200, { closeReason: "terminal" });
+              finalizeTerminal();
               if (terminalInTail) enqueue(encoder.encode("\n\n"));
               close();
               return;
@@ -405,8 +477,26 @@ export function tapAnthropicSseForLog(
               return;
             }
           }
-          inspect(value);
-          if (enqueue(value) > 0) return;
+          if (!strict) {
+            inspect(value);
+            if (enqueue(value) > 0) return;
+            continue;
+          }
+          // A dedicated producer frame (a local error presentation) keeps its identity through the
+          // re-framing, so the client filter still recognizes it; anything else fails closed.
+          const origin = frames?.take(value);
+          const atBoundary = framer.pendingBytes === 0;
+          let split;
+          try { split = framer.feed(value); } catch { failProtocol(); return; }
+          pendingFrames = [];
+          pendingIndex = 0;
+          for (const { block, delimiter, continuation } of split) {
+            pendingFrames.push(continuation || validFrame(block) ? joinSseFrameBytes([block, delimiter]) : MALFORMED);
+          }
+          if (origin) {
+            if (!atBoundary || framer.pendingBytes !== 0 || pendingFrames.length !== 1 || pendingFrames[0] === MALFORMED) { failProtocol(); return; }
+            frames!.register(pendingFrames[0]!, origin);
+          }
         }
       } catch (err) {
         if (settled) return;
@@ -433,7 +523,7 @@ export function tapAnthropicSseForLog(
         if (terminalSeen) {
           // Only the transport trailer was lost; the client already has the turn's terminal.
           // The Responses relay likewise reports a read error only without a seen terminal.
-          finalize(200, { closeReason: "terminal" });
+          finalizeTerminal();
           try {
             // An SSE parser drops an event that EOF cuts off before its blank line, so restore
             // the delimiter when the terminal was only found in that unterminated tail.

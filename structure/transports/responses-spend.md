@@ -144,6 +144,10 @@ cover up to `TRANSIENT_RETRY_MAX_ATTEMPTS` sends per eligible account (currently
 whatever the roster size. A single
 eligible account keeps the existing base ceiling of three and total ceiling of four. Explicit caller
 ceilings and combo-derived scopes keep their existing limits.
+On an AgentRadar gateway (`OPENCODEX_AGENTRADAR=1`) `oauthMaxAccountsPerRequest()` in
+`src/oauth/generic-account-failover.ts` raises that account cap to sixteen (48 default sends), so a
+pooled request with no combo behind it reaches a healthy account after up to fifteen refusals; explicit
+ceilings still intersect it (`tests/adapters/anthropic/anthropic-funded-roster.test.ts`).
 
 A helper recovery's prepaid hop remains part of the full leg attempt allowance. An adapter-owned
 pending hop reconciles the actual target synchronously: a regional endpoint change refunds the old

@@ -47,3 +47,26 @@ account has an eligible sibling before cooling the whole target. This probe reco
 account's cooldown but passes `commit: false`, so it only peeks at a round-robin pool. An unsent
 sibling does not consume a sticky turn. Dispatching callers retain the default committed pick.
 `tests/oauth/generic-oauth-combo-account-cooldown.test.ts` covers this distinction.
+
+## AgentRadar hosted account contract
+
+`src/lib/agentradar-account-pin.ts` is active only with `OPENCODEX_AGENTRADAR=1`. Its two pin headers
+are accepted only on `/v1/messages`, `/v1/messages/count_tokens` and `/v1/chat/completions`; elsewhere, malformed, or with the flag
+off they are refused before dispatch. A pin bypasses native managed lanes and caller credentials,
+uses only its own provider's stored account, never commits the operator selection, and records refusal
+evidence without selecting another account. The Codex pin uses the explicit-account selector and never
+names the native main account. Helpers that cannot run on the pin refuse; Claude web search is bound
+to the pinned primary-pool account. The served-account response header and hashed `[ar-acct]` line are
+written only after a physical dispatch. Under round-robin, a keyed AgentRadar Anthropic session takes
+the rendezvous-hash winner over eligible accounts before startup baseline or restored affinity; ordinary
+installs keep the durable-affinity order above. A refused hashed session fails over to its hash runner-up, so every process agrees on it (`tests/adapters/anthropic/anthropic-agentradar-pool-parity.test.ts`). A streamed terminal-guard re-ask on such a gateway may also move off a refused (429/403) account, opening a new attempt, where ordinary installs never rotate after visible output (`tests/server/terminal-guard-agentradar-rotation.test.ts`). There a 429 with no unified status cools its account (Retry-After, else the default) and rotates, and an allowed unified status fails over at once without a same-account wait (`tests/adapters/anthropic/anthropic-agentradar-429.test.ts`). `stampAnthropicAccountForLog` also writes the serving account's `p<hex6>` into `accountLogLabel`, and `?quota=1` answers `plan` in the hosted vocabulary (`ultra`, `max`) while `planLabel` stays canonical. An organization-disabled refusal (`oauth_org_not_allowed`, or the structured `permission_error` with that exact wording) rotates as usual and also marks the account for reauthentication, since waiting out a cooldown cannot bring it back. On AgentRadar gateways a cached seven-day reading at 100% with a future reset is also a hard hold (selection, affinity, Retry-After and usage-limit answers), and a rejected seven-day refusal persists that reading, so a fresh process cannot seat a session on a spent account (`tests/adapters/anthropic/anthropic-weekly-spent-gate.test.ts`). It reads only cached evidence; no lazy usage probe runs on the request path. `tests/server/agentradar-account-pin-e2e.test.ts`
+runs these cases against real gateway processes and a loopback supplier.
+
+On these gateways `/v1/messages/count_tokens` for a canonical Anthropic target returns Anthropic's
+exact count rather than the local estimate (`src/server/agentradar-count-tokens.ts`). The count sends the exact source to
+`https://api.anthropic.com/v1/messages/count_tokens` under generation's combo eligibility, image policy,
+cooldowns and key scope. A random combo picks from one request-correlation seed shared by the count and its turn.
+A pinned count uses only its pinned account and refuses without a send when that account is unusable.
+An unpinned count selects an account as a dispatch would and commits nothing. Counts are neither billed nor
+request-logged. A noncanonical target, a declined native route and a pinned combo keep the estimate
+(`tests/claude-integration/agentradar-count-tokens.test.ts`).

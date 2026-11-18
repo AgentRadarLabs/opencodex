@@ -420,9 +420,12 @@ describe("day-level estimated cost", () => {
     expect(day!.estimatedCostUsd).toBeCloseTo(modelSum, 10);
   });
 
+  // A read above the observed input denominator is contradictory telemetry, which
+  // `cacheTokensFromUsage` refuses outright, so the clamp is only reachable at exactly 1.
   test.each([
     [0, 0],
-    [150, 1],
+    [50, 0.5],
+    [100, 1],
   ])("overflow rows preserve cache reads and clamp cache hit rate (%d reads)", (cacheRead, expected) => {
     const total = MAX_USAGE_MODEL_BREAKDOWN_ROWS + 1;
     const entries = Array.from({ length: total }, (_, i) => entry({
@@ -1678,20 +1681,6 @@ describe("summarizeUsage", () => {
       .flatMap(d => d.models)
       .find(m => m.model === "unpriced-model");
     expect(dayUnpriced?.cacheHitRate).toBeNull();
-  });
-
-  test("clamps cache hit rate when cache reads exceed input tokens", () => {
-    const sum = summarizeUsage([
-      entry({
-        ts: FIXED_NOW - 1000,
-        provider: "anthropic",
-        model: "claude-sonnet-5",
-        usageStatus: "reported",
-        usage: { inputTokens: 100, outputTokens: 20, cacheReadInputTokens: 150 },
-      }),
-    ], "30d", FIXED_NOW);
-
-    expect(sum.models[0]?.cacheHitRate).toBe(1);
   });
 
   test("attributes combo with mixed priced and unpriced attempts per attempt", () => {

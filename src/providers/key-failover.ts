@@ -38,6 +38,9 @@ import { isDisplayOnlyQuota } from "./quota-types";
 
 const DEFAULT_COOLDOWN_MS = 60_000;
 const MAX_COOLDOWN_MS = 10 * 60_000; // cap at 10 min for api-key rotation
+// AgentRadar gateways rotate a pool of hosted keys and cap an upstream Retry-After at 60s, so a long
+// header cannot park a key for ten minutes; a 401 hold keeps MAX_COOLDOWN_MS.
+const retryAfterCapMs = (): number => process.env.OPENCODEX_AGENTRADAR === "1" ? 60_000 : MAX_COOLDOWN_MS;
 /**
  * Anthropic credit-balance refusal (#6958). An empty prepaid balance is account state, not a
  * rate signal: it clears only when someone buys credits or auto-reload fires, so the
@@ -358,7 +361,7 @@ const DEFAULT_RESET_REPLAY = {
 
 /**
  * Parse an upstream `Retry-After` header: numeric seconds (including `0`) or an HTTP-date.
- * Returns a bounded delay in ms (1..MAX_COOLDOWN_MS), or undefined when the value is
+ * Returns a bounded delay in ms (1..retryAfterCapMs()), or undefined when the value is
  * malformed. An HTTP-date already in the past yields an immediate (1 ms) retry.
  */
 function parseRetryAfterMs(value: string | null | undefined, now = Date.now()): number | undefined {
@@ -367,7 +370,7 @@ function parseRetryAfterMs(value: string | null | undefined, now = Date.now()): 
   if (/^\d+(?:\.\d+)?$/.test(text)) {
     const seconds = Number(text);
     if (Number.isFinite(seconds) && seconds >= 0) {
-      return Math.min(Math.max(Math.ceil(seconds * 1000), 1), MAX_COOLDOWN_MS);
+      return Math.min(Math.max(Math.ceil(seconds * 1000), 1), retryAfterCapMs());
     }
   }
   const timestamp = Date.parse(text);
@@ -375,7 +378,7 @@ function parseRetryAfterMs(value: string | null | undefined, now = Date.now()): 
   const delay = timestamp - now;
   // A valid HTTP-date whose retry time has already passed is an immediate retry, exactly like
   // numeric `Retry-After: 0` — never a malformed-header fallback to the fixed interval.
-  return Math.min(Math.max(delay, 1), MAX_COOLDOWN_MS);
+  return Math.min(Math.max(delay, 1), retryAfterCapMs());
 }
 
 /**

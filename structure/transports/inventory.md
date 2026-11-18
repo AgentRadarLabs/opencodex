@@ -124,6 +124,10 @@ opaque metadata, normal tool passthrough, coalesced-tail accounting, and consume
 both execution paths. Final client tool output also follows the [explicit empty client-catalog
 boundary](responses-wire-shapes.md#declared-tool-membership-by-inbound-wire); internal media tool
 execution rejects explicitly unfinished tool ends and never fulfills media or re-asks after an incomplete, failed or truncated terminal.
+Each `runTurn` iteration hands the slot it reserved to the caller's `runTurnFetch`, which becomes
+the adapter's `providerFetch`: a Cursor turn's RunSSE and BidiAppend sends stay inside that one
+lease and wait only on start intervals, as on the normal `runTurn` lane, and the turn records one
+attempt.
 
 ## Bounded response ingestion and OrcaRouter login
 

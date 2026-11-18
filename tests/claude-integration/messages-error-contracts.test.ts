@@ -184,9 +184,11 @@ const envelopeWriterRows = [
   ["src/claude/outbound.ts", 6, "shared baseline helpers, original verdict and incomplete/unfinished presentation construction"],
   ["src/protocols/encoders/messages.ts", 4, "original verdict construction and fixed local collection failures"],
   ["src/server/messages-native.ts", 5, "local/evidence legacy formatters, original combo and fold envelopes, owned workflow refusal projection"],
-  ["src/server/claude-messages.ts", 30, "mapped local ingress/bypass constructors, original combo and defensive JSON presentation envelopes"],
+  ["src/server/claude-messages.ts", 33, "mapped local ingress/bypass constructors (incl. the AgentRadar pin on messages and count_tokens, and native-tool exact-replay refusals), original combo and defensive JSON presentation envelopes"],
+  ["src/server/agentradar-count-tokens.ts", 9, "AgentRadar exact count_tokens local refusals (image policy, replay, overflow, cancel/timeout/transport) before or around its one count send"],
   ["src/server/index/serve-options.ts", 4, "fixed endpoint auth/origin bypasses"],
   ["src/server/messages-native-tool-guard.ts", 1, "deferred local guard terminal"],
+  ["src/server/responses/core-combo-native.ts", 1, "AgentRadar hosted exact-replay refusal before any combo send"],
 ] as const;
 test("W1/W3 envelope writers are covered by explicit dispositions", async () => {
   const actual: Record<string, number> = {};
@@ -341,8 +343,20 @@ const nativeFailRows = [
     "disposition": "bounded typed local exception or producer-marked dispatch diagnostic"
   },
   {
+    "call": "if (req.signal.aborted) return fail(499, \"Client cancelled request\", \"api_error\");",
+    "disposition": "fixed local literal at the mapped native producer"
+  },
+  {
+    "call": "if (read.oversized) return fail(502, \"upstream response exceeded the safe limit\", \"api_error\", \"translation_buffer_limit\");",
+    "disposition": "hosted .27 relay contract: fixed local literal before any client output"
+  },
+  {
     "call": "return fail(499, \"Client cancelled request\", \"api_error\");",
     "disposition": "fixed local literal at the mapped native producer"
+  },
+  {
+    "call": "return fail(502, \"canonical Anthropic response was not valid JSON\", \"api_error\");",
+    "disposition": "hosted .27 relay contract: fixed local literal before any client output"
   },
   {
     "call": "if (req.signal.aborted) return fail(499, \"Client cancelled request\", \"api_error\");",
@@ -377,16 +391,36 @@ const nativeFailRows = [
     "disposition": "fixed local literal at the mapped native producer"
   },
   {
+    "call": "return fail(502, \"canonical Anthropic returned JSON for a streaming request\", \"api_error\");",
+    "disposition": "hosted .27 relay contract: fixed local literal before any client output"
+  },
+  {
     "call": "if (req.signal.aborted) return fail(499, \"Client cancelled request\", \"api_error\");",
     "disposition": "fixed local literal at the mapped native producer"
+  },
+  {
+    "call": "if (hosted) return fail(502, invalidJson, \"api_error\");",
+    "disposition": "hosted .27 relay contract: fixed local literal before any client output"
+  },
+  {
+    "call": "if (hosted) return fail(502, \"canonical Anthropic response exceeded the configured body limit\", \"api_error\");",
+    "disposition": "hosted .27 relay contract: fixed local literal before any client output"
   },
   {
     "call": "return fail(502, \"upstream response exceeded the safe limit\", \"api_error\", \"translation_buffer_limit\");",
     "disposition": "fixed local literal at the mapped native producer"
   },
   {
-    "call": "return fail(502, \"upstream returned malformed Messages JSON\", \"api_error\");",
-    "disposition": "fixed local literal at the mapped native producer"
+    "call": "if (hosted && read.truncated) return fail(502, invalidJson, \"api_error\");",
+    "disposition": "hosted .27 relay contract: fixed local literal before any client output"
+  },
+  {
+    "call": "return fail(502, hosted ? invalidJson : \"upstream returned malformed Messages JSON\", \"api_error\");",
+    "disposition": "hosted .27 relay contract: fixed local literal before any client output"
+  },
+  {
+    "call": "return fail(502, \"canonical Anthropic returned an invalid JSON response\", \"api_error\");",
+    "disposition": "hosted .27 relay contract: fixed local literal before any client output"
   },
   {
     "call": "return fail(502, \"upstream response was not a Messages result\", \"api_error\");",

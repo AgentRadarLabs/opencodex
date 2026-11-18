@@ -1298,8 +1298,9 @@ function parseKimiQuotaPayload(value: unknown): ProviderQuota | null {
   let weekly = parseKimiQuotaRow(body.usage);
   const total = parseKimiQuotaRow(body.totalQuota);
   const nested = asRecord(root.data);
+  const containers = [root, nested, asRecord(root.quota), asRecord(nested?.quota)];
   let monthly: { percent: number; resetAt?: number } | null = null;
-  for (const container of [root, nested, asRecord(root.quota), asRecord(nested?.quota)]) {
+  for (const container of containers) {
     const usages = asRecord(container?.usages);
     if (!usages) continue;
     monthly = parseKimiQuotaRow(usages.limit_month_total ?? usages.monthTotal)
@@ -1322,6 +1323,20 @@ function parseKimiQuotaPayload(value: unknown): ProviderQuota | null {
       if (fiveHour && weekly) break;
     }
   }
+  // Kimi Code's own client reads usages.limit_5h / limit_7d (MoonshotAI/kimi-code managed-usage.ts).
+  // Beside them the legacy blocks can be unused placeholders, so a usages window wins; legacy
+  // counters win only over a zero ratio, which public kimi.ai key reports show contradicting them.
+  const usagesWindow = (key: string) => {
+    for (const container of containers) {
+      const row = parseKimiQuotaRow(asRecord(container?.usages)?.[key]);
+      if (row) return row;
+    }
+    return null;
+  };
+  const preferUsages = (usages: typeof fiveHour, legacy: typeof fiveHour) =>
+    legacy && usages?.percent === 0 && legacy.percent > 0 ? legacy : usages ?? legacy;
+  fiveHour = preferUsages(usagesWindow("limit_5h"), fiveHour);
+  weekly = preferUsages(usagesWindow("limit_7d"), weekly);
   const quota: ProviderQuota = {
     ...(fiveHour ? {
       fiveHourPercent: fiveHour.percent,

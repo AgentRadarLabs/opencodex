@@ -84,6 +84,7 @@ import {
   AnthropicAccountCooldownError,
   anthropicRoutingFor,
   formatAnthropicProviderForLog,
+  stampAnthropicAccountForLog,
 } from "../../oauth/anthropic-routing";
 import {
   isGenericOAuthFailoverEnabled,
@@ -1368,7 +1369,7 @@ export async function prepareAdapterExchange(
       // Anthropic OAuth: recover a rate limit or proven account entitlement refusal
       // before output, within the shared request and account rotation limits.
       while (
-        (upstreamResponse.status === 429 || upstreamResponse.status === 403 || upstreamResponse.status === 401)
+        [429, 403, 401, 400].includes(upstreamResponse.status)
         && anthropicInstance
         && transportState.anthropicPoolAccountId
       ) {
@@ -1405,7 +1406,7 @@ export async function prepareAdapterExchange(
           transportState.anthropicPoolFailovers += 1;
           route.provider = { ...route.provider, apiKey: admitted.accessToken };
           invalidateSameTargetRequest();
-          logCtx.provider = formatAnthropicProviderForLog(anthropicInstance, admitted.accountId, config);
+          stampAnthropicAccountForLog(logCtx, anthropicInstance, admitted.accountId, config);
           transportState.activeAdapter = resolveSelectionAdapter(
             resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire, route.staticPolicy),
             config.cacheRetention,

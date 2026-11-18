@@ -209,6 +209,12 @@ export function mergeUsage(first: OcxUsage | undefined, second: OcxUsage | undef
     inputTokens,
     outputTokens,
     totalTokens: inputTokens + outputTokens,
+    // The context window the final round saw is the larger one, never their sum (images/loop.ts).
+    ...(first.contextTotalTokens !== undefined || second.contextTotalTokens !== undefined
+      ? { contextTotalTokens: Math.max(first.contextTotalTokens ?? 0, second.contextTotalTokens ?? 0) } : {}),
+    ...(first.anthropicServerToolUse || second.anthropicServerToolUse ? { anthropicServerToolUse: Object.fromEntries(
+      [...new Set([...Object.keys(first.anthropicServerToolUse ?? {}), ...Object.keys(second.anthropicServerToolUse ?? {})])]
+        .map(name => [name, (first.anthropicServerToolUse?.[name] ?? 0) + (second.anthropicServerToolUse?.[name] ?? 0)])) } : {}),
     ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
     ...(cacheReadInputTokens !== undefined ? { cacheReadInputTokens } : {}),
     ...(cacheCreationInputTokens !== undefined ? { cacheCreationInputTokens } : {}),

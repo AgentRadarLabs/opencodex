@@ -8,6 +8,7 @@ import { clearGenericFailoverHealth } from "../../src/oauth/generic-account-fail
 import * as accountFailover from "../../src/oauth/generic-account-failover";
 import * as oauth from "../../src/oauth";
 import { stampOAuthAccountLabel } from "../../src/providers/label";
+import { formatAnthropicProviderForLog } from "../../src/oauth/anthropic-routing";
 import { isCodexUsageAccountLogLabel, isCodexPoolAccountLogLabel } from "../../src/usage/log";
 import type { PersistedUsageEntry } from "../../src/usage/log";
 import { summarizeUsage } from "../../src/usage/summary";
@@ -140,6 +141,28 @@ describe("stampOAuthAccountLabel", () => {
       const ctx: { accountLogLabel?: string } = {};
       stampOAuthAccountLabel(ctx, name, oauth, "acct-1");
       expect(ctx.accountLogLabel).toBeUndefined();
+    }
+  });
+
+  test("on an AgentRadar gateway, stamps anthropic with the same p-digest its account-qualified provider carries", () => {
+    // The hosted ledger needs the serving account on every Anthropic row, including the plain
+    // active-account path that never rewrites the provider; it must join the
+    // `anthropic-p<hex6>` rows of the same account. Self-hosted installs keep the skip above.
+    const prior = process.env.OPENCODEX_AGENTRADAR;
+    process.env.OPENCODEX_AGENTRADAR = "1";
+    try {
+      for (const name of ["anthropic", "anthropic2"]) {
+        const ctx: { accountLogLabel?: string } = {};
+        stampOAuthAccountLabel(ctx, name, oauth, "acct-1");
+        expect(ctx.accountLogLabel).toMatch(/^p[a-f0-9]{6}$/);
+        expect(formatAnthropicProviderForLog(name, "acct-1")).toBe(`${name}-${ctx.accountLogLabel}`);
+      }
+      const ctx: { accountLogLabel?: string } = {};
+      stampOAuthAccountLabel(ctx, "openai", oauth, "acct-1");
+      expect(ctx.accountLogLabel).toBeUndefined();
+    } finally {
+      if (prior === undefined) delete process.env.OPENCODEX_AGENTRADAR;
+      else process.env.OPENCODEX_AGENTRADAR = prior;
     }
   });
 

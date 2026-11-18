@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync} from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendUsageEntry, resetUsageReadCacheForTests, type PersistedUsageEntry } from "../../src/usage/log";
@@ -247,6 +247,55 @@ describe("health-aware scoring (RI-06)", () => {
     expect(finalTarget.successRate).toBe(1);
   });
 
+  test("latest same-route physical attempt ends the failure streak", () => {
+    appendUsageEntry({
+      ...row("same-route-retry", 200, 1500, {
+        provider: "combo",
+        model: "waterfall",
+      }),
+      attempts: [
+        { ordinal: 1, provider: "a", model: "m1", adapter: "openai-chat", status: 429, durationMs: 1000, sendCount: 1, recoveryKinds: [], usageStatus: "unreported" },
+        { ordinal: 2, provider: "a", model: "m1", adapter: "openai-chat", status: 200, durationMs: 500, sendCount: 1, recoveryKinds: [], usageStatus: "reported" },
+      ],
+    });
+
+    const evidence = healthEvidenceForCandidate({ provider: "a", model: "m1" });
+    expect(evidence).toMatchObject({ sampleCount: 2, successRate: 0.5 });
+    expect(evidence.failures).toBeUndefined();
+  });
+  test("single combo attempt contributes health to its physical target", () => {
+    appendUsageEntry({
+      ...row("combo-single", 200, 1500, {
+        provider: "combo",
+        model: "waterfall",
+      }),
+      attempts: [
+        { ordinal: 1, provider: "a", model: "m1", adapter: "openai-chat", status: 200, durationMs: 1500, sendCount: 1, recoveryKinds: [], usageStatus: "reported" },
+      ],
+    });
+
+    expect(healthEvidenceForCandidate({ provider: "a", model: "m1" })).toMatchObject({
+      sampleCount: 1,
+      successRate: 1,
+    });
+  });
+  test("historical attempt health counts only physical sends and unique ordinals", () => {
+    const entry = row("physical-attempts", 200, 1500, {
+      attempts: [
+        { ordinal: 1, provider: "a", model: "m1", adapter: "openai-chat", status: 200, durationMs: 1, sendCount: 0, locallyAnswered: true, recoveryKinds: [], usageStatus: "unreported" },
+        { ordinal: 1, provider: "a", model: "m1", adapter: "openai-chat", status: 503, durationMs: 4000, sendCount: 1, recoveryKinds: [], usageStatus: "unreported" },
+        { ordinal: 1, provider: "a", model: "m1", adapter: "openai-chat", status: 200, durationMs: 2, sendCount: 1, recoveryKinds: [], usageStatus: "unreported" },
+        { ordinal: 2, provider: "a", model: "m1", adapter: "openai-chat", status: 503, durationMs: 3, sendCount: 0, recoveryKinds: [], usageStatus: "unreported" },
+        { ordinal: 3, provider: "a", model: "m1", adapter: "openai-chat", status: 200, durationMs: 1000, sendCount: 1, recoveryKinds: [], usageStatus: "reported" },
+      ],
+    });
+    writeFileSync(join(testDir, "usage.jsonl"), `${JSON.stringify(entry)}\n`);
+
+    const evidence = healthEvidenceForCandidate({ provider: "a", model: "m1" });
+
+    expect(evidence.sampleCount).toBe(2);
+    expect(evidence.successRate).toBeCloseTo(0.5, 4);
+  });
   test("a stream that dies after its 200 head is a failure for the attempt that dropped it", () => {
     for (let index = 0; index < 5; index++) appendUsageEntry(row(`ok-${index}`, 200, 800));
     // b/m2 failed over to a/m1, whose 200 stream was then cut mid-flight.

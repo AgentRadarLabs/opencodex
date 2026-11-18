@@ -1,3 +1,4 @@
+import { agentRadarPin } from "../lib/agentradar-account-pin";
 import { clientFacingModelText, type ClientFacingModelLabel } from "../lib/error-destination";
 import { isBuiltinAnthropicInstanceRow } from "../providers/anthropic-instance";
 /**
@@ -60,6 +61,14 @@ export const GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST = 3;
  * into a pool-wide 429 storm.
  */
 export const GENERIC_OAUTH_MAX_ACCOUNTS_PER_REQUEST = 6;
+/**
+ * AgentRadar gateways serve pooled subscriptions with no combo behind them, so a request walks up to
+ * sixteen funded accounts (the hosted .27 contract) before refusing. Still funded per account and
+ * intersected with every explicit send budget; ordinary installs keep six.
+ */
+export function oauthMaxAccountsPerRequest(): number {
+  return process.env.OPENCODEX_AGENTRADAR === "1" ? 16 : GENERIC_OAUTH_MAX_ACCOUNTS_PER_REQUEST;
+}
 
 const DEFAULT_COOLDOWN_MS = 60_000;
 
@@ -726,6 +735,7 @@ export function rotateGenericOAuthAccountOnRefusal(
     cooldownSource: parsed ? "retry-after" : "default",
   });
   sweepExpiredOnWrite(now);
+  if (agentRadarPin(config)) return null;
 
   const eligible = eligibleFailoverAccounts(providerName, now, family).filter(id => id !== failedAccountId);
   if (eligible.length === 0) return null;

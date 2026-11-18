@@ -820,6 +820,9 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/bun-install-frozen.sh . gui
 
+      - name: Gateway quota and cache guardrails
+        run: bun run test:gateway-quota
+
       - name: GUI lint
         if: needs.changes.outputs.gui == 'true'
         run: |

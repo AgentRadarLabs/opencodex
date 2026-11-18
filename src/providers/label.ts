@@ -1,4 +1,4 @@
-import { ACCOUNT_LOG_LABEL_RE, CODEX_ACCOUNT_LOG_LABEL_RE, KEY_ACCOUNT_LOG_LABEL_RE, apiKeyAccountLogLabel, oauthAccountLogLabel } from "../codex/account-label";
+import { ACCOUNT_LOG_LABEL_RE, CODEX_ACCOUNT_LOG_LABEL_RE, KEY_ACCOUNT_LOG_LABEL_RE, apiKeyAccountLogLabel, fallbackCodexAccountLogLabel, oauthAccountLogLabel } from "../codex/account-label";
 import type { OcxProviderConfig } from "../types";
 import { captureCacheAffinityIdentity } from "./cache-affinity-identity";
 import { isAnthropicInstanceId } from "./anthropic-instance-id";
@@ -99,7 +99,8 @@ export function anthropicAccountTagField(provider: string | undefined): { accoun
  * Two providers are skipped because they already have attribution:
  * - `openai` produces its own `p`-labels through `codexAuthContextLogLabel`.
  * - `anthropic` folds the account into the provider label (`formatAnthropicProviderForLog`);
- *   `anthropicAccountTag` exposes that same label as the separate `accountTag` field.
+ *   `anthropicAccountTag` exposes that same label as the separate `accountTag` field. On an
+ *   AgentRadar gateway (`OPENCODEX_AGENTRADAR=1`) it is also stamped, as that same `p<hex6>`.
  *
  * It lives here rather than in `account-label.ts` because it needs `baseProviderLabel`, and this
  * module already imports from that one -- the reverse direction would be an import cycle. This
@@ -115,6 +116,13 @@ export function stampOAuthAccountLabel(
   if (!accountId) return;
   if (provider.authMode !== "oauth") return;
   const base = baseProviderLabel(providerName);
-  if (base === "openai" || (base === "anthropic" || base === "anthropic2")) return;
+  if (base === "openai") return;
+  if (base === "anthropic" || base === "anthropic2") {
+    // AgentRadar gateways need the serving account on every row, including the plain active-account
+    // path that never rewrites the provider: `p<hex6>`, the same digest `formatAnthropicProviderForLog`
+    // appends, so one account carries one identity in both fields.
+    if (process.env.OPENCODEX_AGENTRADAR === "1") logCtx.accountLogLabel = fallbackCodexAccountLogLabel(accountId);
+    return;
+  }
   logCtx.accountLogLabel = oauthAccountLogLabel(accountId, base);
 }

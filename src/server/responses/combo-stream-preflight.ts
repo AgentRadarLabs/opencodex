@@ -594,7 +594,13 @@ function failedTerminalResponse(
     status: (logCtx.terminalHttpStatus !== 400 && logCtx.terminalHttpStatus !== 422
       && isProviderModerationRefusal(400, JSON.stringify(terminalPayload), undefined, true))
       ? 400
-      : logCtx.terminalHttpStatus ?? bareErrorStatus(terminalPayload) ?? 502,
+      : logCtx.terminalHttpStatus ?? bareErrorStatus(terminalPayload)
+        // AgentRadar hosted keeps .27's classified status (a zero-output stall is 504, not 502).
+        ?? (process.env.OPENCODEX_AGENTRADAR === "1" ? httpStatusFromTerminalError({
+          type: typeof error.type === "string" ? error.type : undefined,
+          code: error.code === null || typeof error.code === "string" ? error.code : undefined,
+          message: typeof error.message === "string" ? error.message : undefined,
+        }) : 502),
     headers,
   });
 }

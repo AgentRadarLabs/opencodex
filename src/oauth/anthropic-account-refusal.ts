@@ -1,8 +1,8 @@
 import { wasAccountAutoPaused } from "./account-auto-pause";
-import { anthropicModelFamily } from "./anthropic-model-quota";
+import { anthropicModelFamily, anthropicModelQuotaFor } from "./anthropic-model-quota";
 /** Narrow pre-output account recovery, fenced to the bearer that physically sent the turn. */
 import { readBoundedResponseBody } from "../lib/bounded-body";
-import { classifyAnthropic429, anthropicRetryAfterMs, anthropicRatePolicyFor, ANTHROPIC_SHORT_RETRY_MS, ANTHROPIC_MAX_INLINE_THROTTLE_MS } from "./anthropic-rate-limit-policy";
+import { anthropicClaimedFamily, classifyAnthropic429, anthropicRetryAfterMs, anthropicRatePolicyFor, ANTHROPIC_SHORT_RETRY_MS, ANTHROPIC_MAX_INLINE_THROTTLE_MS } from "./anthropic-rate-limit-policy";
 import { isNonReplayableResponse, sleepWithAbort } from "../lib/upstream-retry";
 import { credentialGeneration, getAccountCredentialWithStatus, markAccountNeedsReauthIfGeneration } from "./store";
 import type { OAuthAccessSnapshot } from "./index";
@@ -10,6 +10,7 @@ import type { OcxConfig } from "../types";
 import type { AnthropicRouteDecision } from "./anthropic-model-routes";
 import { anthropicRoutingFor } from "./anthropic-routing";
 import { configuredAnthropicInstance } from "../providers/anthropic-instance";
+import { readAnthropicExtraUsageRefusal } from "../providers/anthropic-billing-refusal";
 import type { AnthropicInstanceId } from "../providers/anthropic-instance-id";
 import { captureAnthropicPhysicalSendOwnership, anthropicPhysicalSendOwnershipIsCurrent,
   type AnthropicPhysicalSendOwnership } from "./anthropic-send-ownership";
@@ -17,7 +18,7 @@ import { captureAnthropicPhysicalSendOwnership, anthropicPhysicalSendOwnershipIs
 const responseCredentials = new WeakMap<Response, AnthropicPhysicalSendOwnership & { providerAccountUuid?: string; checkProviderUuid: boolean }>();
 type RetryState = { firstAccountId: string; sameAccount: boolean; detour: boolean };
 const retryStatesByInstance = new Map<AnthropicInstanceId, WeakMap<object, RetryState>>();
-const verdicts = new WeakMap<Response, Promise<boolean>>();
+const verdicts = new WeakMap<Response, Promise<boolean | "org-disabled">>();
 
 /** Legacy compatibility only; physical callers must capture ownership before fetch and use ForSend. */
 export function bindAnthropicRefusalCredential(response: Response, snapshot: OAuthAccessSnapshot, providerAccountUuid?: string): void {
@@ -64,7 +65,8 @@ async function isRevokedOAuthToken(response: Response, signal?: AbortSignal): Pr
   } catch { return false; }
 }
 
-async function isAccountRefusal(response: Response, signal?: AbortSignal): Promise<boolean> {
+/** True for an account-scoped refusal; "org-disabled" when the organization turned subscription access off. */
+async function isAccountRefusal(response: Response, signal?: AbortSignal): Promise<boolean | "org-disabled"> {
   try {
     const body = await readBoundedResponseBody(response.clone(), { signal });
     if (!body.displaySafe || body.truncated) return false;
@@ -78,9 +80,10 @@ async function isAccountRefusal(response: Response, signal?: AbortSignal): Promi
     if ("code" in error && error.code != null
       && (typeof error.code !== "string" || !["subscription_required", "insufficient_quota", "permission_denied", "oauth_org_not_allowed"].includes(error.code))) return false;
     // The organization disabled subscription access: an account-scoped verdict, cooled like its siblings.
-    if (error.type === "oauth_org_not_allowed" || ("code" in error && error.code === "oauth_org_not_allowed")) return true;
+    if (error.type === "oauth_org_not_allowed" || ("code" in error && error.code === "oauth_org_not_allowed")) return "org-disabled";
     const message = error.message.trim();
-    if (error.type === "permission_error" && /^(?:Your account does not have access to Claude Code|Your (?:Claude )?subscription (?:has expired|is (?:expired|inactive))|Your account does not have an active subscription|(?:Your|This) organization has disabled Claude subscription access for Claude Code(?:\. Use an Anthropic API key instead, or ask your admin to enable access)?)[.!]?$/i.test(message)) return true;
+    if (error.type === "permission_error" && /^(?:Your|This) organization has disabled Claude subscription access for Claude Code(?:\. Use an Anthropic API key instead, or ask your admin to enable access)?[.!]?$/i.test(message)) return "org-disabled";
+    if (error.type === "permission_error" && /^(?:Your account does not have access to Claude Code|Your (?:Claude )?subscription (?:has expired|is (?:expired|inactive))|Your account does not have an active subscription)[.!]?$/i.test(message)) return true;
     return (error.type === "billing_error" || error.type === "permission_error")
       && /^Your credit balance is too low to access the Anthropic API\.(?: Please go to Plans & Billing to upgrade or purchase credits\.)?$/i.test(message);
   } catch {
@@ -104,6 +107,8 @@ export async function rotateAnthropicAccountOnResponseForInstance(
     requestKey?: object;
     allow429Recovery?: boolean;
     allowAccountRefusal?: boolean;
+    /** AgentRadar terminal re-ask (.27): of the account refusals only an org-disabled 403 rotates; no 401. */
+    orgDisabledRefusalOnly?: boolean;
     /** Applies to alternate ranking only; the shared same-account throttle remains allowed. */
     excludedAccountIds?: ReadonlySet<string>;
     /** Native dispatch re-reads operator policy after asynchronous classification/waits. */
@@ -132,8 +137,9 @@ export async function rotateAnthropicAccountOnResponseForInstance(
       && credentialGeneration(row.credential) === sent.generation
       && (!sent.checkProviderUuid || row.credential.accountId === sent.providerAccountUuid) ? row : undefined;
   };
+  let orgDisabled = false;
   if (response.status === 401) {
-    if (options.allowAccountRefusal === false) return null;
+    if (options.allowAccountRefusal === false || options.orgDisabledRefusalOnly) return null;
     let verdict = verdicts.get(response);
     if (!verdict) { verdict = isRevokedOAuthToken(response, options.signal); verdicts.set(response, verdict); }
     if (!await verdict || options.signal?.aborted || !ownedCurrent()) return null;
@@ -158,9 +164,16 @@ export async function rotateAnthropicAccountOnResponseForInstance(
     const current = ownedCurrent();
     if (!current) return null;
     options.currentDecision?.();
-    const kind = classifyAnthropic429(response.headers);
+    const kind = classifyAnthropic429(response.headers, Date.now(), options.model);
     if (kind === "family-quota") {
-      if (anthropicModelFamily(options.model) !== "Fable" || !options.canRetry || options.allow429Recovery === false) return null;
+      // A claimed family has no 7d_oi header for the response recorder: record its exclusion here.
+      const claimed = anthropicClaimedFamily(response.headers, options.model);
+      if (claimed) {
+        const reset = Number(response.headers.get("anthropic-ratelimit-unified-reset"));
+        anthropicModelQuotaFor(instance).observeAnthropicFamilyQuota(sent.accountId, [{ label: claimed, scope: "model", percent: 100,
+          rejected: true, passiveObservedAt: Date.now(), ...(reset > 0 && Number.isFinite(reset) ? { resetAt: reset * 1000 } : {}) }], Date.now());
+      }
+      if ((!claimed && anthropicModelFamily(options.model) !== "Fable") || !options.canRetry || options.allow429Recovery === false) return null;
       return pickAlternateAnthropicAccount(options.config, sent.accountId, Date.now(), (options.currentDecision ? options.currentDecision() : options.decision ?? null), options.model, options.excludedAccountIds);
     }
     if (kind !== "shared-quota") {
@@ -176,7 +189,8 @@ export async function rotateAnthropicAccountOnResponseForInstance(
       // A concurrent committed selection may have moved the same-account proposal.
       if (state.firstAccountId !== sent.accountId) state.detour = true;
       const wait = Math.max(delay, (anthropicRatePauseUntil(sent.accountId) ?? now) - now);
-      if (!state.sameAccount && wait <= ANTHROPIC_MAX_INLINE_THROTTLE_MS && !current.paused) {
+      // AgentRadar gateways fail over at once, as the hosted contract did, instead of waiting in place.
+      if (!state.sameAccount && wait <= ANTHROPIC_MAX_INLINE_THROTTLE_MS && !current.paused && process.env.OPENCODEX_AGENTRADAR !== "1") {
         state.sameAccount = true;
         // Millisecond rounding can wake just before this deadline; later extensions still bind.
         const retryAt = now + wait;
@@ -201,27 +215,39 @@ export async function rotateAnthropicAccountOnResponseForInstance(
       return null;
     }
   } else {
-    if (response.status !== 403 || options.allowAccountRefusal === false) return null;
+    // A 400 is account evidence only as Anthropic's exact spent-extra-usage envelope; any other
+    // 400 is the request's own fault and would fail the same way on every account.
+    if (response.status === 400 ? options.allow429Recovery === false : response.status !== 403 || options.allowAccountRefusal === false) return null;
     let verdict = verdicts.get(response);
     if (!verdict) {
-      verdict = isAccountRefusal(response, options.signal);
+      verdict = response.status === 400 ? readAnthropicExtraUsageRefusal(response, options.signal) : isAccountRefusal(response, options.signal);
       verdicts.set(response, verdict);
     }
-    if (!await verdict || options.signal?.aborted) return null;
+    const refusal = await verdict;
+    if (!refusal || options.signal?.aborted) return null;
+    if (options.orgDisabledRefusalOnly && response.status === 403 && refusal !== "org-disabled") return null;
     // A late refusal must not cool a new credential stored while its body was being read.
     const current = ownedCurrent();
     if (!current || current.paused || current.needsReauth || credentialGeneration(current.credential) !== sent.generation
       || sent.checkProviderUuid && current.credential.accountId !== sent.providerAccountUuid) return null;
+    orgDisabled = refusal === "org-disabled" && process.env.OPENCODEX_AGENTRADAR === "1";
   }
   const decision = options.currentDecision ? options.currentDecision() : options.decision;
-  const status = response.status === 429 ? 429 : 403;
-  if (!options.canRetry) {
-    recordAnthropicAccountRefusal(options.config, options.accountId, status,
-      response.headers.get("retry-after"), Date.now(), response.headers);
-    return null;
+  const status = response.status === 429 ? 429 : response.status === 400 ? 400 : 403;
+  const next = options.canRetry
+    ? rotateAnthropicAccountOnRefusal(options.config, options.accountId, status,
+      response.headers.get("retry-after"), options.sessionKey, Date.now(), response.headers, decision, options.model, options.excludedAccountIds)
+    : (recordAnthropicAccountRefusal(options.config, options.accountId, status,
+      response.headers.get("retry-after"), Date.now(), response.headers), null);
+  // AgentRadar gateways keep the hosted contract: an organization that turned subscription access off
+  // will not come back by waiting, so after rotating the account needs a new login, not a retry per cooldown.
+  if (orgDisabled) {
+    try {
+      await markAccountNeedsReauthIfGeneration(instance, sent.accountId, sent.generation, undefined, undefined,
+        store => anthropicPhysicalSendOwnershipIsCurrent(sent, store));
+    } catch { /* the cooldown above still applies */ }
   }
-  return rotateAnthropicAccountOnRefusal(options.config, options.accountId, status,
-    response.headers.get("retry-after"), options.sessionKey, Date.now(), response.headers, decision, options.model, options.excludedAccountIds);
+  return next;
 }
 
 /** Compatibility entrypoint: legacy consumers always recover inside the primary pool. */

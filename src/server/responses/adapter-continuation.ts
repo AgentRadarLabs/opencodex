@@ -45,6 +45,7 @@ import { bindRouteReasoningReplayScope } from "./core-replay";
 import {
   anthropicRoutingFor,
   formatAnthropicProviderForLog,
+  stampAnthropicAccountForLog,
 } from "../../oauth/anthropic-routing";
 import {
   hasEligibleGenericOAuthFailoverTarget,
@@ -199,6 +200,11 @@ export function createAdapterContinuations(
     // Ordinary terminal continuations have already delivered output; empty retries opt in.
     allowAccountRefusal = false,
   ): AsyncGenerator<AdapterEvent> {
+    // AgentRadar gateways (no combo behind the pool) keep the hosted contract: a streamed re-ask may
+    // still move off a refused account, opening a new attempt, rather than failing a visible turn.
+    // Only .27's set rotates there: 429, a quota 400 and an org-disabled 403.
+    const hostedReask = !allowAccountRefusal && process.env.OPENCODEX_AGENTRADAR === "1";
+    allowAccountRefusal ||= hostedReask;
     let response: Response | undefined;
     let refusalPendingReplay: Response | undefined;
     let replaySetupFailed = false;
@@ -467,7 +473,7 @@ export function createAdapterContinuations(
         }
       }
      if (
-       (response.status === 429 || response.status === 403 || response.status === 401)
+       [429, 403, 401, 400].includes(response.status)
        && anthropicInstance
        && transportState.anthropicPoolAccountId
         && !replaySetupFailed && !isNonReplayableResponse(response)
@@ -481,7 +487,7 @@ export function createAdapterContinuations(
             config, accountId: transportState.anthropicPoolAccountId, sessionKey: anthropicSessionKey,
             model: route.modelId, requestKey: transportState, decision: transportState.anthropicRouteDecision, currentDecision: currentAnthropicRouteDecision, signal: upstream.signal,
             canRetry: hop.allowed && transportState.anthropicPoolFailovers < transportState.anthropicFailoverLimit,
-            allowAccountRefusal, allow429Recovery: allowAccountRefusal,
+            allowAccountRefusal, allow429Recovery: allowAccountRefusal, orgDisabledRefusalOnly: hostedReask,
           });
         } catch (error) { hop.permit?.release(); throw error; }
         if (!nextAccountId) hop.permit?.release();
@@ -494,7 +500,7 @@ export function createAdapterContinuations(
             transportState.anthropicPoolFailovers += 1;
             route.provider = { ...route.provider, apiKey: admitted.accessToken };
             invalidateSameTargetRequest();
-            logCtx.provider = formatAnthropicProviderForLog(anthropicInstance, admitted.accountId, config);
+            stampAnthropicAccountForLog(logCtx, anthropicInstance, admitted.accountId, config);
             transportState.activeAdapter = resolveSelectionAdapter(
               resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire, route.staticPolicy),
               config.cacheRetention,

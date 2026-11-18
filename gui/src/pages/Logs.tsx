@@ -365,6 +365,7 @@ const RECOVERY_KIND_KEYS = {
   "rate-limit-429": "logs.detail.attempt.recovery.rateLimit429",
   "anthropic-oauth-429": "logs.detail.attempt.recovery.anthropicOauth429",
   "oauth-account-429": "logs.detail.attempt.recovery.oauthAccount429",
+  "codex-account-retry": "logs.detail.attempt.recovery.codexAccountRetry",
   "oauth-account-402": "logs.detail.attempt.recovery.oauthAccount402",
   "image-413": "logs.detail.attempt.recovery.image413",
   "empty-completion": "logs.detail.attempt.recovery.emptyCompletion",

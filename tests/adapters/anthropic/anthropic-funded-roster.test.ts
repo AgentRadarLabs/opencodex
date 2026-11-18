@@ -23,7 +23,7 @@ const model = "claude-sonnet-4-6";
 
 function answer(stream = false, text = "The answer is complete."): Response {
   const message = { id: "msg_roster", type: "message", role: "assistant", model,
-    content: [{ type: "text", text }], stop_reason: "end_turn", usage: { input_tokens: 8, output_tokens: 6 } };
+    content: [{ type: "text", text }], stop_reason: "end_turn", stop_sequence: null, usage: { input_tokens: 8, output_tokens: 6 } };
   if (!stream) return Response.json(message);
   const frames = [
     { type: "message_start", message: { ...message, content: [], stop_reason: null } },
@@ -147,6 +147,33 @@ for (const native of [false, true]) {
     expect(sends).toHaveLength(6);
     expect(new Set(sends).size).toBe(6);
     expect(fixture.routing.getEligibleAnthropicAccounts()).toHaveLength(2);
+  });
+  test(`native=${native}: an AgentRadar gateway funds sixteen accounts, so seven refusals reach a healthy eighth`, async () => {
+    const previous = process.env.OPENCODEX_AGENTRADAR;
+    process.env.OPENCODEX_AGENTRADAR = "1";
+    try {
+      await seed(8);
+      reply = (index, body) => index <= 7 ? refusal() : answer(body.stream === true);
+      const { response, text } = await post(native);
+      expect(response.status).toBe(200);
+      expect(text).toContain("The answer is complete.");
+      expect(sends).toEqual(Array.from({ length: 8 }, (_, index) => `Bearer synthetic-roster-${index}`));
+    } finally { if (previous === undefined) delete process.env.OPENCODEX_AGENTRADAR; else process.env.OPENCODEX_AGENTRADAR = previous; }
+  });
+  test(`native=${native}: the hosted roster stays inside an explicit physical ceiling`, async () => {
+    const previous = process.env.OPENCODEX_AGENTRADAR;
+    process.env.OPENCODEX_AGENTRADAR = "1";
+    try {
+      await seed(8);
+      const budget = createRequestExecutionBudget({ maxTotalModelSends: 3, baseSendAllowance: 3,
+        finalRecoveryAllowance: 0, maxAlternateTargetSends: 0, maxTargetTransitions: 0 });
+      if (native) budgetSpy = spyOn(inference, "createInferenceSendBudget").mockReturnValue(budget);
+      else options.sendBudget = budget;
+      reply = () => refusal();
+      const { response } = await post(native);
+      expect(response.status).toBe(429);
+      expect(sends).toHaveLength(3);
+    } finally { if (previous === undefined) delete process.env.OPENCODEX_AGENTRADAR; else process.env.OPENCODEX_AGENTRADAR = previous; }
   });
   test(`native=${native}: accounts added mid-turn cannot expand initial four-account snapshot`, async () => {
     await seed(4);

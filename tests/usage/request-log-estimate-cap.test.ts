@@ -161,10 +161,12 @@ describe("request log token-estimate context-window cap (codex-router PR #140)",
   test("an aggregate carries the upstream-reported mark only when every attempt has usage with it", () => {
     const marked = () => {
       const attempt = beginRequestAttempt(1, "kiro", "deepseek-3.2", "kiro");
+      noteAttemptSend(attempt, undefined);
       finishRequestAttempt(attempt, 200, 10, { inputTokens: 10, outputTokens: 2, upstreamReported: true });
       return attempt;
     };
     const unmarked = beginRequestAttempt(2, "kiro", "deepseek-3.2", "kiro");
+    noteAttemptSend(unmarked, undefined);
     finishRequestAttempt(unmarked, 200, 10, { inputTokens: 10, outputTokens: 2 });
 
     expect(aggregateAttemptUsage([marked(), marked()]).usage?.upstreamReported).toBe(true);

@@ -1,5 +1,6 @@
 import { formatRetryAfterAdvice, parseRetryAfterFromMessage } from "./retry-delay";
 import { isMetaMusePlanFailure, META_MUSE_PLAN_REFUSAL_MESSAGE } from "../providers/meta-muse-plan-refusal";
+import { ANTHROPIC_SPEND_LIMIT, EXTRA_USAGE_ROTATION } from "../providers/anthropic-billing-refusal";
 
 export interface OcxErrorPayload {
   message: string;
@@ -426,6 +427,56 @@ export function isUpstreamResetReplayRefusedMessage(text: string): boolean {
   );
 }
 
+/** `Provider error <status>` or `Provider error <status>: <body>`, exactly as this proxy writes it. */
+const EXPLICIT_PROVIDER_STATUS = /^Provider error ([1-5]\d\d)(?::|$)/;
+const PROVIDER_ERROR_400_PREFIX = /^Provider error (?:400|422):\s*/i;
+// Anthropic's quota refusals, start-anchored because a validation 400 echoes client values after
+// its own opening: a spent extra-usage balance and a spend limit.
+const isAnthropicQuotaRefusal = (text: string): boolean => {
+  const trimmed = text.trimStart();
+  return EXTRA_USAGE_ROTATION.test(trimmed) || ANTHROPIC_SPEND_LIMIT.test(trimmed);
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Quota evidence in an HTTP 400 or 422, read from fields, never from words anywhere in the text.
+ * A 400/422 is a verdict on the request and echoes client values ("...: toolu_insufficient_quota"),
+ * so matching words let one crafted request read as a spent account and cool a combo provider.
+ * After this proxy's `Provider error 400: ` / `422: ` prefix it is quota only as a JSON envelope
+ * whose `error.code`/`error.type` field is `insufficient_quota`, whose `error.code` is Volcengine
+ * Ark's `InvalidSubscription` (https://www.volcengine.com/docs/82379/1299023), or Anthropic's
+ * envelope whose `error.message` starts with a quota refusal wording (extra usage, spend limit); a nested `Provider error 400`
+ * message is read the same way, at most three deep. An `invalid_request_error: ` text counts only
+ * when it then starts with that wording (an already-extracted `error.message`). Truncated or
+ * malformed JSON is never quota. Other prose is this proxy's own adapter wording, not an echoing
+ * provider body, and keeps the word rules (see providerBadRequestBody).
+ */
+export function isQuotaBadRequestMessage(message: string): boolean {
+  let text = message.trim();
+  for (let depth = 0; depth < 3; depth += 1) {
+    text = text.replace(PROVIDER_ERROR_400_PREFIX, "");
+    if (!text.startsWith("{")) return isAnthropicQuotaRefusal(text.replace(/^invalid_request_error:\s*/i, ""));
+    let payload: unknown;
+    try { payload = JSON.parse(text); } catch { return false; }
+    if (!isRecord(payload) || !isRecord(payload.error)) return false;
+    const { code, type, message: inner } = payload.error;
+    if (code === "insufficient_quota" || type === "insufficient_quota" || code === "InvalidSubscription") return true;
+    if (typeof inner !== "string") return false;
+    if (payload.type === "error" && type === "invalid_request_error" && isAnthropicQuotaRefusal(inner)) return true;
+    if (!PROVIDER_ERROR_400_PREFIX.test(inner.trim())) return false;
+    text = inner.trim();
+  }
+  return false;
+}
+
+/** A 400/422 whose text is the provider's own body: a JSON envelope or an extracted typed message. */
+function providerBadRequestBody(message: string): boolean {
+  return /^(?:\{|invalid_request_error:)/i.test(message.trim().replace(PROVIDER_ERROR_400_PREFIX, ""));
+}
+
 export function classifyError(status: number, type: string, message: string): OcxErrorPayload {
   const text = message.toLowerCase();
   if (type === SPEND_LEDGER_STORAGE_UNAVAILABLE_CODE) {
@@ -494,10 +545,15 @@ export function classifyError(status: number, type: string, message: string): Oc
   // The Cursor adapter's classified rate-limit prefix is authoritative: its DETAIL may echo
   // quota wording ("... quota exhausted") that would otherwise hit the insufficient_quota
   // branch below and break the planned retry-with-backoff contract (WP3 review blocker 1).
-  if (text.includes("cursor rate limit exceeded")) {
+  //
+  // No quota or rate verdict on a 400 or 422 provider body comes from words anywhere in its text:
+  // see isQuotaBadRequestMessage. Those verdicts hop a combo and cool its target or provider.
+  const badRequest = (status === 400 || status === 422) && providerBadRequestBody(message);
+  if (!badRequest && text.includes("cursor rate limit exceeded")) {
     return { message, type: "rate_limit_error", code: "rate_limit_exceeded" };
   }
-  if (
+  // A caller's structured `type` is a field too, not words in the text.
+  if (badRequest ? type === "insufficient_quota" || isQuotaBadRequestMessage(message) : (
     text.includes("insufficient_quota") ||
     text.includes("exceeded your current quota") ||
     text.includes("quota exhausted") ||
@@ -505,8 +561,10 @@ export function classifyError(status: number, type: string, message: string): Oc
     text.includes("account quota exceeded") ||
     text.includes("monthly quota exceeded") ||
     text.includes("weekly quota exceeded") ||
-    text.includes("daily quota exceeded")
-  ) {
+    text.includes("daily quota exceeded") ||
+    // Anthropic answers a spent extra-usage balance with HTTP 400 prose; only the opening counts.
+    isAnthropicQuotaRefusal(message)
+  )) {
     return { message, type: "insufficient_quota", code: "insufficient_quota" };
   }
   // A refusal this proxy made itself, kept apart from the provider rate limits below. The HTTP
@@ -518,14 +576,15 @@ export function classifyError(status: number, type: string, message: string): Oc
     return { message, type: "rate_limit_error", code: SEND_BUDGET_EXHAUSTED_CODE };
   }
   if (
-    status === 429 ||
-    text.includes("rate limit") ||
-    text.includes("rate limited") ||
-    text.includes("too many requests") ||
-    text.includes("resource_exhausted") ||
-    text.includes("resource exhausted") ||
-    text.includes("throttlingexception") ||
-    text.includes("throttling")
+    status === 429 || (!badRequest && (
+      text.includes("rate limit") ||
+      text.includes("rate limited") ||
+      text.includes("too many requests") ||
+      text.includes("resource_exhausted") ||
+      text.includes("resource exhausted") ||
+      text.includes("throttlingexception") ||
+      text.includes("throttling")
+    ))
   ) {
     return { message, type: "rate_limit_error", code: "rate_limit_exceeded" };
   }
@@ -617,7 +676,10 @@ export function classifyError(status: number, type: string, message: string): Oc
 export function isRateLimitOrQuotaFailureMessage(message: string): boolean {
   const normalized = String(message ?? "").trim();
   if (!normalized) return false;
-  const numericStatus = Number(normalized);
+  // This proxy's `Provider error <status>` prefix states the status; the body after it echoes
+  // client values, so an explicit 400 is read by classifyError's 400 rules, not by its words.
+  const explicit = EXPLICIT_PROVIDER_STATUS.exec(normalized);
+  const numericStatus = explicit ? Number(explicit[1]) : Number(normalized);
   if (numericStatus === 429 || numericStatus === 402) return true;
   const statusHint = Number.isInteger(numericStatus) && numericStatus > 0 ? numericStatus : 0;
   const classified = classifyError(statusHint, "", normalized);
@@ -629,7 +691,9 @@ export function isRateLimitOrQuotaFailureMessage(message: string): boolean {
   ) {
     return true;
   }
-  // Retained quota cue used by subagent health before classifyError covered it.
+  // Retained quota cue used by subagent health before classifyError covered it. Not for an
+  // explicit other 4xx: that is a verdict on the request, and the words may be the client's.
+  if (explicit && statusHint >= 400 && statusHint < 500) return false;
   return normalized.toLowerCase().includes("usage limit");
 }
 
@@ -642,6 +706,11 @@ export function inferHttpStatusFromAdapterMessage(message: string): number {
   if (isClientClosedMessage(lower)) return 499;
   // Codex Transport maps cyber_policy only on HTTP 400 (SSE is code-based).
   if (isCyberPolicyMessage(lower)) return 400;
+  // This proxy's own `Provider error <status>` prefix states the upstream status outright. The
+  // text after it echoes client values, so a 400 quoting "rate limit" must stay 400 rather than
+  // turn into a 429 that cools a combo target.
+  const explicit = EXPLICIT_PROVIDER_STATUS.exec(message.trimStart());
+  if (explicit) return Number(explicit[1]);
   // See classifyError: this prefix now only means explicit request-size overflow (400);
   // quota-style Cursor resource exhaustion carries the rate-limit prefix and maps to 429.
   if (lower.includes("cursor resource limit exceeded")) return 400;

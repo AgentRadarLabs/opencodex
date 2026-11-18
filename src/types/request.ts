@@ -605,6 +605,8 @@ export interface OcxUsage {
    * `contextTotalTokens - outputTokens` so output is never added to an absolute checkpoint twice.
    */
   contextTotalTokens?: number;
+  /** Anthropic server-tool request counters (`usage.server_tool_use`), keyed by counter name. */
+  anthropicServerToolUse?: Record<string, number>;
   totalTokens?: number;
   cachedInputTokens?: number;
   cacheReadInputTokens?: number;

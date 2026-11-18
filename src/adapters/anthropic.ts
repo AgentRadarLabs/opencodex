@@ -40,7 +40,7 @@ import { resolveThinkingEnabled } from "../clients/reasoning-controls";
 import { resolveReasoningCapabilities } from "../providers/reasoning-capabilities";
 import { declaresThinkingToggleWire, reasoningControlsAreUnsupported } from "./reasoning-controls";
 import { applyAgentRouterLanguageFraming, isAgentRouterEndpoint } from "./agentrouter";
-import { anthropicCacheWrite1hTokens, resolveAnthropicCacheRetention, type AnthropicCacheRetention } from "./anthropic/cache-retention";
+import { anthropicCacheWrite1hTokens, anthropicPromptCacheTtlMs, resolveAnthropicCacheRetention, type AnthropicCacheRetention } from "./anthropic/cache-retention";
 import { advisorServerExchange, advisorServerToolDestination, planAnthropicServerTools } from "./anthropic/advisor-tool";
 import { applyAnthropicPerMessageEffort } from "./anthropic/per-message-effort";
 import { claudeFamilyVersion, rejectsCombinedSampling, rejectsForcedToolChoice, rejectsSamplingParameters, supportsExplicitThinkingDisable, usesAdaptiveThinking, usesBetweenToolsFloor } from "./anthropic-model-contract";
@@ -1262,11 +1262,13 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
       // Experimental, default off (#6895): pin the top-level effort and carry changes as effort messages.
       applyAnthropicPerMessageEffort({ provider, parsed, incoming, body, headers, url, isOAuth, chatLineage: resolveTranslatedAnthropicSessionKey(parsed, incoming) });
 
+      const promptCacheTtlMs = anthropicPromptCacheTtlMs(body);
       const request = {
         url,
         method: "POST",
         headers,
         body: JSON.stringify(body),
+        ...(promptCacheTtlMs !== undefined ? { promptCacheTtlMs } : {}),
         // Adapter-owned: the registry wrapper would otherwise report the exact absence of a
         // tier field and mislabel every fast turn as downgraded.
         tierLog: createAdapterTierMetadata(

@@ -48,6 +48,7 @@ import { emptyCompletionRetryEnabled } from "./empty-completion-guard";
 import {
   anthropicRoutingFor,
   formatAnthropicProviderForLog,
+  stampAnthropicAccountForLog,
 } from "../../oauth/anthropic-routing";
 import { resolveWireProtocolOverride } from "../adapter-resolve";
 import { bindRouteReasoningReplayScope, adapterNeedsForcedContinuation, adapterNeedsToolCallContinuation } from "./core-replay";
@@ -193,6 +194,7 @@ export async function executeResponsesSidecars(
   // request-scoped state only; preflight keeps fixed policy separate from user-role advice
   // before the worker is dispatched. Registration seam: the core path sees only
   // `parsed._advisorGuard`; only an activated factory can load the optional implementation.
+  if (options.agentRadarAccount && config.advisor?.enabled) return formatErrorResponse(400, "invalid_request_error", "AgentRadar pinned requests cannot use helper models");
   const advisorPlan = options.advisorInternal === true
     ? null
     : await createRegisteredAdvisorPlan({
@@ -239,6 +241,9 @@ export async function executeResponsesSidecars(
   // Replayed search pairs call the synthetic web_search tool only the sidecar declares (#7269).
   if (!wsPlan) stripReplayedSearchPairs(parsed);
   const vidPlan = !routedCompaction ? await planVideoBridge(config, parsed, route.provider) : undefined;
+  if (options.agentRadarAccount && ((wsPlan && !(options.agentRadarAccount.provider === "claude" && wsPlan.backend === "anthropic")) || imgPlan || vidPlan)) {
+    return formatErrorResponse(400, "invalid_request_error", "AgentRadar pinned requests cannot use helper models");
+  }
   // Hosted loops rebuild per iteration from spread copies; they share one per-message effort turn (#6895).
   if (wsPlan || imgPlan || vidPlan) shareAnthropicPerMessageEffortTurn(parsed);
   const canRunWebSearch = !!wsPlan && !transportState.adapter.runTurn;
@@ -273,7 +278,7 @@ export async function executeResponsesSidecars(
   ): Promise<{ adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind } | null> => {
     const antigravityValidationResponse = canRunWebSearch && route.providerName === "google-antigravity"
       && route.provider.authMode === "oauth" && originalResponse?.status === 403;
-    if (route.providerName !== "kiro" && !(anthropicInstance && (originalResponse?.status === 403 || originalResponse?.status === 401))
+    if (route.providerName !== "kiro" && !(anthropicInstance && [403, 401, 400].includes(originalResponse?.status ?? 0))
       && !antigravityValidationResponse && originalResponse && originalResponse.status !== 429) return null;
     let antigravityVerification = false;
     if (antigravityValidationResponse) {
@@ -417,13 +422,16 @@ export async function executeResponsesSidecars(
         "auth-recovery",
         `${route.providerName}|${route.modelId}|sidecar-anthropic-429`,
       );
-      const nextAccountId = await rotateAnthropicAccountOnResponseForInstance(anthropicInstance,
-        originalResponse ?? new Response(null, { status: 429, headers: responseHeaders ?? (retryAfter ? { "retry-after": retryAfter } : undefined) }), {
-          config, accountId: transportState.anthropicPoolAccountId, sessionKey: anthropicSessionKey,
-          model: route.modelId, requestKey: transportState, decision: transportState.anthropicRouteDecision, currentDecision: currentAnthropicRouteDecision, signal: options.abortSignal,
-          allow429Recovery: !sidecarHasCommittedOutput(), allowAccountRefusal: !sidecarHasCommittedOutput(),
-          canRetry: hop.allowed && transportState.anthropicPoolFailovers < transportState.anthropicFailoverLimit,
-        });
+      let nextAccountId: string | null;
+      try {
+        nextAccountId = await rotateAnthropicAccountOnResponseForInstance(anthropicInstance,
+          originalResponse ?? new Response(null, { status: 429, headers: responseHeaders ?? (retryAfter ? { "retry-after": retryAfter } : undefined) }), {
+            config, accountId: transportState.anthropicPoolAccountId, sessionKey: anthropicSessionKey,
+            model: route.modelId, requestKey: transportState, decision: transportState.anthropicRouteDecision, currentDecision: currentAnthropicRouteDecision, signal: options.abortSignal,
+            allow429Recovery: !sidecarHasCommittedOutput(), allowAccountRefusal: !sidecarHasCommittedOutput(),
+            canRetry: hop.allowed && transportState.anthropicPoolFailovers < transportState.anthropicFailoverLimit,
+          });
+      } catch (error) { hop.permit?.release(); throw error; }
       if (!nextAccountId) {
         hop.permit?.release();
         return null;
@@ -439,7 +447,7 @@ export async function executeResponsesSidecars(
         transportState.anthropicPoolAccountId = admitted.accountId;
         transportState.anthropicPoolFailovers += 1;
         route.provider = { ...route.provider, apiKey: admitted.accessToken };
-        logCtx.provider = formatAnthropicProviderForLog(anthropicInstance, admitted.accountId, config);
+        stampAnthropicAccountForLog(logCtx, anthropicInstance, admitted.accountId, config);
       } catch {
         hop.permit?.release();
         return null;
@@ -596,6 +604,12 @@ export async function executeResponsesSidecars(
       connectTimeoutMs: config.connectTimeoutMs ?? 200_000,
       stallTimeoutSec: config.stallTimeoutSec, proxyErrorContext: logCtx,
       waitForRequestSlot: imageProviderFetch.waitForPacing,
+      // A runTurn adapter sends inside the turn lease the loop reserved; its own sends are turn-scoped.
+      runTurnFetch: pacingSlot => providerFetch(route.provider, options.codexWsRuntimeIdentity, {
+        providerName: route.providerName, modelId: route.modelId,
+        pacingSlotAcquired: true, pacingSlot, turnScopedPacing: true,
+        ...sidecarBudget.fetchOptions(transportState.adapter),
+      }),
       fetchImpl: imageProviderFetch.unpacedFetch ?? imageProviderFetch,
       fetchForRequest: (request, iterParsed, adapter, recovery) => {
         const fetch = providerFetch(route.provider, options.codexWsRuntimeIdentity, {

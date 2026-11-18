@@ -1017,10 +1017,10 @@ export async function retryCodexPoolOnAlternateAccount(
     return reserveWorkflowSend(options.workflowRootId, workflowPolicy);
   };
   let retrySendCount = 0;
-  // The gated-model 400 has no roster kind; it stays unattributed as before.
-  const moveRecovery: AttemptRecoveryKind | undefined = outcomeStatus === 429 ? "oauth-account-429"
+  // The gated-model 400 retry (another account, or the confirmed one in place) says why a second send exists.
+  const moveRecovery: AttemptRecoveryKind = outcomeStatus === 429 ? "oauth-account-429"
     : outcomeStatus === 402 ? "oauth-account-402"
-    : isTransientUpstreamStatus(outcomeStatus) ? "transient-5xx" : undefined;
+    : isTransientUpstreamStatus(outcomeStatus) ? "transient-5xx" : "codex-account-retry";
   let upstreamResponse = firstResponse;
   try {
     while (true) {

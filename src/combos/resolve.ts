@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { errorDestinationText, providerErrorDestinationLabel } from "../lib/error-destination";
 import type { OcxComboTarget, OcxConfig } from "../types";
 import { getCachedProviderRoutingQuota } from "../providers/quota-routing-cache";
@@ -455,6 +456,8 @@ export function pickComboTarget(
     now?: number;
     /** Inspect a round-robin choice without mutating its sticky/weight state. */
     preview?: boolean;
+    /** A random combo's pick from this seed instead of Math.random (AgentRadar count/generation correlation). */
+    randomSeed?: string;
   } = {},
 ): ComboPick | null {
   const writerGeneration = captureConfigGeneration();
@@ -512,7 +515,8 @@ export function pickComboTarget(
       .filter(({ target }) => eligible(target));
     if (eligibleTargets.length > 0) {
       const totalWeight = eligibleTargets.reduce((sum, entry) => sum + entry.target.weight, 0);
-      let random = Math.random() * totalWeight;
+      let random = (options.randomSeed === undefined ? Math.random()
+        : createHash("sha256").update(`${comboId}\0${options.randomSeed}`).digest().readUIntBE(0, 6) / 2 ** 48) * totalWeight;
       for (const entry of eligibleTargets) {
         random -= entry.target.weight;
         if (random <= 0) {
@@ -688,6 +692,7 @@ export async function pickComboTargetWithWait(
     cooldownReprobeTargets?: Iterable<readonly [string, number]>;
     now?: number;
     sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+    randomSeed?: string;
   },
 ): Promise<ComboPick | null> {
   const now = options.now ?? Date.now();
@@ -719,6 +724,7 @@ export async function pickComboTargetWithWait(
     const normalOnly = (target: NormalizedComboTarget): boolean =>
       !target.lastResort && (customEligible?.(target) ?? true);
     const normalPick = pickComboTarget(config, comboId, {
+      randomSeed: options.randomSeed,
       allowCooldownReprobe: false,
       cooldownReprobeTargets,
       exclude: excluded,
@@ -751,6 +757,7 @@ export async function pickComboTargetWithWait(
       // The combo can be deleted or renamed while this request sleeps.
       if (!getCombo(config, comboId)) return null;
       const waited = pickComboTarget(config, comboId, {
+        randomSeed: options.randomSeed,
         allowCooldownReprobe: false,
         cooldownReprobeTargets,
         exclude: excluded,
@@ -768,6 +775,7 @@ export async function pickComboTargetWithWait(
   const remainingWaitMs = options.waitForCooldownMs - spentWaitMs;
 
   const pick = pickComboTarget(config, comboId, {
+    randomSeed: options.randomSeed,
     allowCooldownReprobe: false,
     cooldownReprobeTargets,
     exclude: excluded,
@@ -851,11 +859,13 @@ export function clearComboSelectionState(comboId?: string): void {
   selectionState.delete(comboId);
 }
 
-export function tryPickComboModel(config: OcxConfig, modelId: string, preview = false): ComboPick | null {
+export function tryPickComboModel(
+  config: OcxConfig, modelId: string, preview = false, eligible?: (target: NormalizedComboTarget) => boolean, randomSeed?: string,
+): ComboPick | null {
   const comboId = resolveComboId(config, modelId);
   if (!comboId) return null;
   if (!getCombo(config, comboId)) throw new UnknownComboError(comboId);
-  const picked = pickComboTarget(config, comboId, { preview, allowCooldownReprobe: false });
+  const picked = pickComboTarget(config, comboId, { preview, allowCooldownReprobe: false, eligible, randomSeed });
   if (!picked) throw new NoAvailableComboTargetsError(comboId, comboExclusion(config, comboId));
   return picked;
 }

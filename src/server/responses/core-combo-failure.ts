@@ -33,7 +33,7 @@ import {
 import { normalizeUpstreamErrorText } from "./core-errors";
 import { resolveClientRetryAfter } from "../../lib/retry-after";
 import { formatErrorResponse } from "../../bridge";
-import { upstreamCodeForComboFailure } from "../../bridge/errors";
+import { carryVerbatimComboFailure, upstreamCodeForComboFailure } from "../../bridge/errors";
 import { OLLAMA_LATE_ATTRIBUTION_LIMIT_MESSAGE } from "../../adapters/ollama-native";
 import { carryReplayRefusal, isNonReplayableResponse, isReplayRefusalResponse, markResponseNonReplayable, UPSTREAM_RESET_REPLAY_REFUSED_CODE } from "../../lib/upstream-retry";
 import { MODEL_NOT_ALLOWED_FOR_KEY } from "../admission-model-scope";
@@ -184,6 +184,7 @@ export async function consumeComboFailure(
       ...(clientRetryAfter !== undefined ? { retryAfter: clientRetryAfter } : {}),
     },
   );
+  carryVerbatimComboFailure(response, failureResponse);
   if (nonReplayable) markResponseNonReplayable(failureResponse);
   carryProxyError(response, failureResponse);
   carryWorkflowRefusal(response, failureResponse);

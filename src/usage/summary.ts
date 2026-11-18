@@ -8,11 +8,13 @@ import { isUnresolvedRequestedModel, usageModelPriceOptions } from "./model-iden
 import {
   classifyCacheTelemetryProvenance,
   isCodexUsageAccountLogLabel,
+  normalizeServerToolUsage,
+  physicalUsageAttempts,
   type CacheTelemetryProvenance,
   type PersistedUsageEntry,
   type UsageStatus,
 } from "./log";
-import { type AttemptCostEstimate, type CostEstimate, estimateAttemptCost, estimateRequestCost, isMeasuredStatus, serviceTierContext, type ServiceTierContext, tokensPerSecond } from "./cost";
+import { type AttemptCostEstimate, type CostEstimate, estimateAttemptCost, estimateRequestCost, isMeasuredStatus, normalizeCostTokens, serviceTierContext, type ServiceTierContext, tokensPerSecond } from "./cost";
 
 /**
  * Canonical range members. The warm-up loop in the management usage route
@@ -261,16 +263,14 @@ export function cacheTokensFromUsage(usage?: PersistedUsageEntry["usage"]): {
   hasCacheTelemetry: boolean;
 } {
   if (!usage) return { read: undefined, creation: undefined, hasCacheTelemetry: false };
-  const creation = usage.cacheCreationInputTokens;
-  const read = typeof usage.cacheReadInputTokens === "number"
-    ? usage.cacheReadInputTokens
-    : typeof usage.cachedInputTokens === "number" && typeof creation === "number"
-      ? Math.max(0, usage.cachedInputTokens - creation)
-      : usage.cachedInputTokens;
   const hasCacheTelemetry = typeof usage.cachedInputTokens === "number"
     || typeof usage.cacheReadInputTokens === "number"
     || typeof usage.cacheCreationInputTokens === "number";
-  return { read, creation, hasCacheTelemetry };
+  // The pricing reader's canonical-first decomposition: an implicit read is not reduced by writes,
+  // and contradictory telemetry (read + write above input under every reading) stays unavailable.
+  const normalized = hasCacheTelemetry ? normalizeCostTokens(usage) : null;
+  if (!normalized) return { read: undefined, creation: undefined, hasCacheTelemetry: false };
+  return { read: normalized.cacheRead, creation: normalized.cacheWrite, hasCacheTelemetry: true };
 }
 
 /**
@@ -305,7 +305,7 @@ export function calculateCacheHitRate(
 
 export function computeEntryCost(entry: PersistedUsageEntry): EntryCostInfo {
   const tier = serviceTierContext(entry);
-  if (entry.attempts?.length) {
+  if (entry.attempts !== undefined) {
     const attemptEstimates = entry.attempts.map(attempt =>
       estimateAttemptCost({ ...attempt, ...usageModelPriceOptions(entry, attempt) }, undefined, tier)
     );
@@ -492,7 +492,10 @@ function usageModelKey(providerKey: string, model: string): string {
 }
 
 export function usageAttributions(entry: PersistedUsageEntry): UsageAttribution[] {
-  if (!entry.attempts?.length) {
+  // `=== undefined`, not `!length`: after `normalizePhysicalEntry` an EMPTY list means no attempt
+  // reached upstream and the row's own totals were stripped, so falling back to the row would
+  // invent a request out of stale parent usage. Absent attempts is the older, different case.
+  if (entry.attempts === undefined) {
     return [{
       requestId: entry.requestId,
       provider: entry.provider,
@@ -526,7 +529,7 @@ export function usageAttributions(entry: PersistedUsageEntry): UsageAttribution[
   });
 }
 
-function projectedComboUsage(
+export function projectedComboUsage(
   attempts: readonly NonNullable<PersistedUsageEntry["attempts"]>[number][],
 ): { usage?: PersistedUsageEntry["usage"]; totalTokens?: number } {
   let inputTokens = 0;
@@ -543,10 +546,20 @@ function projectedComboUsage(
   let totalTokens = 0;
   let hasTotalTokens = false;
   let estimated = false;
+  let contextTotalTokens: number | undefined;
+  const anthropicServerToolUse: Record<string, number> = {};
 
   for (const attempt of attempts) {
     if (attempt.usage) {
       hasUsage = true;
+      // A context checkpoint is absolute, so the latest wins; server-tool counters add.
+      if (typeof attempt.usage.contextTotalTokens === "number"
+        && Number.isFinite(attempt.usage.contextTotalTokens) && attempt.usage.contextTotalTokens >= 0) {
+        contextTotalTokens = attempt.usage.contextTotalTokens;
+      }
+      for (const [name, value] of Object.entries(normalizeServerToolUsage(attempt.usage.anthropicServerToolUse) ?? {})) {
+        anthropicServerToolUse[name] = (anthropicServerToolUse[name] ?? 0) + value;
+      }
       inputTokens += attempt.usage.inputTokens;
       outputTokens += attempt.usage.outputTokens;
       const cache = cacheTokensFromUsage(attempt.usage);
@@ -574,13 +587,16 @@ function projectedComboUsage(
   }
 
   if (!hasUsage && !hasTotalTokens) return {};
+  const boundedServerToolUse = normalizeServerToolUsage(anthropicServerToolUse);
   const usage = hasUsage
     ? {
       inputTokens,
       outputTokens,
+      ...(contextTotalTokens !== undefined ? { contextTotalTokens } : {}),
       ...(hasCacheTelemetry ? { cachedInputTokens, cacheReadInputTokens, cacheCreationInputTokens } : {}),
       ...(hasCacheWrite1h ? { cacheCreation1hInputTokens } : {}),
       ...(hasReasoningTelemetry ? { reasoningOutputTokens } : {}),
+      ...(boundedServerToolUse ? { anthropicServerToolUse: boundedServerToolUse } : {}),
       ...(estimated ? { estimated: true } : {}),
     }
     : undefined;
@@ -603,6 +619,8 @@ function addTokens(
   totals: UsageSummaryTotals,
   entry: Pick<PersistedUsageEntry, "usage" | "totalTokens">,
 ): void {
+  // A stored total without usage detail is still tokens spent.
+  totals.totalTokens += usageDisplayTotalTokens(entry.usage, entry.totalTokens) ?? 0;
   if (!entry.usage) return;
   totals.inputTokens += entry.usage.inputTokens;
   totals.outputTokens += entry.usage.outputTokens;
@@ -613,7 +631,6 @@ function addTokens(
   }
   if (typeof creation === "number") totals.cacheCreationInputTokens += creation;
   if (typeof entry.usage.reasoningOutputTokens === "number") totals.reasoningOutputTokens += entry.usage.reasoningOutputTokens;
-  totals.totalTokens += usageDisplayTotalTokens(entry.usage, entry.totalTokens) ?? 0;
 }
 
 /**
@@ -829,6 +846,29 @@ function requestStatusFact(status: UsageStatus): number {
   if (status === "estimated") return REQUEST_ESTIMATED;
   if (status === "unsupported") return REQUEST_UNSUPPORTED;
   return REQUEST_UNREPORTED;
+}
+
+/**
+ * The row as its real upstream sends: locally answered, unsent and duplicate-ordinal attempts are
+ * dropped, legacy root usage with no per-attempt usage lands on the final physical attempt, and the
+ * row's totals and status are recomputed from those attempts. Rows without `attempts` are unchanged.
+ */
+export function normalizePhysicalEntry(entry: PersistedUsageEntry): PersistedUsageEntry {
+  if (entry.attempts === undefined) return entry;
+  const attempts = physicalUsageAttempts(entry.attempts).map(attempt => ({ ...attempt }));
+  const finalAttempt = attempts.at(-1);
+  if (finalAttempt && entry.usage && !attempts.some(attempt => attempt.usage !== undefined)) {
+    finalAttempt.usage = entry.usage;
+    finalAttempt.usageStatus = entry.usageStatus;
+    if (entry.totalTokens !== undefined) finalAttempt.totalTokens = entry.totalTokens;
+  }
+  const { usage: _usage, totalTokens: _totalTokens, ...rest } = entry;
+  return {
+    ...rest,
+    attempts,
+    usageStatus: statusFromRequestFacts(attempts.reduce((facts, attempt) => facts | requestStatusFact(attempt.usageStatus), 0)),
+    ...projectedComboUsage(attempts),
+  };
 }
 
 function statusFromRequestFacts(facts: number): UsageStatus {
@@ -1091,7 +1131,7 @@ function projectedEntryForFilter(
 ): { entry: PersistedUsageEntry; comboOverlap: boolean } | null {
   if (filter.apiKeyId !== null && entry.apiKeyId !== filter.apiKeyId) return null;
   if (filter.sourceFilter && !matchesUsageSource(entry, filter.sourceFilter, filter.configuredApiKeyIdSet)) return null;
-  if (!entry.attempts?.length) {
+  if (entry.attempts === undefined) {
     const identity = usageModelIdentity(entry.provider, entry.model, entry.resolvedModel);
     return filterMatchesAttribution(filter, entry.provider, identity.model)
       ? { entry, comboOverlap: false }
@@ -1454,6 +1494,7 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
   ): void {
     if (attribution.hasUnresolvedRequestedModel) breakdown.hasUnresolvedRequestedModel = true;
     breakdown.attemptCount += 1;
+    breakdown.summaryTotalTokens += usageDisplayTotalTokens(attribution.usage, attribution.totalTokens) ?? 0;
     if (attribution.usage) {
       breakdown.inputTokens += attribution.usage.inputTokens;
       breakdown.outputTokens += attribution.usage.outputTokens;
@@ -1475,7 +1516,6 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
       }
       if (typeof read === "number") breakdown.cacheReadInputTokens += read;
       if (typeof creation === "number") breakdown.cacheCreationInputTokens += creation;
-      breakdown.summaryTotalTokens += usageDisplayTotalTokens(attribution.usage, attribution.totalTokens) ?? 0;
     }
     breakdown.dayTotalTokens += usageDisplayTotalTokens(attribution.usage, attribution.totalTokens) ?? 0;
     if (estimate) breakdown.estimatedCostUsd = (breakdown.estimatedCostUsd ?? 0) + estimate.cost.total;
@@ -1580,6 +1620,7 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
       this.estimatedRetainedBytes += ESTIMATED_BREAKDOWN_BYTES + label.length * 2;
     }
     account.attemptCount += 1;
+    account.totalTokens += usageDisplayTotalTokens(attribution.usage, attribution.totalTokens) ?? 0;
     if (!attribution.usage || !isMeasuredStatus(attribution.usageStatus)) {
       account.unmeteredAttempts += 1;
       return label;
@@ -1595,7 +1636,6 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
     if (typeof attribution.usage.reasoningOutputTokens === "number") {
       account.reasoningOutputTokens += attribution.usage.reasoningOutputTokens;
     }
-    account.totalTokens += usageDisplayTotalTokens(attribution.usage, attribution.totalTokens) ?? 0;
     if (estimate) {
       account.pricedAttempts += 1;
       account.estimatedCostUsd = (account.estimatedCostUsd ?? 0) + estimate.cost.total;
@@ -1620,7 +1660,8 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
     if (!this.filter?.sourceFilter) this.noteSnapshot(sourceEntry);
     if (this.window && (!Number.isFinite(sourceEntry.timestamp)
       || sourceEntry.timestamp < this.window.since || sourceEntry.timestamp > this.window.until)) return;
-    const projected = this.filter ? projectedEntryForFilter(sourceEntry, this.filter) : { entry: sourceEntry, comboOverlap: false };
+    const physicalEntry = normalizePhysicalEntry(sourceEntry);
+    const projected = this.filter ? projectedEntryForFilter(physicalEntry, this.filter) : { entry: physicalEntry, comboOverlap: false };
     if (!projected) return;
     if (this.filter?.sourceFilter) this.noteSnapshot(sourceEntry);
     this.comboOverlap ||= projected.comboOverlap;

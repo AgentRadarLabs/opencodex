@@ -1343,6 +1343,7 @@ export const zh: Record<TKey, string> = {
   "logs.detail.attempt.recovery.key401": "API 密钥重新认证",
   "logs.detail.attempt.recovery.oauthAccount403": "需要验证账号 (403)",
   "logs.detail.attempt.recovery.oauthAccount429": "账号速率受限 (429)",
+  "logs.detail.attempt.recovery.codexAccountRetry": "额度用尽后切换 Codex 账号",
   "logs.detail.attempt.recovery.oauthAccount402": "账号配额已用尽 (402)",
   "logs.detail.attempt.recovery.opaqueBlobRejection": "已丢弃过期加密状态",
   "logs.detail.attempt.recovery.reasoningEffortDowngrade": "已降低推理强度",

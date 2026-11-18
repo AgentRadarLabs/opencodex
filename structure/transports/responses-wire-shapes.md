@@ -190,7 +190,7 @@ one line, with nothing in the response saying so. This also replaces kiro's form
 `invalid_request_error`, which told the client to start a new session and therefore skipped the
 recovery Codex performs on `previous_response_not_found`. Retention is the other half: local
 continuation state is held for `RESPONSE_TTL_MS` (24 hours), long enough that an ordinary idle gap
-resumes by expansion rather than by asking the client to replay. Routed custom-tool lowering requires the same recovery when a delta
+resumes by expansion rather than by asking the client to replay. `OPENCODEX_RESPONSE_STATE_TTL_MS`, `OPENCODEX_RESPONSE_STATE_MAX_BYTES` and `OPENCODEX_RESPONSE_STATE_MAX_SPILL_BYTES` may only lower retention, the resident cap and the spill cap (above default, below 1 or non-numeric is ignored). Routed custom-tool lowering requires the same recovery when a delta
 custom result has no local call, because its original wire type cannot be established and guessing it
 would send an unmatched result upstream. The check resolves the selected wire protocol and the
 request's own tool declarations after final route selection, so stateful destinations keep their

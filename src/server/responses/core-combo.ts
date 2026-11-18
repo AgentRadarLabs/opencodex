@@ -64,6 +64,7 @@ import {
   type JevDecision,
 } from "../../combos";
 import { formatErrorResponse } from "../../bridge";
+import { hasVerbatimComboFailure, verbatimComboFailure } from "../../bridge/errors";
 import { SEND_BUDGET_EXHAUSTED_CODE } from "../../lib/errors";
 import {
   expandPreviousResponseInput,
@@ -695,6 +696,7 @@ export async function executeComboResponses(
     eligible: target => (meteredAllowed || !target.metered) && (pickOptions.eligible?.(target) ?? true),
     waitForCooldownMs: combo.waitForCooldownMs,
     abortSignal: options.abortSignal,
+    randomSeed: options.comboRandomSeed,
   });
   // An in-flight tool loop stays on the target that issued its calls while that target is still
   // selectable (#7298). Override routes never record a lane target, so they never pin either.
@@ -919,7 +921,8 @@ export async function executeComboResponses(
   }
   // One immutable combo selection trace, before any child dispatch; child
   // adoption below must never replace it with a concrete child route trace.
-  const decision = comboRouteDecisionTrace(config, comboId, pick, responseModel);
+  // A target this request can never run on is traced `request-incompatible`, not a `not-selected` runner-up.
+  const decision = comboRouteDecisionTrace(config, comboId, pick, responseModel, undefined, targetEligible);
   const selectedReason = options.memoryModelPhase
     ? memoryModelRouteReason(options.memoryModelPhase)
     : toolLoopPin ? COMBO_TOOL_LOOP_PIN_REASON : jevDecision?.pinned ? JEV_SESSION_PIN_ROUTE_REASON : undefined;
@@ -975,7 +978,12 @@ export async function executeComboResponses(
   // Snapshotted before dispatch: a 401/403 inside this ladder cools its own provider, and that
   // fresh cooldown is not a reason the request found no target.
   const quotaCooldownSnapshot = snapshotComboQuotaCooldowns(config, comboId);
+  // AgentRadar hosted: the client gets a canonical Anthropic child's own error; decisions read the formatted one.
   const exhaustedFailure = (targetsExhausted = false): Response => {
+    const failure = rawExhaustedFailure(targetsExhausted);
+    return verbatimComboFailure(failure) ?? failure;
+  };
+  const rawExhaustedFailure = (targetsExhausted = false): Response => {
     if (contextFailure) {
       adoptFailedChildLog(contextFailure.childLog);
       return contextFailure.response;
@@ -1403,6 +1411,8 @@ export async function executeComboResponses(
         activeAttemptStartedAt: segmentStartedAt(),
         resolvedModel: childLog.resolvedModel ?? childLog.model,
       });
+      // The row's account is the serving attempt's, never one left over from before the ladder.
+      if (childLog.accountLogLabel === undefined) delete logCtx.accountLogLabel;
       options.onCodexAuthContextResolved?.(resolvedAuth);
       options.setTerminalOutcomeRecorder?.(terminalRecorder);
       callbackGate.commit();
@@ -1510,6 +1520,7 @@ export async function executeComboResponses(
     const wantsStream = (rawBody as { stream?: unknown } | null)?.stream === true;
     // Local byte admission has its own diagnostic; do not relabel it as an upstream refusal.
     const classifyOverflow = failure.response.status === 413 && !lateAttributionRefusal
+      && !hasVerbatimComboFailure(failure.response)
       && (wantsStream || (failure.upstreamCode !== "outbound_body_too_large"
         && failure.upstreamCode !== "translation_buffer_limit"));
     lastFailureClassifiesOverflow = classifyOverflow;
@@ -1543,7 +1554,7 @@ export async function executeComboResponses(
           ? streamingContextOverflowResponse(responseModel, options.translatorBudget)
           : jsonContextOverflowResponse();
       }
-      return lastFailure;
+      return verbatimComboFailure(lastFailure) ?? lastFailure;
     }
     if (failureDecision === "stop") {
       adoptFailedChildLog(childLog);
@@ -1552,7 +1563,7 @@ export async function executeComboResponses(
           ? streamingContextOverflowResponse(responseModel, options.translatorBudget)
           : jsonContextOverflowResponse();
       }
-      return lastFailure;
+      return verbatimComboFailure(lastFailure) ?? lastFailure;
     }
     // Retain a confirmed target context refusal when later retryable failures exhaust the ladder.
     // Hard stops above still return their own verdict, and every attempt keeps its own usage.
@@ -1685,6 +1696,9 @@ export async function executeComboResponses(
       }
       // Waiting or recovery may have observed cancellation after the check above.
       if (options.abortSignal?.aborted) return clientCancelledResponse();
+    } else {
+      // One logical request moved to another target; the persisted row and routing analytics read it.
+      logCtx.comboTargetAdvanced = true;
     }
     } finally {
       // External receipts make release a no-op after real work. runTurn owns its asynchronous

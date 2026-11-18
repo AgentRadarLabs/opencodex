@@ -1,5 +1,8 @@
 import { hasHumanDashboardSession } from "./consent-session";
-import { isAnthropicOAuthInstance, configuredAnthropicInstance, type AnthropicInstanceId } from "../../providers/anthropic-instance";
+import { isAnthropicOAuthInstance, configuredAnthropicInstance, isAnthropicInstanceId, type AnthropicInstanceId } from "../../providers/anthropic-instance";
+import { getTokenForAccountQuotaProbe } from "../../providers/quota/account-cache";
+import { anthropicSubscriptionLabel } from "../../providers/anthropic-subscription";
+import { readAnthropicPlan, type AnthropicPlanReading } from "../../oauth/anthropic-identity";
 import { resolveAnthropicAccountPoolConfig } from "../../oauth/anthropic-pool-config";
 import { persistAnthropicPoolPatch, writeAnthropicPoolSettings } from "./anthropic-pool-settings";
 import { parseAnthropicModelRoutes, readAnthropicModelRoutes } from "../../oauth/anthropic-model-routes";
@@ -593,9 +596,22 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
       : await fetchProviderAccountQuotas(provider, forceRefresh, quotaProvider, config);
     const byId = new Map(rows.map(row => [row.accountId, row]));
     const projected = projectAccounts();
+    // A plan the credential has not stored yet is read live, with the token the probe just used;
+    // a sign-in that cannot be used says so instead of leaving the plan blank (AgentRadar 20720).
+    const plans = wantQuota && isAnthropicInstanceId(provider)
+      ? new Map(await Promise.all(projected.accounts.filter(account => account.plan == null).map(async account => [account.id,
+        await getTokenForAccountQuotaProbe(provider, account.id).then(readAnthropicPlan,
+          (): AnthropicPlanReading => ({ plan: null, planUnknownReason: "the sign-in needs renewing" }))] as const)))
+      : null;
     return jsonResponse({
       ...(provider === "anthropic2" ? { provider } : {}), activeAccountId: projected.activeAccountId,
-      accounts: projected.accounts.map(account => {
+      accounts: projected.accounts.map(planless => {
+        const reading = plans?.get(planless.id);
+        const read = reading ? { ...planless, ...reading, ...(reading.plan ? { planLabel: anthropicSubscriptionLabel(reading.plan) } : {}) } : planless;
+        // AgentRadar 20720 keys on the hosted vocabulary; planLabel stays canonical.
+        const hostedPlan = process.env.OPENCODEX_AGENTRADAR === "1" && isAnthropicInstanceId(provider)
+          ? { max_20x: "ultra", max_5x: "max" }[read.plan ?? ""] : undefined;
+        const account = hostedPlan ? { ...read, plan: hostedPlan } : read;
         const row = byId.get(account.id);
         // #8397: a passive provider with no observation for this account yet says so.
         if (!row) return passiveQuota ? { ...account, quotaUnknownReason: "passive_not_observed" } : account;
