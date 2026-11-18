@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import { describe, expect, test } from "bun:test";
-import { usageLogLine, type UsageLogInput } from "../../src/lib/usage-line-log";
+import { hashedAccount, usageLogLine, type UsageLogInput } from "../../src/lib/usage-line-log";
 
 const sha8 = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 8);
+const tag = (label: string) => hashedAccount({ accountLogLabel: label });
 
 const PROMPT = "PROMPT-SECRET-please summarise the private contract for jane@example.com";
 const KEY_ID = "key_rec_7f3a91c2d4";
@@ -28,7 +29,7 @@ describe("per-request summary line", () => {
     const line = usageLogLine(entry());
     expect(line).toBe(
       `[usage] status=200 provider="openai" model="gpt-5.6-sol" in=100 out=10 cached=40`
-      + ` key=${sha8(KEY_ID)} ms=1234 ttft=321 acct=${sha8(ACCT_A)} r429=0 retry=0 fallover=0`,
+      + ` key=${sha8(KEY_ID)} ms=1234 ttft=321 acct=${tag(ACCT_A)} r429=0 retry=0 fallover=0`,
     );
   });
 
@@ -61,11 +62,20 @@ describe("per-request summary line", () => {
     }));
     expect(line).toContain(" r429=1 ");
     expect(line).toContain(" fallover=1");
-    expect(line).toContain(`acct=${sha8(ACCT_B)}`);
+    expect(line).toContain(`acct=${tag(ACCT_B)}`);
   });
 
   test("an advanced combo target gives fallover=1 on one account", () => {
     expect(usageLogLine(entry({ comboTargetAdvanced: true }))).toContain(" fallover=1");
+  });
+
+  test("the account tag is keyed: stable for one label, distinct across labels, never the plain sha256", () => {
+    expect(tag(ACCT_A)).toMatch(/^[0-9a-f]{8}$/);
+    expect(tag(ACCT_A)).toBe(tag(ACCT_A));
+    expect(tag(ACCT_A)).not.toBe(tag(ACCT_B));
+    // A plain short hash of a guessable label could be reversed by trying every label.
+    expect(tag(ACCT_A)).not.toBe(sha8(ACCT_A));
+    expect(usageLogLine(entry())).not.toContain(sha8(ACCT_A));
   });
 
   test("a missing firstOutputMs gives ttft=- and a missing account gives acct=-", () => {
@@ -90,6 +100,6 @@ describe("per-request summary line", () => {
       expect(line).not.toContain(secret);
     }
     expect(line).toContain(`key=${sha8(KEY_ID)}`);
-    expect(line).toContain(`acct=${sha8(ACCT_B)}`);
+    expect(line).toContain(`acct=${tag(ACCT_B)}`);
   });
 });

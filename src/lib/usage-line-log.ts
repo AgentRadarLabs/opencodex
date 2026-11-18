@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { baseProviderLabel } from "../providers/label";
 import { sanitizeLogMetadataString } from "./redact";
 
@@ -7,7 +7,7 @@ import { sanitizeLogMetadataString } from "./redact";
  * the share of calls and tokens on each model from the process log alone.
  *
  * The line carries only the HTTP status, the provider and model ids, three token counts, an 8-hex
- * hash of the gateway API key's record id, the duration, the time to first token, an 8-hex hash of
+ * hash of the gateway API key's record id, the duration, the time to first token, an 8-hex keyed tag of
  * the serving account's label and three 0/1 flags (a 429 was seen, a retry happened, the request
  * moved to another account or combo target). It never carries message text, a request or response
  * body, a header, a secret key value, an account label in clear or an email: the input is the
@@ -82,10 +82,19 @@ export function hashedKeyId(apiKeyId: string | undefined): string {
   return hash8(apiKeyId);
 }
 
-/** First 8 hex of sha256 of the serving account label (the entry's, else the last attempt's), or "-". */
+/**
+ * Account labels are guessable (a provider name plus a short hex suffix), so a plain short hash could be
+ * reversed by trying them all. The tag is an HMAC under a random key made once per process and never
+ * written anywhere: the same account gets the same tag for the life of the process, and nothing more.
+ */
+const ACCOUNT_TAG_KEY = randomBytes(32);
+
+/** First 8 hex of the keyed tag of the serving account label (the entry's, else the last attempt's), or "-". */
 export function hashedAccount(input: Pick<UsageLogInput, "accountLogLabel" | "attempts">): string {
   const last = [...(input.attempts ?? [])].reverse().find(a => typeof a.accountLogLabel === "string" && a.accountLogLabel !== "");
-  return hash8(input.accountLogLabel || last?.accountLogLabel);
+  const label = input.accountLogLabel || last?.accountLogLabel;
+  if (typeof label !== "string" || label === "") return "-";
+  return createHmac("sha256", ACCOUNT_TAG_KEY).update(label).digest("hex").slice(0, 8);
 }
 
 /** 429 / retry / fallover as 0 or 1, read from the attempt rows, spend total and combo flag only. */
