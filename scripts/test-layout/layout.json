@@ -1810,7 +1810,8 @@
     "zz-ci-storage-policy-isolation.test.ts": "ci-workflows",
     "zz-pr-coderabbit-readiness-revalidation.test.ts": "ci-workflows",
     "upstream-refusal-log.test.ts": "lib",
-    "call-usage-line-log.test.ts": "lib"
+    "call-usage-line-log.test.ts": "lib",
+    "request-summary-line.test.ts": "lib"
   },
   "migrated": [
     "adapters",
