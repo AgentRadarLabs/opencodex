@@ -1,7 +1,7 @@
 // AgentRadar hosted gateways (.27): count_tokens for a canonical Anthropic target is Anthropic's own
 // exact count. Ports the .27 claude-messages-endpoint count_tokens cases, plus the pin fix: a pinned
 // request counts on its pinned account only, and an unpinned count commits no account selection.
-import { afterEach, beforeEach, expect } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { installEndpointHooks, test, startServer, testDir, originalFetch } from "../helpers/claude-endpoint-lifetime";
@@ -542,3 +542,70 @@ test("off the hosted flag a count_tokens pin header is refused, as on /v1/messag
   expect(await response.text()).toContain("Invalid AgentRadar account pin");
   expect(sends).toBe(0);
 });
+
+for (const change of ["pause", "remove", "replace", "cancel"] as const) {
+  test(`a pinned count revalidates its credential after pacing: ${change}`, async () => {
+    const pacing = await import("../../src/providers/request-pacing");
+    const store = await import("../../src/oauth/store");
+    writeAccounts("acct-a", ["acct-a", "acct-b"]);
+    saveConfig(OAUTH_POOL_CONFIG);
+    let before = store.captureOAuthAccountSelection("anthropic");
+    const auths: Array<string | null> = [];
+    globalThis.fetch = async (input, init) => {
+      auths.push(new Request(input, init).headers.get("authorization"));
+      return Response.json({ input_tokens: 123 });
+    };
+    let enter!: () => void, resume!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const released = new Promise<void>(resolve => { resume = resolve; });
+    const realWait = pacing.waitForProviderRequestSlot;
+    let waits = 0;
+    const wait = spyOn(pacing, "waitForProviderRequestSlot").mockImplementation(async (...args) => {
+      if (waits++ === 0) { enter(); await released; }
+      return realWait(...args);
+    });
+    const client = new AbortController();
+    const pending = handleClaudeCountTokens(countRequest({ model: "claude-opus-5", messages: [{ role: "user", content: "count" }] },
+      { "x-agentradar-account-provider": "claude", "x-agentradar-account-id": "acct-b" }, client.signal), OAUTH_POOL_CONFIG);
+    try {
+      await entered;
+      if (change === "pause") await store.setAccountPaused("anthropic", "acct-b", true);
+      if (change === "remove") await store.removeAccount("anthropic", "acct-b");
+      if (change === "replace") await store.mergeAccountCredential("anthropic", "acct-b", {
+        access: "token-b-replaced", refresh: "test-refresh-replaced", expires: 9999999999999,
+      });
+      if (change === "cancel") client.abort(new DOMException("count cancelled while queued", "AbortError"));
+      before = store.captureOAuthAccountSelection("anthropic");
+    } finally { resume(); }
+    try {
+      const response = await pending;
+      await response.text();
+      if (change === "replace") {
+        expect(response.status).toBe(200);
+        expect(auths).toEqual(["Bearer token-b-replaced"]);
+      } else {
+        expect(response.status).toBe(change === "cancel" ? 499 : 502);
+        expect(auths).toEqual([]);
+      }
+      expect(store.captureOAuthAccountSelection("anthropic")).toEqual(before);
+    } finally { wait.mockRestore(); }
+  });
+}
+
+for (const [retryAfter, expected] of [
+  ["17", "17"],
+  ["99999999999999999999", "691200"],
+  ["9".repeat(129), null],
+  ["malformed_retry_marker", null],
+] as const) {
+  test(`exact count bounds upstream Retry-After: ${retryAfter.slice(0, 24)}`, async () => {
+    globalThis.fetch = async () => Response.json({ error: { type: "rate_limit_error", message: "count limit" } }, {
+      status: 429, headers: { "retry-after": retryAfter },
+    });
+    const config = keyConfig({ claudeCode: { modelMap: { "claude-opus-5": "target/claude-opus-5" } } } as Partial<OcxConfig>);
+    const response = await handleClaudeCountTokens(countRequest({ model: "claude-opus-5", messages: [{ role: "user", content: "count" }] }), config);
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe(expected);
+    await response.text();
+  });
+}

@@ -4,7 +4,7 @@
 
 - Fixed upstream base: `6bae884cbc66306cfbf4e0c2d50ba19fb79305a3` (upstream package 2.100.0).
 - Compatibility reference: `v2.65.0-vadymhimself.27`, `d0f166aca52d0cbe3dd132601ae8798aba8e002f`.
-- Build version: `2.100.0-vadymhimself.1`.
+- Superseding build version: `2.100.0-vadymhimself.2`. The initial `.1` artifact is on HOLD and must not be installed.
 - Runtime: pinned Bun 1.4.4. Tests use isolated HOME/OPENCODEX_HOME, synthetic credentials and loopback providers. Running laptop, Mini and hosted gateways were not replaced or deployed.
 - Git history was not rebased or force-pushed; this is a fresh upstream-derived branch with the AR overlay reapplied.
 
@@ -15,7 +15,7 @@
 | Pristine upstream full suite | 69,990 pass / 753 skip / 33 fail | Same-machine baseline, not a green full suite. |
 | Rebuild full suite, hosted flag unset | 70,276 pass / 753 skip / 32 fail | Every failing test also fails on pristine upstream; no new failure names. |
 | Rebuild full suite, hosted flag enabled | 69,985 pass / 753 skip / 323 fail | Hosted-only failures were grouped and reviewed against the intentional `.27` contract. These include upstream-only expectations for rewriting native bytes, 502 vs 504, six-account rosters, one-hour cache TTL, and sanitizing canonical server-tool history. Not a green full-suite result. |
-| Final version-stamped AR gate | 522 pass / 0 fail across 29 files | Real-handler budget, cache-prefix, account pin, native fidelity, quota evidence, accounting and count-tokens regressions. |
+| Final repaired AR gate | 534 pass / 0 fail across 29 files | Real-handler budget, cache-prefix, account pin, native fidelity, quota evidence, accounting, count-tokens and final boundary regressions. The metadata-only `.2` version stamp follows these checks. |
 | Typecheck, structure, privacy, diff check | Pass | Final version-stamped source. |
 | Layout and file-size contracts | 38 pass / 0 fail | No baseline caps increased. |
 | Dashboard/package build | Pass | Current upstream dependency versions and lockfiles retained. |
@@ -40,3 +40,7 @@ The paired baseline identifies local Rust/Xcode licence failures, sandbox/servic
 ## Delivery boundary
 
 The build is a tarball candidate, not an npm publication, GitHub release tag, merge, deployment or installed runtime replacement. The old fork publisher requires a successful exact-SHA push-CI event that current upstream intentionally no longer creates. No gate was weakened to disguise that incompatibility.
+
+## Final boundary-review correction
+
+A bounded final independent review found two blockers after the initial `.1` package: the strict SSE EOF tail bypassed frame validation, and hosted OAuth token counts could dispatch a captured credential after its account changed during pacing. The initial artifact was explicitly marked HOLD and PR #46 converted to draft. The superseding build validates EOF tails before enqueue and revalidates the same OAuth authority immediately before physical count dispatch. Controlled regressions cover malformed/non-object/invalid-UTF-8 EOF tails and queued pause/removal/credential replacement/cancellation. The token-count response also bounds Retry-After. Focused results for this repair are recorded in the PR; the full-suite results above predate the repair.

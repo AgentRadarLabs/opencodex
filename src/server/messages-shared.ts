@@ -422,6 +422,7 @@ export function tapAnthropicSseForLog(
           if (done) {
             const tail = strict ? framer.finish() : EMPTY_BYTES;
             if (tail.byteLength > 0) {
+              if (!validFrame(tail)) { failProtocol(); return; }
               inspect(tail);
               enqueue(tail);
             }

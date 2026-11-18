@@ -266,3 +266,29 @@ test("A0g: a local error presentation keeps its identity through the strict re-f
   expect(text).not.toContain(SSE_SENTINEL);
   expect(text.startsWith('event: message_start\ndata: {"type":"error"')).toBe(true);
 });
+
+for (const [name, tail] of [
+  ["malformed JSON", sseEncoder.encode('data: {bad_tail_marker')],
+  ["non-object JSON", sseEncoder.encode('data: "bad_tail_marker"')],
+  ["invalid UTF-8", new Uint8Array([...sseEncoder.encode('data: {"text":"bad_tail_marker'), 0xff, ...sseEncoder.encode('"}')])],
+] as const) {
+  test(`strict EOF tail rejects ${name} before relay`, async () => {
+    const calls: Array<{ status: number; meta: unknown }> = [];
+    const upstream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(tail); controller.close(); } });
+    const text = await new Response(tapAnthropicSseForLog(upstream, {} as RequestLogContext,
+      (status, meta) => calls.push({ status, meta }), { stallMs: 0, maxBytes: 0 })).text();
+    expect(text).not.toContain("bad_tail_marker");
+    expect(text).toContain("anthropic passthrough protocol error");
+    expect(calls).toEqual([{ status: 502, meta: { terminalStatus: "failed", closeReason: "terminal" } }]);
+  });
+}
+
+test("strict EOF tail completes a valid unterminated terminal", async () => {
+  const terminal = 'event: message_stop\ndata: {"type":"message_stop"}';
+  const calls: number[] = [];
+  const upstream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(sseEncoder.encode(terminal)); controller.close(); } });
+  const text = await new Response(tapAnthropicSseForLog(upstream, {} as RequestLogContext,
+    status => calls.push(status), { stallMs: 0, maxBytes: 0 })).text();
+  expect(text).toBe(terminal + "\n\n");
+  expect(calls).toEqual([200]);
+});

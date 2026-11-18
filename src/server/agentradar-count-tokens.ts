@@ -12,6 +12,7 @@ import { resolveInboundModel } from "../claude/inbound";
 import { anthropicErrorResponse } from "../claude/outbound";
 import { getCombo, pickComboTarget, resolveComboId } from "../combos";
 import { readBoundedResponseBytes } from "../lib/bounded-body";
+import { formatClientRetryAfter } from "../lib/client-retry-after";
 import { agentRadarAccountPin, agentRadarPinnedConfig } from "../lib/agentradar-account-pin";
 import { createTranslatorBudget, isTranslatorBudgetExceededError } from "../lib/translator-budget";
 import { applyUpstreamRecoveryInit } from "../lib/upstream-retry";
@@ -27,7 +28,7 @@ import { resolveWireProtocolOverride } from "./adapter-resolve";
 import { resolveAdmissionModelScope, routeAllowedByScope } from "./admission-model-scope";
 import type { DataPlaneAdmission } from "./auth-cors";
 import { nativeMessagesDeclineReason, type NativeMessagesSelector } from "./messages-native-eligibility";
-import { resolveNativeOAuthBindingForInstance } from "./messages-native-oauth";
+import { nativeOAuthBindingIsCurrent, resolveNativeOAuthBindingForInstance, type NativeOAuthBinding } from "./messages-native-oauth";
 import { conversationIdFromClaudeMetadata } from "./request-log-conversation";
 import { createComboProtocolLanes, hostedReplayIncompatible } from "./responses/core-combo-native";
 import { providerFetch } from "./responses/fetch-helpers";
@@ -125,11 +126,12 @@ export async function agentRadarExactCountTokens(
 
     let provider = route.provider;
     let providerAccountUuid: string | undefined;
+    let binding: NativeOAuthBinding | undefined;
     if (provider.authMode === "oauth") {
       const instance = configuredAnthropicInstance(config, route.providerName);
       if (!instance) return undefined;
       try {
-        const binding = await resolveNativeOAuthBindingForInstance(instance, countConfig, {
+        binding = await resolveNativeOAuthBindingForInstance(instance, countConfig, {
           model: route.modelId,
           readOnly: true,
           sessionKey: anthropicSessionKeyFromParts({
@@ -165,13 +167,35 @@ export async function agentRadarExactCountTokens(
     countUrl.pathname = "/v1/messages/count_tokens";
     const signal = AbortSignal.any([req.signal, AbortSignal.timeout(config.connectTimeoutMs ?? 200_000)]);
     try {
-      const upstream = await providerFetch(provider, undefined, { providerName: route.providerName, modelId: route.modelId })(
+      const upstream = await providerFetch(provider, undefined, {
+        providerName: route.providerName, modelId: route.modelId,
+        dispatchOverride: async (input, init, execute, reacquirePacing) => {
+          // Pacing may outlive a pause, removal or credential replacement. A count never commits a
+          // selection; re-resolve the same pin (or the ordinary read-only pool) before the send.
+          for (let attempt = 0; binding && !nativeOAuthBindingIsCurrent(binding); attempt++) {
+            signal.throwIfAborted();
+            if (attempt >= 3) throw new Error("Anthropic count credential changed before dispatch");
+            binding = await resolveNativeOAuthBindingForInstance(binding.instance, countConfig, {
+              routeTarget: binding.routeTarget, sessionKey: binding.sessionKey, model: route.modelId, readOnly: true,
+            });
+            provider = { ...route.provider, apiKey: binding.snapshot.accessToken };
+            translatorBudget.releaseRetained(Buffer.byteLength(built.body), { kind: "request_copies" });
+            built = buildAnthropicMessagesPassthroughRequest(provider, route.modelId, raw, config, {
+              callerAnthropicBeta: req.headers.get("anthropic-beta"), providerAccountUuid: binding.providerAccountUuid, exactSource: true,
+            });
+            translatorBudget.chargeRetained(Buffer.byteLength(built.body), { kind: "request_copies" });
+            await reacquirePacing?.(provider, route.modelId);
+          }
+          signal.throwIfAborted();
+          return execute(input, applyUpstreamRecoveryInit({ ...init, headers: built.headers, body: built.body }, "connection-reset"));
+        },
+      })(
         countUrl,
         applyUpstreamRecoveryInit({ method: "POST", headers: built.headers, body: built.body, signal }, "connection-reset"),
       );
       const read = await readBoundedResponseBytes(upstream, { signal, maxBytes: COUNT_MAX_BYTES });
       if (read.oversized) return anthropicErrorResponse(502, "Anthropic token count body exceeded safe limit", "api_error");
-      const retryAfter = upstream.headers.get("retry-after");
+      const retryAfter = formatClientRetryAfter(upstream.headers.get("retry-after"));
       return new Response(read.bytes.slice(), {
         status: upstream.status,
         headers: { "Content-Type": upstream.headers.get("content-type") ?? "application/json", ...(retryAfter ? { "Retry-After": retryAfter } : {}) },

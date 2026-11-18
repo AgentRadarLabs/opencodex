@@ -59,6 +59,8 @@ export interface NativeOAuthBinding {
   readonly model?: string;
   readonly config: OcxConfig;
   readonly manualSelectionGeneration: number;
+  /** A count resolves a usable credential without committing the active selection or affinity. */
+  readonly readOnly?: true;
 }
 
 /** The selection moved or became ineligible while resolving. Maps to a 409 retry. */
@@ -188,7 +190,7 @@ export async function resolveNativeOAuthBindingForInstance(
     if (candidate.provider !== instance) throw new NativeOAuthSelectionChangedError();
     if (!routeIsCurrent(instance, config, model, routeDecision)) continue;
     if (options.readOnly) {
-      return { instance, routeTarget, selection, snapshot: candidate, routeDecision, sessionKey, model, config, manualSelectionGeneration,
+      return { instance, routeTarget, selection, snapshot: candidate, routeDecision, sessionKey, model, config, manualSelectionGeneration, readOnly: true,
         providerAccountUuid: getAccountCredentialWithStatus(instance, candidate.accountId)?.credential.accountId };
     }
     const committed = await commitOAuthAccountSelection(instance, candidate.accountId, {
@@ -236,7 +238,7 @@ export function nativeOAuthBindingIsCurrent(binding: NativeOAuthBinding): boolea
   // Another conversation may move the automatic active pointer without revoking this
   // session's affinity. Manual selection clears affinity and precedes it in the selector.
   const selectionCurrent = pin ? binding.snapshot.accountId === pin.accountId
-    : (sessionRoute?.reason === "affinity" || sessionRoute?.reason === "hash")
+    : binding.readOnly || (sessionRoute?.reason === "affinity" || sessionRoute?.reason === "hash")
     && sessionRoute.accountId === binding.snapshot.accountId
     || (selected?.accountId === binding.selection.accountId && selected?.revision === binding.selection.revision);
   return selectionCurrent
