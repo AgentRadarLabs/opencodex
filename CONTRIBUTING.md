@@ -36,6 +36,18 @@ Source development requires the `bun` CLI on your `PATH`. The published npm pack
 Bun runtime for end users, but contributor commands such as `bun install`, `bun run test`, and
 `bun run prepush` run from your local Bun installation.
 
+## AgentRadar fork quota and cache checks
+
+On the hosted fork release line, run `bun run test:gateway-quota` before proposing gateway changes.
+It runs the existing offline account-pin, quota-refusal, physical-send, replay-prefix, usage and
+cache-stabilization suites together through the isolated test runner. Provider traffic is synthetic;
+these checks do not measure a live cache-hit rate or spend a subscription.
+
+The `Gateway quota and cache guardrails` step is part of the existing Cross-platform CI `gates`
+job, so a failing suite fails the aggregate `ci` check. Fork publication already requires successful
+push-event Cross-platform CI for the exact release SHA. This does not replace the broader tests,
+review or the repository's branch rules.
+
 ## Pull request contract
 
 A ready-for-review PR is the author's claim that the change is complete, understood, tested, and suitable for merging. Opening a PR does not transfer responsibility for the branch to maintainers.

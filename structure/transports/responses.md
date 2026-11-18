@@ -442,7 +442,8 @@ remain live. Owner names are distinct from local decision variables: `admissionS
 lease while a block-local `admission` holds only the acquisition result.
 
 `handleResponses` creates or inherits the same logical-request send holder. The budget owner
-reads that holder rather than minting a per-phase allowance. Combo recursion is injected through
+reads that holder rather than minting a per-phase allowance. Hosted Anthropic OAuth sends follow
+[the physical dispatch accounting contract](responses-spend.md#hosted-anthropic-physical-sends). Combo recursion is injected through
 `ResponsesDispatchers`: a child re-enters the public handler without a reverse runtime import
 from the combo implementation into `core.ts`. `core-lifetime.ts` owns the shared run-turn response
 marker and translator-budget finalization, so the combo and delivery paths observe one identity.

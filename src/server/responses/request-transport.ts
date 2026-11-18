@@ -1,4 +1,7 @@
 import type { ResponsesRequestContext, ResponsesAdmissionState } from "./core-options";
+import { CODEX_TEXT_GUARDED_BUDGET_POLICY, deriveRequestExecutionBudget, isRequestExecutionBudget, type RequestExecutionBudget } from "../../lib/request-execution-budget";
+import { SendBudgetExhaustedError } from "../../lib/upstream-retry";
+import { chargeWorkflowSends } from "../../lib/workflow-budget";
 import type { PreparedResponsesRequest } from "./request-prepare";
 import type { OAuthAccessSnapshot } from "../../oauth";
 import {
@@ -11,6 +14,7 @@ import type { ProviderAdapter, AdapterRequest } from "../../adapters/base";
 import type { AdapterEvent, OcxParsedRequest, OcxProviderConfig, OcxUsage } from "../../types";
 import type { AnthropicAccountSelectionReason } from "../../oauth/anthropic-routing";
 import {
+  ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST,
   isAnthropicAccountPoolEnabled,
   getAnthropicPoolAccessSnapshot,
   commitAnthropicSelectionRouting,
@@ -90,6 +94,18 @@ export async function prepareResponsesTransport(
 ) {
   const { config, logCtx, options, req } = requestContext;
   const { route, parsed, inboundWire, translatorBudget } = requestState;
+  const anthropicPhysicalBudget = route.providerName === "anthropic" && route.provider.authMode === "oauth";
+  if (anthropicPhysicalBudget && isRequestExecutionBudget(options.sendBudget)
+    && options.sendBudget.policy === CODEX_TEXT_GUARDED_BUDGET_POLICY) {
+    // Keep the fork's existing 16-account recovery allowance; never widen an explicit policy.
+    options.sendBudget = deriveRequestExecutionBudget(options.sendBudget, {
+      ...options.sendBudget.policy, maxTotalModelSends: ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST + 1,
+      baseSendAllowance: ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST + 1,
+    });
+  }
+  let anthropicDispatchBudget = isRequestExecutionBudget(options.sendBudget) ? options.sendBudget : undefined;
+  const anthropicSendAvailable = (): boolean => !anthropicPhysicalBudget || !anthropicDispatchBudget
+    || anthropicDispatchBudget.used < anthropicDispatchBudget.policy.maxTotalModelSends;
   // AgentRadar image patch: the pinned account's own snapshot and credential generation are the
   // only admission; the global selection, affinity and pool cursors are never read or written.
   const pin = route.provider.authMode === "oauth" ? options.agentRadarAccount : undefined;
@@ -275,11 +291,11 @@ export async function prepareResponsesTransport(
   // physical dispatch binds it to the selection that actually reaches the upstream.
   let pendingKeySend: { estimate: number | undefined; recovery?: AttemptRecoveryKind } | undefined;
   const noteRoutedAttemptSend = (estimate: number | undefined, recovery?: AttemptRecoveryKind): void => {
-    if (usesApiKeyAccount(route.provider)) pendingKeySend = { estimate, recovery };
+    if (anthropicPhysicalBudget || usesApiKeyAccount(route.provider)) pendingKeySend = { estimate, recovery };
     else noteProviderAttemptSend(logCtx, route.providerName, route.provider, estimate, recovery);
   };
   const commitKeyAttemptSend = (): void => {
-    if (!usesApiKeyAccount(route.provider)) return;
+    if (!anthropicPhysicalBudget && !usesApiKeyAccount(route.provider)) return;
     noteProviderAttemptSend(logCtx, route.providerName, route.provider,
       pendingKeySend?.estimate ?? logCtx.usageLogInputTokens, pendingKeySend?.recovery);
     pendingKeySend = undefined;
@@ -453,11 +469,19 @@ export async function prepareResponsesTransport(
           // Reselection can choose a provider override instead of the supplied executor.
           // Either way the send crosses the physical boundary, so the connection policy is
           // applied around whichever implementation was just selected (#4992).
-          commitKeyAttemptSend();
           // The binding travels with the send, so a rebuilt request resolves its provider route
           // against the destination it is actually going to rather than the one this dispatch
           // started with. Account reselection can move the upstream host, which would otherwise
           // apply a host-scoped decision to a different host.
+          if (anthropicPhysicalBudget && anthropicDispatchBudget) {
+            const dispatch = anthropicDispatchBudget.reserveDispatch({
+              sendClass: anthropicDispatchBudget.used === 0 ? "initial" : "auth-recovery",
+              targetKey: `${route.providerName}|${route.modelId}|anthropic-physical`,
+            });
+            if (!dispatch.allowed || !dispatch.permit.use()) throw new SendBudgetExhaustedError("Anthropic");
+            chargeWorkflowSends(req.headers.get("x-codex-parent-thread-id")?.trim() || undefined, 1);
+          }
+          commitKeyAttemptSend();
           const response = await sendWithConnectionPolicy(
             fetchImpl,
             destination,
@@ -912,6 +936,9 @@ export async function prepareResponsesTransport(
       anthropicMessagesSource = undefined;
     },
     oauthDispatch,
+    anthropicPhysicalBudget,
+    anthropicSendAvailable,
+    setAnthropicDispatchBudget(budget: RequestExecutionBudget | undefined): void { anthropicDispatchBudget = budget; },
     noteRoutedAttemptSend,
     commitKeyAttemptSend,
     bindKeyUsageFromBridge,

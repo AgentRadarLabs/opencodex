@@ -12,6 +12,7 @@ import { clearResponseStateForTests } from "../../../src/responses/state";
 import { handleResponses } from "../../../src/server/responses";
 import type { OcxConfig, OcxProviderConfig } from "../../../src/types";
 import { removeTreeWithRetry } from "../../helpers/remove-tree";
+import { createRequestExecutionBudget } from "../../../src/lib/request-execution-budget";
 
 const actualResolver = await import("../../../src/server/adapter-resolve");
 const actualResolveAdapter = actualResolver.resolveAdapter;
@@ -162,6 +163,105 @@ function post(config: OcxConfig, body: Record<string, unknown> = {}) {
     body: JSON.stringify({ model: "anthropic/claude-sonnet-4-5", input: "Answer briefly", stream: false, ...body }),
   }), config, { model: "", provider: "" });
 }
+
+test.each([400, 429])("gateway quota guard: HTTP %i account rotation cannot exceed an explicit physical-send ceiling", async status => {
+  await seed(3);
+  const config = configFor(() => status === 429 ? limited() : Response.json({ type: "error",
+    error: { type: "invalid_request_error", message: "You're out of extra usage." } }, { status }));
+  config.anthropicAccountPool = { enabled: true, strategy: "round-robin" };
+  const budget = createRequestExecutionBudget({ maxTotalModelSends: 1, baseSendAllowance: 1,
+    finalRecoveryAllowance: 0, maxAlternateTargetSends: 0, maxTargetTransitions: 0 });
+  const response = await handleResponses(new Request("http://localhost/v1/responses", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "anthropic/claude-sonnet-4-5", input: "Answer briefly", stream: false }),
+  }), config, { model: "", provider: "" }, { sendBudget: budget });
+  const text = await response.text();
+  expect(text).toContain(status === 400 ? "out of extra usage" : "quota exhausted");
+  expect(text).not.toContain("request_send_budget_exhausted");
+  expect(sent).toHaveLength(1);
+  expect(budget.used).toBe(1);
+});
+
+test("gateway quota guard: a funded replacement sends and charges exactly once", async () => {
+  await seed(2);
+  const config = configFor(body => sent.length === 1 ? limited() : answer(body.stream === true));
+  const budget = createRequestExecutionBudget({ maxTotalModelSends: 2, baseSendAllowance: 2,
+    finalRecoveryAllowance: 0, maxAlternateTargetSends: 0, maxTargetTransitions: 0 });
+  const response = await handleResponses(new Request("http://localhost/v1/responses", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "anthropic/claude-sonnet-4-5", input: "Answer briefly", stream: false }),
+  }), config, { model: "", provider: "" }, { sendBudget: budget });
+  expect(await response.text()).toContain("The answer is complete.");
+  expect(sent).toHaveLength(2);
+  expect(budget.used).toBe(2);
+});
+
+test("gateway quota guard: inherited usage is not reset by Anthropic dispatch", async () => {
+  await seed(2);
+  const config = configFor(() => limited());
+  const budget = createRequestExecutionBudget({ maxTotalModelSends: 2, baseSendAllowance: 2,
+    finalRecoveryAllowance: 0, maxAlternateTargetSends: 0, maxTargetTransitions: 0 });
+  budget.used = 1;
+  const response = await handleResponses(new Request("http://localhost/v1/responses", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "anthropic/claude-sonnet-4-5", input: "Answer briefly", stream: false }),
+  }), config, { model: "", provider: "" }, { sendBudget: budget });
+  expect(await response.text()).toContain("quota");
+  expect(sent).toHaveLength(1);
+  expect(budget.used).toBe(2);
+});
+
+test("gateway quota guard: an exhausted budget makes no Anthropic inference call", async () => {
+  await seed(2);
+  const config = configFor(() => answer(false));
+  const budget = createRequestExecutionBudget({ maxTotalModelSends: 0, baseSendAllowance: 0,
+    finalRecoveryAllowance: 0, maxAlternateTargetSends: 0, maxTargetTransitions: 0 });
+  const response = await handleResponses(new Request("http://localhost/v1/responses", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "anthropic/claude-sonnet-4-5", input: "Answer briefly", stream: false }),
+  }), config, { model: "", provider: "" }, { sendBudget: budget });
+  await response.text();
+  expect(sent).toHaveLength(0);
+  expect(budget.used).toBe(0);
+});
+
+test.each([400, 429])("gateway quota guard: continuation HTTP %i cannot refill a spent request budget", async status => {
+  await seed(3);
+  const config = configFor(body => sent.length === 1
+    ? answer(body.stream === true, "0.11", "0.31", "I will modify the file now.")
+    : status === 429 ? limited() : Response.json({ type: "error", error: {
+      type: "invalid_request_error", message: "You're out of extra usage." } }, { status }));
+  const budget = createRequestExecutionBudget({ maxTotalModelSends: 2, baseSendAllowance: 2,
+    finalRecoveryAllowance: 0, maxAlternateTargetSends: 0, maxTargetTransitions: 0 });
+  const response = await handleResponses(new Request("http://localhost/v1/responses", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "anthropic/claude-sonnet-4-5", stream: false,
+      input: "Please modify the file now", tools: [{ type: "function", name: "read_file",
+        description: "read a file", parameters: { type: "object" } }] }),
+  }), config, { model: "", provider: "" }, { sendBudget: budget });
+  await response.text();
+  expect(sent).toHaveLength(2);
+  expect(new Set(sent.map(row => row.authorization)).size).toBe(1);
+  expect(budget.used).toBe(2);
+});
+
+test("gateway quota guard: image sidecar recovery shares the inference ceiling", async () => {
+  await seed(3);
+  const config = configFor(() => limited());
+  config.images = { bridgeEnabled: true };
+  config.providers.xai = { adapter: "openai-chat", baseUrl: "https://api.x.ai/v1",
+    authMode: "key", apiKey: "synthetic-image-key" };
+  const budget = createRequestExecutionBudget({ maxTotalModelSends: 1, baseSendAllowance: 1,
+    finalRecoveryAllowance: 0, maxAlternateTargetSends: 0, maxTargetTransitions: 0 });
+  const response = await handleResponses(new Request("http://localhost/v1/responses", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "anthropic/claude-sonnet-4-5", stream: true,
+      input: "Answer briefly", tools: [{ type: "image_generation" }] }),
+  }), config, { model: "", provider: "" }, { sendBudget: budget });
+  await response.text();
+  expect(sent).toHaveLength(1);
+  expect(budget.used).toBe(1);
+});
 
 function expectQuota(id: string, fiveHourPercent: number, weeklyPercent: number) {
   expect(getCachedProviderAccountQuota("anthropic", id)).toMatchObject({ fiveHourPercent, weeklyPercent });

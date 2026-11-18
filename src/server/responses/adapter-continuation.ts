@@ -90,6 +90,8 @@ export function createAdapterContinuations(
     | "applyFailoverSnapshot"
     | "replayOAuthCredentialSnapshot"
     | "noteRoutedAttemptSend"
+    | "anthropicPhysicalBudget"
+    | "anthropicSendAvailable"
   >,
   sidecarState: Pick<ResponsesSidecarAuth, "routedCompaction">,
   sendBudgetState: Pick<
@@ -257,7 +259,7 @@ export function createAdapterContinuations(
             ...(continuationTransientPolicy
               ? {
                 attempts: remainingTransientSendBudget(continuationTransientPolicy.attempts),
-                onSendsConsumed: noteTransientSends,
+                onSendsConsumed: transportState.anthropicPhysicalBudget ? undefined : noteTransientSends,
               }
               : {}),
           },
@@ -283,7 +285,7 @@ export function createAdapterContinuations(
       // A credential denial (403 oauth_org_not_allowed) rotates the Anthropic account here too:
       // the continuation is a fresh send, so a denied credential is recoverable rather than
       // terminal. `nextParsed` is the terminal-guard clone; both owners are rebound.
-      const deniedCredentialRecovery = await rotateAnthropicProviderOnCredentialDenial({
+      const deniedCredentialRecovery = !transportState.anthropicSendAvailable() ? null : await rotateAnthropicProviderOnCredentialDenial({
         config, route, inboundWire, logCtx, transportState, parsed,
         retryParsed: nextParsed,
         response,
@@ -391,6 +393,7 @@ export function createAdapterContinuations(
        transportState.anthropicPoolAccountId
         && !isNonReplayableResponse(response)
        && transportState.anthropicPoolFailovers < ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST
+       && transportState.anthropicSendAvailable()
       ) {
         try {
           const peeked = await peekAnthropicPoolRotation(response, upstream.signal);

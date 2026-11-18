@@ -49,6 +49,20 @@ describe("OAuth source replay carries the Claude identity block (ANDREW-CLAUDE-4
     expect((await replay(sdk, "oauth")).system).toEqual(sdk);
   });
 
+  test("gateway cache guard: volatile tails never enter the stable cached system prefix", async () => {
+    const stable = [
+      { type: "text", text: "Stable coding instructions." },
+      { type: "text", text: "Stable project rules.", cache_control: { type: "ephemeral" } },
+    ];
+    const first = await replay([...stable, { type: "text", text: "<env>turn: 1; modified: 1</env>" }], "oauth");
+    const second = await replay([...stable, { type: "text", text: "<env>turn: 2; modified: 2</env>" }], "oauth");
+    expect(first.system.slice(0, 3)).toEqual([IDENTITY, ...stable]);
+    expect(JSON.stringify(first.system.slice(0, 3))).toBe(JSON.stringify(second.system.slice(0, 3)));
+    expect(first.system[3]).not.toEqual(second.system[3]);
+    expect(second.system[2].cache_control).toEqual({ type: "ephemeral" });
+    expect(second.system[3].cache_control).toBeUndefined();
+  });
+
   test("an API-key replay stays byte for byte", async () => {
     expect((await replay("You are Hermes Agent.")).system).toBe("You are Hermes Agent.");
   });

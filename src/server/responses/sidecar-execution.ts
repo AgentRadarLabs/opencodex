@@ -72,6 +72,9 @@ export async function executeResponsesSidecars(
     | "noteRoutedAttemptSend"
     | "bindKeyUsageFromBridge"
     | "exactAnthropicSourceReplay"
+    | "anthropicPhysicalBudget"
+    | "anthropicSendAvailable"
+    | "setAnthropicDispatchBudget"
   >,
   sidecarState: Pick<ResponsesSidecarAuth, "routedCompaction" | "openAiSidecar">,
   responseEffects: Pick<
@@ -81,7 +84,7 @@ export async function executeResponsesSidecars(
     | "notifyResponseComplete"
     | "cancelResponseCompletion"
   >,
-  sendBudgetState: Pick<ResponsesSendBudget, "reserveCredentialHop">,
+  sendBudgetState: Pick<ResponsesSendBudget, "reserveCredentialHop" | "adapterDispatchBudget">,
 ) {
   const { config, options, logCtx } = requestContext;
   const {
@@ -101,6 +104,7 @@ export async function executeResponsesSidecars(
   } = requestState;
   const { routedCompaction, openAiSidecar } = sidecarState;
   const { reserveCredentialHop } = sendBudgetState;
+  transportState.setAnthropicDispatchBudget(sendBudgetState.adapterDispatchBudget);
   const {
     commitReasoningReplayServingRoute,
     continuationStateForResponse,
@@ -237,10 +241,9 @@ export async function executeResponsesSidecars(
     ) {
       // Same intersection for the Anthropic roster: its own per-request bound still applies,
       // and the shared budget decides whether this request may spend another send at all.
-      const hop = reserveCredentialHop(
-        "auth-recovery",
-        `${route.providerName}|${route.modelId}|sidecar-anthropic-429`,
-      );
+      const hop = transportState.anthropicPhysicalBudget
+        ? { allowed: transportState.anthropicSendAvailable(), permit: undefined }
+        : reserveCredentialHop("auth-recovery", `${route.providerName}|${route.modelId}|sidecar-anthropic-429`);
       if (!hop.allowed) return null;
       const nextAccountId = rotateAnthropicAccountOn429(
         config,

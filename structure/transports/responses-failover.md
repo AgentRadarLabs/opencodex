@@ -338,7 +338,9 @@ In `adapter-dispatch.ts` the guard at the top of the recovery loop is necessary 
 sufficient. The refusal can also be produced by a refetch made INSIDE an arm, and that arm
 then still holds it: the same-target loop re-enters while `rateLimitRetries` is below the
 configured attempts, and the key, Anthropic-pool and generic-OAuth rotations re-enter while a
-credential is left to try. The key-401 arm is in the same class from the other direction — its
+credential is left to try. Hosted Anthropic rotations also follow the
+[shared physical-send contract](responses-spend.md#hosted-anthropic-physical-sends): no funded
+replacement means the current refusal remains authoritative. The key-401 arm is in the same class from the other direction — its
 refetch answers 429 and it falls through into the arms below. So every arm that reassigns
 `upstreamResponse` from `rebuildAndRefetch` re-enters the loop guard rather than continuing,
 which is what makes the top-of-loop check the single exit for this verdict.
