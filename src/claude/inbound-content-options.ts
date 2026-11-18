@@ -73,7 +73,9 @@ export function toolsToResponses(tools: unknown): Rec[] | undefined {
       if (!restrictedSearch) out.push({ type: "web_search" }); // hosted sidecar path
       continue;
     }
-    if (typeof raw.name === "string" && raw.name.length > 0 && isRec(raw.input_schema)) {
+    // An Anthropic-typed tool (computer_*, bash_*, ...) is not a function even when it carries a
+    // schema: its typed fields (display size, ...) have no translated home (.27).
+    if ((type === "" || type === "custom") && typeof raw.name === "string" && raw.name.length > 0 && isRec(raw.input_schema)) {
       out.push({
         type: "function",
         name: raw.name,
@@ -117,6 +119,8 @@ export function declaredAnthropicServerTools(raw: unknown): Rec[] | undefined {
  * The Advisor rides the out-of-body lane and is optional: a destination without it simply runs the
  * turn unadvised, so it never makes a translated child native-only.
  */
+export const EXACT_REPLAY_REQUIRED_MESSAGE = "Anthropic-native tools and MCP servers require exact canonical Anthropic Messages replay; the selected route cannot carry them";
+
 export function hasNativeOnlyTool(raw: Rec): boolean {
   return Array.isArray(raw.tools)
     && raw.tools.some(tool => !toolsToResponses([tool]) && !declaredAnthropicServerTools({ tools: [tool] }));

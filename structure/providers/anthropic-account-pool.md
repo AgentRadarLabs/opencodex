@@ -44,7 +44,7 @@ kinds as fallback. Safe future tier strings retain their original spelling; malf
 or absent tiers project null and never come from quota percentages. Same-account refreshes
 retain an unobserved plan; an observed invalid tier clears it.
 Refresh gives the profile read a 2-second deadline because a refresh can sit on a request path;
-a missed read leaves the stored label in place.
+a missed read leaves the stored label in place. `GET /api/oauth/accounts?quota=1` fills a plan no credential has stored yet through `readAnthropicPlan` (per-bearer cache, an hour on success, five minutes on failure) and otherwise names a fixed `planUnknownReason` (`tests/oauth/oauth-accounts-api.test.ts`).
 An account replacement cannot inherit another account's label. `src/providers/anthropic-subscription.ts`
 projects optional management `planLabel`: Pro, Max 5x, Ultra (both `ultra` and `max_20x`),
 or the original unfamiliar validated tier. Dashboard OAuth rows prefer a user alias, then the
@@ -401,6 +401,7 @@ quota recovery `anthropic-oauth-429`, as the native Messages path already did.
 A streamed terminal continuation after assistant output and search after live output or a
 published search call cannot rotate on 403. Non-streaming buffered continuations may recover.
 No eligible replacement preserves the upstream 403; generic 401 handling is unchanged.
+A 400 counts only as Anthropic's `invalid_request_error` envelope whose message starts with the spent-extra-usage or spend-limit wording (`readAnthropicExtraUsageRefusal` in `src/providers/anthropic-billing-refusal.ts`); it cools as spent quota (Retry-After, rejected-window reset, else ten minutes) and rotates like a shared-quota 429, recorded as `anthropic-oauth-429` (`tests/adapters/anthropic/anthropic-pool-extra-usage-400.test.ts`, `tests/routing/router-combo-400-quota-echo.test.ts`).
 Reactive recovery also works with proactive pooling disabled when multiple accounts are stored.
 
 Regression coverage: `tests/adapters/anthropic/anthropic-quota-dispatch.test.ts`.
@@ -485,7 +486,7 @@ Regression coverage: `tests/adapters/anthropic/anthropic-pool-usage-limit.test.t
 
 ## Family weekly admission
 
-`src/providers/quota/anthropic-family-headers.ts` attributes 7d_oi only to fixture-confirmed
+A unified 429 whose representative claim is the requested family's own `seven_day_<family>` limit is family quota too (`anthropicClaimedFamily`, `tests/adapters/anthropic/anthropic-family-claim-429.test.ts`). `src/providers/quota/anthropic-family-headers.ts` attributes 7d_oi only to fixture-confirmed
 Fable 5 models. It preserves independent shared and model windows, including rejection-only
 family evidence only on HTTP 429, without advancing the usage-probe clock. Other response
 statuses retain soft utilization without creating a hard family refusal.

@@ -73,7 +73,7 @@ describe("loopback listener policy view", () => {
     expect(chatStart).toBeGreaterThan(messagesStart);
     expect(source.slice(countTokensStart, messagesStart)).toContain(
       // First-party bindings ride on the same call: only the intercept ingress sets the flag.
-      'await handleClaudeCountTokens(req, config, policy, { claudeIntercept: ingress === "claude-intercept" })',
+      'await handleClaudeCountTokens(req, config, policy, { claudeIntercept: ingress === "claude-intercept", admission })',
     );
     expect(source.slice(messagesStart, chatStart)).toContain(
       'await handleClaudeMessages(sessionReq, config, logCtx, { requestId, start, turnAdmissionLease, admission, advisorAdmissionPolicy }, policy, { claudeIntercept: ingress === "claude-intercept" })',

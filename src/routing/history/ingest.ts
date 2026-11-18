@@ -11,6 +11,8 @@ import { closeSync, fstatSync, openSync, readSync, type BigIntStats } from "node
 import {
   encodePersistedRequestedModel,
   exactFileIdentity,
+  normalizedAttempts,
+  physicalUsageAttempts,
   type PersistedUsageEntry,
   type UsageLogRevision,
 } from "../../usage/log";
@@ -88,7 +90,8 @@ export function recordSourceMeta(dbHandle: Database, revision: UsageLogRevision 
 
 /** Extract the `requests` row columns from a canonical persisted entry. */
 function extractRow(entry: PersistedUsageEntry): Array<string | number | null> {
-  const attempts = entry.attempts;
+  // Fallback and attempt count describe real upstream sends only (valid, sent, distinct ordinals).
+  const attempts = Array.isArray(entry.attempts) ? physicalUsageAttempts(normalizedAttempts(entry.attempts)) : undefined;
   return [
     entry.requestId,
     entry.timestamp,

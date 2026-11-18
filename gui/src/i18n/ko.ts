@@ -1370,6 +1370,7 @@ export const ko: Record<TKey, string> = {
   "logs.detail.attempt.recovery.key401": "API 키 재인증",
   "logs.detail.attempt.recovery.oauthAccount403": "계정 확인 필요 (403)",
   "logs.detail.attempt.recovery.oauthAccount429": "계정 속도 제한 (429)",
+  "logs.detail.attempt.recovery.codexAccountRetry": "소진된 창 이후 Codex 계정 전환",
   "logs.detail.attempt.recovery.oauthAccount402": "계정 할당량 소진 (402)",
   "logs.detail.attempt.recovery.opaqueBlobRejection": "만료된 암호화 상태 제거",
   "logs.detail.attempt.recovery.reasoningEffortDowngrade": "추론 강도 하향",

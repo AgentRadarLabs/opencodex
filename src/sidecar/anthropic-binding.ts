@@ -1,3 +1,4 @@
+import { agentRadarPin } from "../lib/agentradar-account-pin";
 import type { OcxConfig } from "../types";
 import type { AnthropicInstanceId } from "../providers/anthropic-instance-id";
 import { configuredAnthropicInstance } from "../providers/anthropic-instance";
@@ -36,7 +37,9 @@ export async function resolveAnthropicHelperSnapshot(config: OcxConfig, instance
   for (let attempt = 0; attempt < 3; attempt++) {
     const route = resolveAnthropicModelRouteForInstance(instance, config, model);
     if (route.error) throw new AnthropicHelperUnavailableError(instance);
-    const selection = routing.resolveAnthropicAccountForSession(null, config, Date.now(), route.decision, model);
+    const pin = agentRadarPin(config);
+    if (pin && (pin.provider !== "claude" || instance !== "anthropic")) throw new AnthropicHelperUnavailableError(instance);
+    const selection = pin ? { accountId: pin.accountId } : routing.resolveAnthropicAccountForSession(null, config, Date.now(), route.decision, model);
     if (!selection.accountId) throw new AnthropicHelperUnavailableError(instance);
     const snapshot = await routing.getAnthropicPoolAccessSnapshot(selection.accountId);
     assertConfigured();
@@ -56,6 +59,8 @@ export async function fetchAnthropicHelper(
   if (instance !== "anthropic" && instance !== "anthropic2") throw new Error("Invalid Anthropic helper instance");
   const row = config.providers[instance];
   const live = getAccountCredentialWithStatus(instance, snapshot.accountId);
+  const pin = agentRadarPin(config);
+  if (pin && (pin.provider !== "claude" || instance !== "anthropic" || snapshot.accountId !== pin.accountId)) throw new AnthropicHelperUnavailableError(instance);
   if (!row || row.disabled || row.authMode !== "oauth" || row.adapter !== "anthropic"
     || configuredAnthropicInstance(config, instance) !== instance || row.baseUrl !== capturedTarget
     || url !== anthropicHelperMessagesUrl(capturedTarget) || !live || live.paused || live.needsReauth

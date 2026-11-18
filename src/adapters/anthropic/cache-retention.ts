@@ -14,6 +14,8 @@ export type AnthropicCacheRetention = "none" | "short" | "long";
  * terms we cannot see. An explicit cacheRetention "long" still sends 1h anywhere.
  */
 export function defaultAnthropicCacheRetention(provider: Pick<OcxProviderConfig, "baseUrl" | "authMode">): "short" | "long" {
+  // AgentRadar hosted gateways keep the .27 5-minute default: a 1 h write bills 2x instead of 1.25x.
+  if (process.env.OPENCODEX_AGENTRADAR === "1") return "short";
   return credentialDomainFor(provider)?.firstPartyAnthropic ? "long" : "short";
 }
 
@@ -44,6 +46,12 @@ const MAX_DEPTH = 16;
 /** Tool inputs, schemas and examples are caller data, not blocks: a cache_control key there is no breakpoint. */
 const isDataKey = (key: string): boolean => key === "cache_control" || key === "input" || key === "input_schema"
   || key === "input_examples";
+
+/** Effective prompt-cache lifetime of a wire body: 1 h only when every breakpoint is 1 h; none -> undefined. */
+export function anthropicPromptCacheTtlMs(body: unknown): number | undefined {
+  const ttls = collectAnthropicCacheTtls(body);
+  return ttls.length === 0 ? undefined : ttls.every(ttl => ttl === "1h") ? 3_600_000 : 300_000;
+}
 
 /**
  * Every caller cache_control breakpoint TTL in a Messages body: top-level automatic caching plus

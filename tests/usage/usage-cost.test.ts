@@ -508,6 +508,7 @@ describe("resolveMatchedPrice", () => {
     for (const expected of [
       "openai-apikey/gpt-6.1-sol", "openai-apikey/gpt-6.1-terra",
       "openai/gpt-6.1-sol", "openai/gpt-6.1-terra",
+      "openai-apikey/gpt-6.2-astra", "openai/gpt-6.2-astra", "openai-apikey/gpt-6.2-sol", "openai/gpt-6.2-sol",
       "devin/gpt-6-1-sol", "devin/gpt-6-1-terra",
       "devin-cli/gpt-6-1-sol", "devin-cli/gpt-6-1-terra",
       "anthropic/claude-fable-5-1",

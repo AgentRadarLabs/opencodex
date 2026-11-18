@@ -17,6 +17,8 @@ import {
   type PersistedJevDecisionV1,
 } from "./jev-stats";
 import { normalizeAttemptDeliverySummary } from "./attempt-delivery";
+import { normalizeServerToolUsage, physicalAttemptTelemetry } from "./physical-attempts";
+export { normalizeServerToolUsage, physicalUsageAttempts } from "./physical-attempts";
 import {
   isRequestCloseReason,
   isRequestTerminalStatus,
@@ -162,6 +164,10 @@ export interface PersistedUsageAttempt {
   /** TTFT relative to THIS attempt's start (WP4); unset for non-streaming/tool-only. */
   firstOutputMs?: number;
   sendCount: number;
+  /** Physical-send telemetry: first send time (ms), sent prompt-cache TTL (5m|1h), recovery occurrences. */
+  firstSendAt?: number;
+  promptCacheTtlMs?: number;
+  recoveryCount?: number;
   recoveryKinds: AttemptRecoveryKind[];
   /**
    * Recoveries this attempt was eligible for and did not make. Absent on ordinary attempts so
@@ -336,6 +342,8 @@ export interface PersistedUsageEntry extends LinkRequestLogCarrier {
   accountLogLabel?: CodexUsageAccountLogLabel;
   /** Anthropic pool account of the row's provider (#8383); never read by account summaries. */
   accountTag?: `p${string}`;
+  /** A combo moved this logical request to another target (routing analytics `comboFailover*`). */
+  comboTargetAdvanced?: true;
   /** Best-effort chat/session correlation for Logs grouping (#330). */
   conversationId?: string;
   resolvedModel?: string;
@@ -623,6 +631,7 @@ export function usageStatusForFinalLog(usage: OcxUsage | undefined): UsageStatus
 
 function normalizeUsageValue(usage: OcxUsage | undefined): OcxUsage | undefined {
   if (!usage) return undefined;
+  const anthropicServerToolUse = normalizeServerToolUsage(usage.anthropicServerToolUse);
   return {
     inputTokens: usage.inputTokens,
     outputTokens: usage.outputTokens,
@@ -640,6 +649,7 @@ function normalizeUsageValue(usage: OcxUsage | undefined): OcxUsage | undefined 
     ...(typeof usage.cacheCreation1hInputTokens === "number" ? { cacheCreation1hInputTokens: usage.cacheCreation1hInputTokens } : {}),
     ...(typeof usage.reasoningOutputTokens === "number" ? { reasoningOutputTokens: usage.reasoningOutputTokens } : {}),
     ...(isNonNegativeFiniteNumber(usage.providerCredits) ? { providerCredits: usage.providerCredits } : {}),
+    ...(anthropicServerToolUse ? { anthropicServerToolUse } : {}),
     ...(usage.estimated ? { estimated: true } : {}),
   };
 }
@@ -767,14 +777,7 @@ function normalizeUsageAttempt(raw: unknown): PersistedUsageAttempt | null {
     || !USAGE_STATUSES.has(attempt.usageStatus as UsageStatus)) {
     return null;
   }
-  if ("inputTokenEstimate" in attempt
-    && !isNonNegativeFiniteNumber(attempt.inputTokenEstimate)) return null;
-  if ("firstOutputMs" in attempt
-    && !isNonNegativeFiniteNumber(attempt.firstOutputMs)) return null;
-  if ("totalTokens" in attempt
-    && !isNonNegativeFiniteNumber(attempt.totalTokens)) return null;
   const usage = "usage" in attempt ? normalizeAttemptUsage(attempt.usage) : undefined;
-  if ("usage" in attempt && usage === null) return null;
   const tierOutcome = "tierOutcome" in attempt
     ? normalizeAttemptTierOutcome(attempt.tierOutcome)
     : undefined;
@@ -817,6 +820,7 @@ function normalizeUsageAttempt(raw: unknown): PersistedUsageAttempt | null {
       ? { firstOutputMs: attempt.firstOutputMs }
       : {}),
     sendCount: attempt.sendCount as number,
+    ...physicalAttemptTelemetry(attempt),
     recoveryKinds,
     ...(recoveryWithheld.length ? { recoveryWithheld } : {}),
     usageStatus: attempt.usageStatus as UsageStatus,
@@ -1094,6 +1098,7 @@ function normalizeUsageEntry(entry: PersistedUsageEntry): PersistedUsageEntry {
       ? { accountLogLabel: entry.accountLogLabel }
       : {}),
     ...(isAnthropicAccountTag(entry.accountTag) ? { accountTag: entry.accountTag } : {}),
+    ...(entry.comboTargetAdvanced === true ? { comboTargetAdvanced: true } : {}),
     ...(typeof entry.conversationId === "string" && entry.conversationId.trim()
       ? { conversationId: entry.conversationId.trim().slice(0, 128) }
       : {}),

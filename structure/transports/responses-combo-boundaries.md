@@ -351,3 +351,10 @@ ordinary failover by supplying the same header. The wire body remains `rate_limi
 The message says no additional provider request was sent when the current request already has
 physical sends; an admission refusal before its first send retains the no-provider wording.
 Coverage: `tests/responses/chat-native-spend.test.ts` and `tests/responses/responses-spend-contract-c.test.ts`.
+
+On an AgentRadar gateway (`OPENCODEX_AGENTRADAR=1`) a 429/402 target cooldown lifts early once the target's account
+pool reports an eligible account again (`setComboPoolEligibilityProbe` in `src/combos/failover.ts`, registered by the
+pool owner), and `coolComboTarget` caps server-stated delays at ten minutes as well as local fallbacks: a `Retry-After`
+describes the account that answered, while the key is the shared target. Elsewhere a non-pool 429 parks the target in
+full and server delays run to the one-day ceiling. Hosted gateways also trust the anchored classifier's 400 quota verdict
+(`upstreamCodeForComboFailure` in `src/bridge/errors.ts`) and an `err_free_prompt_cap` field on a 400/422.

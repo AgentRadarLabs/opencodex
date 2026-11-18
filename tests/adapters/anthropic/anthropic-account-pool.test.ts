@@ -627,13 +627,14 @@ describe("anthropic account pool quota window scoring", () => {
     expect(resolveAnthropicAccountForSession("weekly-unknown-last", cfg(true, 80, { quotaWindow: "weekly" })).accountId).toBe(aId);
   });
 
-  test("weekly mode ranks known 100% before unknown weekly usage", async () => {
+  // .27 parity: a spent account outranking one that may have room was inverted.
+  test("weekly mode ranks unknown weekly usage before a known 100%", async () => {
     const { aId, bId } = await seedTwoAccounts();
     const updatedAt = Date.now();
     setCachedProviderAccountQuotaForTests("anthropic", aId, { fiveHourPercent: 90, weeklyPercent: 100, updatedAt });
     setCachedProviderAccountQuotaForTests("anthropic", bId, { fiveHourPercent: 0, updatedAt });
 
-    expect(resolveAnthropicAccountForSession("weekly-known-100-before-unknown", cfg(true, 80, { quotaWindow: "weekly" })).accountId).toBe(aId);
+    expect(resolveAnthropicAccountForSession("weekly-known-100-before-unknown", cfg(true, 80, { quotaWindow: "weekly" })).accountId).toBe(bId);
   });
 
   test("weekly tie breaks by lower five-hour usage", async () => {

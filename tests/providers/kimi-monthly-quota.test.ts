@@ -512,6 +512,88 @@ describe("Kimi monthly quota", () => {
   });
 });
 
+describe("Kimi usages.limit_5h / limit_7d windows", () => {
+  // Kimi's own client test payload, fields copied as written and serialized as JSON: MoonshotAI/kimi-code
+  // packages/oauth/test/managed-usage.test.ts "parses the full payload" (read 2026-11-15); the vendor
+  // parser is packages/oauth/src/managed-usage.ts. Documented shape, not a live capture; no key or id.
+  const CLIENT_TEST_USAGES_FULL = '{"goods_version":2,"usages":{"limit_5h":{"used_ratio":0.3,"reset_time":"2026-09-11T18:00:00Z"},"limit_7d":{"used_ratio":0.2,"reset_time":"2026-09-17T00:00:00Z"},"limit_month_total":{"used_ratio":0.4,"reset_time":"2026-10-01T00:00:00Z"},"limit_month_code":{"used_ratio":0.25,"reset_time":"2026-10-01T00:00:00Z"}}}';
+  const kimiOnlyConfig = (): OcxConfig => ({
+    defaultProvider: "kimi",
+    providers: { kimi: { adapter: "openai-chat", authMode: "oauth", baseUrl: "https://api.kimi.com/coding/v1" } },
+  } as OcxConfig);
+
+  // Ported verbatim from the hosted fork (aa80674b33).
+  test("Kimi quota reads Kimi Code's documented usages shape: 5-hour, weekly and monthly pools", async () => {
+    await saveCredential("kimi", { access: "kimi-access-secret", refresh: "kimi-refresh-secret", expires: Date.now() + 3600_000 });
+    // Kimi's own client test payload (fixtures/external/kimi/README.md).
+    const usages = CLIENT_TEST_USAGES_FULL;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input) !== "https://api.kimi.com/coding/v1/usages") return new Response("not found", { status: 404 });
+      return new Response(usages, { status: 200 });
+    }) as typeof fetch;
+
+    const result = await fetchProviderQuotaReports(kimiOnlyConfig(), true);
+
+    expect(result.reports[0]?.quota).toEqual({
+      fiveHourPercent: 30,
+      fiveHourResetAt: Date.parse("2026-09-11T18:00:00Z"),
+      weeklyPercent: 20,
+      weeklyResetAt: Date.parse("2026-09-17T00:00:00Z"),
+      monthlyPercent: 40,
+      monthlyResetAt: Date.parse("2026-10-01T00:00:00Z"),
+      updatedAt: expect.any(Number),
+    });
+  });
+
+  test("Kimi quota usages shape: when usages is present, legacy limits and totalQuota blocks are not read", async () => {
+    await saveCredential("kimi", { access: "kimi-access-secret", refresh: "kimi-refresh-secret", expires: Date.now() + 3600_000 });
+    // Edge input, not a provider sample: the documented usages plus legacy blocks that must be ignored.
+    const documented = JSON.parse(CLIENT_TEST_USAGES_FULL);
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      ...documented,
+      limits: [{ window: { duration: 300, timeUnit: "TIME_UNIT_MINUTE" }, detail: { limit: "100", remaining: "1" } }],
+      totalQuota: { limit: "100", remaining: "1" },
+    }), { status: 200 })) as typeof fetch;
+
+    const result = await fetchProviderQuotaReports(kimiOnlyConfig(), true);
+
+    expect(result.reports[0]?.quota?.fiveHourPercent).toBe(30);
+    expect(result.reports[0]?.quota?.monthlyPercent).toBe(40);
+  });
+
+  // Edge input, not a provider sample: ratio forms the parser must accept or skip.
+  test("Kimi quota usages shape: a 0 ratio is 0%, limit_7d is weekly, a missing ratio is skipped", async () => {
+    await saveCredential("kimi", { access: "kimi-access-secret", refresh: "kimi-refresh-secret", expires: Date.now() + 3600_000 });
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      usages: {
+        limit_5h: { used_ratio: 0, reset_time: "2026-11-06T07:46:00Z" },
+        limit_7d: { used_ratio: "0.5", reset_time: "2026-11-10T00:00:00Z" },
+        limit_month_total: { reset_time: "2026-12-06T03:22:00Z" },
+      },
+    }), { status: 200 })) as typeof fetch;
+
+    const result = await fetchProviderQuotaReports(kimiOnlyConfig(), true);
+
+    expect(result.reports[0]?.quota).toEqual({
+      fiveHourPercent: 0,
+      fiveHourResetAt: Date.parse("2026-11-06T07:46:00Z"),
+      weeklyPercent: 50,
+      weeklyResetAt: Date.parse("2026-11-10T00:00:00Z"),
+      updatedAt: expect.any(Number),
+    });
+  });
+
+  test("a positive usages window wins over an unused legacy placeholder", async () => {
+    mockUsage({
+      ...JSON.parse(CLIENT_TEST_USAGES_FULL),
+      usage: { limit: "100", remaining: "100" },
+      limits: [{ window: { duration: 300, timeUnit: "TIME_UNIT_MINUTE" }, detail: { limit: "100", remaining: "100" } }],
+    });
+    const { reports } = await fetchProviderQuotaReports(config(), true);
+    expect(reports[0]?.quota).toMatchObject({ fiveHourPercent: 30, weeklyPercent: 20, monthlyPercent: 40 });
+  });
+});
+
 describe("Kimi regional (kimi.ai) Coding Plan quota (#8332)", () => {
   const regional = "https://api.kimi.ai/coding/v1";
 

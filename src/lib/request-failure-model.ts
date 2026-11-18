@@ -225,6 +225,9 @@ const RECOVERY_KIND_CAUSE = {
   "rate-limit-429": "rate-limit",
   "anthropic-oauth-429": "rate-limit",
   "oauth-account-429": "rate-limit",
+  // The Codex pool rotated off an account whose window the body proved spent: the resend goes to
+  // a different credential, so it is funded, like its sibling `oauth-account-429`.
+  "codex-account-retry": "rate-limit",
   // A 402 is the account's quota, not a transient limit; only another account can serve it.
   "oauth-account-402": "quota-exhausted",
   "image-413": "payload-too-large",

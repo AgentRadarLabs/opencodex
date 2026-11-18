@@ -124,4 +124,19 @@ for (const instance of instances) {
     ]);
     expect(store.getAccountCredentialWithStatus(instance, fixture.ids[0])?.needsReauth).toBe(false);
   });
+  test(instance + ": AgentRadar hosted re-ask after output still never rotates on a revoked 401 (.27 set)", async () => {
+    const previous = process.env.OPENCODEX_AGENTRADAR;
+    process.env.OPENCODEX_AGENTRADAR = "1";
+    try {
+      reply = (_instance, index) => index === 1 ? answerStream("I will modify the file now.") : revoked();
+      const response = await post(instance, {}, { stream: true, input: "Please modify the file now",
+        tools: [{ type: "function", name: "read_file", description: "read a file", parameters: { type: "object" } }] });
+      expect(await response.text()).toContain("I will modify the file now.");
+      expect(sends.map(send => send.token)).toEqual([
+        "Bearer synthetic-" + instance + "-1-access", "Bearer synthetic-" + instance + "-1-access",
+      ]);
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODEX_AGENTRADAR; else process.env.OPENCODEX_AGENTRADAR = previous;
+    }
+  });
 }

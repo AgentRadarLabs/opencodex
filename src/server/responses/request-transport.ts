@@ -1,3 +1,4 @@
+import { noteAgentRadarAccountDispatch } from "../../lib/agentradar-account-pin";
 import { publicOAuthErrorPresentation } from "../../oauth";
 import { observeProviderFailureEvent, projectLocalModelRefusalLog } from "../request-log-failure-detail";
 import { markProxyError } from "../../lib/client-error-body";
@@ -39,6 +40,7 @@ import {
   ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST,
   AnthropicAccountCooldownError,
   formatAnthropicProviderForLog,
+  stampAnthropicAccountForLog,
 } from "../../oauth/anthropic-routing";
 import {
   OAuthAccountPausedError,
@@ -51,7 +53,7 @@ import {
   UnsupportedOAuthProviderError,
 } from "../../oauth";
 import {
-  GENERIC_OAUTH_MAX_ACCOUNTS_PER_REQUEST,
+  oauthMaxAccountsPerRequest,
   GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST,
   antigravityModelRefusal,
   eligibleFailoverAccounts,
@@ -149,6 +151,11 @@ export async function prepareResponsesTransport(
 ) {
   const { config, logCtx, options, req } = requestContext;
   const { route, parsed, inboundWire, translatorBudget } = requestState;
+  const pin = options.agentRadarAccount;
+  const pinnedSnapshot = (): Promise<OAuthAccessSnapshot> => anthropicRouting
+    ? anthropicRouting.getAnthropicPoolAccessSnapshot(pin!.accountId)
+    : getValidAccessSnapshotForAccount(route.providerName, pin!.accountId, { requireUsableAccount: true });
+  let anthropicSelectionReason: AnthropicAccountSelectionReason | undefined;
   const deferPhysicalAttribution = route.providerName === "github-copilot" && route.provider.authMode !== "forward";
   let copilotCandidate: { model: string; adapter: string; accountLogLabel?: string } | undefined;
   bindResponsesSpendTarget(logCtx);
@@ -229,7 +236,7 @@ export async function prepareResponsesTransport(
   let genericFailoverAccountId: string | null = null;
   let genericFailovers = 0;
   let oauthSelection = route.provider.authMode === "oauth"
-    ? captureOAuthAccountSelection(route.providerName) : null;
+    ? pin ? { accountId: pin.accountId, revision: "agentradar-request" } : captureOAuthAccountSelection(route.providerName) : null;
   const anthropicManualSelectionGeneration = anthropicRouting?.captureAnthropicManualSelectionGeneration();
   let servingOAuthSnapshot: OAuthAccessSnapshot | undefined;
   // These owners also serve early passthrough and sidecar sends. A dispatch-time
@@ -254,6 +261,20 @@ export async function prepareResponsesTransport(
     proactive = false,
     anthropicReason?: AnthropicAccountSelectionReason,
   ): Promise<OAuthAccessSnapshot | null> => {
+    if (pin) {
+      requireAnthropicAdmission();
+      if (candidate.provider !== route.providerName || candidate.accountId !== pin.accountId) return null;
+      const row = getAccountCredentialWithStatus(route.providerName, pin.accountId);
+      if (!row || row.paused || row.needsReauth) throw new OAuthLoginRequiredError(route.providerName);
+      if (row.credential.expires <= Date.now() || credentialGeneration(row.credential) !== candidate.generation) candidate = await pinnedSnapshot();
+      if (anthropicInstance) {
+        requireAnthropicAdmission();
+        anthropicRouteDecision = currentAnthropicRouteDecision();
+        if (!routeCandidates(anthropicRouting!.getEligibleAnthropicAccounts(Date.now(), route.modelId), anthropicRouteDecision).includes(pin.accountId)) throw new OAuthLoginRequiredError(route.providerName);
+      }
+      servingOAuthSnapshot = candidate;
+      return candidate;
+    }
     const maxSelectionAttempts = 3;
     for (let attempt = 0; attempt < maxSelectionAttempts; attempt++) {
       requireAnthropicAdmission();
@@ -336,7 +357,7 @@ export async function prepareResponsesTransport(
     // Keyed on the account, not the selection revision: a selection that moved away and back
     // (A -> B -> A) before the 401 landed still serves the rejected credential, and skipping
     // the refresh would replay it and spend the one recovery attempt.
-    const candidate = (current?.accountId === sent.accountId
+    const candidate = (pin || current?.accountId === sent.accountId
       || (genericAffinityMode && current?.revision === oauthSelection?.revision
         && current?.accountId === oauthSelection?.accountId && servingOAuthSnapshot?.accountId === sent.accountId))
       ? await forceRefreshOAuthAccessSnapshot(sent) : sent;
@@ -565,7 +586,7 @@ export async function prepareResponsesTransport(
     if (!deferPhysicalAttribution) stampOAuthAccountLabel(logCtx, route.providerName, route.provider, snapshot.accountId);
     if (anthropicInstance !== undefined) {
       anthropicPoolAccountId = snapshot.accountId;
-      logCtx.provider = formatAnthropicProviderForLog(anthropicInstance!, snapshot.accountId, config);
+      stampAnthropicAccountForLog(logCtx, anthropicInstance!, snapshot.accountId, config);
     } else if (!deferPhysicalAttribution) {
       genericFailoverAccountId = snapshot.accountId;
     }
@@ -621,10 +642,10 @@ export async function prepareResponsesTransport(
     }
     const selected = captureOAuthAccountSelection(route.providerName);
     const row = getAccountCredentialWithStatus(route.providerName, binding.snapshot.accountId);
-    return selected?.accountId === binding.selection.accountId && selected?.revision === binding.selection.revision
+    return (pin ? binding.snapshot.accountId === pin.accountId : selected?.accountId === binding.selection.accountId && selected?.revision === binding.selection.revision)
       && !!row && !row.paused && !row.needsReauth && row.credential.expires > Date.now()
       && (anthropicInstance === undefined || !anthropicRouting!.getAnthropicAccountHealthSnapshot(binding.snapshot.accountId) && !anthropicRatePolicy!.anthropicRatePauseUntil(binding.snapshot.accountId) && !anthropicQuota!.anthropicFamilyRejected(binding.snapshot.accountId, route.modelId))
-      && (!genericAffinityMode
+      && (pin || !genericAffinityMode
         || genericSessionAccountEligible(config, route.providerName, binding.snapshot.accountId, route.modelId, Date.now(), true))
       && credentialGeneration(row.credential) === binding.snapshot.generation;
   };
@@ -782,16 +803,17 @@ export async function prepareResponsesTransport(
       // Pacing may outlive admission. Preserve local pause/cooldown reasons even when
       // a strict route rejects the old proposal before another bearer can be resolved.
       let candidate = servingOAuthSnapshot;
-      if (anthropicInstance === undefined && candidate && getAccountSet(route.providerName)?.accounts.find(row => row.id === candidate!.accountId)?.paused) {
+      if (pin) candidate = await pinnedSnapshot();
+      if (!pin && anthropicInstance === undefined && candidate && getAccountSet(route.providerName)?.accounts.find(row => row.id === candidate!.accountId)?.paused) {
         oauthSelection = captureOAuthAccountSelection(route.providerName);
         candidate = oauthSelection ? await getValidAccessSnapshotForAccount(route.providerName, oauthSelection.accountId, { requireUsableAccount: true }) : undefined;
       }
-      if (anthropicInstance !== undefined) {
+      if (!pin && anthropicInstance !== undefined) {
         oauthSelection = captureOAuthAccountSelection(route.providerName);
         const accountId = await anthropicRouting!.resolveAnthropicDispatchAccountId(config, anthropicSessionKey, anthropicRouteDecision, route.modelId);
         candidate = await anthropicRouting!.getAnthropicPoolAccessSnapshot(accountId);
       }
-      if (genericAffinityMode
+      if (!pin && genericAffinityMode
         && (!candidate || !genericSessionAccountEligible(config, route.providerName, candidate.accountId, route.modelId, Date.now(), true))) {
         const accountId = preferredGenericSessionAccount(config, route.providerName, genericSessionKey, route.modelId)
           ?? captureOAuthAccountSelection(route.providerName)?.accountId;
@@ -986,7 +1008,11 @@ export async function prepareResponsesTransport(
               passiveKeyPhysicalFetch(distributedKeyPhysicalFetch(anthropicBillingPhysicalFetch(fetchImpl, route.providerName, route.provider), route.providerName, route.provider, target), config, route.providerName, route.provider),
               input,
               { ...physicalInit, redirect: "manual",
-                ...physicalSendObserverInit(observeAutoPause, destination instanceof Request ? destination.url : String(destination), deferredCopilotNote ? commitKeyAttemptSend : undefined),
+                ...physicalSendObserverInit(observeAutoPause, destination instanceof Request ? destination.url : String(destination), () => {
+                  if (deferredCopilotNote) commitKeyAttemptSend();
+                  if (binding?.kind === "oauth") noteAgentRadarAccountDispatch(logCtx, binding.snapshot.accountId,
+                    anthropicInstance ? pin ? "pin" : anthropicSelectionReason ?? "active" : undefined, anthropicSessionKey);
+                }),
                 ...(hasVertexRequestAuthority(wireRequest) ? physicalSendGuardInit((finalTarget, finalHeaders) => {
                     if (!selectionIsCurrent(requestBindings.get(wireRequest)) || !vertexRequestAuthorityIsCurrent(wireRequest, finalTarget, finalHeaders)) throw new Error("Vertex credential authority changed before dispatch");
                   }) : {}) },
@@ -1086,7 +1112,19 @@ export async function prepareResponsesTransport(
     ? JSON.stringify([resolveContextPrincipal(req, config, options.admission) ?? "loopback", oauthSessionKey]) : null;
   if (route.provider.authMode === "oauth") {
     try {
-      if (anthropicInstance !== undefined && anthropicRouting!.isAnthropicAccountPoolEnabled(config)) {
+      if (pin) {
+        const admitted = await commitResolvedOAuthSelection(await pinnedSnapshot());
+        if (!admitted) return markProxyError(formatErrorResponse(401, "authentication_error", "Pinned OAuth account is unavailable"));
+        replayOAuthCredentialSnapshot = { accountId: admitted.accountId, generation: admitted.generation };
+        if (isOAuth401ReplayProvider) sentOAuthSnapshot = admitted;
+        route.provider = { ...route.provider, apiKey: admitted.accessToken };
+        stampOAuthAccountLabel(logCtx, route.providerName, route.provider, admitted.accountId);
+        if (anthropicInstance) {
+          anthropicPoolAccountId = admitted.accountId;
+          stampAnthropicAccountForLog(logCtx, anthropicInstance, admitted.accountId, config);
+        } else genericFailoverAccountId = admitted.accountId;
+        if (hasPassiveAccountQuota(route.providerName)) passiveQuotaWriterGeneration = captureConfigGeneration();
+      } else if (anthropicInstance !== undefined && anthropicRouting!.isAnthropicAccountPoolEnabled(config)) {
         const routeResult = resolveAnthropicModelRouteForInstance(anthropicInstance, config, route.modelId);
         if (routeResult.error) return markProxyError(formatErrorResponse(400, "invalid_request_error", "Invalid Anthropic model routes"));
         anthropicRouteDecision = routeResult.decision;
@@ -1106,9 +1144,10 @@ export async function prepareResponsesTransport(
         const admitted = await commitResolvedOAuthSelection(await anthropicRouting!.getAnthropicPoolAccessSnapshot(selection.accountId), true, selection.reason);
         if (!admitted) return markProxyError(formatErrorResponse(409, "conflict_error", "OAuth account selection changed; retry the request"));
         anthropicPoolAccountId = admitted.accountId;
+        anthropicSelectionReason = selection.reason;
         if (anthropicRouteDecision) console.info(`[${anthropicInstance}-pool] route:#${anthropicRouteDecision.position} ${selection.reason}`);
         route.provider = { ...route.provider, apiKey: admitted.accessToken };
-        logCtx.provider = formatAnthropicProviderForLog(anthropicInstance!, admitted.accountId, config);
+        stampAnthropicAccountForLog(logCtx, anthropicInstance!, admitted.accountId, config);
       } else {
         // Prefer the account with known headroom BEFORE the first attempt. Rotation alone
         // only reacts to a 429, so a turn could open on an account a previous probe already
@@ -1424,13 +1463,13 @@ export async function prepareResponsesTransport(
     fundingAccountId,
     ...eligibleFailoverAccounts(route.providerName, Date.now(), classifyModelFamilyForQuota(route.providerName, route.modelId)),
   ]).size : 0;
-  const fundedAccounts = Math.min(genericRosterSize, GENERIC_OAUTH_MAX_ACCOUNTS_PER_REQUEST);
+  const fundedAccounts = Math.min(genericRosterSize, oauthMaxAccountsPerRequest());
   const genericFailoverLimit = Math.max(GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST, fundedAccounts - 1);
   const anthropicRosterSize = anthropicRouting && anthropicPoolAccountId ? new Set([
     anthropicPoolAccountId,
     ...anthropicRouting.getEligibleAnthropicAccounts(Date.now(), route.modelId),
   ]).size : 0;
-  const anthropicFundedAccounts = Math.min(anthropicRosterSize, GENERIC_OAUTH_MAX_ACCOUNTS_PER_REQUEST);
+  const anthropicFundedAccounts = Math.min(anthropicRosterSize, oauthMaxAccountsPerRequest());
   const anthropicFailoverLimit = Math.max(ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST, anthropicFundedAccounts - 1);
   if (fundingAccountId || anthropicPoolAccountId)
     expandInferenceOAuthSendBudget(options.sendBudget, Math.max(fundedAccounts, anthropicFundedAccounts));

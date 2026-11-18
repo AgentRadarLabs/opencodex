@@ -266,6 +266,58 @@ describe("terminal guard", () => {
     expect(actual.at(-1)).toMatchObject({ usage: { inputTokens: 30, outputTokens: 5, totalTokens: 35, providerCredits: 0.05 } });
   });
 
+  // .27 parity (8fb1bbbe79): the context window is the larger round, server-tool counters add up.
+  test("can guard a fetch-based adapter stream with a continuation callback: context and server-tool usage", async () => {
+    let continuations = 0;
+    const actual: AdapterEvent[] = [];
+    for await (const event of guardTerminalEventStream({
+      parsed: parsed("请检查这个问题并修复代码"),
+      firstEvents: (async function* () {
+        yield { type: "text_delta", text: "我接下来会修改相关文件。" } as AdapterEvent;
+        yield {
+          type: "done",
+          usage: {
+            inputTokens: 10,
+            outputTokens: 2,
+            contextTotalTokens: 100,
+            anthropicServerToolUse: { web_search_requests: 1 },
+          },
+        } as AdapterEvent;
+      })(),
+      continuation: next => {
+        continuations += 1;
+        expect(next.context.messages.at(-1)).toMatchObject({ role: "developer" });
+        return (async function* () {
+          yield { type: "tool_call_start", id: "call_1", name: "exec_command" } as AdapterEvent;
+          yield { type: "tool_call_end" } as AdapterEvent;
+          yield {
+            type: "done",
+            usage: {
+              inputTokens: 20,
+              outputTokens: 3,
+              contextTotalTokens: 140,
+              anthropicServerToolUse: { web_search_requests: 2, web_fetch_requests: 1 },
+            },
+          } as AdapterEvent;
+        })();
+      },
+      adapterName: "anthropic",
+    })) actual.push(event);
+
+    expect(continuations).toBe(1);
+    expect(actual.filter(event => event.type === "done")).toHaveLength(1);
+    expect(actual.some(event => event.type === "assistant_boundary")).toBe(true);
+    expect(actual.at(-1)).toMatchObject({
+      usage: {
+        inputTokens: 30,
+        outputTokens: 5,
+        totalTokens: 35,
+        contextTotalTokens: 140,
+        anthropicServerToolUse: { web_search_requests: 3, web_fetch_requests: 1 },
+      },
+    });
+  });
+
 
   // A heartbeat is adapter liveness, not turn content. The openai-chat adapter emits one per
   // tool-call delta while it buffers, so retaining them here would let a single large argument

@@ -255,6 +255,27 @@ test.each(["transient throttle", "entitlement 403"] as const)("one %s among quot
   expect(sent).toHaveLength(0);
 });
 
+test("AgentRadar hosted: a headerless 429 cools and rotates but never reports a usage limit", async () => {
+  const previous = process.env.OPENCODEX_AGENTRADAR;
+  process.env.OPENCODEX_AGENTRADAR = "1";
+  try {
+    const ids = await seed(2);
+    const config = configFor(true);
+    const now = Date.now();
+    holdOnQuota(config, ids[0]!, 20 * 60, now);
+    // Hosted .27: no unified status still cools the account (shared-quota), but is no proof of spent quota.
+    expect(recordAnthropicAccount429(config, ids[1]!, "30", now, new Headers())).toBe(true);
+    const response = await post(config);
+    const error = await errorOf(response);
+    expect(response.status).toBe(429);
+    expect(error).toMatchObject({ type: "rate_limit_error", code: "rate_limit_exceeded" });
+    expect(error).not.toHaveProperty("resets_at");
+    expect(sent).toHaveLength(0);
+  } finally {
+    if (previous === undefined) delete process.env.OPENCODEX_AGENTRADAR; else process.env.OPENCODEX_AGENTRADAR = previous;
+  }
+});
+
 test("the last account refusing on spent quota answers the usage limit at once", async () => {
   const ids = await seed(2);
   const config = configFor(true, () => spent("5h", 1800));

@@ -754,6 +754,15 @@ export async function prepareResponsesRequest(
     // captured where it becomes the request's route. A declined policy target
     // must not lend its eligibility or "policy" route kind to the request.
     if (captureRequestPolicy) capturePolicyRequestRoute(policyScope, candidate);
+    const pin = options.agentRadarAccount;
+    if (pin) {
+      const allowed = !candidate.combo && (pin.provider === "codex"
+        ? candidate.providerName === OPENAI_CODEX_PROVIDER_ID && candidate.codexAccountMode !== undefined && pin.accountId !== "__main__"
+        : candidate.provider.authMode === "oauth"
+          && candidate.providerName === (pin.provider === "claude" ? "anthropic" : pin.provider === "grok" ? "xai" : "kimi"));
+      if (!allowed) throw new Error("AgentRadar pinned account cannot serve this route");
+      if (pin.provider === "codex") Object.assign(candidate, { codexAccountMode: "pool", codexAccountId: pin.accountId, codexAccountNamespace: undefined });
+    }
     candidate.staticPolicy = captureRouteStaticPolicy(
       candidate.providerName,
       candidate.modelId,

@@ -156,3 +156,23 @@ describe("distributed selection cooldown validation", () => {
     expect(providerApiKeySelectionIsCurrent(config, NAME, route)).toBe(false);
   });
 });
+
+test("an AgentRadar gateway caps a key's Retry-After cooldown at 60s; a 401 hold and self-hosted keep 10 minutes", () => {
+  const prior = process.env.OPENCODEX_AGENTRADAR;
+  const now = Date.now();
+  try {
+    for (const [flag, retryCap] of [[undefined, 600_000], ["1", 60_000]] as const) {
+      if (flag === undefined) delete process.env.OPENCODEX_AGENTRADAR;
+      else process.env.OPENCODEX_AGENTRADAR = flag;
+      clearKeyCooldowns();
+      const config = fixture();
+      cool(config, binding(config), now, "3600");
+      expect(getKeyCooldownUntil(NAME, "a")).toBe(now + retryCap);
+      expect(recordDistributedKeyFailure(config, NAME, binding(config, 1)._apiKeyAttempt, 401, now)).toBe(true);
+      expect(getKeyCooldownUntil(NAME, "b")).toBe(now + 600_000);
+    }
+  } finally {
+    if (prior === undefined) delete process.env.OPENCODEX_AGENTRADAR;
+    else process.env.OPENCODEX_AGENTRADAR = prior;
+  }
+});

@@ -1,4 +1,5 @@
 import type { UpstreamConditionEvidence } from "../lib/upstream-condition";
+import { logTranslationBufferLimit } from "../lib/upstream-refusal-log";
 import { ownedAnthropicErrorPayload, messagesOverflowPresentation } from "../lib/messages-error-body";
 import { proxyMessagePresentation, markProxyError, hasProxyErrorMessage, hasProxyIncomplete } from "../lib/client-error-body";
 import { admitMessagesFailure, collectMessagesFailure, type MessagesFailureVerdictSink } from "./failure-verdict";
@@ -621,6 +622,7 @@ export function responsesSseToAnthropicSse(
         });
         const admitted = () => admitMessagesFailure(opts.failureVerdictSink, payload, legacy);
         if (code === "translation_buffer_limit") {
+          logTranslationBufferLimit("stream", { model, bytes: bufferBytes, limit: TRANSLATOR_MAX_TURN_BYTES });
           releaseThinkingBuffer(open);
           if (open?.callId) translatorBudget.closeCall(open.callId);
           open = null;

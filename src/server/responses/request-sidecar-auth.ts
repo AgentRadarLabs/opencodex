@@ -1,3 +1,4 @@
+import { formatErrorResponse } from "../../bridge";
 import { CodexInstallationIdUnavailableError } from "../../codex/installation-id";
 import type { ResponsesRequestContext } from "./core-options";
 import type { PreparedResponsesRequest } from "./request-prepare";
@@ -65,6 +66,7 @@ export async function prepareResponsesSidecarAuth(
       ? shouldResolveOpenAiWebSearchSidecar(config, parsed, isPassthrough)
       : (shouldResolveOpenAiWebSearchSidecar(config, parsed, isPassthrough)
         || shouldResolveOpenAiPassthroughWebSearchBridge(route.provider, parsed, isPassthrough)));
+  if (options.agentRadarAccount && (needsOpenAiVision || needsOpenAiSearch)) return formatErrorResponse(400, "invalid_request_error", "AgentRadar pinned requests cannot use helper models");
   if (needsOpenAiVision || needsOpenAiSearch) {
     try {
       const candidates = listOpenAiForwardSidecarCandidates(config);
@@ -135,6 +137,7 @@ export async function prepareResponsesSidecarAuth(
       admission: options.admission, codexAuthPolicy: options.codexAuthPolicy, providerName: route.providerName,
       advisorAdmissionPolicy: options.advisorAdmissionPolicy,
     });
+  if (options.agentRadarAccount && visionPlan) return formatErrorResponse(400, "invalid_request_error", "AgentRadar pinned requests cannot use helper models");
   const recordSidecarOutcome = openAiSidecar?.recordOutcome;
   if (visionPlan) {
     try {

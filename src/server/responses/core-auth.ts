@@ -251,6 +251,11 @@ export async function resolveResponsesCodexAuth(
       credentialDomainWasRewritten,
       config,
     );
+    if (options.agentRadarAccount) {
+      authInputHeaders = new Headers(authInputHeaders);
+      authInputHeaders.delete("authorization");
+      authInputHeaders.delete("chatgpt-account-id");
+    }
     // A caller-auth transport that is not canonical OpenAI (keyless Cursor) consumes the
     // caller's Authorization as its own upstream token. Keep that contract only for a clean
     // single bearer with NO ChatGPT-domain marker. A bearer marked for the ChatGPT domain —

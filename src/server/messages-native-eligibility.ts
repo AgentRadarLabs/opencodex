@@ -5,11 +5,13 @@
  * `count_tokens` and the protocol planner (`src/protocols/plan-snapshot.ts`) all ask here;
  * previews and counts remain conservative when runtime availability is unknown.
  */
+import { advisorServerToolDestination, isAdvisorServerToolType } from "../adapters/anthropic/advisor-tool";
 import { anthropicBodyElidesBlockedSkill } from "../claude/inbound";
 import { isClaudeWebSearchToolName } from "../claude/outbound";
 import type { ProtocolReasonCode } from "../protocols/contract";
 import { featuresFromMessagesBody } from "../protocols/features";
 import { credentialDomainFor } from "../protocols/opaque-state";
+import { isCanonicalAnthropicMessagesUrl } from "../adapters/anthropic/passthrough";
 import { resolveProtocolSettings } from "../protocols/settings";
 import type { RouteResult } from "../router";
 import type { OcxConfig } from "../types";
@@ -90,7 +92,16 @@ function bridgeOnlyPolicyApplies(
 ): boolean {
   if (resolvePinnedEffort(route, selector.routeSelector, config) !== undefined) return true;
   if (anthropicBodyElidesBlockedSkill(body, selector.claudeCode ?? config.claudeCode)) return true;
+  // An operator who keeps the Advisor off this provider is obeyed by the bridge; exact replay would send it.
+  if (hostedCanonical(route) && !advisorServerToolDestination(route.provider) && Array.isArray(body.tools)
+    && body.tools.some(tool => isRec(tool) && isAdvisorServerToolType(tool.type))) return true;
   return selector.webSearchBackendAvailable !== false && webSearchSidecarMayEngage(body, config);
+}
+
+/** AgentRadar hosted gateways send canonical Anthropic routes natively whatever the rollout says (.27 source replay). */
+function hostedCanonical(route: RouteResult): boolean {
+  return process.env.OPENCODEX_AGENTRADAR === "1" && route.provider.adapter === "anthropic"
+    && isCanonicalAnthropicMessagesUrl(route.provider);
 }
 
 /**
@@ -108,7 +119,7 @@ function credentialDeclineReason(
   const provider = route.provider;
   if (provider.authMode === undefined || provider.authMode === "key") return undefined;
   if (provider.authMode !== "oauth") return "auth-mode-not-native";
-  if (!resolveProtocolSettings(config, route.providerName).rollout.managedMessagesNativeOAuth) return "auth-mode-not-native";
+  if (!hostedCanonical(route) && !resolveProtocolSettings(config, route.providerName).rollout.managedMessagesNativeOAuth) return "auth-mode-not-native";
   if (!configuredAnthropicInstance(config, route.providerName)) return "auth-mode-not-native";
   if (!credentialDomainFor(provider)?.firstPartyAnthropic) return "auth-mode-not-native";
   return undefined;
@@ -134,7 +145,7 @@ export function nativeMessagesDeclineReason(
   config: OcxConfig,
   selector: NativeMessagesSelector = {},
 ): NativeMessagesDeclineReason | undefined {
-  if (!resolveProtocolSettings(config, route.providerName).rollout.managedMessagesNative) return "rollout-disabled";
+  if (!hostedCanonical(route) && !resolveProtocolSettings(config, route.providerName).rollout.managedMessagesNative) return "rollout-disabled";
   const provider = route.provider;
   if (provider.adapter !== "anthropic") return "cross-wire-ir";
   const credentialDecline = credentialDeclineReason(route, config, selector);

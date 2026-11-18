@@ -32,6 +32,7 @@ import {
   type ProviderEgressBinding,
 } from "../../lib/provider-egress";
 import { redactSecretString } from "../../lib/redact";
+import { observeUpstreamRefusal } from "../../lib/upstream-refusal-log";
 import { outboundCredentials } from "../../lib/outbound-credential-registry";
 import { compressUpstreamRequestBody, isCanonicalCodexResponsesUrl } from "./request-compression";
 import { redeemOutboundTurnState, TURN_STATE_BINDING_INIT, turnStateBinding } from "../turn-state-handles";
@@ -351,9 +352,14 @@ export function providerFetch(
   // `provider.fetch ?? execute`, and `execute` is this wrapper. It still carries the binding, so
   // an override that simply calls it gets the route decided rather than dropped; an override
   // that decided for itself has already marked the init and this pass defers to that decision.
+  // Every provider HTTP answer passes here with its final outgoing body: a 4xx gets one
+  // refusal-shape log line (AgentRadar-gated); the response itself is returned untouched.
   const dispatch = markEgressTransparentExecutor(Object.assign(
-    (input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) =>
-      sendWithConnectionPolicy(transport, input, init, egressBinding),
+    async (input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
+      const response = await sendWithConnectionPolicy(transport, input, init, egressBinding);
+      observeUpstreamRefusal(response, { provider: options.providerName, model: options.modelId, body: init?.body });
+      return response;
+    },
     { preconnect },
   ) as typeof globalThis.fetch);
   inheritPassiveKeyProof(dispatch, transport);

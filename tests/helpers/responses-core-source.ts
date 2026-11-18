@@ -32,6 +32,8 @@ export const RESPONSES_CORE_MODULES = [
   "core-errors.ts",
   "core-opaque-recovery.ts",
   "core-codex-account.ts",
+  // Why a 401 skipped the native-main refresh (a log line), reached from passthrough-dispatch.ts.
+  "codex-main-401-log.ts",
   "core-combo-failure.ts",
   "core-auth.ts",
   "core-normalize.ts",

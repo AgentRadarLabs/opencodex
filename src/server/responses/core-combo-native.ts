@@ -35,7 +35,9 @@ import {
 } from "../request-log";
 import { captureRouteStaticPolicy, routeConcreteModel } from "../../router";
 import { comboDefaultEffort, concreteComboRequestBody, getCombo, type JevDecision } from "../../combos";
+import { parseComboModelId } from "../../combos/identifiers";
 import { supportedLadderFor } from "../effort-policy";
+import { claudeFamilyVersion, usesAdaptiveThinking } from "../../adapters/anthropic-model-contract";
 import { applyDroidReasoningDefault } from "../droid-reasoning-default";
 import { resolveWireProtocolOverride } from "../adapter-resolve";
 import { resolveOpenCodeGoTransport } from "../../providers/opencode-go-transport";
@@ -48,7 +50,7 @@ import { credentialDomainFor } from "../../protocols/opaque-state";
 import { chatCompletionsErrorResponse } from "../../chat/outbound";
 import { OUTPUT_CONFIG_EFFORTS } from "../../chat/inbound";
 import { anthropicErrorResponse } from "../../claude/outbound";
-import { hasAnthropicOnlyServerTool, hasNativeOnlyTool } from "../../claude/inbound-content-options";
+import { EXACT_REPLAY_REQUIRED_MESSAGE, hasAnthropicOnlyServerTool, hasNativeOnlyTool } from "../../claude/inbound-content-options";
 import { nativeMessagesInlineToolNames } from "../messages-native-tool-guard";
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -66,6 +68,32 @@ function withdrawsTopLevelTool(body: Record<string, unknown>): boolean {
     && message.role === "system" && Array.isArray(message.content) && message.content.some(block => isRecord(block)
       && block.type === "tool_removal" && isRecord(block.tool) && block.tool.type === "tool_reference"
       && typeof block.tool.name === "string" && declared.has(block.tool.name)));
+}
+
+/** Families that accept `thinking: {type: "adaptive"}` (.27 matrix; usesAdaptiveThinking is the narrower "requires"). */
+const ACCEPTS_ADAPTIVE: Record<string, readonly [number, number]> = { sonnet: [4, 6], opus: [4, 6], fable: [0, 0], haiku: [5, 0] };
+
+/**
+ * AgentRadar hosted gateways (.27): a combo never hands a model-changing exact replay to a target model
+ * that would refuse what the caller sent (dated typed tools, an adaptive or budget thinking shape), so
+ * the ladder moves on instead of stopping on that target's 400.
+ */
+export function hostedReplayIncompatible(body: Record<string, unknown>, targetModel: string): boolean {
+  if (process.env.OPENCODEX_AGENTRADAR !== "1" || body.model === targetModel) return false;
+  // .27 exempted combo aliases from the typed-tool check only: comparing combo/<id> with a concrete
+  // target never matches, which rejected every WebFetch and web_search turn on a combo.
+  if (parseComboModelId(typeof body.model === "string" ? body.model : "") === null
+    && Array.isArray(body.tools) && body.tools.some(tool => isRecord(tool) && Object.hasOwn(tool, "type"))) return true;
+  const thinking = isRecord(body.thinking) ? body.thinking.type : undefined;
+  if (thinking === "enabled") return usesAdaptiveThinking(targetModel);
+  if (thinking !== "adaptive") return false;
+  const parsed = claudeFamilyVersion(targetModel);
+  const minimum = parsed && ACCEPTS_ADAPTIVE[parsed.family];
+  return !minimum || parsed.major < minimum[0] || (parsed.major === minimum[0] && parsed.minor < minimum[1]);
+}
+
+function hasWebFetchTool(body: Record<string, unknown>): boolean {
+  return Array.isArray(body.tools) && body.tools.some(tool => isRecord(tool) && typeof tool.type === "string" && tool.type.startsWith("web_fetch_"));
 }
 
 function hasUnnamedInlineToolDefinition(body: Record<string, unknown>): boolean {
@@ -219,7 +247,7 @@ export function createComboProtocolLanes(input: {
   // has no translated equivalent either; fail closed like a top-level native-only tool.
   const declaresNativeOnlyTool = (body: Record<string, unknown>) =>
     hasNativeOnlyTool(body) || nativeMessagesInlineToolNames(body).size > 0 || hasUnnamedInlineToolDefinition(body)
-    || withdrawsTopLevelTool(body);
+    || withdrawsTopLevelTool(body) || Object.hasOwn(body, "mcp_servers");
   const judge = (target: ComboTarget): CandidateVerdict => {
     const key = selector(target);
     const cached = verdicts.get(key);
@@ -235,6 +263,7 @@ export function createComboProtocolLanes(input: {
     if (targetRoute) {
       const settled = settle(target, targetRoute);
       const native = nativeEligible(target, settled);
+      if (native && inbound === "messages" && hostedReplayIncompatible(envelope.readBody(), settled.modelId)) verdict.nativeOnly = true;
       const upstream = native ? inbound : upstreamWireForAdapter((settled ?? targetRoute).provider.adapter);
       const checked = checkRepresentable({
         inbound,
@@ -254,7 +283,9 @@ export function createComboProtocolLanes(input: {
       if (!native && inbound === "messages") {
         const provider = (settled ?? targetRoute).provider;
         if ((nativeOnlyTool ??= declaresNativeOnlyTool(envelope.readBody()))
-          || ((anthropicOnlyTool ??= hasAnthropicOnlyServerTool(envelope.readBody()))
+          || ((anthropicOnlyTool ??= process.env.OPENCODEX_AGENTRADAR === "1"
+            // .27 kept a restricted web_search's translated fallback; only web_fetch is out-of-body only.
+            ? hasWebFetchTool(envelope.readBody()) : hasAnthropicOnlyServerTool(envelope.readBody()))
             && !(provider.adapter === "anthropic" && credentialDomainFor(provider)?.firstPartyAnthropic))) {
           verdict.nativeOnly = true;
         }
@@ -270,13 +301,18 @@ export function createComboProtocolLanes(input: {
       return verdict.nativeOnly !== true && (!reject || verdict.skip === undefined);
     },
     refusal: () => {
-      if (!reject) return undefined;
       const enabled = targets.filter(target => {
         const provider = config.providers[target.provider];
         return provider !== undefined && provider.disabled !== true;
       });
       if (enabled.length === 0) return undefined;
       const skipped = enabled.map(judge);
+      // AgentRadar hosted gateways (.27): a source no candidate can carry is the request's own 400, with no send.
+      if (process.env.OPENCODEX_AGENTRADAR === "1" && inbound === "messages" && skipped.every(verdict => verdict.nativeOnly)) {
+        logCtx.errorCode = "unsupported_feature";
+        return markClientWire(anthropicErrorResponse(400, EXACT_REPLAY_REQUIRED_MESSAGE, "invalid_request_error", "unsupported_feature"), inbound);
+      }
+      if (!reject) return undefined;
       if (skipped.some(verdict => verdict.skip === undefined)) return undefined;
       const features = [...new Set(skipped.flatMap(verdict => verdict.skip ?? []))];
       // The same refusal the ingress gives a single route: 400 in the Chat shape, feature keys

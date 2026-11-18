@@ -8,14 +8,19 @@ import { sseFieldValue } from "../lib/sse-decoder";
 import type { TranslatorBudget } from "../lib/translator-budget";
 import { anthropicUsageToOcx } from "./messages-shared";
 import type { RequestLogContext } from "./request-log";
-import { BoundedSseFrameBuffer, MAX_CLIENT_SSE_FRAME_BYTES, SseFrameCountLimitError, SseFrameTooLargeError } from "./sse-frame-buffer";
+import { BoundedSseFrameBuffer, joinSseFrameBytes, MAX_CLIENT_SSE_FRAME_BYTES, SseFrameCountLimitError, SseFrameTooLargeError } from "./sse-frame-buffer";
+import { markVerbatimComboFailure } from "../bridge/errors";
+import { markClientWire } from "./inference/client-wire";
 import { UNDECLARED_TOOL_CALL_ERROR_CODE } from "./responses-undeclared-tool-guard";
 
 type Rec = Record<string, unknown>;
 const isRec = (value: unknown): value is Rec => value !== null && typeof value === "object" && !Array.isArray(value);
 
 /** Capture replay evidence before any relay can split a physical upstream read into frames. */
-export function observeNativeMessagesReplayBoundary(body: ReadableStream<Uint8Array>, logCtx: RequestLogContext, replay: { committed: boolean; pending: boolean }): ReadableStream<Uint8Array> {
+export function observeNativeMessagesReplayBoundary(
+  body: ReadableStream<Uint8Array>, logCtx: RequestLogContext, replay: { committed: boolean; pending: boolean },
+  hosted = process.env.OPENCODEX_AGENTRADAR === "1",
+): ReadableStream<Uint8Array> {
   const reader = body.getReader();
   const inspector = new BoundedSseFrameBuffer();
   const decoder = new TextDecoder();
@@ -28,6 +33,7 @@ export function observeNativeMessagesReplayBoundary(body: ReadableStream<Uint8Ar
         if (active) {
           let errorSeen = false;
           let finished = false;
+          let malformed = false;
           try {
             for (const frame of inspector.feed(next.value)) {
               if (frame.continuation) continue;
@@ -39,15 +45,17 @@ export function observeNativeMessagesReplayBoundary(body: ReadableStream<Uint8Ar
               try { payload = JSON.parse(data); } catch { payload = undefined; }
               const type = isRec(payload) && (event === null || event === payload.type) ? payload.type : undefined;
               if (errorSeen && (event !== null || dataFields.length > 0) && type !== "ping") logCtx.streamErrorFollowed = true;
+              // Hosted strict relay stops at a malformed frame: neither it nor anything after it reaches the client.
+              if (hosted && dataFields.length > 0 && !isRec(payload)) { malformed = true; break; }
               if (type === "error" && isRec(payload) && isRec(payload.error)) errorSeen = true;
               else if ((event !== null || dataFields.length > 0) && type !== "ping" && !(type === "message_start" && isRec(payload) && isRec(payload.message) && Array.isArray(payload.message.content) && payload.message.content.length === 0)) {
                 replay.committed = true; finished = true;
               }
             }
-            replay.pending = inspector.pendingBytes > 0;
+            replay.pending = !malformed && inspector.pendingBytes > 0;
             // An unfinished event can still acquire a different name or payload on the next read.
             if (errorSeen && inspector.pendingBytes > 0) logCtx.streamErrorFollowed = true;
-            if (errorSeen || finished) { active = false; inspector.dispose(); }
+            if (errorSeen || finished || malformed) { active = false; inspector.dispose(); }
           } catch (error) {
             if (!(error instanceof SseFrameTooLargeError || error instanceof SseFrameCountLimitError)) throw error;
             logCtx.streamErrorFollowed = true;
@@ -65,6 +73,8 @@ export function observeNativeMessagesReplayBoundary(body: ReadableStream<Uint8Ar
 /** Inspect only the bounded protocol prelude. Any block, unknown payload or cap commits. */
 export async function preflightNativeMessagesResponse(
   response: Response, logCtx: RequestLogContext, budget: TranslatorBudget, replay?: { committed: boolean },
+  /** AgentRadar's .27 contract applies to canonical Anthropic children only; the lane passes its own verdict. */
+  hosted = process.env.OPENCODEX_AGENTRADAR === "1",
 ): Promise<{ kind: "accepted" | "failed"; response: Response }> {
   if (!response.ok || !response.body || !response.headers.get("content-type")?.toLowerCase().includes("text/event-stream")) {
     return { kind: "accepted", response };
@@ -106,11 +116,13 @@ export async function preflightNativeMessagesResponse(
         // Otherwise a structured moderation verdict on the whole event is a request-level refusal,
         // whatever status the terminal mapping infers for its code; judge it like the HTTP reader.
         const moderation = framedAllowsModeration && isProviderModerationRefusal(400, wholeEvent, undefined, true);
-        const mapped = httpStatusFromTerminalError({ type: typeof error.type === "string" ? error.type : undefined,
+        // Hosted gateways record Anthropic's own overloaded status (529), as .27 did.
+        const mapped = hosted && error.type === "overloaded_error" ? 529 : httpStatusFromTerminalError({ type: typeof error.type === "string" ? error.type : undefined,
           code: typeof error.code === "string" ? error.code : undefined,
           message: typeof error.message === "string" ? error.message : undefined }) ?? 502;
         const status = moderation && mapped !== 400 && mapped !== 422 ? 400 : mapped;
-        if (logCtx.terminalSource !== "synthetic" && logCtx.errorCode !== UNDECLARED_TOOL_CALL_ERROR_CODE
+        // Hosted .27 contract: a relay-made pre-output failure (malformed frame, reset) also fails over.
+        if ((logCtx.terminalSource !== "synthetic" || process.env.OPENCODEX_AGENTRADAR === "1") && logCtx.errorCode !== UNDECLARED_TOOL_CALL_ERROR_CODE
           && comboFailureDecision(status, typeof error.message === "string" ? error.message : "", {
           code: typeof error.code === "string" ? error.code : undefined,
           rootCode: typeof payload.code === "string" ? payload.code : undefined,
@@ -161,11 +173,16 @@ export async function preflightNativeMessagesResponse(
       release();
       const headers = new Headers(response.headers);
       headers.set("content-type", "application/json"); headers.delete("content-length"); headers.delete("content-encoding");
+      const failedBytes = chunks.length === 1 ? chunks[0]! : joinSseFrameBytes(chunks);
       const failed = Response.json({ error: {
         ...(typeof failure.type === "string" ? { type: failure.type } : {}),
         ...(typeof failure.code === "string" ? { code: failure.code } : {}),
         message,
       } }, { status: failureStatus, headers });
+      // AgentRadar hosted gateways (.27): if this ends the combo, the client gets Anthropic's own stream bytes.
+      if (hosted) {
+        markVerbatimComboFailure(failed, () => markClientWire(new Response(failedBytes.slice(), { status: response.status, headers: response.headers }), "messages"));
+      }
       // The rebuilt envelope drops the evidence (root code, innererror) the verdict was judged on.
       return { kind: "failed", response: failureEvidence === undefined ? failed : attachComboFailureEvidence(failed, failureEvidence) };
     }

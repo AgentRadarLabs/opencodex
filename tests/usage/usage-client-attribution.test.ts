@@ -98,6 +98,11 @@ describe("usage client attribution", () => {
       accumulator.add({ timestamp: now, requestId: "mixed", provider: "combo", model: "combo", client: "codex_cli",
         status: 200, durationMs: 1, usageStatus: "unreported", attempts: [...attempts, removed] });
       const result = accumulator.summarize("30d", now);
+      // No physical send reached openai, so the openai-filtered view has no request at all.
+      if (!attempts.some(attempt => attempt.sendCount > 0)) {
+        expect(result.summary.requests).toBe(0);
+        continue;
+      }
       const measured = expected === "reported" || expected === "estimated" ? 1 : 0;
       expect(result.summary[`${expected}Requests`]).toBe(1);
       expect(result.apps[0]?.measuredRequests).toBe(measured);

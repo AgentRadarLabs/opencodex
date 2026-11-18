@@ -161,6 +161,17 @@ export function parseRetryAfterMs(
   return options?.preserveImmediate ? 1 : undefined;
 }
 
+/**
+ * Whether an account pool behind `provider` can serve right now. A 429/402 cooldown on a pooled
+ * target only says every account was spent when it was recorded; a newly connected or re-authed
+ * account, or one whose window rolled, makes it stale. Registered by the pool owner so this
+ * module keeps no import on the OAuth stores.
+ */
+let poolHasEligibleAccount: ((provider: string, now: number) => boolean) | undefined;
+export function setComboPoolEligibilityProbe(probe: typeof poolHasEligibleAccount): void {
+  poolHasEligibleAccount = probe;
+}
+
 export function isComboTargetInCooldown(
   comboId: string,
   target: Pick<OcxComboTarget, "provider" | "model">,
@@ -169,7 +180,11 @@ export function isComboTargetInCooldown(
   const key = cooldownMapKey(comboId, target);
   const entry = targetCooldowns.get(key);
   if (!entry) return false;
-  if (entry.cooldownUntil <= now) {
+  if (entry.cooldownUntil <= now
+    // AgentRadar hosted gateways only (.27): elsewhere an upstream 429 that is not the pool's own refusal
+    // parks the target in full even while an account is eligible (isAnthropicPoolLocalRefusal).
+    || (process.env.OPENCODEX_AGENTRADAR === "1" && (entry.status === 429 || entry.status === 402)
+      && poolHasEligibleAccount?.(target.provider, now))) {
     targetCooldowns.dropLocal(key);
     return false;
   }
@@ -322,8 +337,11 @@ export function coolComboTarget(
       }) ? COMBO_REQUEST_RATE_COOLDOWN_MS : DEFAULT_COOLDOWN_MS);
   targetCooldowns.set(cooldownMapKey(comboId, target), {
     revision: ++nextCooldownRevision,
-    // Local fallbacks are capped at ten minutes; explicit server delays at one day.
-    cooldownUntil: now + (serverDelayMs ?? Math.min(Math.max(cooldownMs, 1), MAX_COOLDOWN_MS)),
+    // Local fallbacks are capped at ten minutes; explicit server delays at one day. AgentRadar hosted
+    // gateways cap server delays at ten minutes too (.27, d3ea59ccb9): one account's weekly
+    // Retry-After once parked a shared target for hours while its siblings were healthy.
+    cooldownUntil: now + (serverDelayMs !== undefined && process.env.OPENCODEX_AGENTRADAR !== "1"
+      ? serverDelayMs : Math.min(Math.max(serverDelayMs ?? cooldownMs, 1), MAX_COOLDOWN_MS)),
     status: options?.status,
   });
   sweepExpiredOnWrite(now);
@@ -777,7 +795,9 @@ function isProviderScopedQuotaCap(
   message: string,
   code?: string | null,
 ): boolean {
-  if (status === 400 || status === 422) return false; // Validation prose may reflect the caller's input.
+  // Validation prose may reflect the caller's input. AgentRadar hosted gateways keep the .27 rule:
+  // the free-tier cap still counts there as the provider's own field, never as words.
+  if (status === 400 || status === 422) return process.env.OPENCODEX_AGENTRADAR === "1" && hasFreePromptCapField(message);
   const normalizedCode = normalizedFailureCode(code);
   const text = message.toLowerCase();
   if (
@@ -788,6 +808,22 @@ function isProviderScopedQuotaCap(
   }
   return text.includes("err_free_prompt_cap")
     || (text.includes("free tier") && text.includes("single request"));
+}
+
+/**
+ * `err_free_prompt_cap` as the provider's own field: `error.code`, or `error.metadata.reason` as
+ * the OpenRouter-style free-tier refusal carries it, in a bounded JSON envelope after an optional
+ * `Provider error <status>: ` prefix. Never a word anywhere in the text.
+ */
+function hasFreePromptCapField(message: string): boolean {
+  if (message.length > 16_384) return false;
+  let payload: unknown;
+  try { payload = JSON.parse(message.trim().replace(/^Provider error \d{3}:\s*/, "")); } catch { return false; }
+  const error = payload && typeof payload === "object" && !Array.isArray(payload) ? (payload as Record<string, unknown>).error : undefined;
+  if (!error || typeof error !== "object" || Array.isArray(error)) return false;
+  const { code, metadata } = error as Record<string, unknown>;
+  return code === "err_free_prompt_cap" || (!!metadata && typeof metadata === "object" && !Array.isArray(metadata)
+    && (metadata as Record<string, unknown>).reason === "err_free_prompt_cap");
 }
 
 /** A structured account-window exhaustion code; prose never qualifies (a request can echo it). */
@@ -808,7 +844,8 @@ function isRequestLocalFreePromptCap(
   message: string,
   code?: string | null,
 ): boolean {
-  if (status !== 400 && status !== 422) return false;
+  // .27 (AgentRadar hosted) read a 422 free-tier field as provider-wide, not request-local.
+  if (status !== 400 && (status !== 422 || process.env.OPENCODEX_AGENTRADAR === "1")) return false;
   const text = message.toLowerCase();
   if (normalizedFailureCode(code) === "free_rate_limited") return true;
   if (text.includes("err_free_prompt_cap")) return true;

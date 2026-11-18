@@ -1,6 +1,6 @@
 import { CODEX_TEXT_GUARDED_BUDGET_POLICY, createRequestExecutionBudget, type RequestExecutionBudget } from "../../lib/request-execution-budget";
 import { TRANSIENT_RETRY_MAX_ATTEMPTS, type TransientSendBudget } from "../../lib/upstream-retry";
-import { GENERIC_OAUTH_MAX_ACCOUNTS_PER_REQUEST } from "../../oauth/generic-account-failover";
+import { oauthMaxAccountsPerRequest } from "../../oauth/generic-account-failover";
 import type { RequestLogContext } from "../request-log";
 import { attachRequestSpendTracker } from "../responses/request-spend";
 
@@ -29,7 +29,7 @@ export function createInferenceSendBudget(
 /**
  * Fund each account's normal transient ladder once, before the first physical send. The account
  * count is clamped here as well as at the caller, so no caller can raise the ceiling past
- * GENERIC_OAUTH_MAX_ACCOUNTS_PER_REQUEST × TRANSIENT_RETRY_MAX_ATTEMPTS.
+ * oauthMaxAccountsPerRequest() × TRANSIENT_RETRY_MAX_ATTEMPTS.
  */
 export function expandInferenceOAuthSendBudget(budget: TransientSendBudget | undefined, accounts: number): void {
   if (!budget) return;
@@ -37,7 +37,7 @@ export function expandInferenceOAuthSendBudget(budget: TransientSendBudget | und
   if (!policy || budget.used !== 0 || ("physicalStarted" in budget && Number(budget.physicalStarted) > 0)) return;
   ingressPolicies.delete(budget);
   if (accounts < 2 || !Number.isSafeInteger(accounts)) return;
-  const sends = Math.min(accounts, GENERIC_OAUTH_MAX_ACCOUNTS_PER_REQUEST) * TRANSIENT_RETRY_MAX_ATTEMPTS;
+  const sends = Math.min(accounts, oauthMaxAccountsPerRequest()) * TRANSIENT_RETRY_MAX_ATTEMPTS;
   policy.baseSendAllowance = Math.max(policy.baseSendAllowance, sends);
   policy.maxTotalModelSends = Math.max(policy.maxTotalModelSends, sends);
 }

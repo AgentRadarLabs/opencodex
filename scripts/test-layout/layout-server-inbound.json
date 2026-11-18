@@ -1,4 +1,5 @@
 {
+  "agentradar-account-pin-e2e.test.ts": "server",
   "claude-translated-advisor-tool.test.ts": "claude-integration",
   "management-provider-forward-advisor-tool.test.ts": "server",
   "local-control-socket.test.ts": "server",

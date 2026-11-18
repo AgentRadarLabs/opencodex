@@ -22,6 +22,7 @@ import { collectReferencedSpillFileNames, snapshotReferencedSpillFileNames } fro
 import { selectSnapshotEntries, snapshotPayload } from "./state/snapshot-select";
 import { expandStoredResponseInput } from "./state/replay-input";
 import { normalizedClientThreadId, replayScopeMatches, validReplayOwnerKey } from "./state/replay-owner";
+import { envBoundAtMost } from "./state/env-bounds";
 import { hasPendingClientToolCall } from "./state/unforced-store-false";
 import { computeResponseStateMetrics, type ResponseStateMetrics } from "./state/metrics";
 export type { ResponseStateMetrics } from "./state/metrics";
@@ -224,8 +225,10 @@ function deferSupersededSpill(ref: ResponseSpillRef | undefined): void {
 
 
 function byteCap(): number {
-  return byteCapOverride ?? MAX_STORED_RESPONSE_BYTES;
+  return byteCapOverride ?? envBoundAtMost("OPENCODEX_RESPONSE_STATE_MAX_BYTES", MAX_STORED_RESPONSE_BYTES);
 }
+
+const responseTtlMs = (): number => envBoundAtMost("OPENCODEX_RESPONSE_STATE_TTL_MS", RESPONSE_TTL_MS);
 
 /** Test-only: lower/restore the in-memory byte cap (null restores the default). */
 export function setResponseStateByteCapForTests(bytes: number | null): void {
@@ -249,7 +252,7 @@ export function getStoredResponseBytesForTests(): number {
 let spillByteCapOverride: number | null = null;
 
 function spillByteCap(): number {
-  return spillByteCapOverride ?? MAX_SPILLED_RESPONSE_BYTES;
+  return spillByteCapOverride ?? envBoundAtMost("OPENCODEX_RESPONSE_STATE_MAX_SPILL_BYTES", MAX_SPILLED_RESPONSE_BYTES);
 }
 
 /**
@@ -939,7 +942,7 @@ function enforceSpilledResponseBudget(requiredHeadroomBytes?: number): number {
 
 function pruneResponses(at = now()): void {
   for (const [id, state] of states) {
-    if (at - state.createdAt > RESPONSE_TTL_MS) deleteEntry(id);
+    if (at - state.createdAt > responseTtlMs()) deleteEntry(id);
   }
   while (states.size > MAX_STORED_RESPONSES) {
     const oldest = states.keys().next().value;
@@ -949,11 +952,12 @@ function pruneResponses(at = now()): void {
   // Unconditional RAM cap. Resident payloads demote durably; stubs/tombstones are
   // deleted only when even their bounded metadata cannot fit the override.
   while (storedResponseBytes > byteCap() && states.size > 0) {
-    const oldestResident = [...states].find(([id, entry]) => entry.kind === "resident"
-      && !spillQueueHoldsResidentCandidate(id, entry));
-    const hasPendingResident = !oldestResident && [...states].some(([id, entry]) => entry.kind === "resident"
-      && spillQueueHoldsResidentCandidate(id, entry));
-    if (hasPendingResident) break;
+    // One pass over the map, no copies: a lowered cap demotes on nearly every write.
+    let oldestResident: [string, ResidentResponseState] | undefined, hasPendingResident = false;
+    for (const [id, entry] of states) if (entry.kind === "resident") {
+      if (!spillQueueHoldsResidentCandidate(id, entry)) { oldestResident = [id, entry]; break; } else hasPendingResident = true;
+    }
+    if (!oldestResident && hasPendingResident) break;
     const oldestId = oldestResident?.[0] ?? states.keys().next().value as string | undefined;
     if (!oldestId) break;
     const entry = states.get(oldestId)!;
@@ -988,7 +992,7 @@ function pruneResponses(at = now()): void {
 export function sweepExpiredResponseStates(at = now()): number {
   let removed = 0;
   for (const [id, state] of states) {
-    if (at - state.createdAt <= RESPONSE_TTL_MS) continue;
+    if (at - state.createdAt <= responseTtlMs()) continue;
     deleteEntry(id);
     removed += 1;
   }

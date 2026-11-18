@@ -18,7 +18,7 @@
  * for every destination decides from the full source again.
  */
 import { mergeAnthropicBetaHeader } from "../../providers/anthropic-fast";
-import { applyClaudeToolPrefix, CLAUDE_CODE_SYSTEM_INSTRUCTION } from "../../oauth/anthropic";
+import { ANTHROPIC_OAUTH_BETA, applyClaudeToolPrefix, CLAUDE_CODE_SYSTEM_INSTRUCTION } from "../../oauth/anthropic";
 import { credentialDomainFor, opaqueStateForDestination } from "../../protocols/opaque-state";
 import type { OcxConfig, OcxProviderConfig } from "../../types";
 import {
@@ -93,6 +93,27 @@ export interface AnthropicMessagesPassthroughOptions {
   clientIdentity?: AnthropicClientIdentity;
   /** Optional conversation/session key for deterministic per-conversation X-Claude-Code-Session-Id. */
   sessionKey?: string | null;
+  /**
+   * AgentRadar hosted contract, first-party Anthropic only: send the caller's body as sent (wire
+   * model, plus the OAuth identity line when no identity block exists) and every caller beta. No
+   * allowlist, cache TTL, account metadata or tool-name rewrite: each changes cache billing or drops
+   * a field the caller's beta enabled.
+   */
+  exactSource?: boolean;
+}
+
+/** Exactly Anthropic's own Messages endpoint: no other scheme, port, path prefix or look-alike host. */
+export function isCanonicalAnthropicMessagesUrl(provider: Pick<OcxProviderConfig, "baseUrl">): boolean {
+  try { return resolveAnthropicMessagesUrl(provider) === "https://api.anthropic.com/v1/messages"; } catch { return false; }
+}
+
+const CLAUDE_IDENTITY_LINE = /^You are (Claude Code, Anthropic's official CLI for Claude|a Claude agent, built on Anthropic's Claude Agent SDK)/;
+
+function withClaudeIdentity(body: Rec): Rec {
+  const system = typeof body.system === "string" ? (body.system ? [{ type: "text", text: body.system }] : [])
+    : Array.isArray(body.system) ? body.system : [];
+  if (system.some(block => isRec(block) && typeof block.text === "string" && CLAUDE_IDENTITY_LINE.test(block.text.trimStart()))) return body;
+  return { ...body, system: [{ type: "text", text: CLAUDE_CODE_SYSTEM_INSTRUCTION }, ...system] };
 }
 
 /** The allowlisted copy of `body` with `model` set to the wire model. Shallow: nothing is cloned. */
@@ -301,11 +322,14 @@ export function buildAnthropicMessagesPassthroughRequest(
       : "anthropic provider requires a non-empty apiKey (authMode: key)");
   }
   const url = resolveAnthropicMessagesUrl(provider);
-  const native = anthropicMessagesNativeWireBody(provider, modelId, body, options);
-  const { strippedOpaqueState, oauthToolNames } = native;
-  const ttlBody = applyAnthropicNativeCacheTtlDefault(
+  const exact = options.exactSource === true && domain?.firstPartyAnthropic === true && url === "https://api.anthropic.com/v1/messages";
+  const native = exact ? undefined : anthropicMessagesNativeWireBody(provider, modelId, body, options);
+  const { strippedOpaqueState = false, oauthToolNames } = native ?? {};
+  const ttlBody = native && applyAnthropicNativeCacheTtlDefault(
     native.wireBody, resolveAnthropicCacheRetention(config?.cacheRetention, provider));
-  const wireBody = oauth ? bindAnthropicAccountMetadata(ttlBody, options.providerAccountUuid) : ttlBody;
+  // Exact replay still isolates the pooled account's identity: its own account_uuid and derived device_id.
+  const wireBody = !ttlBody ? (oauth ? bindAnthropicAccountMetadata(withClaudeIdentity({ ...body, model: modelId }), options.providerAccountUuid) : { ...body, model: modelId })
+    : oauth ? bindAnthropicAccountMetadata(ttlBody, options.providerAccountUuid) : ttlBody;
   const headers = anthropicBaseRequestHeaders(wireBody.stream === true);
   const resolvedSessionKey = options.sessionKey?.trim() || extractAnthropicCallerSessionId(body);
   if (oauth) applyAnthropicOAuthAuth(headers, provider.apiKey, resolvedSessionKey);
@@ -323,6 +347,14 @@ export function buildAnthropicMessagesPassthroughRequest(
     }
   }
   if (domain?.firstPartyAnthropic) applyAnthropicClientIdentity(headers, options.clientIdentity, provider.headers);
+  if (exact) {
+    // .27 order: caller betas, then the operator's, then the OAuth pair.
+    const operator = Object.entries(provider.headers ?? {}).flatMap(([name, value]) => name.toLowerCase() === "anthropic-beta" ? [value] : []);
+    for (const name of Object.keys(headers)) if (name.toLowerCase() === "anthropic-beta") delete headers[name];
+    mergeAnthropicBetaHeader(headers, [options.callerAnthropicBeta ?? "", ...operator, oauth ? ANTHROPIC_OAUTH_BETA : ""]);
+    return { url, headers, body: JSON.stringify(wireBody), wireBody, droppedBetas: false, droppedBetaNames: [],
+      droppedUnrecognizedBetas: 0, strippedOpaqueState: false };
+  }
   const betas = allowlistAnthropicBetas(options.callerAnthropicBeta, domain?.firstPartyAnthropic ? "first-party" : "compatible",
     { inlineTools: hasInlineToolChanges(wireBody), observedNativeClient: hasObservedAnthropicClientIdentity(options.clientIdentity) });
   mergeAnthropicBetaHeader(headers, betas.betas);

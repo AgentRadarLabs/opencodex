@@ -346,6 +346,13 @@ export interface ImageBridgeDeps {
   fetchForRequest?: (request: AdapterRequest, parsed: OcxParsedRequest, adapter: ProviderAdapter, recovery?: AttemptRecoveryKind) => typeof globalThis.fetch;
   /** Reserve the routed provider's next request-start slot before each adapter dispatch. */
   waitForRequestSlot?: (signal?: AbortSignal) => Promise<ProviderRequestSlot | void>;
+  /**
+   * Physical fetch for one runTurn iteration, bound to the slot the loop reserved for it. A
+   * stateful transport (Cursor RunSSE + BidiAppend) sends several requests per turn; the caller
+   * makes later sends wait on start intervals only (`turnScopedPacing`), because the turn already
+   * holds the concurrency lease and a second one would wait on itself.
+   */
+  runTurnFetch?: (pacingSlot: ProviderRequestSlot | undefined) => typeof globalThis.fetch;
   /** Raw adapter usage at the terminal event, pre wire-normalization (see bridgeToResponsesSSE onUsage). */
   onUsage?: (usage: OcxUsage | undefined) => void;
   proxyErrorContext?: object;
@@ -579,6 +586,7 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
             abortSignal: signal,
             translatorBudget,
             pacingSlot,
+            providerFetch: deps.runTurnFetch?.(pacingSlot) ?? deps.incomingMeta.providerFetch,
           }, emit);
         } catch (err) { producer = Promise.reject(err); }
         void producer.then(closeOnAbort).catch(err => {
@@ -756,7 +764,7 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
       }
       // 429 key-failover parity with web-search / normal routed path.
       while ((prepared.response.status === 429
-        || ((prepared.response.status === 403 || prepared.response.status === 401) && isAnthropicInstanceId(deps.incomingMeta?.providerName))
+        || ([403, 401, 400].includes(prepared.response.status) && isAnthropicInstanceId(deps.incomingMeta?.providerName))
         || (iterParsed._kiroAuthContext && (prepared.response.status === 400 || prepared.response.status === 403))) && deps.on429) {
         const rotated = await deps.on429(prepared.response.headers.get("retry-after"), prepared.response.headers,
           iterParsed, prepared.response);

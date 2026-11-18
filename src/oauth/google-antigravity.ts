@@ -40,6 +40,9 @@ const REFRESH_SKEW_MS = 5 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const ONBOARD_ATTEMPTS = 5;
 const ONBOARD_POLL_MS = 2_000;
+// A person without a local browser copies the redirect URL from the address bar and pastes it back by
+// hand, which takes far longer than the callback base class's default wait.
+const ANTIGRAVITY_LOGIN_TIMEOUT_MS = 20 * 60 * 1000;
 
 function requestSignal(signal: AbortSignal | undefined): AbortSignal {
   const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
@@ -212,7 +215,7 @@ function credentialsFromPayload(payload: GoogleTokenPayload, refreshFallback = "
   };
 }
 
-class AntigravityOAuthFlow extends OAuthCallbackFlow {
+export class AntigravityOAuthFlow extends OAuthCallbackFlow {
   #verifier = "";
   #forceAccountSelect: boolean;
 
@@ -223,6 +226,7 @@ class AntigravityOAuthFlow extends OAuthCallbackFlow {
       callbackHostname: "127.0.0.1",
       callbackBindHostname: "127.0.0.1",
       redirectUri: `http://127.0.0.1:${CALLBACK_PORT}${CALLBACK_PATH}`,
+      timeoutMs: ANTIGRAVITY_LOGIN_TIMEOUT_MS,
     } satisfies OAuthCallbackFlowOptions);
     this.#forceAccountSelect = opts?.forceAccountSelect === true;
   }

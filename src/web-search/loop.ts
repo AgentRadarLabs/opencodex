@@ -791,7 +791,7 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
       // 429 key-failover parity with the normal routed path: rotate pool keys until one responds
       // or the pool is exhausted (deps.on429 returns null — cooldown map guarantees termination).
       while ((prepared.response.status === 429
-        || (prepared.response.status === 401 && isAnthropicInstanceId(deps.incomingMeta?.providerName)
+        || ((prepared.response.status === 401 || prepared.response.status === 400) && isAnthropicInstanceId(deps.incomingMeta?.providerName)
           && !accountRefusalOutputStarted)
         || (prepared.response.status === 403
           && (isAnthropicInstanceId(deps.incomingMeta?.providerName) || deps.incomingMeta?.providerName === "google-antigravity")
@@ -1310,17 +1310,22 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
           }
           if (split.calls.some(call => call.kind === "advisor")) yield { type: "assistant_boundary" };
         } catch (e) {
-          // The bridge reports no usage for either error; the iterations already sent still count.
-          if (hiddenUsage) deps.onUsage?.(hiddenUsage);
           if (isTranslatorBudgetExceededError(e)) {
+            // The bridge reports an overflow terminal's own usage, so the legs already sent move
+            // onto it: the client sees them and onUsage counts them exactly once.
+            const usage = hiddenUsage;
+            hiddenUsage = undefined;
             yield {
               type: "error",
               status: 502,
               errorType: "upstream_error",
               code: e.code,
               message: "upstream translation buffer exceeded the safe limit",
+              ...(usage ? { usage } : {}),
             };
           } else {
+            // The bridge reports no usage for these errors; the iterations already sent still count.
+            if (hiddenUsage) deps.onUsage?.(hiddenUsage);
             if (e instanceof SendBudgetExhaustedError) yield { type: "error", status: 429,
               errorType: "rate_limit_error", code: e.code, message: e.message, retryable: false };
             // A later iteration's overflow ends the turn as the main path's terminal

@@ -33,6 +33,8 @@ import {
 import type { TranslatorBudget } from "../lib/translator-budget";
 import type { OcxConfig } from "../types";
 import { relaySseWithPayloadRewrite } from "./sse-payload-rewrite";
+import { agentRadarPin } from "../lib/agentradar-account-pin";
+import { OAuthLoginRequiredError } from "../oauth";
 
 const MAX_SELECTION_ATTEMPTS = 3;
 
@@ -114,6 +116,8 @@ export interface NativeOAuthBindingOptions {
   /** Selection captured before asynchronous refusal classification or throttle wait. */
   expectedRecoverySelection?: Selection | null;
   expectedRecoveryRouteDecision?: AnthropicRouteDecision | null;
+  /** Select exactly as a dispatch would but commit nothing (AgentRadar exact count_tokens). */
+  readOnly?: boolean;
 }
 
 /** Compatibility entrypoint: the original instance only. */
@@ -134,6 +138,28 @@ export async function resolveNativeOAuthBindingForInstance(
   };
   const sessionKey = options.sessionKey ?? null;
   const model = options.model;
+  const pin = agentRadarPin(config);
+  if (pin) {
+    // A trusted AgentRadar pin serves exactly its account: no routing, no global selection commit.
+    if (pin.provider !== "claude" || instance !== "anthropic") throw new OAuthLoginRequiredError(instance);
+    const routeDecision = currentRoute(instance, config, model);
+    const usable = () => {
+      const row = getAccountCredentialWithStatus(instance, pin.accountId);
+      if (!row || row.paused || row.needsReauth
+        || !routeCandidates(routing.getEligibleAnthropicAccounts(Date.now(), model), routeDecision).includes(pin.accountId)) {
+        throw new OAuthLoginRequiredError(instance);
+      }
+      return row;
+    };
+    usable();
+    const snapshot = await routing.getAnthropicPoolAccessSnapshot(pin.accountId);
+    assertOwner();
+    const binding: NativeOAuthBinding = { instance, routeTarget, selection: { accountId: pin.accountId, revision: "agentradar-request" },
+      snapshot, providerAccountUuid: usable().credential.accountId, routeDecision, sessionKey, model, config,
+      manualSelectionGeneration: routing.captureAnthropicManualSelectionGeneration() };
+    if (nativeOAuthBindingIsCurrent(binding)) return binding;
+    throw new NativeOAuthSelectionChangedError();
+  }
   for (let attempt = 0; attempt < MAX_SELECTION_ATTEMPTS; attempt++) {
     assertOwner();
     const routeDecision = currentRoute(instance, config, model);
@@ -161,6 +187,10 @@ export async function resolveNativeOAuthBindingForInstance(
     assertOwner();
     if (candidate.provider !== instance) throw new NativeOAuthSelectionChangedError();
     if (!routeIsCurrent(instance, config, model, routeDecision)) continue;
+    if (options.readOnly) {
+      return { instance, routeTarget, selection, snapshot: candidate, routeDecision, sessionKey, model, config, manualSelectionGeneration,
+        providerAccountUuid: getAccountCredentialWithStatus(instance, candidate.accountId)?.credential.accountId };
+    }
     const committed = await commitOAuthAccountSelection(instance, candidate.accountId, {
       expectedSelection: selection,
       expectedCredentialGeneration: candidate.generation,
@@ -195,15 +225,18 @@ export function nativeOAuthBindingIsCurrent(binding: NativeOAuthBinding): boolea
     if (nativeOAuthRouteTarget(instance, binding.config) !== binding.routeTarget) return false;
   } catch { return false; }
   if (binding.snapshot.provider !== instance) return false;
-  if (binding.manualSelectionGeneration !== routing.captureAnthropicManualSelectionGeneration()
+  const pin = agentRadarPin(binding.config);
+  // A pinned binding never followed the shared selection, so a manual switch does not revoke it.
+  if ((!pin && binding.manualSelectionGeneration !== routing.captureAnthropicManualSelectionGeneration())
     || !routeIsCurrent(instance, binding.config, binding.model, binding.routeDecision)) return false;
   const selected = captureOAuthAccountSelection(instance);
   const row = getAccountCredentialWithStatus(instance, binding.snapshot.accountId);
-  const sessionRoute = routing.isAnthropicAccountPoolEnabled(binding.config) && binding.sessionKey
+  const sessionRoute = !pin && routing.isAnthropicAccountPoolEnabled(binding.config) && binding.sessionKey
     ? routing.resolveAnthropicAccountForSession(binding.sessionKey, binding.config, Date.now(), binding.routeDecision, binding.model) : null;
   // Another conversation may move the automatic active pointer without revoking this
   // session's affinity. Manual selection clears affinity and precedes it in the selector.
-  const selectionCurrent = sessionRoute?.reason === "affinity"
+  const selectionCurrent = pin ? binding.snapshot.accountId === pin.accountId
+    : (sessionRoute?.reason === "affinity" || sessionRoute?.reason === "hash")
     && sessionRoute.accountId === binding.snapshot.accountId
     || (selected?.accountId === binding.selection.accountId && selected?.revision === binding.selection.revision);
   return selectionCurrent

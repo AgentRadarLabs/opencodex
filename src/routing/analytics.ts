@@ -11,19 +11,28 @@
  * sample for the full history.
  */
 
-import { normalizePersistedUsageRow, type PersistedUsageEntry } from "../usage/log";
-import { computeEntryCost } from "../usage/summary";
+import {
+  normalizePersistedUsageRow,
+  physicalUsageAttempts,
+  type AttemptRecoveryKind,
+  type PersistedUsageAttempt,
+  type PersistedUsageEntry,
+  type UsageStatus,
+} from "../usage/log";
+import { normalizeCostTokens } from "../usage/cost";
+import { computeEntryCost, type UsageSurface } from "../usage/summary";
 import { withRequestHistoryRead } from "./history/indexer";
 
 export const ANALYTICS_MAX_ROWS = 50_000;
 /** Default row cap for the management API (full cap remains available via `limit`). */
 export const ANALYTICS_API_DEFAULT_ROWS = 5_000;
+export const ANALYTICS_MAX_RED_ALERTS = 100;
 
 export interface RoutingAnalyticsFilters {
   provider?: string;
   model?: string;
   profileId?: string;
-  surface?: string;
+  surface?: UsageSurface;
   from?: number;
   to?: number;
 }
@@ -54,6 +63,69 @@ export interface AnalyticsProfileRow {
   successRate: number | null;
 }
 
+/** Attempt-reported input telemetry. It is not a provider invoice or raw wire capture. */
+export interface AnalyticsAttemptUsage {
+  inclusiveInputTokens: number;
+  rawInputTokens: number;
+  cacheReadInputTokens: number;
+  cacheWriteInputTokens: number;
+  rawInputShare: number | null;
+  cacheReadShare: number | null;
+  cacheWriteShare: number | null;
+}
+
+export interface AnalyticsPhysicalUsageCoverage {
+  totalAttempts: number;
+  measuredAttempts: number;
+  reportedAttempts: number;
+  estimatedAttempts: number;
+  unreportedAttempts: number;
+  unsupportedAttempts: number;
+  ratio: number | null;
+  supportedRatio: number | null;
+}
+
+export interface AnalyticsPhysicalBreakdownRow {
+  provider: string;
+  model: string;
+  accountRef?: string;
+  requests: number;
+  physicalAttempts: number;
+  physicalSends: number;
+  repeatedSendAttempts: number;
+  recoveryAttempts: number;
+  recoveryEvents: number;
+  recoveryRate: number | null;
+  comboFailoverRequests: number;
+  comboFailoverRate: number | null;
+  requestRatePerHour: number | null;
+  attemptUsage: AnalyticsAttemptUsage;
+  usageCoverage: AnalyticsPhysicalUsageCoverage;
+}
+
+export type AnalyticsRedAlertKind =
+  | "consecutive-high-raw-input"
+  | "high-cache-write-after-warmup"
+  | "low-cache-read-share-after-warmup"
+  | "falling-cache-read"
+  | "recovery"
+  | "repeated-send"
+  | "combo-failover";
+
+export interface AnalyticsRedAlert {
+  kind: AnalyticsRedAlertKind;
+  requestId: string;
+  timestamp: number;
+  conversationId?: string;
+  provider: string;
+  model: string;
+  accountRef?: string;
+  attemptOrdinal: number;
+  value?: number;
+  previousValue?: number;
+  recoveryKinds?: AttemptRecoveryKind[];
+}
+
 export interface RoutingAnalyticsResult {
   generatedAt: number;
   totalRequests: number;
@@ -66,6 +138,22 @@ export interface RoutingAnalyticsResult {
   fallbackRate: number | null;
   totalAttempts: number;
   averageAttemptsPerRequest: number | null;
+  physicalAttempts: number;
+  physicalSends: number;
+  repeatedSendAttempts: number;
+  recoveryAttempts: number;
+  recoveryEvents: number;
+  recoveryRate: number | null;
+  comboFailoverRequests: number;
+  comboFailoverRate: number | null;
+  requestRatePerHour: number | null;
+  attemptUsage: AnalyticsAttemptUsage;
+  physicalUsageCoverage: AnalyticsPhysicalUsageCoverage;
+  physicalBreakdown: AnalyticsPhysicalBreakdownRow[];
+  redAlerts: AnalyticsRedAlert[];
+  redAlertsPartial: boolean;
+  sequentialRoutes: number;
+  warmedRoutes: number;
   incompleteStreamRate: number | null;
   cooldownTriggeringFailures: number;
   durationMs: {
@@ -84,6 +172,7 @@ export interface RoutingAnalyticsResult {
   };
   estimatedCostUsdPerSuccessfulRequest: number | null;
   estimatedCostUsdTotalSuccessful: number | null;
+  /** Measured physical attempts divided by all physical attempts. */
   usageCoverage: number | null;
   priceCoverage: number | null;
   breakdown: AnalyticsBreakdownRow[];
@@ -91,6 +180,8 @@ export interface RoutingAnalyticsResult {
 }
 
 interface ScannedRow {
+  requestId: string;
+  timestamp: number;
   provider: string;
   model: string;
   apiKeyId?: string | null;
@@ -102,7 +193,6 @@ interface ScannedRow {
   closeReason?: string | null;
   terminalStatus?: string | null;
   usageStatus: string;
-  usageJson?: string | null;
   attemptCount: number;
   fallback: number;
   rowJson: string;
@@ -112,6 +202,71 @@ interface Bucket extends AnalyticsBreakdownRow {
   durations: number[];
   costUsdSum: number;
   costRows: number;
+}
+
+interface UsageAccumulator {
+  inclusiveInputTokens: number;
+  rawInputTokens: number;
+  cacheReadInputTokens: number;
+  cacheWriteInputTokens: number;
+}
+
+interface CacheDecomposition {
+  inclusive: number;
+  raw: number;
+  read: number;
+  write: number;
+}
+
+interface CoverageAccumulator {
+  totalAttempts: number;
+  reportedAttempts: number;
+  estimatedAttempts: number;
+  unreportedAttempts: number;
+  unsupportedAttempts: number;
+}
+
+interface PhysicalAccumulator {
+  provider: string;
+  model: string;
+  accountRef?: string;
+  requests: number;
+  physicalAttempts: number;
+  physicalSends: number;
+  repeatedSendAttempts: number;
+  recoveryAttempts: number;
+  recoveryEvents: number;
+  comboFailoverRequests: number;
+  usage: UsageAccumulator;
+  coverage: CoverageAccumulator;
+}
+
+interface PhysicalAttempt {
+  ordinal: number;
+  provider: string;
+  model: string;
+  adapter?: string;
+  accountRef?: string;
+  sendCount: number;
+  recoveryKinds: AttemptRecoveryKind[];
+  recoveryCount: number;
+  usageStatus: UsageStatus;
+  usageEstimated: boolean;
+  firstSendAt?: number;
+  promptCacheTtlMs?: number;
+  cache?: CacheDecomposition;
+}
+
+interface ExpandedRow {
+  row: ScannedRow;
+  attempts: PhysicalAttempt[];
+  fallback: boolean;
+  attemptCount: number;
+  comboFailover: boolean;
+  conversationId?: string;
+  kind: "success" | "failure" | "cancelled";
+  rowCostUsd: number | null;
+  cooldownTriggering: boolean;
 }
 
 const COOLDOWN_RECOVERY_KINDS = new Set([
@@ -124,6 +279,41 @@ const COOLDOWN_RECOVERY_KINDS = new Set([
   "oauth-account-429",
   "oauth-account-402",
 ]);
+const USAGE_STATUSES = new Set<UsageStatus>([
+  "reported", "unreported", "unsupported", "estimated",
+]);
+const HOUR_MS = 3_600_000;
+const ANTHROPIC_DEFAULT_PROMPT_CACHE_TTL_MS = 5 * 60_000;
+const ANTHROPIC_ACCOUNT_PROVIDER_RE = /^anthropic-(p[a-f0-9]{6})$/;
+
+/**
+ * One Anthropic account is one physical route, counted once.
+ *
+ * An Anthropic attempt can name its account in the account-qualified provider (`anthropic-p<hex6>`),
+ * in the frozen `accountTag` (#8383, the same `p<hex6>`), and on hosted rows in `accountLogLabel`
+ * (the same digest, also on the plain active account whose provider stays `anthropic`). Keyed on
+ * the raw provider, one account would split into an `anthropic` route and an `anthropic-p<hex6>`
+ * route. So the route takes the account from exactly one source -- the tag or label the caller
+ * passes, else the provider suffix -- and the provider folds to `anthropic`.
+ */
+function physicalAccountRoute(
+  provider: string,
+  accountRef: string | undefined,
+): { provider: string; accountRef?: string } {
+  const suffix = ANTHROPIC_ACCOUNT_PROVIDER_RE.exec(provider)?.[1];
+  if (provider !== "anthropic" && suffix === undefined) return accountRef ? { provider, accountRef } : { provider };
+  const account = accountRef ?? suffix;
+  return { provider: "anthropic", ...(account ? { accountRef: account } : {}) };
+}
+
+function usesAnthropicCacheAlertPolicy(
+  attempt: Pick<PhysicalAttempt, "provider" | "adapter">,
+): boolean {
+  return attempt.adapter === "anthropic"
+    || attempt.provider === "anthropic"
+    || attempt.provider === "anthropic-native"
+    || ANTHROPIC_ACCOUNT_PROVIDER_RE.test(attempt.provider);
+}
 
 function percentile(sorted: number[], p: number): number | undefined {
   if (sorted.length === 0) return undefined;
@@ -147,27 +337,185 @@ function parseEntry(rowJson: string): PersistedUsageEntry | null {
   }
 }
 
-function cooldownTriggering(entry: PersistedUsageEntry | null, status: number): boolean {
-  if (status === 429) return true;
-  if (!Array.isArray(entry?.attempts)) return false;
-  return entry.attempts.some((attempt: unknown) => {
-    if (!attempt || typeof attempt !== "object") return false;
-    const recoveryKinds = (attempt as { recoveryKinds?: unknown }).recoveryKinds;
-    return Array.isArray(recoveryKinds)
-      && recoveryKinds.some(kind => typeof kind === "string" && COOLDOWN_RECOVERY_KINDS.has(kind));
-  });
+/** Account of an attempt: the frozen Anthropic tag, else the persisted account label. */
+function attemptAccount(source: { accountTag?: string; accountLogLabel?: string } | null | undefined): string | undefined {
+  return source?.accountTag ?? source?.accountLogLabel;
 }
 
-/** Same attempt-aware pricing as /api/usage, so a refused retry before a measured send is priced. */
+function usageStatus(value: unknown): UsageStatus {
+  return typeof value === "string" && USAGE_STATUSES.has(value as UsageStatus)
+    ? value as UsageStatus
+    : "unreported";
+}
+
+function cacheDecomposition(value: PersistedUsageEntry["usage"] | undefined): CacheDecomposition | null {
+  if (!value) return null;
+  const tokens = normalizeCostTokens(value);
+  return tokens && {
+    inclusive: value.inputTokens,
+    raw: tokens.input,
+    read: tokens.cacheRead,
+    write: tokens.cacheWrite,
+  };
+}
+
+function physicalAttemptsFor(
+  row: ScannedRow,
+  entry: PersistedUsageEntry | null,
+): PhysicalAttempt[] {
+  const attempts = entry?.attempts;
+  if (entry && attempts !== undefined) {
+    const durable = physicalUsageAttempts(attempts);
+    const legacyAccountAttempt = attemptAccount(entry)
+      ? durable.reduce<PersistedUsageAttempt | undefined>((final, attempt) =>
+          !final || attempt.ordinal > final.ordinal ? attempt : final, undefined)
+      : undefined;
+    const physical = durable
+      .map((attempt): PhysicalAttempt => {
+        const cache = cacheDecomposition(attempt.usage);
+        const route = physicalAccountRoute(attempt.provider, attemptAccount(attempt)
+          ?? (attempt === legacyAccountAttempt ? attemptAccount(entry) : undefined));
+        return {
+          ordinal: attempt.ordinal,
+          model: attempt.model,
+          ...(attempt.adapter ? { adapter: attempt.adapter } : {}),
+          ...route,
+          sendCount: attempt.sendCount,
+          recoveryKinds: attempt.recoveryKinds,
+          recoveryCount: attempt.recoveryCount ?? attempt.recoveryKinds.length,
+          usageStatus: attempt.usageStatus,
+          usageEstimated: attempt.usage?.estimated === true,
+          ...(attempt.firstSendAt !== undefined ? { firstSendAt: attempt.firstSendAt } : {}),
+          ...(attempt.promptCacheTtlMs !== undefined
+            ? { promptCacheTtlMs: attempt.promptCacheTtlMs }
+            : {}),
+          ...(cache ? { cache } : {}),
+        };
+      })
+      .sort((a, b) => a.ordinal - b.ordinal);
+    const rootCache = cacheDecomposition(entry.usage);
+    const finalAttempt = physical.at(-1);
+    if (!durable.some(attempt => attempt.usage !== undefined) && finalAttempt && rootCache) {
+      finalAttempt.cache = rootCache;
+      finalAttempt.usageStatus = usageStatus(entry.usageStatus);
+      finalAttempt.usageEstimated = entry.usage?.estimated === true;
+    }
+    return physical;
+  }
+  const cache = cacheDecomposition(entry?.usage);
+  return [{
+    ordinal: 1,
+    model: row.model,
+    ...physicalAccountRoute(row.provider, attemptAccount(entry)),
+    sendCount: 1,
+    recoveryKinds: [],
+    recoveryCount: 0,
+    usageStatus: usageStatus(entry?.usageStatus ?? row.usageStatus),
+    usageEstimated: entry?.usage?.estimated === true,
+    ...(cache ? { cache } : {}),
+  }];
+}
+
+function cooldownTriggering(entry: PersistedUsageEntry | null, status: number): boolean {
+  if (status === 429) return true;
+  return physicalUsageAttempts(entry?.attempts ?? []).some(attempt =>
+    attempt.recoveryKinds.some(kind => COOLDOWN_RECOVERY_KINDS.has(kind)));
+}
+
+/**
+ * Same attempt-aware pricing as /api/usage, over physical attempts only. Legacy root usage with no
+ * per-attempt usage is priced on the final physical attempt, never added beside it.
+ */
 function successCostUsd(entry: PersistedUsageEntry): number | null {
-  const { isPriced, costTotal } = computeEntryCost(entry);
+  let priced = entry;
+  if (entry.attempts !== undefined) {
+    const attempts = physicalUsageAttempts(entry.attempts).map(attempt => ({ ...attempt }));
+    const finalAttempt = attempts.at(-1);
+    if (finalAttempt && entry.usage && !attempts.some(attempt => attempt.usage !== undefined)) {
+      finalAttempt.usage = entry.usage;
+      finalAttempt.usageStatus = entry.usageStatus;
+    }
+    const { usage: _usage, totalTokens: _totalTokens, ...rest } = entry;
+    priced = { ...rest, attempts };
+  }
+  const { isPriced, costTotal } = computeEntryCost(priced);
   return isPriced ? costTotal : null;
+}
+
+function blankUsage(): UsageAccumulator {
+  return { inclusiveInputTokens: 0, rawInputTokens: 0, cacheReadInputTokens: 0, cacheWriteInputTokens: 0 };
+}
+
+function blankCoverage(): CoverageAccumulator {
+  return { totalAttempts: 0, reportedAttempts: 0, estimatedAttempts: 0, unreportedAttempts: 0, unsupportedAttempts: 0 };
+}
+
+function addAttemptUsage(usage: UsageAccumulator, cache: CacheDecomposition | undefined): void {
+  if (!cache) return;
+  usage.inclusiveInputTokens += cache.inclusive;
+  usage.cacheReadInputTokens += cache.read;
+  usage.cacheWriteInputTokens += cache.write;
+  usage.rawInputTokens += cache.raw;
+}
+
+function addCoverage(coverage: CoverageAccumulator, attempt: PhysicalAttempt): void {
+  coverage.totalAttempts += 1;
+  if (attempt.usageStatus === "unsupported") {
+    coverage.unsupportedAttempts += 1;
+  } else if (
+    attempt.cache
+    && (attempt.usageStatus === "reported" || attempt.usageStatus === "estimated")
+  ) {
+    if (attempt.usageEstimated || attempt.usageStatus === "estimated") coverage.estimatedAttempts += 1;
+    else coverage.reportedAttempts += 1;
+  } else {
+    coverage.unreportedAttempts += 1;
+  }
+}
+
+function finalUsage(usage: UsageAccumulator): AnalyticsAttemptUsage {
+  const total = usage.inclusiveInputTokens;
+  return {
+    ...usage,
+    rawInputShare: total > 0 ? usage.rawInputTokens / total : null,
+    cacheReadShare: total > 0 ? usage.cacheReadInputTokens / total : null,
+    cacheWriteShare: total > 0 ? usage.cacheWriteInputTokens / total : null,
+  };
+}
+
+function finalCoverage(coverage: CoverageAccumulator): AnalyticsPhysicalUsageCoverage {
+  const measuredAttempts = coverage.reportedAttempts + coverage.estimatedAttempts;
+  const supportedAttempts = coverage.totalAttempts - coverage.unsupportedAttempts;
+  return {
+    ...coverage,
+    measuredAttempts,
+    ratio: coverage.totalAttempts > 0 ? measuredAttempts / coverage.totalAttempts : null,
+    supportedRatio: supportedAttempts > 0 ? measuredAttempts / supportedAttempts : null,
+  };
+}
+
+function physicalAccumulator(provider: string, model: string, accountRef?: string): PhysicalAccumulator {
+  return {
+    provider,
+    model,
+    ...(accountRef ? { accountRef } : {}),
+    requests: 0,
+    physicalAttempts: 0,
+    physicalSends: 0,
+    repeatedSendAttempts: 0,
+    recoveryAttempts: 0,
+    recoveryEvents: 0,
+    comboFailoverRequests: 0,
+    usage: blankUsage(),
+    coverage: blankCoverage(),
+  };
 }
 
 export async function computeRoutingAnalytics(
   filters: RoutingAnalyticsFilters,
   options: { maxRows?: number } = {},
 ): Promise<RoutingAnalyticsResult> {
+  const generatedAt = Date.now();
   const maxRows = Math.min(
     Math.max(1, Math.trunc(options.maxRows ?? ANALYTICS_MAX_ROWS)),
     ANALYTICS_MAX_ROWS,
@@ -182,23 +530,46 @@ export async function computeRoutingAnalytics(
   if (filters.provider !== undefined) add("provider = ?", filters.provider);
   if (filters.model !== undefined) add("model = ?", filters.model);
   if (filters.profileId !== undefined) add("profile_id = ?", filters.profileId);
-  if (filters.surface !== undefined) add("surface = ?", filters.surface);
+  if (filters.surface === "codex") where.push("surface IS NULL");
+  else if (filters.surface === "claude") where.push("surface IN ('claude', 'claude-desktop')");
+  else if (filters.surface === "grok") where.push("surface = 'grok'");
   if (filters.from !== undefined) add("timestamp >= ?", filters.from);
   if (filters.to !== undefined) add("timestamp <= ?", filters.to);
   const whereSql = where.length > 0 ? ` WHERE ${where.join(" AND ")}` : "";
 
   const rows = await withRequestHistoryRead(handle => handle.query(
-    `SELECT provider, model, api_key_id AS apiKeyId, profile_id AS profileId,
+    `SELECT request_id AS requestId, timestamp, provider, model,
+            api_key_id AS apiKeyId, profile_id AS profileId,
             profile_revision AS profileRevision, status,
             duration_ms AS durationMs, first_output_ms AS firstOutputMs,
             close_reason AS closeReason, terminal_status AS terminalStatus,
-            usage_status AS usageStatus, usage_json AS usageJson,
-            attempt_count AS attemptCount, fallback, row_json AS rowJson
-     FROM requests${whereSql} ORDER BY timestamp DESC LIMIT ?`,
+            usage_status AS usageStatus, attempt_count AS attemptCount,
+            fallback, row_json AS rowJson
+     FROM requests${whereSql} ORDER BY timestamp DESC, request_id DESC LIMIT ?`,
   ).all(...values, maxRows + 1) as ScannedRow[]);
 
   const scanned = rows.slice(0, maxRows);
   const historyTruncated = rows.length > maxRows;
+  const expanded: ExpandedRow[] = scanned.map(row => {
+    const entry = parseEntry(row.rowJson);
+    row.rowJson = "";
+    const attempts = physicalAttemptsFor(row, entry);
+    const hasDurableAttempts = entry?.attempts !== undefined;
+    const kind = classifyRow(row);
+    return {
+      row,
+      attempts,
+      fallback: hasDurableAttempts ? attempts.length > 1 : row.fallback === 1,
+      attemptCount: hasDurableAttempts ? attempts.length : row.attemptCount,
+      comboFailover: entry?.comboTargetAdvanced === true,
+      ...(entry?.conversationId?.trim()
+        ? { conversationId: entry.conversationId.trim() }
+        : {}),
+      kind,
+      rowCostUsd: kind === "success" && entry ? successCostUsd(entry) : null,
+      cooldownTriggering: kind === "failure" && cooldownTriggering(entry, row.status),
+    };
+  });
 
   let successes = 0;
   let failures = 0;
@@ -207,7 +578,6 @@ export async function computeRoutingAnalytics(
   let totalAttempts = 0;
   let incompleteStreams = 0;
   let cooldownFailures = 0;
-  let usageReported = 0;
   const durations: number[] = [];
   const firstOutputs: number[] = [];
   let costTotalUsd = 0;
@@ -216,36 +586,31 @@ export async function computeRoutingAnalytics(
   const byKey = new Map<string, Bucket>();
   const byProfile = new Map<string, AnalyticsProfileRow>();
 
-  for (const row of scanned) {
-    const kind = classifyRow(row);
+  for (const {
+    row,
+    fallback,
+    attemptCount,
+    kind,
+    rowCostUsd,
+    cooldownTriggering: triggersCooldown,
+  } of expanded) {
     if (kind === "success") successes += 1;
     else if (kind === "failure") failures += 1;
     else cancelled += 1;
-    if (row.fallback === 1) fallbacks += 1;
-    totalAttempts += row.attemptCount;
+    if (fallback) fallbacks += 1;
+    totalAttempts += attemptCount;
     if (row.terminalStatus === "incomplete") incompleteStreams += 1;
     durations.push(row.durationMs);
     if (row.firstOutputMs !== null && row.firstOutputMs !== undefined && row.firstOutputMs >= 0) {
       firstOutputs.push(row.firstOutputMs);
     }
-    if (row.usageStatus !== "unreported") usageReported += 1;
 
-    let rowCostUsd: number | null = null;
-    if (kind === "success") {
-      const entry = parseEntry(row.rowJson);
-      if (entry) {
-        rowCostUsd = successCostUsd(entry);
-        if (rowCostUsd !== null) {
-          costTotalUsd += rowCostUsd;
-          costCount += 1;
-        }
-      }
+    if (rowCostUsd !== null) {
+      costTotalUsd += rowCostUsd;
+      costCount += 1;
     }
 
-    if (kind === "failure") {
-      const failureEntry = parseEntry(row.rowJson);
-      if (cooldownTriggering(failureEntry, row.status)) cooldownFailures += 1;
-    }
+    if (triggersCooldown) cooldownFailures += 1;
 
     const key = `${row.provider}\0${row.model}\0${row.apiKeyId ?? ""}\0${row.profileId ?? ""}`;
     let bucket: Bucket | undefined = byKey.get(key);
@@ -293,14 +658,207 @@ export async function computeRoutingAnalytics(
       profile.requests += 1;
       if (kind === "success") profile.successes += 1;
       else if (kind === "failure") profile.failures += 1;
-      if (row.fallback === 1) profile.fallbacks += 1;
+      if (fallback) profile.fallbacks += 1;
     }
   }
+
+  const overall = physicalAccumulator("", "");
+  const byPhysicalRoute = new Map<string, PhysicalAccumulator>();
+  let comboFailoverRequests = 0;
+  let alertCount = 0;
+  const redAlerts: AnalyticsRedAlert[] = [];
+  const appendAlert = (alert: AnalyticsRedAlert) => {
+    alertCount += 1;
+    if (redAlerts.length === ANALYTICS_MAX_RED_ALERTS) redAlerts.shift();
+    redAlerts.push(alert);
+  };
+  const sequenceObservations: Array<{
+    row: ScannedRow;
+    attempt: PhysicalAttempt;
+    conversationId?: string;
+    measuredCache?: CacheDecomposition;
+  }> = [];
+
+  for (let index = expanded.length - 1; index >= 0; index--) {
+    const { row, attempts, comboFailover, conversationId } = expanded[index]!;
+    if (comboFailover) comboFailoverRequests += 1;
+    const seenRoutes = new Set<string>();
+    for (const [attemptIndex, attempt] of attempts.entries()) {
+      const measuredCache = attempt.usageStatus === "reported" || attempt.usageStatus === "estimated"
+        ? attempt.cache
+        : undefined;
+      const routeKey = `${attempt.provider}\0${attempt.model}\0${attempt.accountRef ?? ""}`;
+      let route = byPhysicalRoute.get(routeKey);
+      if (!route) {
+        route = physicalAccumulator(attempt.provider, attempt.model, attempt.accountRef);
+        byPhysicalRoute.set(routeKey, route);
+      }
+      if (!seenRoutes.has(routeKey)) {
+        seenRoutes.add(routeKey);
+        route.requests += 1;
+        if (comboFailover) route.comboFailoverRequests += 1;
+      }
+      for (const accumulator of [overall, route]) {
+        accumulator.physicalAttempts += 1;
+        accumulator.physicalSends += attempt.sendCount;
+        if (attempt.sendCount > 1) accumulator.repeatedSendAttempts += 1;
+        if (attempt.recoveryCount > 0) accumulator.recoveryAttempts += 1;
+        accumulator.recoveryEvents += attempt.recoveryCount;
+        addAttemptUsage(accumulator.usage, measuredCache);
+        addCoverage(accumulator.coverage, attempt);
+      }
+
+      const baseAlert = {
+        requestId: row.requestId,
+        timestamp: row.timestamp,
+        ...(conversationId ? { conversationId } : {}),
+        provider: attempt.provider,
+        model: attempt.model,
+        ...(attempt.accountRef ? { accountRef: attempt.accountRef } : {}),
+        attemptOrdinal: attempt.ordinal,
+      };
+      if (attempt.recoveryCount > 0) {
+        appendAlert({
+          ...baseAlert,
+          kind: "recovery",
+          value: attempt.recoveryCount,
+          ...(attempt.recoveryKinds.length > 0 ? { recoveryKinds: attempt.recoveryKinds } : {}),
+        });
+      }
+      if (attempt.sendCount > 1) {
+        appendAlert({ ...baseAlert, kind: "repeated-send", value: attempt.sendCount });
+      }
+      if (comboFailover && attemptIndex === attempts.length - 1) {
+        appendAlert({ ...baseAlert, kind: "combo-failover", value: attempts.length });
+      }
+      if (usesAnthropicCacheAlertPolicy(attempt)) {
+        sequenceObservations.push({
+          row,
+          attempt,
+          ...(conversationId ? { conversationId } : {}),
+          ...(measuredCache ? { measuredCache } : {}),
+        });
+      }
+    }
+  }
+
+  type CacheLineage = {
+    previousRead: number;
+    previousInclusive: number;
+    previousCacheable: number;
+    previousSendAt: number;
+    previousTtlMs?: number;
+  };
+  const sequence = new Map<string, {
+    previousRaw?: number;
+    previousRawSendAt?: number;
+    previousRawTtlMs?: number;
+    lineages: CacheLineage[];
+  }>();
+  sequenceObservations.sort((a, b) =>
+    (a.attempt.firstSendAt ?? a.row.timestamp) - (b.attempt.firstSendAt ?? b.row.timestamp)
+    || a.row.requestId.localeCompare(b.row.requestId)
+    || a.attempt.ordinal - b.attempt.ordinal);
+  for (const { row, attempt, conversationId, measuredCache } of sequenceObservations) {
+    if (!measuredCache) continue;
+    const routeKey = `${attempt.provider}\0${attempt.model}\0${attempt.accountRef ?? ""}`;
+    const sequentialKey = `${conversationId ?? row.requestId}\0${routeKey}`;
+    let routeState = sequence.get(sequentialKey);
+    if (!routeState) {
+      routeState = { lineages: [] };
+      sequence.set(sequentialKey, routeState);
+    }
+    const sendAt = attempt.firstSendAt ?? row.timestamp;
+    routeState.lineages = routeState.lineages.filter(lineage =>
+      sendAt - lineage.previousSendAt
+        < (lineage.previousTtlMs ?? ANTHROPIC_DEFAULT_PROMPT_CACHE_TTL_MS));
+    if (
+      routeState.previousRawSendAt !== undefined
+      && sendAt - routeState.previousRawSendAt
+        >= (routeState.previousRawTtlMs ?? ANTHROPIC_DEFAULT_PROMPT_CACHE_TTL_MS)
+    ) {
+      routeState.previousRaw = undefined;
+    }
+
+    const baseAlert = {
+      requestId: row.requestId,
+      timestamp: row.timestamp,
+      ...(conversationId ? { conversationId } : {}),
+      provider: attempt.provider,
+      model: attempt.model,
+      ...(attempt.accountRef ? { accountRef: attempt.accountRef } : {}),
+      attemptOrdinal: attempt.ordinal,
+    };
+    const { inclusive, raw, read, write } = measuredCache;
+    let lineageIndex = -1;
+    for (const [index, candidate] of routeState.lineages.entries()) {
+      if (
+        candidate.previousCacheable > 0
+        && read / candidate.previousCacheable >= 0.9
+        && (
+          lineageIndex === -1
+          || candidate.previousCacheable > routeState.lineages[lineageIndex]!.previousCacheable
+        )
+      ) {
+        lineageIndex = index;
+      }
+    }
+    const previous = lineageIndex >= 0
+      ? routeState.lineages[lineageIndex]
+      : routeState.lineages.at(-1);
+    const newInputGrowth = Math.max(0, inclusive - (previous?.previousInclusive ?? inclusive));
+    const excessWrite = Math.max(0, write - newInputGrowth);
+    const retainedPrefixShare = previous?.previousCacheable && previous.previousCacheable > 0
+      ? Math.min(1, read / previous.previousCacheable)
+      : null;
+    if (raw > 100_000 && routeState.previousRaw !== undefined && routeState.previousRaw > 100_000) {
+      appendAlert({ ...baseAlert, kind: "consecutive-high-raw-input", value: raw, previousValue: routeState.previousRaw });
+    }
+    if (previous) {
+      if (excessWrite > 10_000) {
+        appendAlert({ ...baseAlert, kind: "high-cache-write-after-warmup", value: excessWrite });
+      }
+      if (retainedPrefixShare !== null && retainedPrefixShare < 0.9) {
+        appendAlert({ ...baseAlert, kind: "low-cache-read-share-after-warmup", value: retainedPrefixShare });
+      }
+      if (read < previous.previousRead) {
+        appendAlert({ ...baseAlert, kind: "falling-cache-read", value: read, previousValue: previous.previousRead });
+      }
+    }
+    routeState.previousRaw = raw;
+    routeState.previousRawSendAt = sendAt;
+    routeState.previousRawTtlMs = attempt.promptCacheTtlMs;
+    if (read > 0 || write > 0) {
+      const nextLineage: CacheLineage = {
+        previousRead: read,
+        previousInclusive: inclusive,
+        previousCacheable: read + write,
+        previousSendAt: sendAt,
+        ...(attempt.promptCacheTtlMs ? { previousTtlMs: attempt.promptCacheTtlMs } : {}),
+      };
+      if (lineageIndex >= 0) routeState.lineages.splice(lineageIndex, 1);
+      routeState.lineages.push(nextLineage);
+      if (routeState.lineages.length > 8) routeState.lineages.shift();
+    }
+  }
+  const sequentialRoutes = sequence.size;
+  const warmedRoutes = [...sequence.values()].filter(state => state.lineages.length > 0).length;
 
   durations.sort((a, b) => a - b);
   firstOutputs.sort((a, b) => a - b);
   const total = scanned.length;
   const rate = (count: number): number | null => (total > 0 ? count / total : null);
+  const timestamps = scanned.map(row => row.timestamp).filter(Number.isFinite);
+  const observedStart = timestamps.length > 0 ? Math.min(...timestamps) : undefined;
+  const observedEnd = timestamps.length > 0 ? Math.max(...timestamps) : undefined;
+  const windowStart = filters.from ?? observedStart;
+  const windowEnd = filters.to ?? (filters.from !== undefined ? generatedAt : observedEnd);
+  const windowMs = windowStart !== undefined && windowEnd !== undefined && windowEnd > windowStart
+    ? windowEnd - windowStart
+    : 0;
+  const requestRatePerHour = (count: number): number | null => windowMs > 0
+    ? count / (windowMs / HOUR_MS)
+    : null;
 
   const breakdown: AnalyticsBreakdownRow[] = [...byKey.values()].map(bucket => {
     const sorted = bucket.durations.sort((a, b) => a - b);
@@ -329,12 +887,34 @@ export async function computeRoutingAnalytics(
     successRate: profile.requests > 0 ? profile.successes / profile.requests : null,
   })).sort((a, b) => b.requests - a.requests);
 
+  const physicalBreakdown: AnalyticsPhysicalBreakdownRow[] = [...byPhysicalRoute.values()].map(route => ({
+    provider: route.provider,
+    model: route.model,
+    ...(route.accountRef ? { accountRef: route.accountRef } : {}),
+    requests: route.requests,
+    physicalAttempts: route.physicalAttempts,
+    physicalSends: route.physicalSends,
+    repeatedSendAttempts: route.repeatedSendAttempts,
+    recoveryAttempts: route.recoveryAttempts,
+    recoveryEvents: route.recoveryEvents,
+    recoveryRate: route.physicalAttempts > 0 ? route.recoveryAttempts / route.physicalAttempts : null,
+    comboFailoverRequests: route.comboFailoverRequests,
+    comboFailoverRate: route.requests > 0 ? route.comboFailoverRequests / route.requests : null,
+    requestRatePerHour: requestRatePerHour(route.requests),
+    attemptUsage: finalUsage(route.usage),
+    usageCoverage: finalCoverage(route.coverage),
+  })).sort((a, b) => b.physicalAttempts - a.physicalAttempts
+    || a.provider.localeCompare(b.provider)
+    || a.model.localeCompare(b.model)
+    || (a.accountRef ?? "").localeCompare(b.accountRef ?? ""));
+
   const confidence: AnalyticsConfidence | null = total === 0
     ? null
     : total >= 100 ? "high" : total >= 20 ? "medium" : "low";
+  const physicalUsageCoverage = finalCoverage(overall.coverage);
 
   return {
-    generatedAt: Date.now(),
+    generatedAt,
     totalRequests: total,
     scannedRows: scanned.length,
     historyTruncated,
@@ -345,6 +925,24 @@ export async function computeRoutingAnalytics(
     fallbackRate: rate(fallbacks),
     totalAttempts,
     averageAttemptsPerRequest: total > 0 ? totalAttempts / total : null,
+    physicalAttempts: overall.physicalAttempts,
+    physicalSends: overall.physicalSends,
+    repeatedSendAttempts: overall.repeatedSendAttempts,
+    recoveryAttempts: overall.recoveryAttempts,
+    recoveryEvents: overall.recoveryEvents,
+    recoveryRate: overall.physicalAttempts > 0 ? overall.recoveryAttempts / overall.physicalAttempts : null,
+    comboFailoverRequests,
+    comboFailoverRate: rate(comboFailoverRequests),
+    requestRatePerHour: requestRatePerHour(total),
+    attemptUsage: finalUsage(overall.usage),
+    physicalUsageCoverage,
+    physicalBreakdown,
+    redAlerts: redAlerts.sort((a, b) => b.timestamp - a.timestamp
+      || b.requestId.localeCompare(a.requestId)
+      || b.attemptOrdinal - a.attemptOrdinal),
+    redAlertsPartial: historyTruncated || alertCount > ANALYTICS_MAX_RED_ALERTS,
+    sequentialRoutes,
+    warmedRoutes,
     incompleteStreamRate: rate(incompleteStreams),
     cooldownTriggeringFailures: cooldownFailures,
     durationMs: {
@@ -362,7 +960,7 @@ export async function computeRoutingAnalytics(
     },
     estimatedCostUsdPerSuccessfulRequest: costCount > 0 ? costTotalUsd / costCount : null,
     estimatedCostUsdTotalSuccessful: costCount > 0 ? costTotalUsd : null,
-    usageCoverage: total > 0 ? usageReported / total : null,
+    usageCoverage: physicalUsageCoverage.ratio,
     priceCoverage: successes > 0 ? costCount / successes : null,
     breakdown,
     profileBreakdown,

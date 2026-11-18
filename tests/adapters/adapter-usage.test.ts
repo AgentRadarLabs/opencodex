@@ -150,6 +150,70 @@ describe("adapter reasoning and usage details", () => {
     expect(body.messages[0].content).toBe("hi");
   });
 
+  test("Anthropic API-key requests mark system prompt as cacheable (AgentRadar hosted, .27 5-minute default)", async () => {
+    const prior = process.env.OPENCODEX_AGENTRADAR;
+    process.env.OPENCODEX_AGENTRADAR = "1";
+    try {
+      const adapter = createAnthropicAdapter({ ...provider, adapter: "anthropic", baseUrl: "https://api.anthropic.com" });
+      const request = await adapter.buildRequest({
+        modelId: "claude-opus-4-1",
+        context: {
+          systemPrompt: ["stable project instructions"],
+          messages: [{ role: "user", content: "hi" }],
+        },
+        stream: true,
+        options: {},
+      });
+      const body = JSON.parse(request.body) as { system: unknown; messages: Array<{ content: unknown }>; cache_control?: unknown };
+
+      // Native Anthropic gets top-level automatic caching plus stable explicit breakpoints.
+      expect(body.cache_control).toEqual({ type: "ephemeral" });
+      expect(request.promptCacheTtlMs).toBe(5 * 60_000);
+      expect(body.system).toEqual([{
+        type: "text",
+        text: "stable project instructions",
+        cache_control: { type: "ephemeral" },
+      }]);
+      // The moving final user block is handled by top-level automatic caching.
+      expect(body.messages[0].content).toBe("hi");
+    } finally {
+      if (prior === undefined) delete process.env.OPENCODEX_AGENTRADAR; else process.env.OPENCODEX_AGENTRADAR = prior;
+    }
+  });
+
+  test("Anthropic long cache retention records its one-hour effective TTL", async () => {
+    const adapter = createAnthropicAdapter(
+      { ...provider, adapter: "anthropic", baseUrl: "https://api.anthropic.com" },
+      "long",
+    );
+    const request = await adapter.buildRequest({
+      modelId: "claude-opus-4-1",
+      context: {
+        systemPrompt: ["stable project instructions"],
+        messages: [{ role: "user", content: "hi" }],
+      },
+      stream: true,
+      options: {},
+    });
+
+    expect(request.promptCacheTtlMs).toBe(60 * 60_000);
+  });
+
+  test("Anthropic short or uncached retention records five minutes or nothing", async () => {
+    const build = (retention: "short" | "none") => createAnthropicAdapter(
+      { ...provider, adapter: "anthropic", baseUrl: "https://api.anthropic.com" },
+      retention,
+    ).buildRequest({
+      modelId: "claude-opus-4-1",
+      context: { systemPrompt: ["stable"], messages: [{ role: "user", content: "hi" }] },
+      stream: true,
+      options: {},
+    });
+
+    expect((await build("short")).promptCacheTtlMs).toBe(5 * 60_000);
+    expect((await build("none")).promptCacheTtlMs).toBeUndefined();
+  });
+
   test("Anthropic OAuth requests keep Claude identity first and cache user system prompt", async () => {
     const adapter = createAnthropicAdapter({
       ...provider,

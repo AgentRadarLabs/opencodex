@@ -75,6 +75,7 @@ import { attachAdvisorReasoning } from "./inference/advisor-diagnostics";
 import { directEncodersApply } from "./inference/client-encoder-delivery";
 import { responseWithDeferredRequestLog } from "./relay";
 import { handleResponses } from "./responses";
+import { agentRadarAccountPin, agentRadarPinnedConfig } from "../lib/agentradar-account-pin";
 import { previewXaiOauthWireModel } from "./responses/core-normalize";
 import { providerConsumesCallerAuthorization } from "../providers/caller-authorization";
 import { captureExplicitOpenAiCallerAuth } from "../providers/openai-sidecar";
@@ -178,6 +179,11 @@ async function handleChatCompletionsWithBudget(
     advisorAdmissionPolicy?: CapturedAdmissionPolicy;
   },
 ): Promise<Response> {
+  const agentRadarAccount = agentRadarAccountPin(req.headers);
+  if (agentRadarAccount === null) {
+    if (logIds) addFinalRequestLog(logIds.requestId, logIds.start, logCtx, 400, { closeReason: "non_stream" });
+    return chatCompletionsErrorResponse(400, "Invalid AgentRadar account pin", "invalid_request_error");
+  }
   const advisorInternal = isInternalCallCapability(req.headers.get(ADVISOR_INTERNAL_CAPABILITY_HEADER));
   const sidecarInternal = isInternalCallCapability(req.headers.get(SIDECAR_INTERNAL_CAPABILITY_HEADER));
   const callerPolicy = advisorInternal
@@ -296,7 +302,7 @@ async function handleChatCompletionsWithBudget(
     nativeDecline = route.combo ? "combo-or-policy-route"
       : effortRow ? "effort-row"
       : nativeChatDeclineReason(route, chatBody, config);
-    if (nativeDecline === undefined) {
+    if (nativeDecline === undefined && !agentRadarAccount) {
       chatNativeRoute = route;
       // Reserve an input estimate for spend without recording it as usage: native Chat attempts
       // keep the provider-reported counts, as they did before the reservation existed.
@@ -510,7 +516,7 @@ async function handleChatCompletionsWithBudget(
   }
   // Existing primary enrichment stays on non-caller-auth routes. Caller-auth routes defer
   // optional stored sidecar auth until the final helper plan actually needs it.
-  if (!callerAuthorizationRoute) {
+  if (!callerAuthorizationRoute && !agentRadarAccount) {
     // This enrichment is optional for routed/non-main providers. If native main
     // is fenced, omit it and let auth-context reject only a final physical-main
     // selection while healthy pool/provider routes continue.
@@ -560,10 +566,11 @@ async function handleChatCompletionsWithBudget(
   linkRequestSessionLane(req, internalReq);
 
   const finalizeNativeLog = createFinalRequestLog(logIds, logCtx).finish;
-  const upstream = await handleResponses(internalReq, config, logCtx, {
+  const upstream = await handleResponses(internalReq, agentRadarAccount ? agentRadarPinnedConfig(config, agentRadarAccount) : config, logCtx, {
+    ...(agentRadarAccount ? { agentRadarAccount } : {}),
     clientModelLabel: clientFacingModelLabel(requestedModel),
     openAiSidecarAuth,
-    allowStoredOpenAiSidecarAuth: !!(callerAuthorizationRoute && settledRoute
+    allowStoredOpenAiSidecarAuth: !agentRadarAccount && !!(callerAuthorizationRoute && settledRoute
       && !isCanonicalOpenAiForwardProvider(settledRoute.provider)),
     nativeCallerAuth,
     callerDirectAuth,

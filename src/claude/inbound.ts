@@ -388,6 +388,23 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 
+function claudeCacheSessionUserId(userId: string): string {
+  const session = claudeSessionUserId(userId);
+  // AgentRadar hosted gateways key on the session id alone (.27): every other user_id field may vary.
+  const hosted = process.env.OPENCODEX_AGENTRADAR === "1";
+  if (!hosted && !session.includes("parent_session_id")) return session;
+  try {
+    const parsed: unknown = JSON.parse(session);
+    if (isRec(parsed) && typeof parsed.parent_session_id === "string" && parsed.parent_session_id) {
+      if (hosted) return parsed.parent_session_id;
+      const { parent_session_id: parent, ...rest } = parsed;
+      return JSON.stringify({ ...rest, session_id: parent });
+    }
+    if (hosted && isRec(parsed) && typeof parsed.session_id === "string" && parsed.session_id) return parsed.session_id;
+  } catch { /* not JSON */ }
+  return session;
+}
+
 /** Provenance of the generated prompt_cache_key (never serialized into the wire body). */
 export type ClaudeCacheKeySource = "metadata" | "system" | null;
 
@@ -601,8 +618,9 @@ function applyAnthropicSettings(
     // metadata.user_id embeds the session uuid, so hashing it yields a stable
     // per-session key with a bounded length/charset. Remote Claude Code adds a per-turn
     // attribution token (`tk`) to that blob; it is dropped, as Claude Code itself drops it,
-    // so every turn of one session keeps one key.
-    body.prompt_cache_key = createHash("sha256").update(claudeSessionUserId(raw.metadata.user_id)).digest("hex").slice(0, 32);
+    // so every turn of one session keeps one key. A fork keys on its parent session, whose
+    // cached prefix it shares.
+    body.prompt_cache_key = createHash("sha256").update(claudeCacheSessionUserId(raw.metadata.user_id)).digest("hex").slice(0, 32);
     cacheKeySource = "metadata";
   } else if (typeof cacheSystem === "string" || cacheSystem.length > 0) {
     // Claude Desktop sends no metadata.user_id (H1, devlog 130): without any key the

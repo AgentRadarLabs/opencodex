@@ -256,6 +256,48 @@ describe("CL-09 bounded passive production projection", () => {
     expect(derivePassiveProductionSignals([entry], subjectId).signals).toHaveLength(1);
     expect(derivePassiveProductionSignals([], subjectId).signals).toHaveLength(0);
   });
+
+  test("projects only physical attempts and keeps the first physical duplicate ordinal", () => {
+    const subjectId = "8".repeat(64);
+    const entry = usageEntryWithAttempt({ labRouteSubjectId: subjectId });
+    const attempt = entry.attempts![0]!;
+    entry.attempts = [
+      { ...attempt, sendCount: 0, locallyAnswered: true },
+      { ...attempt, status: 502, errorCode: "upstream_error" },
+      { ...attempt, status: 200 },
+      { ...attempt, ordinal: 2, status: 503, sendCount: 0 },
+      { ...attempt, ordinal: 3, status: 200 },
+    ];
+
+    const result = derivePassiveProductionSignals([entry], subjectId);
+
+    expect(result.signals.map(signal => [signal.attemptOrdinal, signal.outcome])).toEqual([
+      [3, "success"],
+      [1, "route_error"],
+    ]);
+    expect(result.summary.recentProductionAttempts).toBe(2);
+  });
+  test("classifies cancellation against the final physical attempt", () => {
+    const subjectId = "9".repeat(64);
+    const entry = usageEntryWithAttempt({
+      labRouteSubjectId: subjectId,
+      status: 499,
+      errorCode: "upstream_error",
+    });
+    entry.status = 499;
+    entry.closeReason = "client_cancel";
+    entry.attempts!.push({
+      ...entry.attempts![0]!,
+      ordinal: 2,
+      sendCount: 0,
+      locallyAnswered: true,
+    });
+
+    const result = derivePassiveProductionSignals([entry], subjectId);
+
+    expect(result.signals).toHaveLength(1);
+    expect(result.signals[0]?.outcome).toBe("client_cancel");
+  });
 });
 
 describe("CL-09 no-feedback architecture guards", () => {

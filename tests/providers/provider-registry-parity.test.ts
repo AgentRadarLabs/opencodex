@@ -1561,6 +1561,7 @@ describe("provider registry parity", () => {
   test("jawcode metadata aliases are derived from the registry", () => {
     expect(deriveJawcodeAliases()).toEqual({
       xai: "xai",
+      "xai-apikey": "xai",
       anthropic: "anthropic",
       anthropic2: "anthropic",
       "anthropic-apikey": "anthropic",

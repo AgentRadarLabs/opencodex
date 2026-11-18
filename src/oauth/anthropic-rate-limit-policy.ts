@@ -2,6 +2,7 @@
 import type { AnthropicInstanceId } from "../providers/anthropic-instance-id";
 import type { GenerationContext } from "../lib/state-store-sweeper";
 import { credentialGeneration, getAccountCredential } from "./store";
+import { anthropicModelFamily, type AnthropicModelFamily } from "./anthropic-model-family";
 export type AnthropicRateLimitKind = "shared-quota" | "family-quota" | "transient-rate" | "request-scoped-unknown";
 export type RateLimitHeaders = Pick<Headers, "get">;
 export const ANTHROPIC_SHORT_RETRY_MS = 100;
@@ -13,6 +14,16 @@ export const ANTHROPIC_MAX_INLINE_THROTTLE_MS = 1_000;
  */
 export const ANTHROPIC_DETOUR_GRACE_MS = 5 * 60_000;
 
+/**
+ * A unified refusal whose representative claim is the requested model's own weekly limit
+ * (`seven_day_opus` on an Opus request) spends only that family; the shared windows are open.
+ */
+export function anthropicClaimedFamily(headers: RateLimitHeaders, model?: string): AnthropicModelFamily | undefined {
+  const family = anthropicModelFamily(model);
+  return family && headers.get("anthropic-ratelimit-unified-status")?.trim() === "rejected"
+    && headers.get("anthropic-ratelimit-unified-representative-claim")?.trim() === `seven_day_${family.toLowerCase()}` ? family : undefined;
+}
+
 export function anthropicRetryAfterMs(value: string | null | undefined, now: number): number | undefined {
   const text = value?.trim();
   if (!text || text.length > 128) return undefined;
@@ -20,11 +31,14 @@ export function anthropicRetryAfterMs(value: string | null | undefined, now: num
   return Number.isFinite(new Date(at).getTime()) && at > now ? Math.ceil(at - now) : undefined;
 }
 
-export function classifyAnthropic429(headers: RateLimitHeaders, now = Date.now()): AnthropicRateLimitKind {
+export function classifyAnthropic429(headers: RateLimitHeaders, now = Date.now(), model?: string): AnthropicRateLimitKind {
   const rejected = (window: string) => headers.get(`anthropic-ratelimit-unified-${window}-status`)?.trim() === "rejected";
   if (rejected("5h") || rejected("7d")) return "shared-quota";
-  if (rejected("7d_oi")) return "family-quota";
+  if (rejected("7d_oi") || anthropicClaimedFamily(headers, model)) return "family-quota";
   if (headers.get("anthropic-ratelimit-unified-status")?.trim() === "rejected") return "shared-quota";
+  // AgentRadar gateways keep the hosted contract: with no unified status at all, a 429 cools the
+  // account (Retry-After, else the default) and rotates, rather than a same-account retry.
+  if (process.env.OPENCODEX_AGENTRADAR === "1" && headers.get("anthropic-ratelimit-unified-status") === null) return "shared-quota";
   // Retry-After is an account-local admission pause, not proof of spent subscription quota.
   if (anthropicRetryAfterMs(headers.get("retry-after"), now) !== undefined
     || headers.get("anthropic-ratelimit-unified-status")?.trim() === "allowed") return "transient-rate";
