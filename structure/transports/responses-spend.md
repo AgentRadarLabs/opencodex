@@ -74,6 +74,20 @@ derivation agree rather than each settling against a counter the other cannot se
 What stays per-scope is deliberate: the reserve, alternate-target and transition ledgers are each
 target's own recovery decision, while the physical-send total is what binds every target together.
 
+## Hosted Anthropic physical sends
+
+The fork charges Anthropic OAuth inference at the `oauthDispatch` physical boundary in
+`src/server/responses/request-transport.ts`, including initial, continuation and sidecar sends.
+The boundary uses the shared adapter budget view, so an existing hop reservation is consumed
+rather than charged twice; helper reporters do not charge that same send again. A zero allowance
+prevents inference, and an unfunded account replacement retains the preceding upstream refusal.
+Only the factory's unchanged default guarded policy is expanded for the fork's existing account
+walk. Explicit policies and inherited custom ceilings are never widened or reset.
+`tests/adapters/anthropic/anthropic-quota-dispatch.test.ts` counts mock-provider calls for zero,
+one-send, funded replacement, inherited-budget, continuation and sidecar cases. The fork's
+`bun run test:gateway-quota` also exercises pin isolation, replay cache-prefix stability and usage
+accounting in the existing CI `gates` job; it makes no live cache-hit or paid-provider claim.
+
 ## Durable spend reservations
 
 The request's send budget bounds how many times it may reach upstream; the spend ledger bounds

@@ -139,6 +139,7 @@ describe("server terminal guard integration", () => {
     const home = mkdtempSync(join(tmpdir(), "ocx-terminal-anthropic-pool-"));
     const previousHome = process.env.OPENCODEX_HOME;
     process.env.OPENCODEX_HOME = home;
+    takeInheritedSpendHome();
     clearAnthropicAccountPoolState();
     clearPoolRotationState();
     try {
@@ -218,6 +219,8 @@ describe("server terminal guard integration", () => {
       });
       expect(logCtx.attempts?.[1]?.provider).not.toBe(logCtx.attempts?.[0]?.provider);
     } finally {
+      releaseInheritedSpendHome?.();
+      releaseInheritedSpendHome = undefined;
       clearAnthropicAccountPoolState();
       clearPoolRotationState();
       if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
@@ -230,6 +233,7 @@ describe("server terminal guard integration", () => {
     const home = mkdtempSync(join(tmpdir(), "ocx-terminal-anthropic-denial-"));
     const previousHome = process.env.OPENCODEX_HOME;
     process.env.OPENCODEX_HOME = home;
+    takeInheritedSpendHome();
     clearAnthropicAccountPoolState();
     clearPoolRotationState();
     try {
@@ -340,6 +344,8 @@ describe("server terminal guard integration", () => {
       expect(auth.anthropic.accounts.find(account => account.id === "account-b")?.needsReauth).toBe(true);
       expect(auth.anthropic.accounts.find(account => account.id === "account-c")?.needsReauth).toBeUndefined();
     } finally {
+      releaseInheritedSpendHome?.();
+      releaseInheritedSpendHome = undefined;
       clearAnthropicAccountPoolState();
       clearPoolRotationState();
       if (previousHome === undefined) delete process.env.OPENCODEX_HOME;

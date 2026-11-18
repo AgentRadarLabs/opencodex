@@ -46,6 +46,7 @@
     "start": "bun run src/cli/index.ts start",
     "test": "bun scripts/test.ts",
     "test:changed": "bun scripts/test.ts --changed=dev",
+    "test:gateway-quota": "bun scripts/test.ts tests/adapters/anthropic/anthropic-quota-dispatch.test.ts tests/adapters/anthropic/anthropic-pool-extra-usage-400.test.ts tests/adapters/anthropic/anthropic-account-pool.test.ts tests/adapters/anthropic/anthropic-replay-oauth-identity.test.ts tests/adapters/anthropic/anthropic-replay-combo.test.ts tests/server/agentradar-account-pin-e2e.test.ts tests/responses/responses-send-budget-counts.test.ts tests/adapters/adapter-inner-send-budget.test.ts tests/usage/key-attribution.test.ts tests/claude-integration/claude-inbound-cache-stabilize.test.ts tests/server/terminal-guard-server.test.ts",
     "typecheck": "bun x tsc --noEmit",
     "audit:high": "bun audit --audit-level=high && cd gui && bun audit --audit-level=high",
     "privacy:scan": "bun scripts/privacy-scan.ts",

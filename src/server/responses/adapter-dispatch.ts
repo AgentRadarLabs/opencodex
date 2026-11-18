@@ -129,6 +129,9 @@ export async function prepareAdapterExchange(
     | "genericFailovers"
     | "applyFailoverSnapshot"
     | "noteRoutedAttemptSend"
+    | "anthropicPhysicalBudget"
+    | "anthropicSendAvailable"
+    | "setAnthropicDispatchBudget"
   >,
   responseEffects: Pick<ResponsesEffects, "cancelResponseCompletion" | "notifyResponseComplete" | "refreshRequestToolAliases">,
   sendBudgetState: Pick<
@@ -178,7 +181,7 @@ export async function prepareAdapterExchange(
     sendBudgetExhausted,
     reserveCredentialHop,
   } = sendBudgetState;
-
+  transportState.setAnthropicDispatchBudget(adapterDispatchBudget);
 
   const upstream = new AbortController();
   const cleanupUpstreamAbort = linkAbortSignal(upstream, options.abortSignal);
@@ -359,7 +362,7 @@ export async function prepareAdapterExchange(
             // shared counter was inherited without ever being read as a limit.
             ? {
               attempts: remainingTransientSendBudget(transientPolicy.attempts),
-              onSendsConsumed: noteTransientSends,
+              onSendsConsumed: transportState.anthropicPhysicalBudget ? undefined : noteTransientSends,
             }
             : {}),
         },
@@ -455,7 +458,7 @@ export async function prepareAdapterExchange(
       // their physical-send boundary, without booking the request ledger again.
       let fastDowngradeWorkflowCharged = false;
       const chargeFastDowngradeWorkflowSend = (): void => {
-        if (recovery !== "anthropic-fast-downgrade" || fastDowngradeWorkflowCharged) return;
+        if (transportState.anthropicPhysicalBudget || recovery !== "anthropic-fast-downgrade" || fastDowngradeWorkflowCharged) return;
         fastDowngradeWorkflowCharged = true;
         chargeWorkflowSends(sendBudgetState.workflowRootId, 1);
       };
@@ -537,7 +540,7 @@ export async function prepareAdapterExchange(
           // Same rule as the passthrough rebuild: spend the base allowance first, then the one
           // shared final-recovery reserve, so a recovery that follows a spent streak still gets
           // its single send instead of dying at three.
-          const refetchAllowance = refetchTransientPolicy
+          const refetchAllowance = refetchTransientPolicy && !transportState.anthropicPhysicalBudget
             ? recoverySendAllowance(
               refetchTransientPolicy.attempts,
               recoveryClassFor(recovery),
@@ -571,7 +574,7 @@ export async function prepareAdapterExchange(
                 ...(refetchAllowance
                   ? {
                     attempts: refetchAllowance.attempts,
-                    onSendsConsumed: noteTransientSends,
+                    onSendsConsumed: transportState.anthropicPhysicalBudget ? undefined : noteTransientSends,
                   }
                   : {}),
               },
@@ -704,7 +707,7 @@ export async function prepareAdapterExchange(
 
       // An Anthropic OAuth credential denial (403 oauth_org_not_allowed) is not a quota verdict:
       // the account is marked for reauth and the turn continues on the next eligible account.
-      const deniedCredentialRecovery = await rotateAnthropicProviderOnCredentialDenial({
+      const deniedCredentialRecovery = !transportState.anthropicSendAvailable() ? null : await rotateAnthropicProviderOnCredentialDenial({
         config, route, inboundWire, logCtx, transportState, parsed,
         response: upstreamResponse,
         signal: upstream.signal,
@@ -735,8 +738,8 @@ export async function prepareAdapterExchange(
         const adapterOwnsDispatch = transportState.activeAdapter.fetchResponse !== undefined;
         const hop = reserveCredentialHop(
           "repair",
-          `${route.providerName}|${route.modelId}|anthropic-fast-downgrade`,
-          !adapterOwnsDispatch && transientRetryPolicyFor(route.provider) !== null,
+          `${route.providerName}|${route.modelId}|${transportState.anthropicPhysicalBudget ? "anthropic-physical" : "anthropic-fast-downgrade"}`,
+          !transportState.anthropicPhysicalBudget && !adapterOwnsDispatch && transientRetryPolicyFor(route.provider) !== null,
         );
         if (hop.allowed) {
           anthropicFastDowngradeGuard.attempted = true;
@@ -751,7 +754,7 @@ export async function prepareAdapterExchange(
           let result: Response | { failed: Response };
           try {
             result = await rebuildAndRefetch("anthropic-fast-downgrade", () => {
-              if (!adapterOwnsDispatch) hop.permit?.use();
+              if (!adapterOwnsDispatch && !transportState.anthropicPhysicalBudget) hop.permit?.use();
             });
           } finally {
             sendBudgetState.pendingHopPermit = undefined;
@@ -869,6 +872,7 @@ export async function prepareAdapterExchange(
       while (
         transportState.anthropicPoolAccountId
         && transportState.anthropicPoolFailovers < ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST
+        && transportState.anthropicSendAvailable()
       ) {
         let poolRotation: Awaited<ReturnType<typeof peekAnthropicPoolRotation>>;
         try {
@@ -1012,7 +1016,7 @@ export async function prepareAdapterExchange(
             // and settling here first would hand it a dead permit, which it reads as an
             // exhausted request and stops sending on.
             result = await rebuildAndRefetch("oauth-account-429", () => {
-              if (!adapterOwnsDispatch) hop.permit?.use();
+              if (!adapterOwnsDispatch && !transportState.anthropicPhysicalBudget) hop.permit?.use();
             });
           } finally {
             sendBudgetState.pendingHopPermit = undefined;

@@ -627,6 +627,9 @@ jobs:
           cd gui
           bun install --frozen-lockfile
 
+      - name: Gateway quota and cache guardrails
+        run: bun run test:gateway-quota
+
       - name: GUI lint
         if: needs.changes.outputs.gui == 'true'
         run: |

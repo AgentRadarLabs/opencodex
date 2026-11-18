@@ -17,6 +17,7 @@ type Seen = { path: string; auth: string | null; account: string | null; interna
 const seen: Seen[] = [];
 const limited = new Set<string>();
 const denied = new Set<string>();
+const quotaSpent = new Set<string>();
 const enc = new TextEncoder();
 const sse = (events: [string, object][]) => new Response(new ReadableStream({
   start(c) { for (const [type, data] of events) c.enqueue(enc.encode(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)); c.close(); },
@@ -36,6 +37,8 @@ const fake = Bun.serve({
       seen.push({ path, auth, account: req.headers.get("chatgpt-account-id"), internal: [...req.headers.keys()].filter(k => k.startsWith("x-agentradar-")), search, image: body.includes('"type":"image"') });
     }
     if (path === "/v1/messages") {
+      if (auth && quotaSpent.has(auth)) return Response.json({ type: "error", error: {
+        type: "invalid_request_error", message: "You're out of extra usage." } }, { status: 400 });
       if (auth && limited.has(auth)) return rateLimited(retryAfter);
       if (auth && denied.has(auth)) return Response.json({ type: "error", error: { type: "oauth_org_not_allowed",
         message: "Your organization has disabled Claude subscription access for Claude Code. Use an Anthropic API key instead, or ask your admin to enable access." } }, { status: 403 });
@@ -146,11 +149,12 @@ test("outside an AgentRadar gateway a pin is refused, never served unpinned", ()
 });
 
 test("an AgentRadar account pin serves exactly its own stored account (pin.check)", async () => {
-  limited.clear(); denied.clear(); retryAfter = "30";
+  limited.clear(); denied.clear(); quotaSpent.clear(); retryAfter = "30";
   const ocx = await startOcx({
     anthropic: { activeAccountId: "B", accounts: [
       { id: "A", credential: cred("atA") }, { id: "B", credential: cred("atB") }, { id: "C", credential: cred("atC"), needsReauth: true },
-      { id: "D", credential: cred("atD") }, { id: "E", credential: cred("atE") }] },
+      { id: "D", credential: cred("atD") }, { id: "E", credential: cred("atE") },
+      { id: "F", credential: cred("atF") }] },
     xai: { activeAccountId: "gB", accounts: ["gA", "gB", "gC"].map(id => ({ id, credential: cred(`t${id}`) })) },
     kimi: { activeAccountId: "kB", accounts: ["kA", "kB"].map(id => ({ id, credential: cred(`t${id}`) })) },
   }, {
@@ -239,6 +243,15 @@ test("an AgentRadar account pin serves exactly its own stored account (pin.check
     r = await msg(ocx);
     assert.equal(r.status, 200, r.text); assert.deepEqual(tokens(r, "/v1/messages"), ["Bearer atB"]);
 
+    // A newly rotatable extra-usage 400 must not spend a different account when a pin is present.
+    quotaSpent.add("Bearer atE");
+    r = await msg(ocx, pin("claude", "E"));
+    assert.ok(r.status >= 400, r.text);
+    assert.deepEqual(tokens(r, "/v1/messages"), ["Bearer atE"]);
+    assert.match(r.text, /out of extra usage/);
+    assert.equal((await accounts(ocx, "anthropic")).activeAccountId, "B");
+    quotaSpent.clear();
+
     // Claude credential denial on the pinned account: returned as is, never moved to E; the unpinned control does fail over.
     denied.add("Bearer atD");
     r = await msg(ocx, pin("claude", "D"));
@@ -290,7 +303,7 @@ test("an AgentRadar account pin serves exactly its own stored account (pin.check
 }, 120_000);
 
 test("pooled turns log and answer their served account hashed; one request walks every spent account (failover.check)", async () => {
-  limited.clear(); denied.clear(); retryAfter = "318747";
+  limited.clear(); denied.clear(); quotaSpent.clear(); retryAfter = "318747";
   const ids = ["A", "B", "C", "D", "E", "F", "G", "H"];
   // The hosted gateway's pool defaults (AgentRadar images/ocx/pool-defaults.mjs).
   const ocx = await startOcx({
