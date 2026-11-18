@@ -373,6 +373,11 @@ export const SERIAL_FULL_SUITE_FILES = [
   "service/service-sqlite-home.test.ts",
   "service/service.test.ts",
   "codex-integration/native-grok-toggle.test.ts",
+  // Its transaction fixture bounds a child with a blocking spawnSync timeout, and the case that
+  // keeps its child alive on purpose depends on that timeout to kill it. A shared Bun process has
+  // stalled there after earlier files (test 4/4, batch 8, 120 s) while every file passes alone;
+  // a fresh process keeps the same assertions without sharing that state.
+  "clients/client-connect.test.ts",
 ] as const;
 
 type SerialLaneBasename = (typeof SERIAL_FULL_SUITE_FILES)[number] extends infer P
