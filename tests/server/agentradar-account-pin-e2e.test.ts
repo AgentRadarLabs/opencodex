@@ -24,6 +24,7 @@ const sse = (events: [string, object][]) => new Response(new ReadableStream({
 const rateLimited = (retryAfter: string) => Response.json({ type: "error", error: { type: "rate_limit_error", message: "slow down" } }, { status: 429, headers: { "retry-after": retryAfter } });
 let retryAfter = "30";
 const fake = Bun.serve({
+  hostname: "127.0.0.1",
   port: 0,
   async fetch(req) {
     const path = new URL(req.url).pathname;
@@ -82,7 +83,7 @@ async function startOcx(auth: object, config: object) {
   mkdirSync(`${home}/.codex`, { mode: 0o700 });
   writeFileSync(`${home}/auth.json`, JSON.stringify(auth), { mode: 0o600 });
   writeFileSync(`${home}/codex-accounts.json`, JSON.stringify({ acct1: codexCred(1), acct2: codexCred(2) }), { mode: 0o600 });
-  const probe = Bun.serve({ port: 0, fetch: () => new Response() });
+  const probe = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
   const port = probe.port;
   probe.stop(true);
   writeFileSync(`${home}/config.json`, JSON.stringify({ port, hostname: "127.0.0.1", ...config }), { mode: 0o600 });
