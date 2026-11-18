@@ -14,7 +14,7 @@ const API_KEY_SECRET = "sk-test-9942distinctive";
 const AUTH_HEADER = "Bearer access-token-5531distinctive";
 const KEY_ID = "key-record-1";
 
-const LINE_RE = /^\[usage\] status=\d+ provider="[^"]*" model="[^"]*" in=(?:\d+|-) out=(?:\d+|-) cached=(?:\d+|-) key=(?:[0-9a-f]{8}|-) ms=(?:\d+|-)$/;
+const LINE_RE = /^\[usage\] status=\d+ provider="[^"]*" model="[^"]*" in=(?:\d+|-) out=(?:\d+|-) cached=(?:\d+|-) key=(?:[0-9a-f]{8}|-) ms=(?:\d+|-) ttft=(?:\d+|-) acct=(?:[0-9a-f]{8}|-) r429=[01] retry=[01] fallover=[01]$/;
 
 let infos: string[];
 let restoreEnv: () => void;
@@ -44,7 +44,7 @@ describe("usage line", () => {
     });
     const expectedHash = createHash("sha256").update(KEY_ID).digest("hex").slice(0, 8);
     expect(usageLines()).toEqual([
-      `[usage] status=200 provider="anthropic" model="claude-test-1" in=1200 out=340 cached=900 key=${expectedHash} ms=2150`,
+      `[usage] status=200 provider="anthropic" model="claude-test-1" in=1200 out=340 cached=900 key=${expectedHash} ms=2150 ttft=- acct=- r429=0 retry=0 fallover=0`,
     ]);
     expect(LINE_RE.test(usageLines()[0]!)).toBe(true);
   });
@@ -57,7 +57,7 @@ describe("usage line", () => {
 
   test("missing counts, key and duration log as a dash", () => {
     logUsageLine({ status: 502 });
-    expect(usageLines()).toEqual(['[usage] status=502 provider="-" model="-" in=- out=- cached=- key=- ms=-']);
+    expect(usageLines()).toEqual(['[usage] status=502 provider="-" model="-" in=- out=- cached=- key=- ms=- ttft=- acct=- r429=0 retry=0 fallover=0']);
     expect(hashedKeyId(undefined)).toBe("-");
     expect(hashedKeyId("")).toBe("-");
     const odd = usageLogLine({ status: 200, usage: { inputTokens: Number.NaN, outputTokens: -3 } });
@@ -148,7 +148,7 @@ describe("usage line from the final request record", () => {
     try {
       addFinalRequestLog("ocx-usage-line-2", Date.now(), { model: "gpt-test", provider: "openai", admissionKind: "loopback" }, 499, { closeReason: "client_cancel" });
       expect(usageLines()).toHaveLength(1);
-      expect(usageLines()[0]).toMatch(/^\[usage\] status=499 provider="openai" model="gpt-test" in=- out=- cached=- key=- ms=\d+$/);
+      expect(usageLines()[0]).toMatch(/^\[usage\] status=499 provider="openai" model="gpt-test" in=- out=- cached=- key=- ms=\d+ ttft=- acct=- r429=0 retry=0 fallover=0$/);
     } finally {
       if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previousHome;
