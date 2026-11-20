@@ -621,6 +621,8 @@ export function advanceComboAfterFailure(
     cooldownMs?: number;
     eligible?: (target: NormalizedComboTarget) => boolean;
     cooldownScope?: ComboFailureCooldownScope;
+    /** A request-local deadline can advance the ladder without penalizing its target. */
+    recordFailure?: boolean;
     onCooldownRecorded?: (target: Pick<OcxComboTarget, "provider" | "model">) => void;
     status?: number;
     code?: string | null;
@@ -629,7 +631,7 @@ export function advanceComboAfterFailure(
     failedAccount?: string;
   } = {},
 ): ComboPick | null {
-  noteComboFailure(pick.comboId, pick.target, pick.writerGeneration);
+  if (options.recordFailure !== false) noteComboFailure(pick.comboId, pick.target, pick.writerGeneration);
   const combo = getCombo(config, pick.comboId);
   // A 429 from a pooled provider names the ACCOUNT that is spent, not the target. The pool
   // records that account's own cooldown and rotates past it, so cooling the target here blacks
@@ -647,7 +649,7 @@ export function advanceComboAfterFailure(
     && (options.status === 429 ? options.cooldownScope === "target" : options.status === 402);
   // "none" records no cooldown at all: the failure described the request, not the target, so
   // the target must stay immediately selectable for the next (differently shaped) request.
-  if (options.cooldownScope !== "none" && !accountScoped) {
+  if (options.recordFailure !== false && options.cooldownScope !== "none" && !accountScoped) {
     const cooldownTargets = options.cooldownScope === "provider" && combo
       ? combo.targets.filter(target => target.provider === pick.target.provider)
       : [pick.target];
@@ -669,6 +671,7 @@ export function advanceComboAfterFailure(
     && combo.targets.some(target => !target.lastResort);
   return pickComboTarget(config, pick.comboId, {
     exclude: pick.attempted,
+    preview: options.recordFailure === false,
     now: options.now,
     cooldownReprobeTargets: pick.cooldownReprobeTargets
       ? Object.entries(pick.cooldownReprobeTargets)

@@ -36,6 +36,9 @@ import {
 import { captureRouteStaticPolicy, routeConcreteModel } from "../../router";
 import { comboDefaultEffort, concreteComboRequestBody, getCombo, type JevDecision } from "../../combos";
 import { parseComboModelId } from "../../combos/identifiers";
+import { comboAdvertisesEffortUnion } from "../../combos/capability-policy";
+import { comboStripsReasoningControls, stripUnsupportedReasoningControls } from "../../combos/request";
+import { clampComboCallerEffort } from "../../combos/request-capability";
 import { supportedLadderFor } from "../effort-policy";
 import { claudeFamilyVersion, usesAdaptiveThinking } from "../../adapters/anthropic-model-contract";
 import { applyDroidReasoningDefault } from "../droid-reasoning-default";
@@ -375,6 +378,11 @@ function applyComboEffort(
 ): void {
   const combo = getCombo(config, comboId);
   if (!combo) return;
+  const ladder = supportedLadderFor({ provider: targetRoute.provider, modelId: targetRoute.modelId });
+  if (comboStripsReasoningControls(ladder, combo.reasoningEffortMode)) {
+    stripUnsupportedReasoningControls(body);
+    return;
+  }
   // Same precedence as the Chat inbound parser (`resolveReasoningEffort`): a string
   // `reasoning_effort` first, a string nested `reasoning.effort` second. A non-string top-level
   // value (an explicit null) is no caller effort, so the nested one still decides.
@@ -391,7 +399,7 @@ function applyComboEffort(
     callerEffort !== undefined || hadEffort ? { reasoning: { effort: callerEffort } } : {},
     target,
     comboDefaultEffort(config, comboId),
-    supportedLadderFor({ provider: targetRoute.provider, modelId: targetRoute.modelId }),
+    ladder,
     combo.reasoningEffortMode,
     combo.defaultEffortMode,
   );
@@ -402,6 +410,9 @@ function applyComboEffort(
   }
   const effort = (reasoning as { effort?: unknown }).effort;
   if (typeof effort === "string") body.reasoning_effort = effort;
+  if (comboAdvertisesEffortUnion(combo.capabilityPolicy, combo.reasoningEffortMode)) {
+    clampComboCallerEffort(body, ladder, target);
+  }
 }
 
 /** The combo's child callbacks, gated so a discarded attempt never reaches the parent. */

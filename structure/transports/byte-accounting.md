@@ -5,6 +5,7 @@ Native result continuations and function-result injection follow [the mode-speci
 Native steering follows [the shared WebSocket contract](streaming-health.md#experimental-native-mid-turn-steering); this surface's defaults remain unchanged.
 
 Translated Chat inline-image normalization keeps retained wire bytes in its aggregate budget while process-wide native-decode admission and a decoded-pixel ceiling bound memory outside that byte accounting.
+Microsoft 365 Copilot's bounded UploadFile workspace uses the provider_image_upload observation; its [provider contract](../providers/m365-copilot.md) defines image limits and conversation-bound attachment ownership.
 
 Responses body-reader limits and lifetime handling follow the
 [core module ownership](responses.md#core-module-ownership). Raised HTTP concurrency follows the separate admission contract below.
@@ -96,6 +97,9 @@ returns a Buffer view of the coded output, without an explicit full-input UTF-8 
 Zstd still encodes a UTF-8 input buffer that briefly overlaps its coded output for that send.
 Neither codec retains these bytes beyond the send. Admission limits and every byte observation
 still measure the uncompressed body; native codec workspace is not a counted JavaScript copy.
+Optional [history slimming](upload-reduction.md#historical-image-and-tool-context) can shorten a
+native Responses create before this encoding step. Native `/responses/compact` is encoded from
+the complete context.
 
 ## Raised HTTP body admission
 
@@ -144,6 +148,14 @@ It does not bound state beyond the HTTP lifetime or change default-cap concurren
 envelopes, and real HTTP streams; `tests/server/inbound-body-budget.test.ts` covers FIFO/accounting.
 
 ## Stream-buffer accounting
+
+Responses terminal repair in `src/server/responses-terminal-repair.ts` uses the shared incremental
+SSE block buffer. Each append measures its new decoded fragment. Draining measures each consumed
+block to subtract its bytes and keeps the existing byte count for the residual suffix. Delimiter
+searches resume at the scan cursor, and consumed prefixes are compacted before yielding. Replacement overlap admission,
+Unicode decoding, delayed LF handling, terminal decisions and teardown retain their contracts.
+`tests/responses/responses-terminal-repair.test.ts` bounds byte-measurement work by input size
+for fragmented and coalesced frames and checks exact overlap admission with another retained owner.
 
 `src/lib/tool-envelope-echo-filter.ts` retains at most 65,536 UTF-16 code units of
 unresolved marker-line content, independently of its existing bounded fenced-code hold.
@@ -367,10 +379,23 @@ item/metadata limits and lifecycle behavior; raw continuation replay stays upstr
 
 ## Response-log inspection
 
+`src/lib/outbound-credential-registry.ts` rejects impossible two-code-unit prefix starts
+before slicing an eight-character credential window. Each nonempty window/prefix index owns
+an 8 KiB bitset of UTF-16 low-byte pairs; collisions still require the original exact
+lookup, so Unicode and escaped spellings retain their matching behavior. Per-text work
+remains linear and confirmation/KMP work retains its fail-closed budget. Once every long
+secret has received a complete overlapping-occurrence scan, no further prefix walk is
+needed. `tests/responses/sse-untyped-credential-mask.test.ts` bounds slice/lookup counts
+and covers Unicode collisions, short values, overlapping spans and request isolation.
+
 `src/lib/redact-folding.ts` uses an identity fold and UTF-16 offset map for ASCII
 strings without escape introducers when decoding is enabled, and all ASCII strings
-when it is disabled. Other strings keep the general Unicode/escape fold; all
-credential masking passes still run. `tests/lib/redact.test.ts` compares both paths.
+when it is disabled. The identity offset array is cached lazily and pattern matchers
+request it only after a credential label matches; absent labels allocate no offset
+array. Other strings keep the general Unicode/escape fold, preserving credential
+matching coverage. `tests/lib/redact.test.ts` compares both paths.
+Literal ASCII without label delimiters (`:`, `=`, `<`) or escape introducers
+(`\`, `%`, `&`) bypasses label folding; token-pattern redaction still runs.
 
 `src/lib/redact.ts` scans XML identifying attributes over disjoint tag spans rather than
 searching the remaining suffix from each opening delimiter. Tag terminators are quote-aware,
@@ -379,6 +404,7 @@ The decoded and raw passes
 retain the original-offset mapping and mask a credential-bearing element through the rest
 of the input. `tests/lib/redact.test.ts` counts delimiter searches and scanned characters across doubled inputs
 without a machine-speed deadline, as well as malformed and escaped credential coverage.
+The redactor masks bare Hub relay leases and values carried by `X-OpenCodex-API-Key`.
 
 `src/server/response-log-body.ts` forwards raw response chunks on downstream demand.
 Diagnostic retention is limited to 32 MiB for JSON and an 8 KiB prefix for other
@@ -472,6 +498,25 @@ Native steering generation overrides, explicit public-API eligibility and the co
 
 ## Durable spill admission
 
+`src/responses/state/spill-codec.ts` encodes compressible 128 KiB–16 MiB spill payloads
+in self-contained JSON envelopes `{ "ocxSpillCodec": "zstd/1", "decodedBytes", "data" }`
+(zstd/base64). The marker is a dedicated key, never `version`: the payload owns `version`
+(`RESPONSE_SPILL_VERSION` in `src/responses/spill-store.ts`), so a plain record of any future
+payload version is never read as an envelope. The full envelope must save at least 12.5% over
+the original JSON; other payloads stay plain version-1 JSON.
+References, digests, prospective reservations and disk totals measure the physical
+envelope. The reader accepts both formats and enforces the decoded-record ceiling
+before bounded decompression, then validates the original response ID and payload.
+The resident-memory cap remains based on decoded content. Records have no parent-file
+dependencies, and existing files are not rewritten. Rolling back the writer must keep
+the envelope reader until these records expire. Downgrade: an older binary without the
+reader fails such a record as `spill_corrupt`, so a continuation that needed it answers
+`previous_response_not_found` and the client must resend its full history once; plain
+records stay readable both ways.
+`tests/responses/responses-spill-compression.test.ts` covers size savings, bounded
+decoding, legacy records, a payload carrying its own `version`, snapshot reload and
+thread-isolated replay.
+
 `enforceSpilledResponseBudget` in `src/responses/state.ts` owns the durable spill ceiling
 described in [Codex home](../codex-home.md). A queued publication, and the shutdown fallback, call it
 with the headroom their write needs on top of what is already accounted; called with no argument it
@@ -552,11 +597,4 @@ counted). A local socket has no flow, and link sockets exist only while the link
 switch and release gate are on.
 
 ## Operator log lines and physical-attempt analytics
-
-`src/lib/usage-line-log.ts`: one `[usage]` line per final request record (`addRequestLog` in `src/server/request-log.ts`), only when `OPENCODEX_AGENTRADAR=1`: `status`, `provider` (pooled account suffix dropped), `model`, `in`, `out`, `cached`, `key` (8 hex of SHA-256 over the API key record id) and `ms`, `-` when unknown. One finalized record, not proof of one physical dispatch; ids sanitized, quoted, 80 characters; never text, body, header, secret, account label or email. `tests/lib/call-usage-line-log.test.ts`.
-
-`src/lib/upstream-refusal-log.ts`, also only when `OPENCODEX_AGENTRADAR=1`: one `[upstream-refusal]` line per upstream 4xx except 401/429 at the physical send with status, provider/model ids, envelope `type`/`code`/`param` and outgoing body bytes. The envelope is read from a clone (64 KiB, 2 s) off the request path; `message` is never read. A field is logged verbatim only as a short identifier without a 20+ character alphanumeric run, else as `#` plus 8 hex of SHA-256 over its redacted value. `logTranslationBufferLimit` and `logOversizedInbound` log the proxy's own 413 and a >5 MiB declared inbound size with closed fields. `tests/lib/upstream-refusal-log.test.ts`.
-
-Physical attempts: `physicalUsageAttempts` (`src/usage/physical-attempts.ts`, re-exported by `src/usage/log.ts`) keeps only real upstream sends (not locally answered, `sendCount > 0`, first of each ordinal). `aggregateAttemptUsage`, `normalizePhysicalEntry` (usage summary and `/api/logs` `displayMetrics`), the request-history ingest columns, route explainability's final target, health scoring (`src/routing/health.ts`, ordered by row then attempt) and Lab passive production evidence (`src/lab/query/passive-production.ts`) and the final row's tier outcome read only those; an explicit empty or all-nonphysical list never falls back to stale root usage, and legacy root usage with no attempt usage prices on the final physical attempt. A malformed optional attempt field drops only that field. Usage carries bounded `anthropicServerToolUse` counters (summed) and the latest `contextTotalTokens`. Covered by `tests/usage/usage-log-physical.test.ts`, `tests/usage/usage-summary-physical.test.ts`, `tests/usage/request-log-physical.test.ts` and `tests/server/management-api-logs-metrics-physical.test.ts`.
-
-`GET /api/routing-analytics` (`src/routing/analytics.ts`, bounded `withRequestHistoryRead`) adds physical-attempt telemetry: real sends only (locally answered, unsent and duplicate-ordinal attempts dropped), `physicalSends`, `repeatedSendAttempts`, `recoveryAttempts`/`recoveryEvents` (`recoveryCount`, else `recoveryKinds`), `comboFailoverRequests` (`comboTargetAdvanced` rows), input cache shares, `physicalUsageCoverage` (`usageCoverage` is its ratio; unreported and unsupported never count as measured) and `physicalBreakdown`. An Anthropic route folds to `anthropic` with one account: `accountTag`, else `p<hex6>` `accountLogLabel`, else the provider suffix. `redAlerts` (newest `ANALYTICS_MAX_RED_ALERTS`, `redAlertsPartial` when capped or truncated) hold ids and numbers only: `recovery`, `repeated-send`, `combo-failover`, and per Anthropic conversation route in `firstSendAt` order `consecutive-high-raw-input`, `high-cache-write-after-warmup`, `low-cache-read-share-after-warmup`, `falling-cache-read`, with warm state expiring after `promptCacheTtlMs` (default 5 minutes). `range` reuses the usage calendar window; `surface` takes the usage groups. `tests/routing/routing-analytics-physical.test.ts`.
+`src/lib/usage-line-log.ts`: one `[usage]` line per final request record (`addRequestLog` in `src/server/request-log.ts`), only when `OPENCODEX_AGENTRADAR=1`: `status`, `provider` (pooled account suffix dropped), `model`, `in`, `out`, `cached`, `key` (8 hex of SHA-256 over the API key record id) and `ms`, `-` when unknown. One finalized record, not proof of one physical dispatch; ids sanitized, quoted, 80 characters; never text, body, header, secret, account label or email. `tests/lib/call-usage-line-log.test.ts`. `src/lib/upstream-refusal-log.ts`, also only when `OPENCODEX_AGENTRADAR=1`: one `[upstream-refusal]` line per upstream 4xx except 401/429 at the physical send with status, provider/model ids, envelope `type`/`code`/`param` and outgoing body bytes. The envelope is read from a clone (64 KiB, 2 s) off the request path; `message` is never read. A field is logged verbatim only as a short identifier without a 20+ character alphanumeric run, else as `#` plus 8 hex of SHA-256 over its redacted value. `logTranslationBufferLimit` and `logOversizedInbound` log the proxy's own 413 and a >5 MiB declared inbound size with closed fields. `tests/lib/upstream-refusal-log.test.ts`. Physical attempts: `physicalUsageAttempts` (`src/usage/physical-attempts.ts`, re-exported by `src/usage/log.ts`) keeps only real upstream sends (not locally answered, `sendCount > 0`, first of each ordinal). `aggregateAttemptUsage`, `normalizePhysicalEntry` (usage summary and `/api/logs` `displayMetrics`), the request-history ingest columns, route explainability's final target, health scoring (`src/routing/health.ts`, ordered by row then attempt) and Lab passive production evidence (`src/lab/query/passive-production.ts`) and the final row's tier outcome read only those; an explicit empty or all-nonphysical list never falls back to stale root usage, and legacy root usage with no attempt usage prices on the final physical attempt. A malformed optional attempt field drops only that field. Usage carries bounded `anthropicServerToolUse` counters (summed) and the latest `contextTotalTokens`. Covered by `tests/usage/usage-log-physical.test.ts`, `tests/usage/usage-summary-physical.test.ts`, `tests/usage/request-log-physical.test.ts` and `tests/server/management-api-logs-metrics-physical.test.ts`. `GET /api/routing-analytics` (`src/routing/analytics.ts`, bounded `withRequestHistoryRead`) adds physical-attempt telemetry: real sends only (locally answered, unsent and duplicate-ordinal attempts dropped), `physicalSends`, `repeatedSendAttempts`, `recoveryAttempts`/`recoveryEvents` (`recoveryCount`, else `recoveryKinds`), `comboFailoverRequests` (`comboTargetAdvanced` rows), input cache shares, `physicalUsageCoverage` (`usageCoverage` is its ratio; unreported and unsupported never count as measured) and `physicalBreakdown`. An Anthropic route folds to `anthropic` with one account: `accountTag`, else `p<hex6>` `accountLogLabel`, else the provider suffix. `redAlerts` (newest `ANALYTICS_MAX_RED_ALERTS`, `redAlertsPartial` when capped or truncated) hold ids and numbers only: `recovery`, `repeated-send`, `combo-failover`, and per Anthropic conversation route in `firstSendAt` order `consecutive-high-raw-input`, `high-cache-write-after-warmup`, `low-cache-read-share-after-warmup`, `falling-cache-read`, with warm state expiring after `promptCacheTtlMs` (default 5 minutes). `range` reuses the usage calendar window; `surface` takes the usage groups. `tests/routing/routing-analytics-physical.test.ts`.
