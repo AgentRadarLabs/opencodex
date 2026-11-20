@@ -17,6 +17,7 @@ import {
   beginRequestAttempt,
   finishRequestAttempt,
   inspectResponseLogSsePayloadParsed,
+  noteAttemptSend,
   registerCommittedTerminalCooldownHandler,
   type RequestLogContext,
   type RequestLogEntry,
@@ -357,9 +358,12 @@ describe("committed-terminal combo cooldown", () => {
   test.each([[1024, false], [4096, true]] as const)("uses %i serving output tokens for cooldown and preserves aggregate accounting", (outputTokens, cooled) => {
     registerCommittedTerminalCooldownHandler(coolComboTargetForCommittedTerminal);
     try {
+      // Both attempts reached upstream; aggregation sums physical sends only.
       const earlier = beginRequestAttempt(1, "b", "m2", "openai-responses");
+      noteAttemptSend(earlier, undefined);
       finishRequestAttempt(earlier, 502, 10, { inputTokens: 100, outputTokens: 3500 });
       const serving = beginRequestAttempt(2, "a", "m1", "openai-responses");
+      noteAttemptSend(serving, undefined);
       const logCtx: RequestLogContext = {
         model: "m1", provider: "a", providerAdapter: "openai-responses",
         comboId: "free", comboTarget: first, comboTargetOutputCeiling: 4096,
