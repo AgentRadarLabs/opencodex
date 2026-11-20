@@ -1,5 +1,6 @@
 {
   "combo-stream-preflight-agentradar.test.ts": "routing",
+  "claude-usage-credits.test.ts": "providers",
   "call-usage-line-log.test.ts": "lib",
   "upstream-refusal-log.test.ts": "lib",
   "routing-analytics-physical.test.ts": "routing",

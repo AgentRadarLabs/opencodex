@@ -1868,5 +1868,6 @@
   "agentradar-account-pin-parity-e2e.test.ts": "server",
   "terminal-guard-agentradar-rotation.test.ts": "server",
   "agentradar-account-pin-e2e.test.ts": "server",
+  "claude-usage-credits.test.ts": "providers",
   "combo-stream-preflight-agentradar.test.ts": "routing"
 }

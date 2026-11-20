@@ -4,6 +4,7 @@ import { anthropicProviderIdentityError, cmdAnthropicAccountThreshold } from "./
 import { isReservedCodexAccountWord, reportCodexAccountTargetError, resolveCodexAccountTarget } from "./account-target";
 import { hasPassiveAccountQuota } from "../providers/quota";
 import { isWeeklyAllowancePercent } from "../providers/quota-types";
+import { claudeCreditsText } from "./account-key-quota";
 import { readSecretLine, terminalSafeText } from "./runtime-api";
 import {
   ANTIGRAVITY_RISK_ACK_FIELD,
@@ -307,6 +308,8 @@ function quotaParts(quota: ProviderQuotaDto): string[] {
     const reset = resetIso(window.resetAt);
     if (reset) parts.push(`resets ${reset}`);
   }
+  const credits = claudeCreditsText(quota.claudeUsageCredits);
+  if (credits) parts.push(credits);
   return parts;
 }
 

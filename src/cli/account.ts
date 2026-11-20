@@ -1,5 +1,5 @@
 /** `ocx account` — list and switch provider credentials (issue #180). */
-import { apiKeyQuotaText, quotaUnknownReasonText } from "./account-key-quota";
+import { apiKeyQuotaText, claudeCreditsText, quotaUnknownReasonText } from "./account-key-quota";
 import { redactSecretArgs } from "./secret-args";
 import { emptyAccountNextAction, recoveryAccountLabel } from "./account-next-actions";
 import { loadConfig } from "../config";
@@ -165,6 +165,8 @@ function quotaText(row: AccountRow): string {
   if (typeof quota.monthlyPercent === "number") parts.push(`mo ${Math.round(quota.monthlyPercent)}%`);
   // #8574: the stored weekly reading follows whichever of two live windows came last; say so.
   if (row.weeklyQuotaConflicts?.length) parts.push("(weekly windows conflict)");
+  const credits = claudeCreditsText(quota.claudeUsageCredits);
+  if (credits) parts.push(credits);
   return parts.length > 0 ? parts.join(" ") : "-";
 }
 
