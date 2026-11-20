@@ -1,4 +1,7 @@
 import type { OcxConfig } from "../../types";
+import type { LowQuotaEvent } from "../../codex/low-quota-events";
+import type { Channel } from "../../update/index";
+import type { UpdateCheckResult } from "../../update/job";
 import type { NativeProfileApiDeps } from "../../codex/native-profile-api";
 import type { CodexLogGuardProtectionDeps } from "../../codex/log-guard/protection";
 import type { CodexLogGuardMaintenanceDeps } from "../../codex/log-guard/maintenance";
@@ -6,10 +9,11 @@ import type { StartupHealth } from "../../codex/autostart-health";
 import type { StartupInstallAction } from "../startup-action-control";
 import type { ManagementPrincipal, ManagementSessionControl } from "../management-auth";
 import type { CatalogModel } from "../../codex/catalog";
+import type { refreshOwnedCatalogIntegrations } from "../../integrations/catalog-refresh";
 import type { Paths as CodexPromptPaths } from "../../codex/prompt-layers";
 import type { injectGrokConfig } from "../../grok/inject";
 import type { removeDesktop3pStandardPivot, writeDesktop3pConfig } from "../../claude/desktop-3p";
-import type { probeClaudeDesktopPolicy } from "../../claude/desktop-policy";
+import type { ClaudeDesktopPolicyProbeOptions, ClaudeDesktopPolicyState } from "../../claude/desktop-policy";
 import type { RuntimePortState } from "../../config/process-state";
 import type { CursorInstall } from "../../integrations/cursor-detect";
 import type { CursorEffortTable } from "../../integrations/cursor-effort-table";
@@ -18,12 +22,56 @@ import type {
   performCodexRestart,
   readCodexAppServerState,
 } from "../../codex/app-server-restart-service";
+import type { RequestMetricsSnapshotter } from "../request-metrics";
+
+import type { RemoteWorkspaceHub } from "../../remote-control/workspace-hub";
+import type { RemoteWorkspaceSessionService } from "../../remote-control/workspace-sessions";
+import type { LinkSupervisor } from "../../link/supervisor";
+import type { LinkListenerLifecycle } from "../index/link-listener";
+import type { SshRunner } from "../../link/ssh-runner";
+import type { LinkStore } from "../../link/store";
+import type { IssuedApiKey } from "./oauth-account-routes";
+
+export type RemoteWorkspaceHubApi = Pick<RemoteWorkspaceHub,
+  "identity" | "createPairingGrant" | "assertPairingSourceAllowed" | "pairDevice"
+  | "authenticateDeviceToken" | "attachConnection" | "updateDeviceCapabilities"
+  | "detachConnection" | "listDevices" | "revokeDevice" | "closeAllConnections">;
+export type RemoteWorkspaceSessionsApi = Pick<RemoteWorkspaceSessionService,
+  "availability" | "list" | "create" | "prompt" | "submitPrompt" | "stop" | "shutdown">;
+
+export interface ManagementRequestIngress {
+  trustedLoopback: boolean;
+  guiSessionIssuance?: import("../gui-session").GuiSessionIssuance | null;
+}
 
 export interface ManagementApiDeps {
+  desktopStartupSettings?: import("../../codex/desktop-compatibility/startup-settings").DesktopStartupSettingsService;
+  desktopCertificateService?: import("../../codex/desktop-compatibility/certificate-service").DesktopCertificateService;
+  desktopCompatibilityRuntime?: import("../../codex/desktop-compatibility/runtime").DesktopCompatibilityRuntime;
+  onDesktopCompatibilityShutdown?: (shutdown: () => Promise<void>) => void;
+  /** Bound to this server's lifecycle owner; absent in direct route tests. */
+  listLowQuotaEvents?: (limit?: number) => LowQuotaEvent[];
+  /** Bound Claude intercept state, injectable for isolated management-route tests. */
+  ensureClaudeIntercept?: () => Promise<import("../../claude/intercept/runtime").ClaudeInterceptOutcome>;
+  getClaudeInterceptState?: typeof import("../../claude/intercept/runtime").getClaudeInterceptState;
+  /** Reconciliation seam for field-scoped rollback tests. */
+  reconcileClaudeFirstPartySettings?: typeof import("../../claude/first-party-settings").reconcileClaudeFirstPartySettings;
+  /** Read-only process-local aggregate metrics; absent keeps the scrape route unavailable. */
+  requestMetrics?: RequestMetricsSnapshotter;
+  checkPackageUpdate?: (channel: Channel) => Promise<UpdateCheckResult>;
+  /** Test seam for the dashboard restart supervisor check (src/update/worker-launch.ts). */
+  dashboardRestartRefusal?: typeof import("../../update/worker-launch").dashboardRestartRefusal;
+  remoteWorkspaceHub?: RemoteWorkspaceHubApi;
+  remoteWorkspaceSessions?: RemoteWorkspaceSessionsApi;
+  /** The listener retains and awaits teardown only after this optional subsystem activates. */
+  remoteWorkspaceStopping?: () => boolean;
+  onRemoteWorkspaceShutdown?: (shutdown: () => Promise<void>) => void;
+  /** Isolates automatic owned-client writes in route tests. */
+  refreshOwnedCatalogIntegrations?: typeof refreshOwnedCatalogIntegrations;
   /** Platform seam for capability projections; does not alter host-level startup behavior. */
   platform?: NodeJS.Platform;
-  toggleCodexMultiAgentV2?: (enabled: boolean) => void;
-  toggleDefaultModeRequestUserInput?: (enabled: boolean) => void;
+  toggleCodexMultiAgentV2?: (enabled: boolean, env: NodeJS.ProcessEnv, validateBeforeSpawn: () => void) => void;
+  toggleDefaultModeRequestUserInput?: (enabled: boolean, env: NodeJS.ProcessEnv, validateBeforeSpawn: () => void) => void;
   createManagementConvergeCodex?: (config: Readonly<OcxConfig>) => ConvergeCodex;
   /** Test-only destination for best-effort Claude agent-definition sync. */
   claudeAgentConfigDir?: string;
@@ -43,6 +91,9 @@ export interface ManagementApiDeps {
    * Tests stub it to orphan the fixture file mid-fetch (the r7 recheck test).
    */
   fetchAllModels?: (config: OcxConfig) => Promise<CatalogModel[]>;
+  /** Codex role auto-assign's one sizing model call; route tests answer it without a provider. */
+  completeCodexRoleSizing?: import("./codex-role-auto-assign").CompleteRoleSizing;
+  loadCodexRoleCapability?: import("../../codex/role-capability").LoadCapability;
   /**
    * Writer seam for the Grok toggle: lets a test place the file in any state
    * between the pre-write recheck and the write itself (the r8 post-inspection
@@ -53,7 +104,9 @@ export interface ManagementApiDeps {
   removeDesktop3pStandardPivot?: typeof removeDesktop3pStandardPivot;
   writeDesktop3pConfig?: typeof writeDesktop3pConfig;
   /** Read-only Windows MDM policy seam for status/apply tests. */
-  probeClaudeDesktopPolicy?: typeof probeClaudeDesktopPolicy;
+  probeClaudeDesktopPolicy?: (
+    options?: ClaudeDesktopPolicyProbeOptions,
+  ) => ClaudeDesktopPolicyState | Promise<ClaudeDesktopPolicyState>;
   /**
    * Runtime-state seam: the fence must name the host/port the RUNNING process
    * bound (agent-settings-routes.ts:99-103 pattern), and a test must not depend
@@ -104,6 +157,27 @@ export interface ManagementApiDeps {
    * `saveConfigPreservingClaudeCode` above exists to prevent.
    */
   codexPromptPaths?: CodexPromptPaths;
+  /** Link seams are getters so the optional listener and supervisor are singletons. */
+  linkSupervisor?: () => LinkSupervisor;
+  linkListener?: () => Pick<LinkListenerLifecycle<unknown>, "ensureStarted" | "status" | "close" | "onAuthenticatedCatalog"> & Partial<Pick<LinkListenerLifecycle<unknown>, "peerObservation">> & Partial<Pick<import("../index/optional-listeners").OptionalListenerSet<unknown>, "ensureClaudeIntercept" | "claudeInterceptOutcome" | "linkActivity" | "linkTraffic" | "catalogPull" | "flushCatalogPulls">>;
+  readLinkStore?: () => LinkStore;
+  writeLinkStore?: (store: LinkStore) => void;
+  linkKnownHostsPath?: () => string;
+  sshRunner?: SshRunner;
+  /** id: the key id an operation reserved before issuing it (src/server/management/link-operation.ts). */
+  issueApiKey?: (config: OcxConfig, name: string, id?: string) => IssuedApiKey;
+  /** The operation journal (src/link/operations-journal.ts); defaults to <configDir>/link/operations.json. */
+  linkOperationsPath?: () => string;
+  /** The per-alias lock (src/link/alias-lock.ts): directory, clock, sleep and wait bound. */
+  linkAliasLock?: import("../../link/alias-lock").AliasLockDeps;
+  /** Called before an operation's effect mark is written; a throw stands for a failed journal write (tests). */
+  linkOperationMarkHook?: (effect: string, phase: "intent" | "done") => void;
+  revokeApiKey?: (config: OcxConfig, id: string) => boolean;
+  loadLinkCandidates?: () => Array<{ alias: string; source: "ssh_config" | "tailscale" }>;
+  resolveChildBinarySource?: typeof import("../../link/child-binary-source").resolveChildBinarySource;
+  /** Bound public inference port, not the ingress receiving this management request. */
+  liveListenPort?: () => number | undefined;
+  now?: () => number;
 }
 
 
@@ -125,6 +199,17 @@ export interface ManagementContext {
   principal?: ManagementPrincipal;
   /** Narrow current-session revocation seam; contains neither the token nor session map. */
   sessionControl?: ManagementSessionControl;
+  /** Whether the request arrived through a trusted loopback ingress. */
+  trustedLoopbackIngress: boolean;
+  /** The issuance mode of the session, when the principal is a GUI session. */
+  guiSessionIssuance: import("../gui-session").GuiSessionIssuance | null;
   convergeCodexCatalog: () => Promise<CatalogDisposition>;
   syncClaudeAgentDefsBestEffort: () => Promise<void>;
+}
+
+/** A management-only ingress cannot supply the port used by generated inference clients. */
+export function managementInferencePort(ctx: Pick<ManagementContext, "config" | "deps">): number {
+  // Lifecycle owns the actual port (including CLI overrides/ephemeral binds); direct route
+  // fixtures fall back to config without consulting another runtime's state file.
+  return ctx.deps.liveListenPort?.() ?? ctx.config.port;
 }

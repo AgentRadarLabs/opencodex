@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { cmdPause, cmdPauseExhausted, cmdStrategy, cmdSticky } from "../../src/cli/account-extended";
+import { cmdClearCooldown, cmdPause, cmdPauseExhausted, cmdStrategy, cmdSticky, cmdRoutes } from "../../src/cli/account-extended";
 import type { AccountDeps } from "../../src/cli/account-api";
 
 /**
@@ -30,11 +30,21 @@ function deps(
         body: init?.body === undefined ? undefined : JSON.parse(String(init.body)),
       };
       calls.push(captured);
+      if (captured.method === "GET" && captured.path === "/api/codex-auth/accounts") {
+        // Pool verbs resolve their account argument against the list before writing.
+        return new Response(JSON.stringify({ accounts: KNOWN_ACCOUNTS.map(id => ({ id })) }), { status: 200 });
+      }
+      if (captured.method === "GET" && captured.path === "/api/oauth/accounts") {
+        return new Response(JSON.stringify({ accounts: [{ id: "acct_1", alias: "gem-pro" }] }), { status: 200 });
+      }
       const { status = 200, json } = respond(captured);
       return new Response(JSON.stringify(json), { status });
     }) as unknown as typeof fetch,
   };
 }
+
+// Ids the mocked pool list answers with; "nope" stays listed so the 404 test still reaches the server.
+const KNOWN_ACCOUNTS = ["acct_1", "acct_2", "nope"];
 
 function capture(): { lines: string[]; errors: string[]; restore: () => void } {
   const lines: string[] = [];
@@ -46,7 +56,114 @@ function capture(): { lines: string[]; errors: string[]; restore: () => void } {
   return { lines, errors, restore: () => { console.log = log; console.error = err; } };
 }
 
+describe("ocx account reset-affinity", () => {
+  test.each(["anthropic", "anthropic2"])("%s requires no roster or local config", async provider => {
+    const { cmdAccount } = await import("../../src/cli/account");
+    const calls: Captured[] = [];
+    const out = capture();
+    const d = deps(() => ({ json: { ok: true, provider, affinityResetConfirmed: true } }), calls);
+    d.loadConfigImpl = () => { throw new Error("must not require a roster or local configuration"); };
+    try {
+      expect(await cmdAccount(["reset-affinity", provider, "--json"], d)).toBe(0);
+      expect(calls).toEqual([{ path: "/api/oauth/accounts/affinity-reset", method: "PUT", body: { provider } }]);
+      expect(JSON.parse(out.lines.join(""))).toEqual({ ok: true, provider, affinityResetConfirmed: true });
+    } finally { out.restore(); }
+  });
+
+  test.each([
+    [503, { code: "affinity_reset_not_persisted", retryable: true }, "affinity_reset_not_persisted", true],
+    [503, { ok: true, provider: "anthropic", affinityResetConfirmed: true }, "affinity_reset_failed", false],
+    [200, { ok: true }, "affinity_reset_unconfirmed", false],
+    [200, null, "affinity_reset_unconfirmed", false],
+    [200, { ok: true, provider: "anthropic2", affinityResetConfirmed: true }, "affinity_reset_unconfirmed", false],
+    [200, { ok: true, provider: "anthropic", affinityResetConfirmed: false }, "affinity_reset_unconfirmed", false],
+  ] as const)("HTTP %s without matching durable confirmation fails (%#)", async (status, json, code, retryable) => {
+    const { cmdAccount } = await import("../../src/cli/account");
+    const calls: Captured[] = [];
+    const out = capture();
+    try {
+      expect(await cmdAccount(["reset-affinity", "anthropic", "--json"], deps(() => ({ status, json }), calls))).toBe(1);
+      expect(calls).toHaveLength(1);
+      expect(JSON.parse(out.lines.join(""))).toEqual({ ok: false, code, retryable });
+    } finally { out.restore(); }
+  });
+
+  test.each([[], ["openai"], ["anthropic", "account-id"], ["anthropic", "--unknown"]].map(args => ({ args })))("rejects invalid arguments before dispatch (%#)", async ({ args }) => {
+    const { cmdAccount } = await import("../../src/cli/account");
+    const calls: Captured[] = [];
+    const out = capture();
+    try {
+      expect(await cmdAccount(["reset-affinity", ...args, "--json"], deps(() => ({ json: {} }), calls))).toBe(1);
+      expect(calls).toHaveLength(0);
+      expect(JSON.parse(out.lines.join(""))).toMatchObject({ ok: false, code: "invalid_arguments" });
+    } finally { out.restore(); }
+  });
+});
+
 describe("ocx account pause / resume", () => {
+  test("Anthropic ambiguous aliases fail without a write; exact ids still win", async () => {
+    const out = capture();
+    const writes: unknown[] = [];
+    const d: AccountDeps = {
+      baseUrl: "http://127.0.0.1:10100",
+      loadConfigImpl: () => ({ providers: { anthropic: { adapter: "anthropic", authMode: "oauth" } } }) as never,
+      fetchImpl: (async (_url, init) => {
+        if (init?.method === "PUT") { writes.push(JSON.parse(String(init.body))); return Response.json({ ok: true }); }
+        return Response.json({ accounts: [{ id: "a", alias: "reserve" }, { id: "b", alias: "reserve" }] });
+      }) as typeof fetch,
+    };
+    try {
+      expect(await cmdPause(["anthropic", "reserve"], d, true)).toBe(1);
+      expect(writes).toEqual([]);
+      expect(await cmdPause(["anthropic", "a"], d, true)).toBe(0);
+      expect(writes).toEqual([{ provider: "anthropic", accountId: "a", paused: true }]);
+    } finally { out.restore(); }
+  });
+
+  test.each([true, false])("Anthropic pause=%s resolves a unique alias and preserves the JSON contract", async paused => {
+    const calls: Captured[] = [];
+    const out = capture();
+    const d = deps(() => ({ json: { ok: true, activeAccountId: "acct_2" } }), calls);
+    d.loadConfigImpl = () => ({ providers: { anthropic: { adapter: "anthropic", authMode: "oauth" } } }) as never;
+    try {
+      expect(await cmdPause(["anthropic", "GEM-PRO", "--json"], d, paused)).toBe(0);
+      expect(calls.find(call => call.method === "PUT")?.body).toEqual({ provider: "anthropic", accountId: "acct_1", paused });
+      expect(JSON.parse(out.lines.join("\n"))).toEqual({ ok: true, provider: "anthropic", id: "acct_1", paused, activeAccountId: "acct_2" });
+    } finally { out.restore(); }
+  });
+
+  test("generic OAuth pause resolves aliases and uses the OAuth account route", async () => {
+    const calls: Captured[] = [];
+    const out = capture();
+    const base = deps(() => ({ json: { ok: true } }), calls);
+    const genericDeps: AccountDeps = {
+      ...base,
+      loadConfigImpl: () => ({ providers: { "google-antigravity": { adapter: "google", baseUrl: "https://cloudcode-pa.googleapis.com", authMode: "oauth" } } }) as never,
+    };
+    let code: number;
+    try {
+      code = await cmdPause(["google-antigravity", "gem-pro"], genericDeps, true);
+    } finally { out.restore(); }
+    expect(code).toBe(0);
+    const write = calls.find(call => call.path === "/api/oauth/accounts/pause");
+    expect(write?.method).toBe("PUT");
+    expect(write?.body).toEqual({ provider: "google-antigravity", accountId: "acct_1", paused: true });
+  });
+
+  test("generic OAuth resume reports when it changes the active account", async () => {
+    const calls: Captured[] = [];
+    const out = capture();
+    const base = deps(() => ({ json: { ok: true, activeAccountChanged: true, activeAccountId: "acct_2" } }), calls);
+    const genericDeps: AccountDeps = {
+      ...base,
+      loadConfigImpl: () => ({ providers: { "google-antigravity": { adapter: "google", baseUrl: "https://cloudcode-pa.googleapis.com", authMode: "oauth" } } }) as never,
+    };
+    try {
+      await cmdPause(["google-antigravity", "acct_1"], genericDeps, false);
+    } finally { out.restore(); }
+    expect(out.errors.join("\n")).toContain("Active account changed to acct_2.");
+  });
+
   test("pause PUTs the shared route with paused true", async () => {
     const calls: Captured[] = [];
     const out = capture();
@@ -55,10 +172,10 @@ describe("ocx account pause / resume", () => {
       code = await cmdPause(["openai", "acct_1"], deps(() => ({ json: { ok: true } }), calls), true);
     } finally { out.restore(); }
     expect(code).toBe(0);
+    const write = calls.find(call => call.path === "/api/codex-auth/accounts/pause");
     // PUT, not POST: the issue text says POST and the server implements PUT.
-    expect(calls[0]?.method).toBe("PUT");
-    expect(calls[0]?.path).toBe("/api/codex-auth/accounts/pause");
-    expect(calls[0]?.body).toEqual({ id: "acct_1", paused: true });
+    expect(write?.method).toBe("PUT");
+    expect(write?.body).toEqual({ id: "acct_1", paused: true });
     expect(out.lines.join("\n")).toContain("paused");
   });
 
@@ -68,8 +185,8 @@ describe("ocx account pause / resume", () => {
     try {
       await cmdPause(["openai", "acct_1"], deps(() => ({ json: { ok: true } }), calls), false);
     } finally { out.restore(); }
-    expect(calls[0]?.path).toBe("/api/codex-auth/accounts/pause");
-    expect(calls[0]?.body).toEqual({ id: "acct_1", paused: false });
+    const write = calls.find(call => call.path === "/api/codex-auth/accounts/pause");
+    expect(write?.body).toEqual({ id: "acct_1", paused: false });
     expect(out.lines.join("\n")).toContain("resumed");
   });
 
@@ -108,6 +225,71 @@ describe("ocx account pause / resume", () => {
     } finally { out.restore(); }
     expect(code).not.toBe(0);
     expect(out.errors.join("\n")).toContain("Account not found");
+  });
+});
+
+describe("ocx account clear-cooldown", () => {
+  test("Codex keeps its dedicated route and body", async () => {
+    const calls: Captured[] = [];
+    const out = capture();
+    try {
+      expect(await cmdClearCooldown(["openai", "acct_1"], deps(() => ({ json: { ok: true, cleared: true } }), calls))).toBe(0);
+    } finally { out.restore(); }
+    expect(calls.at(-1)).toEqual({
+      method: "POST",
+      path: "/api/codex-auth/accounts/clear-cooldown",
+      body: { id: "acct_1" },
+    });
+  });
+
+  test("Anthropic resolves an alias and posts to the OAuth cooldown owner", async () => {
+    const calls: Captured[] = [];
+    const out = capture();
+    const anthropicDeps: AccountDeps = {
+      baseUrl: "http://127.0.0.1:10100",
+      loadConfigImpl: () => ({ providers: { anthropic: {} } }) as never,
+      fetchImpl: (async (url: string | URL | Request, init?: RequestInit) => {
+        const parsed = new URL(String(url));
+        const call: Captured = {
+          method: init?.method ?? "GET",
+          path: parsed.pathname + parsed.search,
+          body: init?.body === undefined ? undefined : JSON.parse(String(init.body)),
+        };
+        calls.push(call);
+        const json = call.method === "GET"
+          ? { accounts: [{ id: "anthropic_1", alias: "work" }] }
+          : { ok: true, cleared: true };
+        return Response.json(json);
+      }) as typeof fetch,
+    };
+    try {
+      expect(await cmdClearCooldown(["anthropic", "work"], anthropicDeps)).toBe(0);
+    } finally { out.restore(); }
+    expect(calls).toEqual([
+      { method: "GET", path: "/api/oauth/accounts?provider=anthropic", body: undefined },
+      {
+        method: "POST",
+        path: "/api/oauth/accounts/clear-cooldown",
+        body: { provider: "anthropic", accountId: "anthropic_1" },
+      },
+    ]);
+    expect(out.lines.join("\n")).toContain("anthropic: cooldown lifted for work");
+  });
+
+  test("unrelated OAuth providers are rejected before any management request", async () => {
+    const calls: Captured[] = [];
+    const out = capture();
+    let code: number;
+    try {
+      code = await cmdClearCooldown(["google-antigravity", "acct_1"], {
+        baseUrl: "http://127.0.0.1:10100",
+        loadConfigImpl: () => ({ providers: { "google-antigravity": { authMode: "oauth" } } }) as never,
+        fetchImpl: (async () => { calls.push({ method: "GET", path: "unexpected", body: undefined }); return Response.json({}); }) as typeof fetch,
+      });
+    } finally { out.restore(); }
+    expect(code).toBe(1);
+    expect(calls).toHaveLength(0);
+    expect(out.errors.join("\n")).toContain("no operator-clearable account cooldown");
   });
 });
 
@@ -168,7 +350,7 @@ describe("ocx account strategy / sticky", () => {
     const out = capture();
     try {
       await cmdStrategy(["openai"], deps(() => ({
-        json: { accountPoolStrategy: "round-robin", accountPoolStickyLimit: 4 },
+        json: { strategy: "round-robin", stickyLimit: 4 },
       }), calls));
     } finally { out.restore(); }
     expect(calls.every(call => call.method === "GET")).toBe(true);
@@ -180,14 +362,16 @@ describe("ocx account strategy / sticky", () => {
     const stickyCalls: Captured[] = [];
     const out = capture();
     try {
-      await cmdStrategy(["openai", "fill-first"], deps(() => ({ json: { accountPoolStrategy: "fill-first", accountPoolStickyLimit: 1 } }), strategyCalls));
-      await cmdSticky(["openai", "7"], deps(() => ({ json: { accountPoolStrategy: "fill-first", accountPoolStickyLimit: 7 } }), stickyCalls));
+      await cmdStrategy(["openai", "fill-first"], deps(() => ({ json: { strategy: "fill-first", stickyLimit: 1 } }), strategyCalls));
+      await cmdSticky(["openai", "7"], deps(() => ({ json: { strategy: "fill-first", stickyLimit: 7 } }), stickyCalls));
     } finally { out.restore(); }
-    expect(strategyCalls[0]?.path).toBe("/api/codex-auth/pool-strategy");
-    expect(stickyCalls[0]?.path).toBe("/api/codex-auth/pool-strategy");
-    expect(strategyCalls[0]?.body).toEqual({ strategy: "fill-first" });
+    expect(strategyCalls[0]?.path).toBe("/api/pool/settings");
+    expect(stickyCalls[0]?.path).toBe("/api/pool/settings");
+    // Every kind now carries `provider`, including Codex. The bare-field body was the other
+    // half of the asymmetry the unified route removes.
+    expect(strategyCalls[0]?.body).toEqual({ provider: "openai", strategy: "fill-first" });
     // Sent as a number so the server sees the type it validates.
-    expect(stickyCalls[0]?.body).toEqual({ stickyLimit: 7 });
+    expect(stickyCalls[0]?.body).toEqual({ provider: "openai", stickyLimit: 7 });
   });
 
   test("the APPLIED value is echoed, not the requested one", async () => {
@@ -195,7 +379,7 @@ describe("ocx account strategy / sticky", () => {
     // should see.
     const out = capture();
     try {
-      await cmdSticky(["openai", "9"], deps(() => ({ json: { accountPoolStrategy: "quota", accountPoolStickyLimit: 3 } }), []));
+      await cmdSticky(["openai", "9"], deps(() => ({ json: { strategy: "quota", stickyLimit: 3 } }), []));
     } finally { out.restore(); }
     expect(out.lines.join("\n")).toContain("3");
     expect(out.lines.join("\n")).not.toContain("9");
@@ -257,7 +441,7 @@ describe("ocx account strategy / sticky on the anthropic pool", () => {
       await cmdStrategy(["anthropic"], anthropicDeps(() => ({ json: { strategy: "round-robin", stickyLimit: 5 } }), calls));
     } finally { out.restore(); }
     expect(calls[0]?.method).toBe("GET");
-    expect(calls[0]?.path).toBe("/api/oauth/accounts/pool?provider=anthropic");
+    expect(calls[0]?.path).toBe("/api/pool/settings?provider=anthropic");
     // Unprefixed keys: this route spells the same settings without `accountPool`.
     expect(out.lines.join("\n")).toContain("round-robin");
   });
@@ -269,7 +453,7 @@ describe("ocx account strategy / sticky on the anthropic pool", () => {
       await cmdSticky(["anthropic", "6"], anthropicDeps(() => ({ json: { ok: true, strategy: "quota", stickyLimit: 6 } }), calls));
     } finally { out.restore(); }
     expect(calls[0]?.method).toBe("PUT");
-    expect(calls[0]?.path).toBe("/api/oauth/accounts/pool");
+    expect(calls[0]?.path).toBe("/api/pool/settings");
     // Omitting `provider` here earns a 400 from the real route, so it is asserted exactly.
     expect(calls[0]?.body).toEqual({ provider: "anthropic", stickyLimit: 6 });
     expect(out.lines.join("\n")).toContain("6");
@@ -286,7 +470,7 @@ describe("ocx account strategy / sticky on the anthropic pool", () => {
   test("the codex pool keeps its own prefixed keys mapped onto the same neutral output", async () => {
     const out = capture();
     try {
-      await cmdStrategy(["openai", "--json"], deps(() => ({ json: { accountPoolStrategy: "quota", accountPoolStickyLimit: 1 } }), []));
+      await cmdStrategy(["openai", "--json"], deps(() => ({ json: { strategy: "quota", stickyLimit: 1 } }), []));
     } finally { out.restore(); }
     expect(JSON.parse(out.lines.join("\n"))).toMatchObject({ provider: "openai", strategy: "quota", stickyLimit: 1 });
   });
@@ -342,17 +526,144 @@ describe("generic OAuth pool-settings contract (#695)", () => {
     try {
       await cmdStrategy(["google-antigravity", "round-robin"], genericDeps(() => ({ json: { ok: true, strategy: "round-robin", stickyLimit: null } }), calls));
     } finally { out.restore(); }
-    expect(calls[0]).toMatchObject({ method: "PUT", path: "/api/oauth/accounts/pool", body: { provider: "google-antigravity", strategy: "round-robin" } });
+    expect(calls[0]).toMatchObject({ method: "PUT", path: "/api/pool/settings", body: { provider: "google-antigravity", strategy: "round-robin" } });
   });
 
   test("auto-switch on a generic provider writes autoSwitchThreshold through the pool route", async () => {
     const calls: Captured[] = [];
     const out = capture();
     try {
-      expect(await cmdAutoSwitch(["google-antigravity", "threshold", "90"], genericDeps(() => ({ json: { ok: true, autoSwitchThreshold: 90 } }), calls))).toBe(0);
+      expect(await cmdAutoSwitch(["google-antigravity", "threshold", "90"], genericDeps(() => ({ json: { ok: true, autoSwitchThreshold: 90, enabled: true, inert: true } }), calls))).toBe(0);
     } finally { out.restore(); }
     expect(calls[0]).toMatchObject({ method: "PUT", path: "/api/oauth/accounts/pool", body: { provider: "google-antigravity", autoSwitchThreshold: 90 } });
-    expect(out.lines.join("\n")).toContain("threshold 90%");
+    expect(out.lines.join("\n")).toContain("stored threshold 90%");
+    expect(out.lines.join("\n")).toContain("inactive");
+    expect(out.lines.join("\n")).not.toContain("auto-switch: on");
+  });
+
+  test("generic status preserves configured pool state without claiming an inert threshold is active", async () => {
+    for (const poolEnabled of [true, false, null]) {
+      const calls: Captured[] = [];
+      const out = capture();
+      try {
+        expect(await cmdAutoSwitch(["google-antigravity", "status", "--json"], genericDeps(() => ({
+          json: { kind: "generic", enabled: poolEnabled, autoSwitchThreshold: 90, inert: true },
+        }), calls))).toBe(0);
+      } finally { out.restore(); }
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toMatchObject({ method: "GET", path: "/api/oauth/accounts/pool?provider=google-antigravity" });
+      expect(JSON.parse(out.lines.join("\n"))).toEqual({
+        provider: "google-antigravity", autoSwitchThreshold: 90, enabled: false, poolEnabled, inert: true,
+      });
+    }
+  });
+
+  test("generic writes report the confirmed DTO, not the requested threshold", async () => {
+    const calls: Captured[] = [];
+    const out = capture();
+    try {
+      expect(await cmdAutoSwitch(["google-antigravity", "on", "--json"], genericDeps(() => ({
+        json: { ok: true, enabled: null, autoSwitchThreshold: null, inert: true },
+      }), calls))).toBe(0);
+    } finally { out.restore(); }
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.body).toEqual({ provider: "google-antigravity", autoSwitchThreshold: 80 });
+    expect(JSON.parse(out.lines.join("\n"))).toEqual({
+      provider: "google-antigravity", autoSwitchThreshold: null, enabled: false, poolEnabled: null, inert: true,
+    });
+  });
+
+  test("generic missing or malformed capability stays unknown rather than enabled", async () => {
+    for (const json of [null, [], {}, { enabled: "true", autoSwitchThreshold: "90", inert: "false" },
+      { enabled: true, autoSwitchThreshold: 90 }, { enabled: true, autoSwitchThreshold: 101, inert: false }]) {
+      const out = capture();
+      try {
+        expect(await cmdAutoSwitch(["google-antigravity", "status", "--json"], genericDeps(() => ({ json }), []))).toBe(0);
+      } finally { out.restore(); }
+      const result = JSON.parse(out.lines.join("\n"));
+      expect(result.enabled).toBe(false);
+      expect(result.autoSwitchThreshold === null || result.autoSwitchThreshold === 90).toBe(true);
+    }
+  });
+
+  test("a generic pool that reports inert false is live, not unknown", async () => {
+    // `inert: false` used to be lumped in with the malformed bodies above, which made the CLI
+    // render a threshold the kernel is actually applying as "threshold support is unknown" --
+    // the opposite of the truth. The three states are distinct: true is stored-but-not-applied,
+    // false is applied, absent is a server that does not speak the field at all.
+    const out = capture();
+    try {
+      expect(await cmdAutoSwitch(
+        ["google-antigravity", "status", "--json"],
+        genericDeps(() => ({ json: { enabled: true, autoSwitchThreshold: 90, inert: false } }), []),
+      )).toBe(0);
+    } finally { out.restore(); }
+    expect(JSON.parse(out.lines.join("\n"))).toEqual({
+      provider: "google-antigravity", autoSwitchThreshold: 90, enabled: true, poolEnabled: true, inert: false,
+    });
+  });
+
+  test("a live generic pool with no stored threshold reports off, not on", async () => {
+    // `inert: false` alone is not enablement: the kernel is consuming settings, but there is
+    // no threshold to consume. Reporting "on" here would invent a value nobody set.
+    const out = capture();
+    try {
+      expect(await cmdAutoSwitch(
+        ["google-antigravity", "status", "--json"],
+        genericDeps(() => ({ json: { enabled: true, inert: false } }), []),
+      )).toBe(0);
+    } finally { out.restore(); }
+    const result = JSON.parse(out.lines.join("\n"));
+    expect(result.enabled).toBe(false);
+    expect(result.inert).toBe(false);
+    expect(result.autoSwitchThreshold).toBeNull();
+  });
+
+  test("a live generic pool reports a zero threshold as off", async () => {
+    const out = capture();
+    try {
+      expect(await cmdAutoSwitch(
+        ["google-antigravity", "status", "--json"],
+        genericDeps(() => ({ json: { enabled: true, autoSwitchThreshold: 0, inert: false } }), []),
+      )).toBe(0);
+    } finally { out.restore(); }
+    expect(JSON.parse(out.lines.join("\n"))).toEqual({
+      provider: "google-antigravity", autoSwitchThreshold: 0, enabled: false, poolEnabled: true, inert: false,
+    });
+
+    const human = capture();
+    try {
+      expect(await cmdAutoSwitch(
+        ["google-antigravity", "status"],
+        genericDeps(() => ({ json: { enabled: true, autoSwitchThreshold: 0, inert: false } }), []),
+      )).toBe(0);
+    } finally { human.restore(); }
+    expect(human.lines.join("\n")).toContain("auto-switch: off (stored threshold 0%; usage-based switching disabled)");
+  });
+
+  test("a successful generic write with a null body reports unknown settings", async () => {
+    const calls: Captured[] = [];
+    const out = capture();
+    try {
+      expect(await cmdAutoSwitch(["google-antigravity", "off", "--json"], genericDeps(() => ({ json: null }), calls))).toBe(0);
+    } finally { out.restore(); }
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.body).toEqual({ provider: "google-antigravity", autoSwitchThreshold: 0 });
+    expect(JSON.parse(out.lines.join("\n"))).toEqual({
+      provider: "google-antigravity", autoSwitchThreshold: null, enabled: false, poolEnabled: null, inert: null,
+    });
+  });
+
+  test("an inert zero threshold remains distinct from an unset threshold", async () => {
+    for (const autoSwitchThreshold of [0, null]) {
+      const out = capture();
+      try {
+        expect(await cmdAutoSwitch(["google-antigravity", "status", "--json"], genericDeps(() => ({
+          json: { enabled: true, autoSwitchThreshold, inert: true },
+        }), []))).toBe(0);
+      } finally { out.restore(); }
+      expect(JSON.parse(out.lines.join("\n"))).toMatchObject({ autoSwitchThreshold, enabled: false, inert: true });
+    }
   });
 
   test("api-key providers are still refused before any request", async () => {
@@ -363,5 +674,72 @@ describe("generic OAuth pool-settings contract (#695)", () => {
     } finally { out.restore(); }
     expect(calls).toHaveLength(0);
     expect(out.errors.join("\n")).toContain("API-key provider");
+  });
+});
+
+
+describe("ocx account routes anthropic", () => {
+  test("reads, writes and clears through unified settings", async () => {
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "ocx-route-cli-"));
+    const file = join(dir, "routes.json");
+    const routes = [{ name: "sonnet", match: "claude-*", accounts: ["id"] }];
+    writeFileSync(file, JSON.stringify(routes));
+    const calls: Captured[] = [];
+    const out = capture();
+    try {
+      const d = deps(() => ({ json: { provider: "anthropic", routes } }), calls);
+      expect(await cmdRoutes(["anthropic"], d)).toBe(0);
+      expect(await cmdRoutes(["anthropic", "--file", file], d)).toBe(0);
+      expect(await cmdRoutes(["anthropic", "--clear"], d)).toBe(0);
+      expect(calls.map(c => c.method)).toEqual(["GET", "PUT", "PUT"]);
+      expect(calls[1]?.body).toEqual({ provider: "anthropic", routes });
+      expect(calls[2]?.body).toEqual({ provider: "anthropic", routes: null });
+      writeFileSync(file, "not-json");
+      expect(await cmdRoutes(["anthropic", "--file", file], d)).toBe(1);
+      expect(calls).toHaveLength(3);
+    } finally { out.restore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe("ocx account resume --if-healthy (#8398)", () => {
+  const genericConfig = () => ({ providers: { "google-antigravity": { adapter: "google", baseUrl: "https://cloudcode-pa.googleapis.com", authMode: "oauth" } } }) as never;
+  test("asks the server for a health-gated resume on the Codex pool and an OAuth pool", async () => {
+    const calls: Captured[] = [];
+    const out = capture();
+    try {
+      expect(await cmdPause(["openai", "acct_1", "--if-healthy"], deps(() => ({ json: { ok: true } }), calls), false)).toBe(0);
+      expect(await cmdPause(["google-antigravity", "acct_1", "--if-healthy"], { ...deps(() => ({ json: { ok: true } }), calls), loadConfigImpl: genericConfig }, false)).toBe(0);
+    } finally { out.restore(); }
+    expect(calls.find(call => call.path === "/api/codex-auth/accounts/pause")?.body).toEqual({ id: "acct_1", paused: false, ifHealthy: true });
+    expect(calls.find(call => call.path === "/api/oauth/accounts/pause")?.body).toEqual({ provider: "google-antigravity", accountId: "acct_1", paused: false, ifHealthy: true });
+  });
+
+  test("a refused resume names the reason and exits non-zero, also as JSON", async () => {
+    const calls: Captured[] = [];
+    const refused = () => ({ status: 409, json: { error: "account was not resumed: usage_read_failed", code: "resume_refused", reason: "usage_read_failed" } });
+    const out = capture();
+    let text: number; let json: number;
+    try {
+      text = await cmdPause(["openai", "acct_1", "--if-healthy"], deps(refused, calls), false);
+      json = await cmdPause(["openai", "acct_1", "--if-healthy", "--json"], deps(refused, calls), false);
+    } finally { out.restore(); }
+    expect(text).toBe(3);
+    expect(json).toBe(3);
+    expect(out.lines.join("\n")).toContain("acct_1 not resumed: usage_read_failed");
+    expect(JSON.parse(out.lines.at(-1)!)).toEqual({ ok: false, provider: "openai", id: "acct_1", resumed: false, reason: "usage_read_failed" });
+  });
+
+  test("is refused locally for a pause and for an API-key pool", async () => {
+    const calls: Captured[] = [];
+    const out = capture();
+    try {
+      expect(await cmdPause(["openai", "acct_1", "--if-healthy"], deps(() => ({ json: { ok: true } }), calls), true)).not.toBe(0);
+      expect(await cmdPause(["deepseek", "key_1", "--if-healthy"], { ...deps(() => ({ json: { ok: true } }), calls),
+        loadConfigImpl: () => ({ providers: { deepseek: { adapter: "openai-chat", baseUrl: "https://api.deepseek.com", authMode: "key", apiKey: "sk-test" } } }) as never }, false)).not.toBe(0);
+    } finally { out.restore(); }
+    expect(calls.filter(call => call.method === "PUT")).toEqual([]);
   });
 });

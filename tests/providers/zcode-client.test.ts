@@ -1,19 +1,28 @@
 import { describe, expect, test } from "bun:test";
-import { join } from "node:path";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import {
   ClientPathError,
   LOOPBACK_API_KEY_PLACEHOLDER,
   OPENCODE_PROVIDER_ID,
+  ZcodeSettingsPathError,
   buildClientConfig,
   buildClientConfigText,
   buildClientContribution,
+  buildZcodeStoreContribution,
+  zcodeBootstrapSettingsPath,
   zcodeConfigPath,
   zcodeHomeDir,
   type ExportContext,
+  type ManagedFragment,
   type ZcodeGeneratedConfig,
 } from "../../src/clients/config-export";
 import type { OcxConfig } from "../../src/types";
 import { handleZcodeCommand } from "../../src/cli/integrations";
+import { repoPath } from "../helpers/repo-root";
+import { removeTreeWithRetry } from "../helpers/remove-tree";
 
 const CONFIG = {
   port: 10100,
@@ -43,7 +52,7 @@ describe("ZCode client config", () => {
     expect(Object.keys(document)).toEqual(["provider"]);
     const provider = document.provider[OPENCODE_PROVIDER_ID]!;
     expect(provider.name).toBe("OpenCodex");
-    expect(provider.kind).toBe("openai-compatible");
+    expect(provider.kind).toBe("openai");
     expect(provider.enabled).toBe(true);
     expect(provider.source).toBe("custom");
     expect(provider.options).toEqual({
@@ -51,6 +60,17 @@ describe("ZCode client config", () => {
       baseURL: "http://127.0.0.1:10100/v1",
       apiKeyRequired: true,
     });
+  });
+
+  test("the exported kind resolves to the proxy's native Responses route", () => {
+    const document = buildClientConfig("zcode", context()) as ZcodeGeneratedConfig;
+    const provider = document.provider[OPENCODE_PROVIDER_ID]!;
+    // ZCode 3.11.2 getDefaultModelProviderEndpointPathForKind sends `openai` to
+    // `/responses` and normalizeModelProviderBaseUrlForKind strips only that suffix,
+    // so the `/v1` root we serialize survives and the turn lands on the route
+    // src/server/index.ts registers as POST /v1/responses.
+    expect(provider.kind).toBe("openai");
+    expect(`${provider.options.baseURL}/responses`).toBe("http://127.0.0.1:10100/v1/responses");
   });
 
   test("models carry authoritative limits, text-floor modalities, and drop audio-only rows", () => {
@@ -86,15 +106,157 @@ describe("ZCode client config", () => {
   });
 
   test("resolves the data-dir override and the documented v2 destination", () => {
-    expect(zcodeHomeDir({}, "/home/u")).toBe(join("/home/u", ".zcode"));
-    expect(zcodeConfigPath({}, "/home/u")).toBe(join("/home/u", ".zcode", "v2", "config.json"));
-    expect(zcodeConfigPath({ ZCODE_DATA_DIR: "/elsewhere" }, "/home/u")).toBe(join("/elsewhere", "v2", "config.json"));
-    expect(() => zcodeConfigPath({ ZCODE_DATA_DIR: "relative" }, "/home/u")).toThrow(ClientPathError);
+    const reads: string[] = [];
+    const missingBootstrap = { readText: (path: string) => {
+      reads.push(path);
+      return { kind: "missing" as const };
+    } };
+    expect(zcodeHomeDir({}, "/home/u", missingBootstrap)).toBe(join("/home/u", ".zcode"));
+    expect(zcodeConfigPath({}, "/home/u", missingBootstrap)).toBe(join("/home/u", ".zcode", "v2", "config.json"));
+    expect(zcodeConfigPath({ ZCODE_DATA_DIR: join(tmpdir(), "elsewhere") }, "/home/u", missingBootstrap)).toBe(join(join(tmpdir(), "elsewhere"), "v2", "config.json"));
+    expect(() => zcodeConfigPath({ ZCODE_DATA_DIR: "relative" }, "/home/u", missingBootstrap)).toThrow(ClientPathError);
+    expect(reads).toEqual(Array(2).fill(join("/home/u", ".zcode", "v2", "setting.json")));
+  });
+});
+
+describe("ZCode reasoning export", () => {
+  test("emits on-disk variants for thought-capable models and omits them otherwise", () => {
+    const document = buildClientConfig("zcode", {
+      ...context(),
+      models: [
+        {
+          namespaced: "google-antigravity/gemini-3.8-flash",
+          provider: "google-antigravity",
+          id: "gemini-3.8-flash",
+          contextWindow: 1_048_576,
+          inputModalities: ["text", "image"],
+          reasoningEfforts: ["low", "medium", "high", "max"],
+          defaultReasoningEffort: "medium",
+        },
+        {
+          namespaced: "CommandCode/meituan-LongCat-2.0:free",
+          provider: "CommandCode",
+          id: "meituan-LongCat-2.0:free",
+          contextWindow: 128_000,
+        },
+      ],
+    }) as ZcodeGeneratedConfig;
+    const models = document.provider[OPENCODE_PROVIDER_ID]!.models;
+    expect(models["google-antigravity/gemini-3.8-flash"]).toEqual({
+      name: "gemini-3.8-flash (google-antigravity)",
+      modalities: { input: ["text", "image"], output: ["text"] },
+      limit: { context: 1_048_576 },
+      reasoning: { enabled: true, variants: ["low", "medium", "high", "max"], defaultVariant: "medium" },
+    });
+    expect(models["CommandCode/meituan-LongCat-2.0:free"]).not.toHaveProperty("reasoning");
+  });
+
+  test("drops none, keeps ultra, and omits defaultVariant when it is not in the emitted ladder", () => {
+    const document = buildClientConfig("zcode", {
+      ...context(),
+      models: [
+        {
+          namespaced: "opencode-go/muse-spark-1.3-contributor",
+          provider: "opencode-go",
+          id: "muse-spark-1.3-contributor",
+          reasoningEfforts: ["none", "high", "ultra", "turbo"],
+          defaultReasoningEffort: "none",
+        },
+        { namespaced: "a/none-only", provider: "a", id: "none-only", reasoningEfforts: ["none"] },
+        { namespaced: "a/empty", provider: "a", id: "empty", reasoningEfforts: [] },
+      ],
+    }) as ZcodeGeneratedConfig;
+    const models = document.provider[OPENCODE_PROVIDER_ID]!.models;
+    expect(models["opencode-go/muse-spark-1.3-contributor"]).toEqual({
+      name: "muse-spark-1.3-contributor (opencode-go)",
+      modalities: { input: ["text"], output: ["text"] },
+      reasoning: { enabled: true, variants: ["high", "ultra"] },
+    });
+    expect(models["a/none-only"]).not.toHaveProperty("reasoning");
+    expect(models["a/empty"]).not.toHaveProperty("reasoning");
+  });
+});
+
+describe("ZCode provider store", () => {
+  /** The model-rule fragments of one store contribution, keyed by modelId. */
+  function modelRules(ctx: ExportContext): Map<string, unknown> {
+    const rules = new Map<string, unknown>();
+    for (const fragment of buildZcodeStoreContribution(ctx).fragments as readonly ManagedFragment[]) {
+      if (fragment.path[0] !== "config" || fragment.path[1] !== "modelConfigRules") continue;
+      rules.set((fragment.value as { modelId: string }).modelId, fragment.value);
+    }
+    return rules;
+  }
+
+  test("model rules carry the catalog's image support and effort ladder, not just the context window", () => {
+    const rules = modelRules({
+      ...context(),
+      models: [
+        {
+          namespaced: "opencode-go/mimo-v2.6-pro",
+          provider: "opencode-go",
+          id: "mimo-v2.6-pro",
+          contextWindow: 600_000,
+          inputModalities: ["text", "image"],
+          reasoningEfforts: ["max", "low", "high", "none", "medium", "xhigh"],
+          defaultReasoningEffort: "medium",
+        },
+      ],
+    });
+    expect(rules.get("opencode-go/mimo-v2.6-pro")).toEqual({
+      providerId: OPENCODE_PROVIDER_ID,
+      modelId: "opencode-go/mimo-v2.6-pro",
+      config: {
+        properties: { contextWindow: 600_000, inputFormat: { supportsImage: true } },
+        optionSpecs: { reasoningLevel: { values: ["low", "medium", "high", "xhigh", "max"] } },
+      },
+    });
+  });
+
+  test("a text-only row asserts no inputFormat and keeps the client's own defaults", () => {
+    const rules = modelRules({
+      ...context(),
+      models: [{ namespaced: "xai/grok-5", provider: "xai", id: "grok-5", contextWindow: 262_144 }],
+    });
+    expect(rules.get("xai/grok-5")).toEqual({
+      providerId: OPENCODE_PROVIDER_ID,
+      modelId: "xai/grok-5",
+      config: { properties: { contextWindow: 262_144 } },
+    });
+  });
+
+  test("a row without a context window still ships a rule when it has capabilities to assert", () => {
+    const rules = modelRules({
+      ...context(),
+      models: [
+        { namespaced: "mystery/vision", provider: "mystery", id: "vision", inputModalities: ["text", "image"], reasoningEfforts: ["low", "high"] },
+      ],
+    });
+    expect(rules.get("mystery/vision")).toEqual({
+      providerId: OPENCODE_PROVIDER_ID,
+      modelId: "mystery/vision",
+      config: {
+        properties: { inputFormat: { supportsImage: true } },
+        optionSpecs: { reasoningLevel: { values: ["low", "high"] } },
+      },
+    });
+  });
+
+  test("a row with nothing authoritative to assert ships no rule, and audio-only ships none either", () => {
+    const rules = modelRules({
+      ...context(),
+      models: [
+        { namespaced: "mystery/model", provider: "mystery", id: "model" },
+        { namespaced: "zenmux/audio-only", provider: "zenmux", id: "audio-only", inputModalities: ["audio"], contextWindow: 100_000, reasoningEfforts: ["low"] },
+      ],
+    });
+    expect(rules.has("mystery/model")).toBe(false);
+    expect(rules.has("zenmux/audio-only")).toBe(false);
   });
 });
 
 describe("ocx zcode CLI alias", () => {
-  /** Captures the client-integration requests the alias forwards. */
+  /** Captures canonical intent writes and legacy status/history requests. */
   function fakeRuntime(): { deps: { baseUrl: string; fetchImpl: typeof fetch }; requests: Array<{ path: string; method: string; body: unknown }> } {
     const requests: Array<{ path: string; method: string; body: unknown }> = [];
     const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -104,7 +266,10 @@ describe("ocx zcode CLI alias", () => {
         method: init?.method ?? "GET",
         body: typeof init?.body === "string" ? JSON.parse(init.body) : null,
       });
-      return new Response(JSON.stringify({ ok: true, message: "done", clients: [] }), {
+      const payload = url.pathname === "/api/route-to"
+        ? { schema: "ocx.route-to/1", devices: [{ id: "home", clients: [{ client: "zcode", intent: "on", source: "default", applied: "current" }] }] }
+        : { ok: true, message: "done", clients: [] };
+      return new Response(JSON.stringify(payload), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -112,18 +277,25 @@ describe("ocx zcode CLI alias", () => {
     return { deps: { baseUrl: "http://127.0.0.1:10100", fetchImpl }, requests };
   }
 
-  test("enable forwards to the client-integration route with --client zcode", async () => {
+  // A plain toggle is the Home's own decision, like the dashboard: it never writes the Children's default.
+  test("enable is a Home-only decision for zcode", async () => {
     const { deps, requests } = fakeRuntime();
     const code = await handleZcodeCommand(["enable"], deps);
     expect(code).toBe(0);
-    expect(requests.some(r => r.path === "/api/client-integrations/zcode" && r.method === "PUT" && (r.body as { enabled?: boolean }).enabled === true)).toBe(true);
+    expect(requests).toEqual([{ path: "/api/client-integrations/zcode", method: "PUT", body: { enabled: true } }]);
   });
 
   test("a flag before the verb does not swallow it", async () => {
     const { deps, requests } = fakeRuntime();
     const code = await handleZcodeCommand(["--json", "enable"], deps);
     expect(code).toBe(0);
-    expect(requests.some(r => r.path === "/api/client-integrations/zcode" && r.method === "PUT")).toBe(true);
+    expect(requests).toEqual([{ path: "/api/client-integrations/zcode", method: "PUT", body: { enabled: true } }]);
+  });
+
+  test("disable is a Home-only decision for zcode", async () => {
+    const { deps, requests } = fakeRuntime();
+    expect(await handleZcodeCommand(["disable", "--json"], deps)).toBe(0);
+    expect(requests).toEqual([{ path: "/api/client-integrations/zcode", method: "PUT", body: { enabled: false } }]);
   });
 
   test("bare invocation reads status, never writes", async () => {
@@ -150,3 +322,76 @@ describe("ocx zcode CLI alias", () => {
   });
 });
 
+/** Runs a synchronous case in a temporary bootstrap home, cleaning up after the callback. */
+function withBootstrapFixture(run: (home: string, settings: string) => void): void {
+  const home = mkdtempSync(join(tmpdir(), "ocx-zcode-bootstrap-"));
+  const settings = zcodeBootstrapSettingsPath(home);
+  mkdirSync(dirname(settings), { recursive: true });
+  try { run(home, settings); } finally { removeTreeWithRetry(home); }
+}
+
+/**
+ * Probes Windows file-symlink support; only EPERM or EACCES allows this regression to skip.
+ * POSIX runs the regression without a probe, and unexpected filesystem errors still fail.
+ */
+function canCreateBootstrapSymlink(): boolean {
+  if (process.platform !== "win32") return true;
+  let supported = true;
+  withBootstrapFixture((home, settings) => {
+    const target = join(home, "symlink-probe.json");
+    writeFileSync(target, "{}");
+    try { symlinkSync(target, settings, "file"); }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EPERM" && code !== "EACCES") throw error;
+      supported = false;
+    }
+  });
+  return supported;
+}
+
+test("default ZCode bootstrap lookup preserves absence and ordinary relocation", () => {
+  withBootstrapFixture((home, settings) => {
+    expect(zcodeHomeDir({}, home)).toBe(join(home, ".zcode"));
+    const base = join(home, "relocated");
+    writeFileSync(settings, JSON.stringify({ dataBaseDir: base }));
+    expect(zcodeHomeDir({}, home)).toBe(join(base, ".zcode"));
+    expect(zcodeConfigPath({}, home)).toBe(join(base, ".zcode", "v2", "config.json"));
+  });
+});
+test("default ZCode bootstrap lookup enforces the shared four-MiB boundary", () => {
+  withBootstrapFixture((home, settings) => {
+    const bounded = "{}" + " ".repeat(4 * 1024 * 1024 - 2);
+    writeFileSync(settings, bounded);
+    expect(zcodeHomeDir({}, home)).toBe(join(home, ".zcode"));
+    writeFileSync(settings, bounded + " ");
+    expect(() => zcodeHomeDir({}, home)).toThrow(ZcodeSettingsPathError);
+    expect(readFileSync(settings, "utf8")).toBe(bounded + " ");
+    expect(zcodeHomeDir({ ZCODE_DATA_DIR: join(home, "explicit") }, home)).toBe(join(home, "explicit"));
+  });
+});
+test.skipIf(!canCreateBootstrapSymlink())("default ZCode bootstrap lookup refuses final symlinks without changing the target", () => {
+  withBootstrapFixture((home, settings) => {
+    const target = join(home, "target.json");
+    const content = JSON.stringify({ dataBaseDir: join(home, "relocated") });
+    writeFileSync(target, content);
+    symlinkSync(target, settings, "file");
+    expect(() => zcodeHomeDir({}, home)).toThrow(ZcodeSettingsPathError);
+    expect(readFileSync(target, "utf8")).toBe(content);
+    expect(lstatSync(settings).isSymbolicLink()).toBe(true);
+    unlinkSync(target);
+    expect(() => zcodeHomeDir({}, home)).toThrow(ZcodeSettingsPathError);
+  });
+});
+test.skipIf(process.platform === "win32")("default ZCode bootstrap lookup refuses a FIFO without waiting for a writer", () => {
+  withBootstrapFixture((home, settings) => {
+    expect(spawnSync("mkfifo", [settings], { timeout: 2_000 }).status).toBe(0);
+    const result = spawnSync(process.execPath, ["--eval", `
+      const { zcodeHomeDir, ZcodeSettingsPathError } = await import("./src/clients/config-export.ts");
+      try { zcodeHomeDir({}, process.env.ZCODE_BOOTSTRAP_TEST_HOME); process.exitCode = 2; }
+      catch (error) { if (!(error instanceof ZcodeSettingsPathError)) throw error; }
+    `], { cwd: repoPath(), env: { ...process.env, ZCODE_BOOTSTRAP_TEST_HOME: home }, timeout: 5_000 });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+  });
+}, 10_000);

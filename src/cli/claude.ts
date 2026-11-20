@@ -7,29 +7,47 @@
  * `claude` CLI with stdio inherited. User-exported env wins except when a stale
  * loopback opencodex base URL points at a different proxy port.
  */
+import { resolveSubagentForceModel } from "../claude/subagent-model";
 import { spawn } from "node:child_process";
 import { loadConfig } from "../config";
 import { injectClaudeAgentDefs } from "../claude/agents-inject";
-import { CLAUDE_ALIAS_PREFIX_V1, CLAUDE_ALIAS_PREFIX_V2 } from "../claude/alias";
-import { effectiveModelEnv, resolveAutoContext } from "../claude/context-windows";
-import { claudeConfigDir, refreshGatewayModelCacheFromProxy } from "../claude/gateway-cache";
+import { CLAUDE_ALIAS_PREFIX_CURRENT, CLAUDE_ALIAS_PREFIX_CURRENT_V2, CLAUDE_ALIAS_PREFIX_V1, CLAUDE_ALIAS_PREFIX_V2 } from "../claude/alias";
+import { claudeTierDisplayName, claudeToolSearchEnv, effectiveModelEnv, isClaudeTierLabelSlot, resolveAutoContext } from "../claude/context-windows";
+import { claudeConfigDir, fetchGatewayModels, writeGatewayModelCache } from "../claude/gateway-cache";
 import { commandInvocation } from "../lib/win-exec";
 import { isProxyAdmissionSecret } from "../server/auth-cors";
 import { findLiveProxy } from "../server/proxy-liveness";
 import type { OcxConfig } from "../types";
 import { configuredAdminToken } from "../lib/admin-secrets";
-import { PROXY_MARKER, ownAdmissionTokens, defaultAuthDetectDeps, detectClaudeAuth, type AuthDetectDeps } from "../claude/auth-detect";
+import { localAdmissionToken, localInferenceDestination, localLoopbackInferencePorts, localManagementOrigin } from "../lib/local-destinations";
+import { PROXY_MARKER, ownAdmissionTokens, defaultAuthDetectDeps, detectClaudeAuth, resolveClaudeKeychainPresence, type AuthDetectDeps } from "../claude/auth-detect";
 import { resolveClaudeAuthMode } from "../claude/auth-mode";
 import { withProcessRuntimeProvenance } from "../lib/bun-runtime";
 import { selfLaunchArgv } from "../lib/self-launch-argv";
 import { ANTHROPIC_PARENT_ENV_SLOTS, trustedNodeLauncherContext, type AnthropicParentEnvSlot } from "./launcher-context";
 import { readClientConnectionState, type ClientConnectionState } from "../client/state";
+import { resolveHubState } from "../client/hub-state";
 import { readServiceApiTokenState, type ServiceApiTokenState } from "../lib/service-secrets";
 import { DEFAULT_CATALOG_PATH } from "../codex/paths";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { aliasForNative, aliasForRoute } from "../claude/alias";
-import { desktop3pAlias } from "../claude/desktop-3p";
+import { aliasForNative, aliasForRoute, legacyAliasForNative, legacyAliasForRoute } from "../claude/alias";
+import { desktop3pAlias, isRealDesktop3pModelId, legacyDesktop3pAlias, resolveDesktop3pAlias } from "../claude/desktop-3p";
+import { desktopProfileWireAlias, legacyDesktopProfileWireAlias } from "../claude/desktop-profile";
+import { inspectDesktopFirstParty } from "../claude/desktop-first-party";
+import { isClaudeInterceptProxyUrl, type ClaudeInterceptSettingsState } from "../claude/intercept/settings";
+import { withoutSiblingMarker } from "../codex/sibling-start";
+import { withoutSupervisorMarkers } from "../lib/supervisor-markers";
+
+/**
+ * The environment of the detached `ocx start` that `ocx claude` launches (the spawn adds the runtime
+ * provenance stamp): an ordinary owner. It carries OCX_SERVICE=1 but no service manager's marker, so a
+ * manager-launched process is told apart from it; a client runtime cannot tell it from a service registered before
+ * the marker existed, and its restart is refused as legacy-flag (src/client/runtime-restart.ts, #8545).
+ */
+export function claudeProxyStartEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return withoutSupervisorMarkers(withoutSiblingMarker({ ...base, OCX_SERVICE: "1" }));
+}
 
 export interface ClaudeLaunchEnv {
   [key: string]: string | undefined;
@@ -45,11 +63,15 @@ export interface ClaudeRoutingTarget {
  * launch base so detection and the spawned process can never disagree (audit R3-3).
  */
 export type ClaudeEnvDeps = {
+  forceAvailable?: readonly string[];
+  forceAvailableSelectors?: readonly string[];
   authDetect?: Omit<Partial<AuthDetectDeps>, "env" | "ownTokens">;
   /** Test seam; production uses the authenticated Node-launcher context. */
   preBunAnthropicSlots?: readonly AnthropicParentEnvSlot[] | null;
   /** Explicit unsafe opt-in from a root `--dangerously-skip-permissions` launch. */
   allowRootSkipPermissions?: boolean;
+  ownedInterceptSettings?: ClaudeInterceptSettingsState;
+  warn?: (line: string) => void;
 };
 
 function deleteUntrustedAnthropicSlots(env: ClaudeLaunchEnv, deps: ClaudeEnvDeps): void {
@@ -102,16 +124,34 @@ function isClaudeLoopbackHostname(hostname: string): boolean {
     || normalized === "[::1]";
 }
 
-function targetsLocalClaudeProxy(value: string | undefined, port: number): boolean {
+/**
+ * Is this base URL one of OURS?
+ *
+ * Two ways to be ours (#4236), because a hub has two shapes of local destination:
+ *
+ *  - a SET of loopback ports, not one port: with an unauthenticated loopback listener the
+ *    public port and the listener's port are both addresses this proxy answers on at
+ *    127.0.0.1, so a URL naming either of them was written by us. Treating the one this launch
+ *    did not pick as a foreign proxy would strip our own admission token out of the
+ *    environment. On a tailnet bind with no listener that set is EMPTY, so a leftover
+ *    `http://127.0.0.1:<port>` is correctly seen as stale rather than as ours.
+ *  - the resolved destination origin itself, which on such a bind is the bind address. Without
+ *    this arm the launch would write a base URL and then refuse to recognize it one line later.
+ */
+function targetsLocalClaudeProxy(
+  value: string | undefined,
+  ports: readonly number[],
+  ownOrigin?: string,
+): boolean {
   if (!value) return false;
   try {
     const parsed = new URL(value);
+    if (parsed.username !== "" || parsed.password !== "") return false;
+    if (ownOrigin !== undefined && parsed.origin === ownOrigin) return true;
     const effectivePort = parsed.port === "" ? 80 : Number(parsed.port);
     return parsed.protocol === "http:"
       && isClaudeLoopbackHostname(parsed.hostname)
-      && effectivePort === port
-      && parsed.username === ""
-      && parsed.password === "";
+      && ports.includes(effectivePort);
   } catch {
     return false;
   }
@@ -147,7 +187,16 @@ export function buildClaudeEnv(
 ): ClaudeLaunchEnv {
   const explicitTarget = typeof portOrTarget === "number" ? null : portOrTarget;
   const port = typeof portOrTarget === "number" ? portOrTarget : null;
-  const managedBaseUrl = explicitTarget ? new URL(explicitTarget.baseUrl).origin : `http://127.0.0.1:${port}`;
+  // A local launch dials the unauthenticated loopback listener whenever one is enabled — the
+  // only credential-free local socket a tailnet-bound hub has (#4236). With the listener OFF
+  // the destination is the BIND address, which is reachable but demands data-plane admission;
+  // the resolver says which of the two this is instead of every caller guessing.
+  const destination = port === null ? null : localInferenceDestination(config, port);
+  const managedBaseUrl = explicitTarget
+    ? new URL(explicitTarget.baseUrl).origin
+    : destination!.origin;
+  // Every port this proxy answers on at 127.0.0.1, so a base URL naming any of them is ours.
+  const ownLocalPorts = port === null ? [] : localLoopbackInferencePorts(config, port);
   const env: ClaudeLaunchEnv = { ...base };
   // Step 1 — strip OUR OWN dummy from the inherited environment before anything reads
   // or writes the token slot. setDefault below preserves any non-empty value, so a
@@ -174,11 +223,22 @@ export function buildClaudeEnv(
   // real cost to a documented entry point, and the escape hatch is the launcher: run
   // through `ocx` (the published bin) and genuine shell exports are preserved by proof.
   deleteUntrustedAnthropicSlots(env, deps);
-  const setDefault = (name: string, value: string | undefined) => {
-    if (value === undefined || value.length === 0) return;
-    if (env[name] !== undefined && env[name] !== "") return; // user wins
+  /** Returns whether the value was written; a value the user already has wins. */
+  const setDefault = (name: string, value: string | undefined): boolean => {
+    if (value === undefined || value.length === 0) return false;
+    if (env[name] !== undefined && env[name] !== "") return false; // user wins
     env[name] = value;
+    return true;
   };
+  if (config.claudeCode?.subagentModelForce !== undefined) {
+    const forced = resolveSubagentForceModel(config, contextWindows, deps.forceAvailableSelectors !== undefined ? { selectors: deps.forceAvailableSelectors } : { entries: deps.forceAvailable ?? [] });
+    if (forced) {
+      setDefault("CLAUDE_CODE_SUBAGENT_MODEL", forced);
+      setDefault("CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "1");
+    } else {
+      (deps.warn ?? console.warn)("⚠ Claude subagent force target is invalid or unavailable; launch override skipped.");
+    }
+  }
   if (deps.allowRootSkipPermissions === true) {
     setDefault("IS_SANDBOX", "1");
   }
@@ -188,10 +248,14 @@ export function buildClaudeEnv(
     try {
       const parsed = new URL(existingBaseUrl);
       const effectivePort = parsed.port === "" ? 80 : Number(parsed.port);
+      // Stale means "a port no live local listener of ours owns". With a loopback listener
+      // enabled that is two ports, and rewriting one of them into the other would reject a
+      // destination we wrote ourselves.
       if (parsed.protocol === "http:"
         && isClaudeLoopbackHostname(parsed.hostname)
-        && effectivePort !== port) {
-        const replacement = `http://127.0.0.1:${port}`;
+        && !ownLocalPorts.includes(effectivePort)
+        && parsed.origin !== managedBaseUrl) {
+        const replacement = managedBaseUrl;
         console.error(`⚠ Replacing stale opencodex ANTHROPIC_BASE_URL ${parsed.origin} with ${replacement}.`);
         env.ANTHROPIC_BASE_URL = replacement;
         // The credentials in this environment were paired with the destination we just
@@ -216,10 +280,19 @@ export function buildClaudeEnv(
   // the user's Claude login. Resolve the mode before adding any proxy-owned credential:
   // subscription launches must keep their OAuth, while proxy launches may use the
   // admission key or dummy marker (see server/claude-messages.ts).
-  const ownTokens = explicitTarget ? [explicitTarget.admissionToken] : ownAdmissionTokens(config);
+  // A bind that demands admission needs a credential the machine can actually present, which
+  // is wider than `config.apiKeys`: the service installs its data-plane secret as
+  // `OPENCODEX_API_AUTH_TOKEN` / the hardened token file, and that is the ladder the Codex
+  // provider table already uses. Never the admin token (reviewer constraint on #4236).
+  const hostAdmissionToken = destination?.requiresAdmissionToken === true
+    ? localAdmissionToken(config)
+    : undefined;
+  const ownTokens = explicitTarget
+    ? [explicitTarget.admissionToken]
+    : [...new Set([...(hostAdmissionToken ? [hostAdmissionToken] : []), ...ownAdmissionTokens(config)])];
   const targetsLocalProxy = explicitTarget
     ? targetsClaudeRoutingTarget(env.ANTHROPIC_BASE_URL, explicitTarget)
-    : targetsLocalClaudeProxy(env.ANTHROPIC_BASE_URL, port!);
+    : targetsLocalClaudeProxy(env.ANTHROPIC_BASE_URL, ownLocalPorts, managedBaseUrl);
   const isOwnAdmissionToken = (value: string): boolean =>
     ownTokens.includes(value) || isProxyAdmissionSecret(value, config);
   const inheritedApiKey = env.ANTHROPIC_API_KEY;
@@ -265,6 +338,19 @@ export function buildClaudeEnv(
   if (!env.ANTHROPIC_AUTH_TOKEN && !hasUserApiKey && targetsLocalProxy && resolved.markerMode === "proxy") {
     env.ANTHROPIC_AUTH_TOKEN = PROXY_MARKER;
   }
+  // Degrade out loud rather than hand Claude Code a destination that 401s (#4236). A
+  // subscription launch deliberately carries no host token — asserting one logs a claude.ai
+  // subscriber out (#253) — so on a bind that demands admission the honest outcome is a
+  // warning naming the two fixes, not a silent refusal at the first request.
+  if (destination?.requiresAdmissionToken === true && targetsLocalProxy) {
+    const carried = env.ANTHROPIC_AUTH_TOKEN?.trim();
+    if (!hasUserApiKey && (!carried || carried === PROXY_MARKER)) {
+      console.error(
+        `⚠ ${managedBaseUrl} requires an opencodex data-plane credential and this launch carries none — `
+        + "requests will be refused. Enable `unauthenticatedLoopbackListener` or bind the proxy to loopback.",
+      );
+    }
+  }
   const finalAuthToken = env.ANTHROPIC_AUTH_TOKEN;
   const hostOwnsAuthentication = targetsLocalProxy
     && !hasUserApiKey
@@ -302,12 +388,34 @@ export function buildClaudeEnv(
   if (config.claudeCode?.alwaysEnableEffort === true) {
     setDefault("CLAUDE_CODE_ALWAYS_ENABLE_EFFORT", "1");
   }
-  // Context-window override: the official pair — MAX_CONTEXT_TOKENS alone is ignored
-  // for recognized claude-shaped ids unless DISABLE_COMPACT=1 rides along (devlog 135).
+  // Tool-search deferral (#4838, #7963). Claude Code v2.1.304 and later turn tool
+  // search ON by default behind an ANTHROPIC_BASE_URL gateway, so MCP tools are
+  // deferred and requests carry defer_loading fields and tool_reference blocks.
+  // Earlier versions kept it off behind a gateway unless ENABLE_TOOL_SEARCH was
+  // true / auto / auto:N (code.claude.com/docs/en/mcp#tool-search-through-a-gateway).
+  //
+  // The native Anthropic passthrough route forwards those fields. A translated
+  // route cannot honour them server-side: deferred tools still carry input_schema
+  // on the wire (deferral is a server-side context optimisation, not a smaller
+  // request), toolsToResponses drops the tool_search server tool and ignores
+  // defer_loading, and compatibility.ts lists tool_search/tool_reference/
+  // deferred_tools as unsupported. On a translated Chat route each client
+  // ToolSearch load also changes the tool list and the catalog nudge, so the next
+  // request re-misses the provider's prompt cache (#7963);
+  // claudeCode.appendOnlyToolLoadingModels covers verified Responses destinations
+  // and claudeCode.chatToolDispatchModels verified direct Chat routes.
+  //
+  // We inject only when claudeCode.toolSearch is set, so an unset value leaves the
+  // client's own version default in place, and setDefault keeps an operator's own
+  // export (ENABLE_TOOL_SEARCH=false restores upfront loading).
+  setDefault("ENABLE_TOOL_SEARCH", claudeToolSearchEnv(config.claudeCode?.toolSearch));
   const maxCtx = config.claudeCode?.maxContextTokens;
   if (typeof maxCtx === "number" && Number.isFinite(maxCtx) && maxCtx > 0) {
     setDefault("CLAUDE_CODE_MAX_CONTEXT_TOKENS", String(Math.floor(maxCtx)));
-    setDefault("DISABLE_COMPACT", "1");
+    // Claude Code 2.1.278 honors this without DISABLE_COMPACT when the model id
+    // does not start with "claude-" (gF). Current ocx-claude aliases qualify.
+    // A persisted claude-ocx id is still claude-shaped, so that one session keeps
+    // the 200k accounting until the picker is moved to the new id.
   }
   // Auto-context (devlog 260712 020): min(believed window, env) inside the CLI means
   // one global env acts as a per-model floor — [1m]-marked models compact here while
@@ -326,7 +434,9 @@ export function buildClaudeEnv(
   // with automatic [1m] context-variant marking when the slot's target model has an
   // authoritative >=1M window (Claude Code then accounts 1M, compaction preserved).
   for (const [name, value] of Object.entries(effectiveModelEnv(config.claudeCode, contextWindows, auto))) {
-    setDefault(name, value);
+    // A tier slot this launch wrote gets its picker label too (#6926). A slot the user exported
+    // stays unlabelled, and a `<slot>_NAME` the user exported wins.
+    if (setDefault(name, value) && isClaudeTierLabelSlot(name)) setDefault(`${name}_NAME`, claudeTierDisplayName(value));
   }
   return env;
 }
@@ -335,8 +445,15 @@ export function buildClaudeEnv(
  * Context-window map from the RUNNING proxy's management API (warm TTL cache; the
  * daemon registers every selector form — audit R3#1). 3s bound + management auth header.
  * (no [1m] marking, conservative).
+ *
+ * This is the MANAGEMENT destination, not the inference one (#4236): `/api/claude-code` is
+ * never served by the unauthenticated loopback listener, so it resolves through
+ * `localManagementOrigin` — a hub's loopback management ingress when it has one, otherwise the
+ * public bind — and keeps sending the local admin token. `enabled: false` is how `ocx claude`
+ * decides to launch natively, so a wrong destination here silently downgrades every launch.
  */
 export interface ClaudeCodeLiveState {
+  forceAvailable?: string[];
   contextWindows: Record<string, number>;
   enabled?: boolean;
 }
@@ -346,14 +463,15 @@ export async function fetchClaudeCodeState(config: OcxConfig, port: number, time
     const headers = new Headers();
     const token = configuredAdminToken();
     if (token) headers.set("x-opencodex-api-key", token);
-    const res = await fetch(`http://127.0.0.1:${port}/api/claude-code`, {
+    const res = await fetch(`${localManagementOrigin(config, port)}/api/claude-code`, {
       headers,
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) return { contextWindows: {} };
-    const body = await res.json() as { contextWindows?: Record<string, number>; enabled?: boolean };
+    const body = await res.json() as { contextWindows?: Record<string, number>; enabled?: boolean; forceAvailable?: string[] };
     return {
       contextWindows: body.contextWindows && typeof body.contextWindows === "object" ? body.contextWindows : {},
+      ...(Array.isArray(body.forceAvailable) ? { forceAvailable: body.forceAvailable.filter(value => typeof value === "string") } : {}),
       ...(typeof body.enabled === "boolean" ? { enabled: body.enabled } : {}),
     };
   } catch {
@@ -387,10 +505,15 @@ export function readConnectedClaudeContextWindows(path = DEFAULT_CATALOG_PATH): 
         const id = slug.slice(slash + 1);
         const routeAlias = aliasForRoute(provider, id);
         if (routeAlias) put(routeAlias, contextWindow);
+        // A selector saved under the legacy claude-ocx spelling keeps its window here too.
+        const legacyRoute = legacyAliasForRoute(provider, id);
+        if (legacyRoute) put(legacyRoute, contextWindow);
         put(desktop3pAlias(provider, id), contextWindow);
       } else {
         const nativeAlias = aliasForNative(slug);
         if (nativeAlias) put(nativeAlias, contextWindow);
+        const legacyNative = legacyAliasForNative(slug);
+        if (legacyNative) put(legacyNative, contextWindow);
         put(desktop3pAlias("native", slug), contextWindow);
       }
     }
@@ -408,7 +531,8 @@ export async function ensureProxyForClaude(deps: ClaudeProxyEnsureDeps = {}): Pr
   // A proxy that has only just bound can miss a single probe while its event loop
   // is still settling startup work — the same just-started race the stop paths
   // already retry for (#764, SERVICE_STOP_LIVENESS). Only the attempts budget is
-  // borrowed here; the probe timeout remains DEFAULT_PROBE_TIMEOUT_MS (750 ms).
+  // borrowed here; the probe timeout remains DEFAULT_PROBE_TIMEOUT_MS (750 ms unless
+  // OCX_PROBE_TIMEOUT_MS raises it).
   // Without this, `ocx claude` can spawn a second proxy while the first is serving.
   const live = await (deps.findLiveProxy ?? findLiveProxy)({ attempts: 3 });
   if (live) return live.port;
@@ -418,7 +542,8 @@ export async function ensureProxyForClaude(deps: ClaudeProxyEnsureDeps = {}): Pr
     detached: true,
     stdio: "ignore",
     windowsHide: true,
-    env: withProcessRuntimeProvenance({ ...process.env, OCX_SERVICE: "1" }),
+    // An ordinary owner: a stray sibling marker would otherwise mark it before any probe.
+    env: withProcessRuntimeProvenance(claudeProxyStartEnv()),
   });
   child.unref();
   const deadline = Date.now() + 8_000;
@@ -481,9 +606,20 @@ export function claudeLaunchPreflight(
     : { kind: "native", notice: CLAUDE_NATIVE_ROUTING_OFF };
 }
 
+/**
+ * Levers a native (non-routed) launch must shed. The loop below deletes them
+ * unconditionally, because each one either points Claude Code at a gateway that
+ * is not there or asserts host ownership that a native session does not have.
+ *
+ * ENABLE_TOOL_SEARCH is deliberately NOT in this list (#4838). It is the only
+ * one of these whose value is meaningful to a native session: natively the base
+ * URL is first-party, where deferral is already Claude Code's default and the
+ * variable is the user's own tuning knob (auto:N, force). Stripping it would
+ * delete a preference that works, to protect a session that does not need
+ * protecting.
+ */
 const NATIVE_STRIPPED_LEVERS = [
   "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
-  "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
   "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
   "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
   "CLAUDE_CODE_ALWAYS_ENABLE_EFFORT",
@@ -499,12 +635,50 @@ const MODEL_ENV_SLOT_NAMES = [
   "ANTHROPIC_SMALL_FAST_MODEL",
 ] as const;
 
-const DESKTOP_3P_ALIAS = /^claude-opus-4(?:-8)?-[a-z][0-9a-z]{2}$/;
+const DESKTOP_3P_ALIAS = /^claude-(?:opus-4(?:-8)?-[a-z][0-9a-z]{2}|(?:opus-4-8|fable-5)-p[0-9a-z]{3})(?:--fast)?$/;
 
-export function isProxyOnlyModelId(value: string, providerNames: readonly string[] = []): boolean {
+export function nativeClaudeModelIds(config: OcxConfig): string[] {
+  const assignments = config.claudeCode?.desktopProfile?.assignments ?? {};
+  const routes = Object.keys(assignments);
+  const realProfileIds = new Set(routes.filter(route => route.startsWith("anthropic/claude-"))
+    .map(route => route.slice("anthropic/".length)));
+  // A native CLI starts without the server registry. Persisted profile bindings still
+  // identify proxy selectors, even when an old provider declaration has the same spelling.
+  const proxyProfileIds = new Set(routes.filter(route => !route.startsWith("anthropic/claude-"))
+    .flatMap(route => {
+      const alias = assignments[route]!.alias;
+      const slash = route.indexOf("/");
+      return [alias, desktopProfileWireAlias(alias), legacyDesktopProfileWireAlias(alias),
+        desktop3pAlias(route.slice(0, slash), route.slice(slash + 1)),
+        legacyDesktop3pAlias(route.slice(0, slash), route.slice(slash + 1))];
+    }));
+  // The configured default is a genuine declaration too: the catalog seeds it for static
+  // providers, so it must be recognized here even without a server registry.
+  const anthropic = config.providers.anthropic;
+  const declaredIds = [
+    ...(anthropic?.defaultModel ? [anthropic.defaultModel] : []),
+    ...(anthropic?.models ?? []), ...(anthropic?.selectedModels ?? []), ...(anthropic?.retainModels ?? []),
+  ];
+  return [...new Set([
+    ...realProfileIds,
+    ...declaredIds
+      .filter(id => {
+        const base = id.endsWith("--fast") ? id.slice(0, -"--fast".length) : id;
+        return id.startsWith("claude-") && (realProfileIds.has(id)
+          || (!proxyProfileIds.has(id) && !proxyProfileIds.has(base)));
+      }),
+  ])];
+}
+
+export function isProxyOnlyModelId(value: string, providerNames: readonly string[] = [], realAnthropicIds: readonly string[] = []): boolean {
   const id = value.trim().replace(/\[1m\]$/, "");
   if (!id) return false;
-  if (id.startsWith(CLAUDE_ALIAS_PREFIX_V1) || id.startsWith(CLAUDE_ALIAS_PREFIX_V2) || DESKTOP_3P_ALIAS.test(id)) {
+  if (isRealDesktop3pModelId(id)) return false;
+  const base = id.endsWith("--fast") ? id.slice(0, -"--fast".length) : id;
+  if (resolveDesktop3pAlias(id) || resolveDesktop3pAlias(base)) return true;
+  if (realAnthropicIds.includes(id)) return false;
+  const aliasPrefixes = [CLAUDE_ALIAS_PREFIX_CURRENT, CLAUDE_ALIAS_PREFIX_CURRENT_V2, CLAUDE_ALIAS_PREFIX_V1, CLAUDE_ALIAS_PREFIX_V2];
+  if (aliasPrefixes.some(prefix => id.startsWith(prefix)) || DESKTOP_3P_ALIAS.test(id)) {
     return true;
   }
   const slash = id.indexOf("/");
@@ -517,6 +691,23 @@ export function buildNativeClaudeEnv(
   deps: ClaudeEnvDeps = {},
 ): ClaudeLaunchEnv {
   const env: ClaudeLaunchEnv = { ...base };
+  const owned = deps.ownedInterceptSettings;
+  // A CA-only stale entry does not override an inherited proxy.
+  if ((owned?.kind === "applied" || owned?.kind === "stale") && isClaudeInterceptProxyUrl(owned.env.HTTPS_PROXY)) {
+    const expected = owned.env.HTTPS_PROXY;
+    const foreignInheritedProxy = [env.HTTPS_PROXY, env.https_proxy].some(value =>
+      value !== undefined && value !== "" && value !== expected);
+    if (foreignInheritedProxy) {
+      deps.warn?.("⚠ Claude settings-owned intercept proxy still applies. Turn Desktop/CLI first-party off or unset the foreign HTTPS_PROXY/https_proxy to use native Claude.");
+    } else {
+      env.NO_PROXY = "*";
+      env.no_proxy = "*";
+      if (env.HTTPS_PROXY === expected) delete env.HTTPS_PROXY;
+      if (env.https_proxy === expected) delete env.https_proxy;
+      if (owned.env.NODE_EXTRA_CA_CERTS !== undefined && env.NODE_EXTRA_CA_CERTS === owned.env.NODE_EXTRA_CA_CERTS)
+        delete env.NODE_EXTRA_CA_CERTS;
+    }
+  }
   deleteUntrustedAnthropicSlots(env, deps);
 
   const admissionSlots = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"] as const;
@@ -525,7 +716,16 @@ export function buildNativeClaudeEnv(
     return Boolean(value && (value === PROXY_MARKER || isProxyAdmissionSecret(value, config)));
   });
   const baseUrl = env.ANTHROPIC_BASE_URL;
-  if (hasOwnedAdmission && targetsLocalClaudeProxy(baseUrl, config.port)) {
+  // Shedding asks a DIFFERENT question than the stale-replacement branch above, so it uses a
+  // wider set (#4236). There the question is "is this inherited URL a live destination of
+  // ours?" and a port nothing answers on must be rewritten. Here it is "could we have written
+  // this?" — and the answer is yes for the public port on any topology, because an earlier
+  // config on this machine may have been loopback-bound. Leaving such a URL in place with its
+  // admission token stripped (the loop below always strips it) would point a native launch at a
+  // dead socket with no credential, which is strictly worse than shedding one port too many.
+  const nativeLocalPorts = [...new Set([config.port, ...localLoopbackInferencePorts(config, config.port)])];
+  const nativeOwnOrigin = localInferenceDestination(config, config.port).origin;
+  if (hasOwnedAdmission && targetsLocalClaudeProxy(baseUrl, nativeLocalPorts, nativeOwnOrigin)) {
     delete env.ANTHROPIC_BASE_URL;
   }
   for (const name of admissionSlots) {
@@ -534,10 +734,19 @@ export function buildNativeClaudeEnv(
   }
 
   for (const name of NATIVE_STRIPPED_LEVERS) delete env[name];
+  // An explicit caller-owned guard must follow a caller-owned gateway and credential;
+  // otherwise settings.env can replace the destination while retaining the credential.
+  if (hasOwnedAdmission) delete env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST;
   const providerNames = Object.keys(config.providers);
+  const realAnthropicIds = nativeClaudeModelIds(config);
   for (const name of MODEL_ENV_SLOT_NAMES) {
     const value = env[name];
-    if (value && isProxyOnlyModelId(value, providerNames)) delete env[name];
+    if (!value || !isProxyOnlyModelId(value, providerNames, realAnthropicIds)) continue;
+    delete env[name];
+    // The label opencodex paired with this slot names a proxy route the native session cannot use.
+    const labelName = `${name}_NAME`;
+    const label = claudeTierDisplayName(value);
+    if (isClaudeTierLabelSlot(name) && label !== undefined && env[labelName] === label) delete env[labelName];
   }
   if (deps.allowRootSkipPermissions === true && !env.IS_SANDBOX) env.IS_SANDBOX = "1";
   return env;
@@ -548,11 +757,12 @@ export function nativeModelOverride(
   configuredModel: string | undefined,
   args: readonly string[],
   providerNames: readonly string[] = [],
+  realAnthropicIds: readonly string[] = [],
 ): { flag?: string[]; warning?: string } {
-  if (!pickedModel || !isProxyOnlyModelId(pickedModel, providerNames)) return {};
+  if (!pickedModel || !isProxyOnlyModelId(pickedModel, providerNames, realAnthropicIds)) return {};
   if (args.some(arg => arg === "--model" || arg.startsWith("--model="))) return {};
   const fallback = configuredModel?.trim();
-  if (fallback && !isProxyOnlyModelId(fallback, providerNames)) {
+  if (fallback && !isProxyOnlyModelId(fallback, providerNames, realAnthropicIds)) {
     return {
       flag: ["--model", fallback],
       warning: `ℹ️ The saved model (${pickedModel}) requires the proxy. This native session will use ${fallback}.`,
@@ -594,6 +804,43 @@ export function rootSkipPermissionsNotice(env: ClaudeLaunchEnv): string {
   return `⚠ Root --dangerously-skip-permissions requested: preserving user IS_SANDBOX=${env.IS_SANDBOX}; Claude Code's root guard remains in control.`;
 }
 
+/**
+ * The hub's featured subagent roster, or undefined to fall back to local `subagentModels`.
+ *
+ * Best-effort by design: a launch must not fail because the hub is slow or old. But the
+ * fallback is ANNOUNCED (#4236) — a silently local roster is exactly how an operator came to
+ * believe a hub that serves grok could only delegate to five native models.
+ *
+ * An empty hub roster is honoured as empty, not treated as "no answer": an operator who cleared
+ * the hub's featured list meant it.
+ */
+export async function resolveHubRosterForClaude(
+  connection: { serverUrl: string; apiKeyId: string; connectedAt: string },
+  token: string,
+  deps: { resolve?: typeof resolveHubState; warn?: (message: string) => void } = {},
+): Promise<readonly string[] | undefined> {
+  const warn = deps.warn ?? (message => console.error(message));
+  const resolve = deps.resolve ?? resolveHubState;
+  try {
+    const resolved = await resolve({
+      owner: { serverUrl: connection.serverUrl, apiKeyId: connection.apiKeyId, connectedAt: connection.connectedAt },
+      token,
+    });
+    if (!resolved.state) {
+      warn(`⚠ Hub roster unavailable (${resolved.reason ?? "unknown reason"}); using this machine's local subagentModels instead. The delegable agents below may not be what the hub can route.`);
+      return undefined;
+    }
+    if (resolved.stateSource === "cache") {
+      warn(`⚠ Hub roster came from a cached read ${resolved.ageSeconds ?? "?"}s old (${resolved.reason ?? "live read failed"}).`);
+    }
+    return resolved.state.subagentModels;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    warn(`⚠ Hub roster could not be read (${message}); using this machine's local subagentModels instead.`);
+    return undefined;
+  }
+}
+
 export async function cmdClaude(args: string[]): Promise<number> {
   const config = loadConfig();
   const clientState = readClientConnectionState();
@@ -606,10 +853,14 @@ export async function cmdClaude(args: string[]): Promise<number> {
   if (preflight.kind === "native") return launchNativeClaude(config, args, preflight.notice);
   let route: number | ClaudeRoutingTarget;
   let contextWindows: Record<string, number>;
+  let forceAvailable: readonly string[] | undefined;
+  /** The hub's featured roster on a connected client; undefined means "use local config". */
+  let hubRoster: readonly string[] | undefined;
   if (clientState.kind === "connected") {
     if (tokenState?.kind !== "present") return 1;
     route = { baseUrl: clientState.value.serverUrl, admissionToken: tokenState.token };
     contextWindows = readConnectedClaudeContextWindows();
+    hubRoster = await resolveHubRosterForClaude(clientState.value, tokenState.token);
   } else {
     const port = await ensureProxyForClaude();
     if (!port) {
@@ -621,18 +872,22 @@ export async function cmdClaude(args: string[]): Promise<number> {
     if (plan.kind === "native") return launchNativeClaude(config, args, plan.notice);
     route = port;
     contextWindows = liveState.contextWindows;
+    forceAvailable = liveState.forceAvailable ?? [];
   }
+  const gateway = await fetchGatewayModels(route, { admissionConfig: config });
+  const forceAvailableSelectors = typeof route === "number" ? undefined : gateway?.models.map(model => model.id) ?? [];
   const allowRootSkipPermissions = shouldAllowRootSkipPermissions(args);
-  const env = buildClaudeEnv(config, route, process.env, contextWindows, { allowRootSkipPermissions });
+  const keychainPresence = await resolveClaudeKeychainPresence(config.claudeCode?.authMode);
+  const env = buildClaudeEnv(config, route, process.env, contextWindows, {
+    allowRootSkipPermissions, forceAvailable, forceAvailableSelectors, authDetect: { keychainProbe: () => keychainPresence },
+  });
   if (allowRootSkipPermissions) {
     console.error(rootSkipPermissionsNotice(env));
   }
   // Pre-write the CLI's gateway-model cache (devlog 030): without a token the CLI
   // never refreshes it, so the picker would keep showing yesterday's aliases.
   try {
-    const cachePath = typeof route === "number"
-      ? await refreshGatewayModelCacheFromProxy(route, { admissionConfig: config })
-      : await refreshGatewayModelCacheFromProxy(route, { admissionConfig: config });
+    const cachePath = gateway ? writeGatewayModelCache(gateway.baseUrl, gateway.models) : null;
     if (cachePath === null) {
       console.error("⚠ Gateway model cache could not be refreshed; the model picker may be stale.");
     }
@@ -641,16 +896,24 @@ export async function cmdClaude(args: string[]): Promise<number> {
     console.error(`⚠ Gateway model cache could not be refreshed: ${message}`);
   }
   // Sync roster agents (devlog 070): subagentModels + self -> ~/.claude/agents/ocx-*.md.
-  if (typeof route === "number") {
-    try {
-      const written = injectClaudeAgentDefs(config, contextWindows);
-      if (written === null) {
-        console.error("⚠ Claude agent definitions could not be synced; check ~/.claude/agents permissions.");
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.error(`⚠ Claude agent definitions could not be synced: ${message}`);
+  //
+  // This used to run only when `route` was a number — i.e. never on a connected client, where
+  // `route` is a ClaudeRoutingTarget (#4236). So `~/.claude/agents/ocx-*.md` on a client stayed
+  // whatever a previous standalone run had left, and the five delegable agents an operator saw
+  // were a frozen snapshot of a machine that no longer does the routing. Nothing in the output
+  // said so; the roster simply looked like the answer.
+  //
+  // On a client the roster comes from the hub, because the local `subagentModels` list is the
+  // one this machine had before it joined. The five-row cap stays: it is a Claude Code picker
+  // constraint, not the defect — sourcing the five from the wrong machine was.
+  try {
+    const written = injectClaudeAgentDefs(config, contextWindows, undefined, hubRoster);
+    if (written === null) {
+      console.error("⚠ Claude agent definitions could not be synced; check ~/.claude/agents permissions.");
     }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`⚠ Claude agent definitions could not be synced: ${message}`);
   }
   return spawnClaude(args, env);
 }
@@ -663,10 +926,14 @@ async function launchNativeClaude(config: OcxConfig, args: string[], notice: str
     config.claudeCode?.model,
     args,
     providerNames,
+    nativeClaudeModelIds(config),
   );
   if (override.warning) console.error(override.warning);
   const allowRootSkipPermissions = shouldAllowRootSkipPermissions(args);
-  const env = buildNativeClaudeEnv(config, process.env, { allowRootSkipPermissions });
+  const env = buildNativeClaudeEnv(config, process.env, {
+    allowRootSkipPermissions, ownedInterceptSettings: inspectDesktopFirstParty(config).settings,
+    warn: line => console.error(line),
+  });
   if (allowRootSkipPermissions) console.error(rootSkipPermissionsNotice(env));
   return spawnClaude([...(override.flag ?? []), ...args], env);
 }

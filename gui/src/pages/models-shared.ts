@@ -1,7 +1,9 @@
-import type { TFn } from "../i18n/shared";
+import type { TFn, TKey } from "../i18n/shared";
 import type { ProviderDiscoverySummary } from "../models-groups";
 import { modelVisible, type ProviderModelMap } from "../model-visibility";
 import { formatNamespacedModelId } from "../provider-icons";
+import type { SubagentSurfaceMode } from "../subagent-surface";
+import type { ShadowCallSourceOption } from "./shadow-call-source";
 
 export type StorageLike = Pick<Storage, "getItem" | "setItem">;
 
@@ -35,12 +37,104 @@ export interface ModelRow {
   custom?: boolean;
   customId?: string;
   displayName?: string;
+  displayNameOverride?: string;
+  displayNameSource?: "operator" | "provider" | "fallback";
+  manualPricing?: boolean;
+  /**
+   * Listed but currently unable to serve, because every usable target is quota-exhausted
+   * (#1711). Distinct from `disabled`, which is the operator's own choice, and from visibility:
+   * the row is still offered.
+   */
+  quotaInactiveReason?: "no_credit";
+  /**
+   * Provider-published cost class from model discovery (#3666). Absent means unknown — either
+   * the provider publishes no per-token rates, or the row was cached by a build that predates
+   * the field. Absent is never treated as free.
+   */
+  pricingStatus?: "free" | "paid";
   inputModalities?: string[];
   contextWindow?: number;
+  /** Exact stored context override; absent when the row inherits its effective window. */
+  contextWindowDeclared?: number;
   contextCap?: number;
   contextCapped?: boolean;
-  /** Stored custom-row override (not the inherited ladder); only present on custom rows. */
+  /**
+   * Stored custom-row override, or — on a routed row — the ladder that actually applies to it,
+   * resolved from the config and the registry. A routed row carries it because the per-model
+   * editor needs the answer rather than the absence of one.
+   */
   reasoningEfforts?: string[];
+  /** The level a request inherits when it names none; absent when nothing pins one. */
+  defaultReasoningEffort?: string;
+  /**
+   * The stored modality declaration, which is NOT the row's own `inputModalities`: that one is
+   * the catalog value. An editor has to pre-fill from this one, or it shows what the provider
+   * published while writing something else, and every save reads back as "nothing changed".
+   */
+  inputModalitiesDeclared?: string[];
+  /** True when the config really changes this model's reasoning, decided by value, not by key. */
+  reasoningOverridden?: boolean;
+}
+
+/** The pricing shape both Free-only consumers read; keeps the helpers usable from either page. */
+export type PricedRow = { pricingStatus?: "free" | "paid" };
+
+/**
+ * Whether a Free-only control should be offered for this set of rows at all (#3666).
+ *
+ * A provider that publishes no per-token prices — Ollama, a static catalog, anything whose
+ * /models rows carry no usable rate pair — leaves every row unclassified, so a Free switch
+ * there could only ever empty the list. That reads as a broken filter rather than as "this
+ * provider does not say", so the control is hidden instead.
+ */
+export function modelPricingKnown(rows: readonly PricedRow[]): boolean {
+  return rows.some(row => row.pricingStatus !== undefined);
+}
+
+/**
+ * Apply the Free-only narrowing (#3666).
+ *
+ * Absent `pricingStatus` is never free: the discovery classifier omits the field exactly when
+ * the provider's rates were missing, one-sided, non-numeric, or negative, and a cached row from
+ * an older build has no field either. Both consumers call this BEFORE their own search, sort,
+ * and page slice, or free models stay stranded behind Show more on a long provider list.
+ */
+export function filterFreeModelRows<T extends PricedRow>(rows: readonly T[], freeOnly: boolean): T[] {
+  return freeOnly ? rows.filter(row => row.pricingStatus === "free") : [...rows];
+}
+
+/**
+ * Whether the Free-only narrowing is actually in force for this set of rows.
+ *
+ * The switch is offered only where discovery returned prices, but the operator's choice is
+ * component state that outlives the rows it was made against. When the evidence goes away —
+ * a refresh that comes back without pricing, a re-auth, a discovery fallback to a static
+ * catalog — the control disappears while the stale `true` keeps filtering, and every row is
+ * unclassified, so the list empties with no visible way to turn it off. Gate the filter on the
+ * same condition that gates the switch and the narrowing lapses with the control.
+ */
+export function freeOnlyInForce(freeOnly: boolean, rows: readonly PricedRow[]): boolean {
+  return freeOnly && modelPricingKnown(rows);
+}
+
+function containsDisplayNameControlCharacter(value: string): boolean {
+  return [...value].some(character => {
+    const codePoint = character.codePointAt(0)!;
+    return codePoint <= 0x1f
+      || (codePoint >= 0x7f && codePoint <= 0x9f)
+      || codePoint === 0x2028
+      || codePoint === 0x2029;
+  });
+}
+
+/** Mirror the server display-name contract for immediate form feedback. */
+export function modelDisplayNameValidationKey(value: string): TKey | null {
+  const trimmed = value.trim();
+  if (!trimmed) return "models.displayNameRequired";
+  if (trimmed.length > 128) return "models.displayNameTooLong";
+  if (trimmed.includes("/")) return "models.displayNameNoSlash";
+  if (containsDisplayNameControlCharacter(trimmed)) return "models.displayNameNoControl";
+  return null;
 }
 
 /**
@@ -56,14 +150,45 @@ export interface ProviderContextCapsResponse {
   cap?: number;
   value?: number;
   caps?: Record<string, number>;
+  values?: Record<string, number>;
 }
 
 export interface V2Status {
   enabled: boolean;
   agentsMaxThreadsConflict: boolean;
   maxConcurrentThreadsPerSession?: number | null;
-  multiAgentMode?: "v1" | "default" | "v2";
+  multiAgentMode?: SubagentSurfaceMode;
   keepNativeChatGptOnV1?: boolean;
+  /** Response-only; absent on a runtime older than the v1-default advisory. */
+  multiAgentSurfaceAdvisory?: unknown;
+  /** Response-only; absent on a runtime older than the 'v2-plaintext' mode. */
+  supportsPlaintextV2Mode?: boolean;
+  /**
+   * Response-only: the plaintext-delivery SETTING is on (the mode, or the legacy
+   * experimental flag). It does not prove any particular message left in plaintext —
+   * a request the compiler cannot safely rewrite is still sent unchanged.
+   */
+  plaintextAgentMessagesEnabled?: boolean;
+}
+
+/**
+ * Narrow a /api/v2 response into renderable state. Absent or unrecognised fields fall
+ * back to the pre-'v2-plaintext' shape, so an older runtime cannot produce a phantom
+ * option and a malformed mode cannot stick.
+ */
+export function normalizeV2Status(data: V2Status): V2Status {
+  return {
+    enabled: data.enabled,
+    agentsMaxThreadsConflict: data.agentsMaxThreadsConflict === true,
+    maxConcurrentThreadsPerSession: typeof data.maxConcurrentThreadsPerSession === "number" ? data.maxConcurrentThreadsPerSession : null,
+    multiAgentMode: data.multiAgentMode === "v1" || data.multiAgentMode === "v2" || data.multiAgentMode === "v2-plaintext"
+      ? data.multiAgentMode
+      : "default",
+    keepNativeChatGptOnV1: data.keepNativeChatGptOnV1 === true,
+    multiAgentSurfaceAdvisory: data.multiAgentSurfaceAdvisory,
+    supportsPlaintextV2Mode: data.supportsPlaintextV2Mode === true,
+    plaintextAgentMessagesEnabled: data.plaintextAgentMessagesEnabled === true,
+  };
 }
 
 export interface ShadowCallData {
@@ -71,6 +196,29 @@ export interface ShadowCallData {
   model: string;
   /** Source models the runtime actually intercepts. Older runtimes omit it. */
   sourceModels?: string[];
+  /** Runtime-owned source inventory; older runtimes omit it. */
+  sourceModelOptions?: ShadowCallSourceOption[];
+}
+
+/**
+ * Message for a rejected shadow-call save.
+ *
+ * The endpoint returns HTTP 400 for several distinct validation failures, so the status alone
+ * cannot tell the operator what to change. The stable `code` decides the message; an older
+ * runtime or a proxy error page without one falls back to the neutral save failure instead of
+ * claiming the replacement target is wrong. A failed fetch stays a network error and never
+ * reaches this mapping.
+ */
+export function shadowCallSaveErrorKey(code: unknown): TKey {
+  if (code === "shadow_call_target_invalid") return "models.shadowCallTargetInvalid";
+  if (code === "shadow_call_source_invalid") return "models.shadowCallSourceInvalid";
+  return "models.shadowCallSaveFailed";
+}
+
+/** The global auto-review (approval reviewer) override the Models settings panel writes. */
+export interface AutoReviewData {
+  enabled: boolean;
+  model: string;
 }
 
 export const CAP_OPTIONS = Array.from({ length: 18 }, (_, i) => 100_000 + i * 50_000); // 100k … 950k
@@ -92,6 +240,24 @@ export const NATIVE_CAP_OPTION_SET = new Set(NATIVE_CAP_OPTIONS);
 export const CUSTOM_OPTION = "custom";
 export const THREAD_OPTIONS = [4, 8, 16, 32, 64, 128, 256, 500, 1000];
 export const THREAD_OPTION_SET = new Set(THREAD_OPTIONS);
+
+/**
+ * The /api/v2 maxConcurrentThreadsPerSession field is expressed in the ACTIVE backend's
+ * units: the [agents] keys (v1/base/hybrid, enabled:false) count child agents, while
+ * the V2 storage counts the root agent's own slot too (total = children + 1). The
+ * control always presents the logical child count, so only the V2-total case translates
+ * across the root slot. A stored V2 total of 1 is root-only and displays zero
+ * children, even though new child-limit edits must be at least 1. This display
+ * conversion is independent of the backend's V2-to-V1 migration clamp.
+ */
+export function threadLimitToChildCount(limit: number, v2Enabled: boolean): number {
+  return v2Enabled ? Math.max(0, limit - 1) : limit;
+}
+
+export function childCountToThreadLimit(children: number, v2Enabled: boolean): number {
+  return v2Enabled ? children + 1 : children;
+}
+
 export const PAGE = 60; // rows rendered per provider before a "show more"
 
 export const COLLAPSED_KEY_V2 = "ocx-models-collapsed:v2";
@@ -135,6 +301,27 @@ export function activeModelOptions(
   return options;
 }
 
+/**
+ * Narrow the catalog options to the routed rows an auto-review override may name.
+ *
+ * The reviewer selector has to resolve to a provider-namespaced catalog row; native rows are
+ * dropped because Codex's own default already covers them and choosing one would pin the
+ * subscription model the override exists to avoid. A value saved before its row left the list
+ * stays selectable, or the control would read back blank and the next save would erase it.
+ */
+export function routedModelOptions(
+  visible: readonly { value: string; label: string }[],
+  models: readonly ModelRow[],
+  saved?: string,
+): { value: string; label: string }[] {
+  const native = new Set(models.filter(model => model.native === true).map(model => model.namespaced));
+  const options = visible.filter(option => !native.has(option.value));
+  if (saved && !options.some(option => option.value === saved)) {
+    options.push({ value: saved, label: visible.find(option => option.value === saved)?.label ?? saved });
+  }
+  return options;
+}
+
 /** `null` = no preference yet → caller should default to all groups collapsed. */
 export function readCollapsedProviders(storage: StorageLike = localStorage): Set<string> | null {
   try {
@@ -156,4 +343,31 @@ export function writeCollapsedProviders(collapsed: Set<string>, storage: Storage
   } catch {
     /* quota / private-mode */
   }
+}
+
+/**
+ * Parse a context-window field: a number, `null` for "unset", or `undefined` when the text is
+ * not usable. Separators are cosmetic, so "64,000" and "64_000" and "64000" are one value.
+ *
+ * Safe-integer rather than integer: `Number.isInteger(1e100)` is true, the server rejects it,
+ * and accepting it here would turn a typo into a round-trip error instead of inline feedback.
+ *
+ * Module scope because it closes over nothing — rebuilding it every render is wasted work.
+ */
+export function parseContextWindowDraft(raw: string): number | null | undefined {
+  const normalized = raw.replace(/[_,\s]/g, "");
+  if (!normalized) return null;
+  const value = Number(normalized);
+  return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+/** #2465 per-provider model-preset view, as `GET /api/model-presets` returns it. */
+export interface ModelPresetView {
+  mode: "preset" | "all" | "custom";
+  appliedVersion?: number;
+  availableVersion: number;
+  presetIds: string[];
+  presetCount: number;
+  totalCount: number;
+  fallback?: string;
 }

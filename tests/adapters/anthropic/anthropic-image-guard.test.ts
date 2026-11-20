@@ -142,14 +142,22 @@ describe("enforceAnthropicImageLimits", () => {
   });
 
   test("C6: a single >8000px image is textified even in a small request", () => {
-    const oversized = imageBlock(HUGE) as Record<string, unknown>;
-    oversized.cache_control = { type: "ephemeral", ttl: "1h" };
-    const messages = [userMsg([oversized, imageBlock(SMALL)])];
+    const messages = [userMsg([imageBlock(HUGE), imageBlock(SMALL)])];
+    enforceAnthropicImageLimits(messages);
+    const content = (messages[0] as { content: Array<{ type: string }> }).content;
+    expect(content[0].type).toBe("text");
+    expect(content[1].type).toBe("image");
+  });
+
+  test("a cache_control breakpoint survives textification", () => {
+    const huge = { ...imageBlock(HUGE), cache_control: { type: "ephemeral", ttl: "1h" } };
+    const messages = [userMsg([huge, imageBlock(SMALL)])];
     enforceAnthropicImageLimits(messages);
     const content = (messages[0] as { content: Array<Record<string, unknown>> }).content;
     expect(content[0].type).toBe("text");
     expect(content[0].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
-    expect(content[1].type).toBe("image");
+    // The image block's own properties must NOT ride along onto a text block.
+    expect(content[0].source).toBeUndefined();
   });
 
   test("C4: >100 small images trimmed to 100", () => {

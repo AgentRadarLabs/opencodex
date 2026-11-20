@@ -1,13 +1,17 @@
 import type { TFn } from "../i18n/shared";
 import { isAccountProvider, type WorkspaceItem } from "./catalog";
 import { isLocalProvider } from "./kind";
+import { isSubscriptionCliProvider } from "./subscription-cli";
 
 export type ProviderAuthSurface = "codex-accounts" | "oauth-accounts" | "api-keys" | null;
 
 export interface OAuthAccountIdentity {
   id: string;
   alias?: string;
-  email?: string;
+  /** Server label that follows privacy.maskEmails: masked by default, the raw email when unmasked. */
+  accountLabel?: string;
+  /** Always-masked label; fallback for servers that do not send accountLabel. */
+  maskedLabel?: string;
 }
 
 /**
@@ -24,7 +28,10 @@ export function providerAuthSurface(item: WorkspaceItem): ProviderAuthSurface {
 
   const hasKeyMaterial = item.hasApiKey === true;
   const keyAuth = mode === "key" || hasKeyMaterial || mode === "";
-  if (!keyAuth || (item.keyOptional === true && !hasKeyMaterial)) return null;
+  // A subscription CLI row is keyless by adapter, with or without the registry's `keyOptional`:
+  // it offers no key prompt, and only a key already saved on it keeps the surface for removal.
+  const keyless = item.keyOptional === true || isSubscriptionCliProvider(item);
+  if (!keyAuth || (keyless && !hasKeyMaterial)) return null;
   return "api-keys";
 }
 
@@ -36,8 +43,8 @@ export function oauthAccountDisplayLabel<T extends OAuthAccountIdentity>(
 ): string {
   const alias = account.alias?.trim();
   if (alias) return alias;
-  const email = account.email?.trim();
-  if (email) return email;
+  const label = account.accountLabel?.trim() || account.maskedLabel?.trim();
+  if (label) return label;
   const index = accounts.findIndex(candidate => candidate.id === account.id);
   return t("pws.accountOrdinal", { count: String(index >= 0 ? index + 1 : 1) });
 }

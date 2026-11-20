@@ -1,13 +1,20 @@
-import { readFileSync } from "node:fs";
+import { lstatSync, readFileSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
 import {
+  getConfigDir,
   getConfigPath,
   deleteConfigTopLevelKey,
   getDefaultConfig,
   mutatePersistedConfig,
   readConfigDiagnostics,
   saveConfig,
+  withConfigMutationLockSync,
 } from "../config";
+import { atomicWriteFileNoFollowUnclaimed } from "../config/atomic-write";
+import { readConfigFileSnapshot } from "../config/diagnostics";
 import type { OcxClientConnectionConfig } from "../types";
+import { inspectRemoteDesktopStore, readDesktopDisconnectReceipt } from "../claude/desktop-remote-store";
+import { withClientLifecycleSync, type ClientLifecycleLockDeps } from "./lifecycle-lock";
 import {
   readServiceApiTokenState,
   readTokenBackupState,
@@ -19,6 +26,45 @@ export type ClientConnectionState =
   | { kind: "connected"; value: OcxClientConnectionConfig }
   | { kind: "invalid"; reason: string }
   | { kind: "mismatched"; reason: string };
+
+export function isLinkConnection(c: OcxClientConnectionConfig | undefined): boolean {
+  return c?.transport === "link";
+}
+
+const pendingConnectPath = (): string => join(getConfigDir(), "client-connect-pending");
+
+/** Validate pending ownership; an optional fingerprint restricts it to that exact key. */
+export function pendingClientConnectMayOwnToken(fingerprint?: string): boolean {
+  const path = pendingConnectPath();
+  let stat;
+  try { stat = lstatSync(path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+  if (!stat.isFile() || stat.nlink !== 1 || stat.size !== 65) {
+    throw new Error("pending client connection owner is unsafe");
+  }
+  const marker = readFileSync(path, "utf8");
+  if (!/^[a-f0-9]{64}\n$/.test(marker)) throw new Error("pending client connection owner is malformed");
+  return fingerprint === undefined || marker === `${fingerprint}\n`;
+}
+
+/** Publish only the token fingerprint, before the key file, under the client lifecycle lock. */
+export function markClientConnectPending(fingerprint: string): void {
+  if (!/^[a-f0-9]{64}$/.test(fingerprint)) throw new Error("invalid pending client fingerprint");
+  atomicWriteFileNoFollowUnclaimed(pendingConnectPath(), `${fingerprint}\n`);
+}
+
+/** Clear only the marker for this connect attempt while the client lifecycle lock is held. */
+export function clearClientConnectPending(fingerprint: string): void {
+  const path = pendingConnectPath();
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.nlink !== 1 || stat.size !== 65 || readFileSync(path, "utf8") !== `${fingerprint}\n`) {
+    throw new Error("pending client connection owner changed");
+  }
+  unlinkSync(path);
+}
 
 export type ClientRotationRecoveryGate =
   | { kind: "clean" }
@@ -37,14 +83,43 @@ function rawTopLevelConfig(): Record<string, unknown> | null {
   }
 }
 
+/**
+ * The client state with evidence required for "disconnected", decided from ONE read of the saved
+ * file (readConfigFileSnapshot): the bytes and their validation belong together, so a connect that
+ * commits meanwhile cannot pair old bytes with a validation of new ones. "disconnected" means a
+ * saved config.json that validates and records no client; a missing, unreadable or invalid file is
+ * invalid with its reason. Used wherever "disconnected" authorizes a restart, a recycle or exit 0.
+ */
+export function readClientConnectionStateWithEvidence(): ClientConnectionState {
+  const snapshot = readConfigFileSnapshot({ passive: true });
+  if (snapshot.raw === undefined) {
+    return { kind: "invalid", reason: snapshot.diagnostics.source === "default" ? "config.json is missing" : "config.json is unreadable" };
+  }
+  if (snapshot.diagnostics.source !== "file") {
+    return { kind: "invalid", reason: `config.json failed validation (${snapshot.diagnostics.error ?? "invalid"})` };
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(snapshot.raw.replace(/^\uFEFF/, "")); } catch { return { kind: "invalid", reason: "config.json is unreadable" }; }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { kind: "invalid", reason: "config.json is not an object" };
+  return classifyClientConnection(parsed as Record<string, unknown>, snapshot.diagnostics);
+}
+
 export function readClientConnectionState(): ClientConnectionState {
   const raw = rawTopLevelConfig();
-  const diagnostics = readConfigDiagnostics();
+  const diagnostics = readConfigDiagnostics({ passive: true });
   if (!raw) {
     return diagnostics.source === "default"
       ? { kind: "disconnected" }
       : { kind: "invalid", reason: "config.json is missing or unreadable" };
   }
+  return classifyClientConnection(raw, diagnostics);
+}
+
+/** The client verdict for one saved top-level object and the diagnostics of the same bytes. */
+function classifyClientConnection(
+  raw: Record<string, unknown>,
+  diagnostics: Pick<ReturnType<typeof readConfigDiagnostics>, "config" | "warnings">,
+): ClientConnectionState {
   const hasClient = Object.hasOwn(raw, "client") && raw.client !== undefined;
   const role = raw.runtimeRole;
   if (role !== undefined && role !== "standalone" && role !== "hub" && role !== "client") {
@@ -71,60 +146,100 @@ export function readClientConnectionState(): ClientConnectionState {
   return { kind: "connected", value: client };
 }
 
+export function sameClientConnectionOwner(
+  left: Pick<OcxClientConnectionConfig, "serverUrl" | "apiKeyId" | "connectedAt">,
+  right: Pick<OcxClientConnectionConfig, "serverUrl" | "apiKeyId" | "connectedAt">,
+): boolean {
+  return left.serverUrl === right.serverUrl && left.apiKeyId === right.apiKeyId && left.connectedAt === right.connectedAt;
+}
+
+/** Read-only: safe at a Codex N/C commit boundary; never acquires L or removes recovery state. */
+export function assertNoClientDisconnectPending(): void {
+  const receipt = readDesktopDisconnectReceipt();
+  if (receipt.kind === "unsafe") throw new Error("client_disconnect_receipt_unsafe");
+  if (receipt.kind === "valid" && receipt.value.phase !== "complete") {
+    throw new Error("client_disconnect_pending");
+  }
+}
+
 /**
- * Does the persisted config record a rotation that has not finished?
- *
- * Read fresh rather than taken from a caller-supplied snapshot: the whole point is to see a
- * `pendingOperation` that landed after that snapshot was taken.
+ * The message client startup refuses with. A pending disconnect names the command that clears it:
+ * under the desktop app or a service the supervisor only logs this line, and on 2.100.2 a person
+ * had to move desktop-remote/ aside by hand because nothing said a retry would finish or roll back.
  */
-function rotationInFlight(): boolean {
+export function clientStartupRefusalMessage(reason: string): string {
+  if (reason !== "client_disconnect_pending") return `client startup refused: ${reason}`;
+  const receipt = readDesktopDisconnectReceipt();
+  const valid = receipt.kind === "valid" ? receipt.value : null;
+  const command = valid?.keepCatalog ? "ocx disconnect --keep-catalog" : "ocx disconnect";
+  return `client startup refused: an ocx disconnect on this machine stopped part way${valid ? ` at phase ${valid.phase}` : ""}. `
+    + `Run ${command} again to finish it or roll it back. (code client_disconnect_pending)`;
+}
+
+/** Full snapshot CAS for work returning from an await, including selection and rotation state. */
+export function assertClientConnectionUnchanged(expected: OcxClientConnectionConfig): void {
+  assertNoClientDisconnectPending();
   const current = readClientConnectionState();
-  return current.kind === "connected" && current.value.pendingOperation !== undefined;
+  if (current.kind !== "connected" || JSON.stringify(current.value) !== JSON.stringify(expected)) {
+    throw new Error("client_connection_changed");
+  }
+}
+
+/** Undefined means only "possible orphan": the caller must repeat this read under L/C. */
+function observeClientRotationRecovery(): ClientRotationRecoveryGate | undefined {
+  const state = readClientConnectionState();
+  const current = readServiceApiTokenState();
+  const backup = readTokenBackupState();
+  const receipt = readDesktopDisconnectReceipt();
+  if (receipt.kind === "unsafe") return { kind: "unsafe", reason: "client_disconnect_receipt_unsafe" };
+  if (receipt.kind === "valid" && receipt.value.phase !== "complete") {
+    return { kind: "recovery-required", reason: "client_disconnect_pending" };
+  }
+  if (state.kind === "connected" && state.value.pendingOperation) {
+    if (current.kind !== "present" || backup.kind !== "present") {
+      return { kind: "unsafe", reason: "pending rotation requires current and backup token files" };
+    }
+    return { kind: "recovery-required", reason: "rerun ocx connect rotate with transient authority" };
+  }
+  if (backup.kind === "unsafe") return { kind: "unsafe", reason: "service token backup is unsafe" };
+  if (backup.kind === "present" && current.kind === "present") {
+    if (state.kind === "invalid" || state.kind === "mismatched"
+      || (state.kind === "connected" && current.fingerprint !== state.value.tokenFingerprint)) {
+      return { kind: "unsafe", reason: "connected token ownership changed" };
+    }
+    if (state.kind === "connected") {
+      const desktop = inspectRemoteDesktopStore({ serverUrl: state.value.serverUrl, apiKeyId: state.value.apiKeyId, connectedAt: state.value.connectedAt });
+      if (desktop.kind !== "absent" && desktop.kind !== "restored") {
+        // The inspection DTO deliberately exposes no credential generation. Let
+        // explicit rotation reconcile an active Desktop copy before discarding .prev.
+        return { kind: "recovery-required", reason: "Desktop credential reconciliation requires ocx connect rotate" };
+      }
+    }
+    return undefined;
+  }
+  return { kind: "clean" };
 }
 
 export function inspectClientRotationRecoveryGate(
-  state: ClientConnectionState = readClientConnectionState(),
+  _state: ClientConnectionState = readClientConnectionState(),
+  lockDeps?: ClientLifecycleLockDeps,
 ): ClientRotationRecoveryGate {
-  const current = readServiceApiTokenState();
-  const backup = readTokenBackupState();
-  if (state.kind === "connected" && state.value.pendingOperation) {
-    if (current.kind !== "present" || backup.kind !== "present") {
-      return {
-        kind: "unsafe",
-        reason: "pending key rotation requires owner-only service-api-token and service-api-token.prev files",
-      };
-    }
-    return {
-      kind: "recovery-required",
-      reason: "rerun ocx connect rotate with --pairing-code-stdin or --admin-token-stdin",
-    };
-  }
-  if (backup.kind === "unsafe") return { kind: "unsafe", reason: backup.reason };
-  if (backup.kind === "present" && current.kind === "present") {
-    // Only an ORPHAN backup is cleanable, and this branch cannot always tell an orphan from
-    // a backup belonging to a rotation that is mid-flight.
-    //
-    // `rotateConnectedClientKey` writes the .prev backup BEFORE it persists
-    // `pendingOperation`. A concurrent `ocx connect status` landing in that window sees
-    // "backup present, token present, no pending marker" — indistinguishable from a stale
-    // leftover — and deleted the live rollback target. If the rotation then failed, its
-    // restore had nothing to restore from.
-    //
-    // Re-reading the persisted state closes most of the window: the caller's `state` may
-    // have been captured before the marker landed, while a fresh read sees it. The
-    // remaining window is narrow enough that the rotation's own lock is the right owner,
-    // and deleting nothing is the safe side of it.
-    if (rotationInFlight()) {
-      return { kind: "recovery-required", reason: "a key rotation is in flight; leave service-api-token.prev in place" };
-    }
-    try {
+  try {
+    // Ordinary status is read-only: even acquiring C creates config-mutation.sqlite.
+    // Only actual orphan cleanup needs L/C; this first observation authorizes no write.
+    const observed = observeClientRotationRecovery();
+    if (observed) return observed;
+    return withClientLifecycleSync(() => withConfigMutationLockSync((): ClientRotationRecoveryGate => {
+      const fresh = observeClientRotationRecovery();
+      if (fresh) return fresh;
       removeOrphanTokenBackup();
       return { kind: "orphan-cleaned" };
-    } catch (error) {
-      return { kind: "unsafe", reason: error instanceof Error ? error.message : "token backup cleanup failed" };
-    }
+    }), lockDeps);
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+    if (code === "client_lifecycle_busy") return { kind: "recovery-required", reason: "client_lifecycle_busy" };
+    return { kind: "unsafe", reason: "client rotation state could not be inspected safely" };
   }
-  return { kind: "clean" };
 }
 
 export function commitClientConnection(
@@ -157,13 +272,13 @@ export function commitClientConnection(
 }
 
 export function clearClientConnection(
-  expectedApiKeyId: string,
+  expected: string | Pick<OcxClientConnectionConfig, "serverUrl" | "apiKeyId" | "connectedAt">,
 ): "committed" | "absent" | "conflict" {
   const outcome = mutatePersistedConfig(config => {
     if (!config.client && config.runtimeRole !== "client") {
       return { changed: false, value: "absent" as const };
     }
-    if (!config.client || config.runtimeRole !== "client" || config.client.apiKeyId !== expectedApiKeyId) {
+    if (!config.client || config.runtimeRole !== "client" || (typeof expected === "string" ? config.client.apiKeyId !== expected : !sameClientConnectionOwner(config.client, expected))) {
       return { changed: false, value: "conflict" as const };
     }
     deleteConfigTopLevelKey(config, "client");

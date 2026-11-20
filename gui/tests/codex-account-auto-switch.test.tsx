@@ -119,7 +119,7 @@ describe("Codex account auto-switch threshold", () => {
     expect(html).toContain('max="100"');
     expect(html).toContain('aria-label="Usage threshold, percent"');
     expect(html).toContain("95% usage or above");
-    expect(html).toContain("including an already-bound task");
+    expect(html).toContain("Bound tasks keep affinity by default");
     expect(html).toContain('aria-pressed="true"');
   });
 
@@ -143,7 +143,7 @@ describe("Codex account auto-switch threshold", () => {
     const roundRobin = renderSetting(80, "80", false, false, null, "round-robin");
     const fillFirst = renderSetting(80, "80", false, false, null, "fill-first");
 
-    expect(quota).toContain("including an already-bound task");
+    expect(quota).toContain("Bound tasks keep affinity by default");
     expect(roundRobin).toContain("does not use this threshold");
     expect(fillFirst).toContain("drain point for new/unbound tasks");
     for (const html of [quota, roundRobin, fillFirst]) {
@@ -165,7 +165,7 @@ describe("Codex account auto-switch threshold", () => {
       </LanguageProvider>,
     );
 
-    expect(renderStrategy("quota")).toContain("can also rebind an existing task");
+    expect(renderStrategy("quota")).toContain("rebinds an existing task at the usage threshold only when");
     expect(renderStrategy("round-robin")).toContain("usage threshold does not change normal rotation");
     const fillFirst = renderStrategy("fill-first");
     expect(fillFirst).toContain("healthy bound tasks keep affinity");
@@ -245,9 +245,12 @@ describe("Codex account auto-switch threshold", () => {
     };
 
     expect(await putAutoSwitchThreshold("http://localhost:10100", 95, fetchImpl)).toBe(true);
-    expect(request?.input).toBe("http://localhost:10100/api/codex-auth/auto-switch");
+    expect(request?.input).toBe("http://localhost:10100/api/pool/settings");
     expect(request?.init.method).toBe("PUT");
-    expect(request?.init.body).toBe(JSON.stringify({ threshold: 95 }));
+    // Mapped, not forwarded: the contract field is autoSwitchThreshold and the provider is
+    // always sent. A body that still said `threshold` would be ignored and the save would
+    // report success while changing nothing.
+    expect(request?.init.body).toBe(JSON.stringify({ provider: "openai", autoSwitchThreshold: 95 }));
   });
 
   test("reports HTTP and network failures without accepting the write", async () => {
@@ -293,5 +296,64 @@ describe("Codex account auto-switch threshold", () => {
     };
     expect(await putAutoSwitchThreshold("", 101, fetchImpl)).toBe(false);
     expect(calls).toBe(0);
+  });
+
+  test("the auto-switch save carries the captured relay target", async () => {
+    const { Window } = await import("happy-dom");
+    const { act, useLayoutEffect } = await import("react");
+    const { createRoot } = await import("react-dom/client");
+    const { configureApiTargets } = await import("../src/api");
+    const { standaloneApiTargets } = await import("../src/api-targets");
+    const { useCodexAutoSwitch } = await import("../src/hooks/useCodexAutoSwitch");
+    const win = new Window({ url: "http://localhost/" });
+    const saved = (["window", "document", "navigator", "IS_REACT_ACT_ENVIRONMENT"] as const)
+      .map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const);
+    Object.defineProperties(globalThis, {
+      window: { configurable: true, value: win },
+      document: { configurable: true, value: win.document },
+      navigator: { configurable: true, value: win.navigator },
+      IS_REACT_ACT_ENVIRONMENT: { configurable: true, value: true },
+    });
+    const base = standaloneApiTargets("");
+    configureApiTargets({
+      ...base,
+      connected: true,
+      shared: { ...base.shared, baseUrl: "/api/machine/hub-relay", serverOrigin: "https://hub-a.example", transport: "relay" },
+      apiKeyId: "fixture-key",
+      relayTargetCheck: "expected-target-v1",
+    });
+    const expected: Array<string | null> = [];
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "PUT") {
+        expected.push(new Headers(init.headers).get("x-opencodex-expected-target"));
+        return new Response(null, { status: 204 });
+      }
+      return Response.json({});
+    }) as typeof fetch;
+    let controller!: ReturnType<typeof useCodexAutoSwitch>;
+    function Probe() {
+      const current = useCodexAutoSwitch("/api/machine/hub-relay", { updated: "u", updateFailed: "f", invalid: "i" });
+      // Publish after commit: the compiler rejects a render-phase write of a hook result
+      // into a module binding, and the test body only reads it after act().
+      useLayoutEffect(() => { controller = current; });
+      return null;
+    }
+    const host = win.document.createElement("div");
+    win.document.body.appendChild(host as never);
+    const root = createRoot(host);
+    try {
+      await act(async () => { root.render(<Probe />); });
+      await act(async () => { controller.hydrateServerValue(80); });
+      await act(async () => { await controller.toggle(); });
+      expect(expected).toEqual(["https://hub-a.example"]);
+    } finally {
+      await act(async () => { root.unmount(); });
+      configureApiTargets(standaloneApiTargets(""));
+      for (const [key, descriptor] of saved) {
+        if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+        else delete (globalThis as Record<string, unknown>)[key];
+      }
+      await win.happyDOM?.close?.();
+    }
   });
 });

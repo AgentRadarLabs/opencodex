@@ -10,6 +10,12 @@ import {
 } from "../../src/responses/state";
 import { resetAgentTaskRecoveryState } from "../../src/server/responses/agent-task-recovery";
 import { agentTaskRecoveryCacheSnapshotForTests } from "../../src/server/responses/agent-task-recovery-cache";
+import { clearComboTargetCooldowns, coolComboTarget, isComboTargetInCooldown } from "../../src/combos/failover";
+import { clearComboSelectionState } from "../../src/combos/resolve";
+import {
+  clearCachedProviderQuotas,
+  setCachedProviderQuotaForTests,
+} from "../../src/providers/quota-routing-cache";
 import {
   codexHeaders,
   encryptedInput,
@@ -20,7 +26,14 @@ import {
   recoverySse,
   routedConfig,
 } from "../helpers/agent-task-recovery";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+
+// Direct handler dispatch never takes the writer lease that startServer would take, so it is
+// refused. Taken inside the block below rather than here, because that block installs its own
+// OPENCODEX_HOME after this hook would have run, and a lease binds the directory in effect when
+// it was taken.
+let releaseSpendHome: (() => void) | undefined;
 
 function providerCompletion(): Response {
   return Response.json({
@@ -53,14 +66,24 @@ describe("combo path encrypted agent task recovery", () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "ocx-agent-task-combo-"));
     process.env["OPENCODEX_HOME"] = home;
+    releaseSpendHome = acquireOwnedSpendHome();
     clearResponseStateMemoryForTests();
     resetAgentTaskRecoveryState();
+    clearCachedProviderQuotas();
+    clearComboTargetCooldowns();
+    clearComboSelectionState();
   });
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
     resetAgentTaskRecoveryState();
+    clearCachedProviderQuotas();
+    clearComboTargetCooldowns();
+    clearComboSelectionState();
     clearResponseStateForTests();
+    // Released after the state flush and before the directory holding it is removed.
+    releaseSpendHome?.();
+    releaseSpendHome = undefined;
     removeTreeWithRetry(home);
     if (priorHome === undefined) delete process.env["OPENCODEX_HOME"];
     else process.env["OPENCODEX_HOME"] = priorHome;
@@ -105,6 +128,78 @@ describe("combo path encrypted agent task recovery", () => {
     const snapshot = existsSync(snapshotPath) ? readFileSync(snapshotPath, "utf8") : "";
     expect(snapshot).not.toContain(assignment);
     expect(snapshot).not.toContain(responsePayload.id!);
+  });
+
+  test.each([false, true])("encrypted recovery keeps replay-incompatible targets excluded (reprobe=%s)", async (reprobe) => {
+    const strict = { provider: "strict", model: "deepseek-v4-flash" };
+    const backup = { provider: "xai", model: "grok-4.5" };
+    const config = comboConfig([strict, backup]);
+    config.providers.strict = {
+      adapter: "openai-responses", baseUrl: "https://strict.example.test/v1", apiKey: "synthetic-key",
+      preserveResponsesReasoningContent: true, requiresAdjacentResponsesToolResults: true,
+    };
+    config.combos!.routed!.cooldownReprobe = { enabled: reprobe };
+    if (reprobe) {
+      for (const target of [strict, backup]) coolComboTarget("routed", target, { cooldownMs: 60_000 });
+    }
+    const urls: string[] = [];
+    globalThis.fetch = (async (input) => {
+      const url = String(input);
+      urls.push(url);
+      return url.includes("chatgpt.com")
+        ? new Response(recoverySse("recovered assignment"), { headers: { "content-type": "text/event-stream" } })
+        : providerCompletion();
+    }) as typeof fetch;
+    const headers = codexHeaders();
+    headers.set("session_id", `encrypted-replay-${reprobe}`);
+    const seeded = await post(config, "xai/grok-4.5", [{ role: "user", content: "seed identity" }], headers);
+    expect(seeded.status).toBe(200);
+    await seeded.text();
+    urls.length = 0;
+    const response = await post(config, "combo/routed", [
+      { type: "reasoning", id: "rs_foreign", summary: [], encrypted_content: "foreign-blob", content: [] },
+      { type: "function_call", call_id: "call_1", name: "get_weather", arguments: "{}" },
+      { type: "function_call_output", call_id: "call_1", output: "rain" },
+      ...encryptedInput(),
+    ], headers, undefined, { tools: [{ type: "function", name: "get_weather", parameters: { type: "object", properties: {} } }] });
+    await response.text();
+    expect(response.status).toBe(200);
+    expect(urls).toHaveLength(2);
+    expect(urls[0]).toContain("chatgpt.com");
+    expect(urls[1]).not.toContain("strict.example.test");
+    if (reprobe) expect(isComboTargetInCooldown("routed", strict)).toBe(true);
+  });
+
+  test.each(["non-spawn", "disabled-recovery"] as const)("refused %s recovery preserves cooldowns and the reprobe reservation", async (reason) => {
+    const target = { provider: "xai", model: "grok-4.5" };
+    const config = comboConfig([target]);
+    config.combos!.routed!.cooldownReprobe = { enabled: true, intervalMs: 86400000 };
+    coolComboTarget("routed", target, { cooldownMs: 60_000 });
+    const headers = codexHeaders();
+    if (reason === "non-spawn") headers.delete("x-openai-subagent");
+    else config.agentTaskRecovery = { enabled: false };
+    const urls: string[] = [];
+    globalThis.fetch = (async (input) => {
+      const url = String(input);
+      urls.push(url);
+      return url.includes("chatgpt.com")
+        ? new Response(recoverySse("admitted assignment"), { headers: { "content-type": "text/event-stream" } })
+        : providerCompletion();
+    }) as typeof fetch;
+    const refused = await post(config, "combo/routed", encryptedInput(), headers);
+    await refused.text();
+    expect(refused.status).toBe(503);
+    expect(urls).toEqual([]);
+    expect(isComboTargetInCooldown("routed", target)).toBe(true);
+    expect(agentTaskRecoveryCacheSnapshotForTests()).toEqual({ entries: 0, bytes: 0 });
+
+    // An admitted request immediately afterwards must still own the first recovery pass.
+    config.agentTaskRecovery = { enabled: true };
+    const admitted = await post(config, "combo/routed", encryptedInput(), codexHeaders());
+    await admitted.text();
+    expect(admitted.status).toBe(200);
+    expect(urls).toHaveLength(2);
+    expect(isComboTargetInCooldown("routed", target)).toBe(false);
   });
 
   test("rejects an all-disabled combo before recovery creates or caches plaintext", async () => {
@@ -170,6 +265,122 @@ describe("combo path encrypted agent task recovery", () => {
     expect(agentTaskRecoveryCacheSnapshotForTests()).toEqual({ entries: 0, bytes: 0 });
     expect(recoveryFetches).toBe(1);
     expect(providerFetches).toBe(1);
+  });
+
+  test.each(["disabled", "cooldown"] as const)("recovers a mixed combo when the native target is blocked by %s", async (reason) => {
+    const config = comboConfig([
+      { provider: "xai", model: "grok-4.5" },
+      { provider: "openai", model: "gpt-5.5" },
+    ]);
+    if (reason === "disabled") {
+      config.providers.openai!.disabled = true;
+    } else {
+      coolComboTarget("routed", { provider: "openai", model: "gpt-5.5" }, { cooldownMs: 60_000 });
+    }
+    const assignment = "MIXED-RECOVERY-PRIVATE-ASSIGNMENT";
+    const recoveryBodies: string[] = [];
+    const forwardedBodies: string[] = [];
+    globalThis.fetch = (async (input, init) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+      if (String(input).includes("chatgpt.com")) {
+        recoveryBodies.push(body);
+        return new Response(recoverySse(assignment), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      }
+      forwardedBodies.push(body);
+      return providerCompletion();
+    }) as typeof fetch;
+
+    const response = await post(config, "combo/routed", encryptedInput(), codexHeaders());
+    await response.text();
+
+    expect(response.status).toBe(200);
+    expect(recoveryBodies).toHaveLength(1);
+    expect(forwardedBodies).toHaveLength(1);
+    expect(forwardedBodies[0]).toContain(assignment);
+    expect(forwardedBodies[0]).not.toContain(FERNET_TASK);
+    expect(responseContinuationRetainedStoreSnapshot().count).toBe(0);
+  });
+
+  test("fails closed without routed dispatch when mixed-combo recovery fails", async () => {
+    const config = comboConfig([
+      { provider: "xai", model: "grok-4.5" },
+      { provider: "openai", model: "gpt-5.5" },
+    ]);
+    coolComboTarget("routed", { provider: "openai", model: "gpt-5.5" }, { cooldownMs: 60_000 });
+    const urls: string[] = [];
+    globalThis.fetch = (async (input) => {
+      urls.push(String(input));
+      return new Response("unavailable", { status: 503 });
+    }) as typeof fetch;
+
+    const response = await post(config, "combo/routed", encryptedInput(), codexHeaders());
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: { code: "unreadable_encrypted_agent_task" } });
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toContain("chatgpt.com/backend-api/codex/responses");
+    expect(responseContinuationRetainedStoreSnapshot().count).toBe(0);
+  });
+
+  test("recovers once when the selected native target fails model authorization", async () => {
+    const config = comboConfig([
+      { provider: "openai", model: "gpt-5.5" },
+      { provider: "xai", model: "grok-4.5" },
+    ]);
+    const assignment = "RECOVERED-AFTER-NATIVE-401";
+    const chatgptBodies: string[] = [];
+    const forwardedBodies: string[] = [];
+    globalThis.fetch = (async (input, init) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+      if (String(input).includes("chatgpt.com")) {
+        chatgptBodies.push(body);
+        if (body.includes("capture_assignment")) {
+          return new Response(recoverySse(assignment), {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          });
+        }
+        return Response.json(
+          { error: { message: "model is not enabled for this account", code: "model_not_found" } },
+          { status: 401 },
+        );
+      }
+      forwardedBodies.push(body);
+      return providerCompletion();
+    }) as typeof fetch;
+
+    const response = await post(config, "combo/routed", encryptedInput(), codexHeaders());
+    await response.text();
+
+    expect(response.status).toBe(200);
+    expect(chatgptBodies).toHaveLength(2);
+    expect(chatgptBodies[0]).not.toContain("capture_assignment");
+    expect(chatgptBodies[1]).toContain("capture_assignment");
+    expect(forwardedBodies).toHaveLength(1);
+    expect(forwardedBodies[0]).toContain(assignment);
+    expect(forwardedBodies[0]).not.toContain(FERNET_TASK);
+    expect(responseContinuationRetainedStoreSnapshot().count).toBe(0);
+  });
+
+  test("does not recover when every mixed-combo target is unavailable", async () => {
+    const config = comboConfig([
+      { provider: "xai", model: "grok-4.5" },
+      { provider: "openai", model: "gpt-5.5" },
+    ]);
+    coolComboTarget("routed", { provider: "openai", model: "gpt-5.5" }, { cooldownMs: 60_000 });
+    setCachedProviderQuotaForTests("xai", { updatedAt: Date.now(), weeklyPercent: 100 });
+    globalThis.fetch = (async () => {
+      throw new Error("No network call is permitted without an eligible execution target");
+    }) as typeof fetch;
+
+    const response = await post(config, "combo/routed", encryptedInput(), codexHeaders());
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: "combo_unavailable" } });
+    expect(responseContinuationRetainedStoreSnapshot().count).toBe(0);
   });
 
   test("keeps an opted-in Responses target out of encrypted combo dispatch", async () => {
@@ -250,5 +461,69 @@ describe("combo path encrypted agent task recovery", () => {
     expect(forwardedBodies).toHaveLength(1);
     expect(forwardedBodies[0]).toContain(FERNET_TASK);
     expect(forwardedBodies[0]).not.toContain("capture_assignment");
+  });
+
+  test.each([
+    { site: "native-disabled", expectedNative: 0 },
+    { site: "native-401", expectedNative: 1 },
+  ] as const)("cancels $site recovery before routed dispatch or plaintext cache", async ({ site, expectedNative }) => {
+    const config = comboConfig([
+      { provider: "openai", model: "gpt-5.5" },
+      { provider: "xai", model: "grok-4.5" },
+    ]);
+    if (site === "native-disabled") {
+      config.providers.openai!.disabled = true;
+    }
+    const controller = new AbortController();
+    let markRecoveryStarted: (() => void) | undefined;
+    const recoveryStarted = new Promise<void>((resolve) => {
+      markRecoveryStarted = resolve;
+    });
+    let nativeFetches = 0;
+    let recoveryFetches = 0;
+    let routedFetches = 0;
+    globalThis.fetch = ((input, init) => {
+      const body = typeof init?.body === "string" ? init.body : "";
+      if (!String(input).includes("chatgpt.com")) {
+        routedFetches += 1;
+        return Promise.resolve(providerCompletion());
+      }
+      if (body.includes("capture_assignment")) {
+        recoveryFetches += 1;
+        markRecoveryStarted?.();
+        return new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          const rejectAbort = () => reject(signal?.reason ?? new DOMException("aborted", "AbortError"));
+          if (signal?.aborted) rejectAbort();
+          else signal?.addEventListener("abort", rejectAbort, { once: true });
+        });
+      }
+      nativeFetches += 1;
+      return Promise.resolve(Response.json(
+        { error: { message: "model is not enabled for this account", code: "model_not_found" } },
+        { status: 401 },
+      ));
+    }) as typeof fetch;
+
+    const pending = post(
+      config,
+      "combo/routed",
+      encryptedInput(),
+      codexHeaders(),
+      controller.signal,
+    );
+    await recoveryStarted;
+    controller.abort(new DOMException("client disconnected", "AbortError"));
+    const response = await pending;
+    await runPendingResponseStatePersistForTests();
+    const payload = await response.json() as { error?: { code?: string } };
+
+    expect(response.status).toBe(499);
+    expect(payload).toMatchObject({ error: { code: "client_cancelled" } });
+    expect(nativeFetches).toBe(expectedNative);
+    expect(recoveryFetches).toBe(1);
+    expect(routedFetches).toBe(0);
+    expect(agentTaskRecoveryCacheSnapshotForTests()).toEqual({ entries: 0, bytes: 0 });
+    expect(responseContinuationRetainedStoreSnapshot().count).toBe(0);
   });
 });

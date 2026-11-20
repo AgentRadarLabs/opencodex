@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,7 +10,10 @@ import {
 import { CODEX_NATIVE_ALIAS_CATALOG_KIND } from "../../src/codex/catalog/kinds";
 import { buildCatalogEntriesFromObservedState } from "../../src/codex/catalog/sync";
 import { cmdV2 } from "../../src/cli/v2";
+import * as recovery from "../../src/codex/cli-update-recovery";
+import * as gate from "../../src/codex/cli-update-selection-gate";
 import { loadConfig, saveConfig } from "../../src/config";
+import { MULTI_AGENT_SURFACE_ADVISORY_VERSION, SUBAGENT_SURFACE_GUIDE_URL } from "../../src/config/multi-agent-surface";
 import { isMultiAgentV2Enabled } from "../../src/codex/features";
 import { handleManagementAPI } from "../../src/server/management-api";
 import { catalogConvergenceFactory } from "../helpers/catalog-convergence";
@@ -264,11 +267,13 @@ describe("ocx v2 keep-native-v1", () => {
     const events: string[] = [];
 
     const code = await cmdV2(["keep-native-v1", "on"], {
+      // This state-transition fixture supplies both invocation and execution.
+      featuresInvocation: action => ({ file: "fixture-codex", args: ["features", action, "multi_agent_v2"], options: {} }),
       execFile: (_file, args) => {
         events.push(featureActionOf(args));
         writeFileSync(codexConfig, readFileSync(codexConfig, "utf8").replace("enabled = true", "enabled = false"));
       },
-      sync: async () => { events.push("sync"); },
+      sync: async () => { events.push("sync"); return { status: "applied", ok: true, added: 0, catalogPath: null, catalogExists: true, catalogWritten: false, cacheSynced: false, message: "fixture" }; },
       log: captureLog().log,
     });
 
@@ -303,11 +308,12 @@ describe("ocx v2 keep-native-v1", () => {
     const actions: string[] = [];
 
     expect(await cmdV2(["mode", "v2"], {
+      featuresInvocation: action => ({ file: "fixture-codex", args: ["features", action, "multi_agent_v2"], options: {} }),
       execFile: (_file, args) => {
         actions.push(featureActionOf(args).split(" ")[1]!);
         writeFileSync(codexConfig, readFileSync(codexConfig, "utf8").replace("enabled = true", "enabled = false"));
       },
-      sync: async () => {},
+      sync: async () => ({ status: "applied", ok: true, added: 0, catalogPath: null, catalogExists: true, catalogWritten: false, cacheSynced: false, message: "fixture" }),
       log: captureLog().log,
     })).toBe(0);
     expect(loadConfig().multiAgentMode).toBe("v2");
@@ -319,7 +325,7 @@ describe("ocx v2 keep-native-v1", () => {
     isolateHomes();
     const { logs, errors, log } = captureLog();
     let syncs = 0;
-    const deps = { log, sync: async () => { syncs++; } };
+    const deps = { log, sync: async () => { syncs++; return { status: "applied", ok: true, added: 0, catalogPath: null, catalogExists: true, catalogWritten: false, cacheSynced: false, message: "fixture" }; } };
 
     expect(await cmdV2(["keep-native-v1"], deps)).toBe(1);
     expect(errors.join("\n")).toContain("expected on|off");
@@ -441,5 +447,172 @@ describe("/api/v2 keepNativeChatGptOnV1", () => {
     );
     expect(bad?.status).toBe(400);
     expect(converges).toBe(3);
+  });
+});
+
+describe("/api/v2 sub-agent surface advisory", () => {
+  const url = () => new URL("http://localhost/api/v2");
+  const deps = () => ({
+    createManagementConvergeCodex: catalogConvergenceFactory(),
+    toggleCodexMultiAgentV2: () => {},
+  });
+  const liveConfig = (extra: Partial<OcxConfig> = {}): OcxConfig => ({
+    providers: {}, hostname: "127.0.0.1", port: 10100, defaultProvider: "openai", ...extra,
+  } as OcxConfig);
+
+  test("base raises it, and the recommended answer writes the mode and the acknowledgement together", async () => {
+    isolateHomes();
+    writeFileSync(join(process.env.CODEX_HOME!, "config.toml"), "[features.multi_agent_v2]\nenabled = false\n");
+    const config = liveConfig();
+    const d = deps();
+
+    const raised = await handleManagementAPI(getV2(), url(), config, d);
+    expect(await raised?.json()).toMatchObject({
+      multiAgentMode: "default",
+      multiAgentSurfaceAdvisory: {
+        required: true,
+        mode: "default",
+        recommended: "v1",
+        version: MULTI_AGENT_SURFACE_ADVISORY_VERSION,
+        docsUrl: SUBAGENT_SURFACE_GUIDE_URL,
+      },
+    });
+
+    const switched = await handleManagementAPI(
+      putV2({ multiAgentMode: "v1", multiAgentSurfaceAdvisoryAcknowledged: true }),
+      url(), config, d,
+    );
+    expect(switched?.status).toBe(200);
+    expect(await switched?.json()).toMatchObject({
+      multiAgentMode: "v1",
+      multiAgentSurfaceAdvisory: { required: false, mode: "v1" },
+    });
+    expect(loadConfig().multiAgentMode).toBe("v1");
+    expect(loadConfig().multiAgentSurfaceAdvisoryVersion).toBe(MULTI_AGENT_SURFACE_ADVISORY_VERSION);
+
+    const again = await handleManagementAPI(getV2(), url(), config, d);
+    expect(await again?.json()).toMatchObject({ multiAgentSurfaceAdvisory: { required: false } });
+  });
+
+  test("keeping v2 answers the advisory and leaves the mode alone", async () => {
+    isolateHomes();
+    writeFileSync(join(process.env.CODEX_HOME!, "config.toml"), "[features.multi_agent_v2]\nenabled = true\n");
+    const config = liveConfig({ multiAgentMode: "v2" });
+    const d = deps();
+
+    const kept = await handleManagementAPI(putV2({ multiAgentSurfaceAdvisoryAcknowledged: true }), url(), config, d);
+    expect(kept?.status).toBe(200);
+    expect(await kept?.json()).toMatchObject({
+      multiAgentMode: "v2",
+      multiAgentSurfaceAdvisory: { required: false, mode: "v2" },
+    });
+    expect(loadConfig().multiAgentMode).toBe("v2");
+    expect(loadConfig().multiAgentSurfaceAdvisoryVersion).toBe(MULTI_AGENT_SURFACE_ADVISORY_VERSION);
+  });
+
+  test("false is an explicit no-op, so a client that always sends the field cannot un-answer it", async () => {
+    isolateHomes();
+    writeFileSync(join(process.env.CODEX_HOME!, "config.toml"), "[features.multi_agent_v2]\nenabled = true\n");
+    const config = liveConfig({ multiAgentMode: "v2", multiAgentSurfaceAdvisoryVersion: MULTI_AGENT_SURFACE_ADVISORY_VERSION });
+    const d = deps();
+
+    const noop = await handleManagementAPI(putV2({ multiAgentSurfaceAdvisoryAcknowledged: false }), url(), config, d);
+    expect(noop?.status).toBe(200);
+    expect(await noop?.json()).toMatchObject({ multiAgentSurfaceAdvisory: { required: false } });
+    expect(config.multiAgentSurfaceAdvisoryVersion).toBe(MULTI_AGENT_SURFACE_ADVISORY_VERSION);
+  });
+
+  test("a non-boolean acknowledgement is rejected before anything is written", async () => {
+    isolateHomes();
+    writeFileSync(join(process.env.CODEX_HOME!, "config.toml"), "[features.multi_agent_v2]\nenabled = false\n");
+    const config = liveConfig();
+    const bad = await handleManagementAPI(putV2({ multiAgentSurfaceAdvisoryAcknowledged: 1 }), url(), config, deps());
+    expect(bad?.status).toBe(400);
+    expect(await bad?.json()).toEqual({ error: "body.multiAgentSurfaceAdvisoryAcknowledged must be a boolean" });
+    expect(config.multiAgentSurfaceAdvisoryVersion).toBeUndefined();
+  });
+});
+
+describe("ocx v2 revalidates state once the awaited admission enters", () => {
+  const fixtureSync = async () => ({ status: "applied" as const, ok: true, added: 0, catalogPath: null, catalogExists: true, catalogWritten: false, cacheSynced: false, message: "fixture" });
+  function holdAdmission() {
+    let entered!: () => void, release!: (blocked: boolean) => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const proof = new Promise<boolean>(resolve => { release = resolve; });
+    const spy = spyOn(recovery, "codexCliUpdateRecoveryBlocksAdmissionAsync").mockImplementation(() => { entered(); return proof; });
+    return { started, release: () => release(false), restore: () => spy.mockRestore() };
+  }
+
+  test("v2 on refuses when the hybrid pin was enabled while admission waited", async () => {
+    isolateHomes();
+    saveConfig({ ...loadConfig(), multiAgentMode: "v2" });
+    const codexConfig = join(process.env.CODEX_HOME!, "config.toml");
+    writeFileSync(codexConfig, "[features.multi_agent_v2]\nenabled = false\n");
+    const hold = holdAdmission();
+    const { errors, log } = captureLog();
+    let toggles = 0;
+    try {
+      const running = cmdV2(["on"], { execFile: () => { toggles++; }, sync: async () => { throw new Error("must not sync"); }, log });
+      await hold.started;
+      saveConfig({ ...loadConfig(), keepNativeChatGptOnV1: true });
+      hold.release();
+      expect(await running).toBe(1);
+    } finally { hold.restore(); }
+    expect(toggles).toBe(0);
+    expect(isMultiAgentV2Enabled(codexConfig)).toBe(false);
+    expect(errors.join("\n")).toContain("global multi_agent_v2 overrides the native v1 catalog pin");
+  });
+
+  test("threads keeps a feature state changed while admission waited", async () => {
+    isolateHomes();
+    const codexConfig = join(process.env.CODEX_HOME!, "config.toml");
+    writeFileSync(codexConfig, "[features.multi_agent_v2]\nenabled = false\n");
+    const hold = holdAdmission();
+    const actions: string[] = [];
+    try {
+      const running = cmdV2(["threads", "4"], {
+        featuresInvocation: action => ({ file: "fixture-codex", args: ["features", action, "multi_agent_v2"], options: {} }),
+        execFile: (_file, args) => { actions.push(featureActionOf(args)); },
+        log: captureLog().log,
+      });
+      await hold.started;
+      writeFileSync(codexConfig, "[features.multi_agent_v2]\nenabled = true\n");
+      hold.release();
+      expect(await running).toBe(0);
+    } finally { hold.restore(); }
+    expect(actions).toEqual([]);
+    expect(isMultiAgentV2Enabled(codexConfig)).toBe(true);
+  });
+
+  test("mode saves the config read once admitted, keeping a setting saved meanwhile", async () => {
+    isolateHomes();
+    writeFileSync(join(process.env.CODEX_HOME!, "config.toml"), "[features.multi_agent_v2]\nenabled = false\n");
+    const hold = holdAdmission();
+    try {
+      const running = cmdV2(["mode", "v1"], { execFile: () => {}, sync: fixtureSync, log: captureLog().log });
+      await hold.started;
+      saveConfig({ ...loadConfig(), keepNativeChatGptOnV1: true });
+      hold.release();
+      expect(await running).toBe(0);
+    } finally { hold.restore(); }
+    expect(loadConfig().multiAgentMode).toBe("v1");
+    expect(loadConfig().keepNativeChatGptOnV1).toBe(true);
+  });
+
+  test("mode saves inside admission, so a save landing after the callback is kept", async () => {
+    isolateHomes();
+    writeFileSync(join(process.env.CODEX_HOME!, "config.toml"), "[features.multi_agent_v2]\nenabled = false\n");
+    const real = gate.withCodexCliSelectionParentWriteAsync;
+    const spy = spyOn(gate, "withCodexCliSelectionParentWriteAsync").mockImplementation(async (run, options) => {
+      const value = await real(run, options);
+      // A competing writer between the admitted callback and this command's continuation.
+      saveConfig({ ...loadConfig(), keepNativeChatGptOnV1: true });
+      return value;
+    });
+    try {
+      expect(await cmdV2(["mode", "v1"], { execFile: () => {}, sync: fixtureSync, log: captureLog().log })).toBe(0);
+    } finally { spy.mockRestore(); }
+    expect(loadConfig().multiAgentMode).toBe("v1");
+    expect(loadConfig().keepNativeChatGptOnV1).toBe(true);
   });
 });

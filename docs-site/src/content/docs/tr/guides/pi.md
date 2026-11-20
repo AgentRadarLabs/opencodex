@@ -3,13 +3,7 @@ title: "Pi Entegrasyonu"
 description: "Inflection Pi ve hafif sohbet modellerini OpenCodex üzerinden bağlama rehberi."
 ---
 
-Pi reads its providers from a single global JSON file rather than environment
-variables, so
-opencodex does not launch it. Instead, `ocx export` serializes the `opencodex`
-provider block —
-base URL, model list, and the env reference Pi interpolates — and you merge it
-into your own
-config.
+Pi, sağlayıcılarını tek bir genel JSON dosyasından okur. opencodex Pi’yi başlatmaz; `ocx export`, temel URL, model listesi ve gizli olmayan yerel anahtar yer tutucusunu içeren `opencodex` sağlayıcı bloğunu üretir. Bu bloğu mevcut yapılandırmanızla birleştirin.
 
 ## Quickstart
 
@@ -17,12 +11,15 @@ Start the proxy, then print the config:
 
 ```bash
 ocx start
+```
+
+Bu işlemi çalışır durumda bırakın. İkinci bir terminalde yapılandırmayı yazdırın:
+
+```bash
 ocx export --client pi
 ```
 
-The output leads with the JSON, then prints the destination path, the merge
-warning, the env
-export line, and how many models carry authoritative context limits.
+JSON’dan sonra hedef yol, birleştirme uyarısı, loopback kullanım ipucu ve doğrulanmış bağlam sınırları olan model sayısı yazdırılır. Bu dışa aktarım yalnızca kimlik doğrulamasız loopback proxy’sini destekler; uzak erişim kimlik doğrulamasını yapılandırmaz.
 
 ```json
 {
@@ -30,20 +27,28 @@ export line, and how many models carry authoritative context limits.
     "opencodex": {
       "baseUrl": "http://127.0.0.1:10100/v1",
       "api": "openai-completions",
-      "apiKey": "$OPENCODEX_API_KEY",
+      "apiKey": "opencodex-loopback",
+      "compat": {
+        "sendSessionAffinityHeaders": true,
+        "supportsDeveloperRole": false
+      },
       "models": [
         {
           "id": "anthropic/claude-opus-5",
           "name": "Claude Opus 5 (anthropic)",
           "input": ["text"],
           "contextWindow": 200000,
-          "maxTokens": 32000
+          "maxTokens": 128000
         }
       ]
     }
   }
 }
 ```
+
+Oluşturulan Pi sağlayıcılarında `compat.sendSessionAffinityHeaders` etkinleştirilir. Sağlayıcıyı birleştirirken veya elle düzenlerken bu ayarı koruyun: Pi sabit bir oturum kimliği gönderir ve OpenCodex bu kimlikten kanonik OpenCode Go hedefi için oturum yakınlığı üretir. `cacheRetention` değeri `none` olduğunda Pi kimliği göndermeyebilir.
+
+Oluşturulan Pi sağlayıcıları ayrıca `compat.supportsDeveloperRole` değerini `false` yapar; böylece Pi sistem istemini `developer` yerine `system` rolüyle gönderir. OpenCodex Chat Completions rollerini olduğu gibi iletir ve OpenAI uyumlu bazı sağlayıcılar `developer` rolünü 400 hatasıyla reddeder; `system` rolünü hepsi kabul eder.
 
 Model ids are the proxy's canonical selectors, so routed models appear as
 `provider/model`
@@ -52,6 +57,12 @@ Model ids are the proxy's canonical selectors, so routed models appear as
 suffix — `(anthropic)`, `(native)`, `(routed)` — is what makes two same-named
 models from
 different upstreams distinguishable in Pi's picker.
+
+İç içe geçmiş bir sağlayıcı model kimliği için Pi dışa aktarımı, çalışan proxy aynı modele
+ulaştığını kanıtladığında eğik çizgili ham seçiciyi kullanır: örneğin `openrouter/openrouter/free`,
+OpenRouter'ın `openrouter/free` modelini seçer ve Fast satırı `openrouter/openrouter/free--fast` olur.
+Proxy'nin bu şekilde kanıtlayamadığı bir model (örneğin envanteri henüz yüklenmemiş ya da ham
+yazımı başka bir modele ait olan) kodlanmış seçicisini korur. Özel takma adlar adlarını korur.
 
 ## Where it goes
 
@@ -81,34 +92,7 @@ provider or changing model visibility, and merge the new block over the old one.
 
 ## The admission key
 
-Two different keys are easy to confuse here, and only the first one appears in
-this file:
-
-| Key | What it is | Where it lives |
-| --- | --- | --- |
-| Proxy admission key | opencodex's own credential, generated on the dashboard's **API** tab | referenced by `apiKey` as `$OPENCODEX_API_KEY`; the value stays in your environment |
-| Provider key | your Anthropic / OpenAI / OpenRouter key | opencodex's own config, per [Providers](/guides/providers/) |
-
-The exported config carries only the reference, never a secret. Pi interpolates
-a bare `$NAME`, so
-the variable is:
-
-```bash
-export OPENCODEX_API_KEY=<your key>
-```
-
-That name is Pi's alone. opencode uses a different variable
-(`OPENCODEX_OPENCODE_API_KEY`, in `{env:…}` form) — see the [opencode
-guide](/guides/opencode/).
-
-**A loopback proxy needs no key at all.** opencodex binds `127.0.0.1` by default
-and authenticates
-nothing there, so the `$OPENCODEX_API_KEY` reference is inert and you can leave
-the variable unset.
-It matters only when `hostname` is set beyond loopback, which is also the case
-where the proxy
-refuses to start without a token — see [Remote
-access](/reference/configuration/#remote-access).
+Dışa aktarılan `apiKey`, gizli olmayan `opencodex-loopback` yer tutucusudur. Anahtar için ortam değişkeni dışa aktarmanız gerekmez. Dışa aktarıcı yalnızca kimlik doğrulamasız loopback proxy’sine izin verir; uzak veya token ile korunan proxy’leri reddeder. Sağlayıcı kimlik bilgileri [Sağlayıcılar](/tr/guides/providers/) sayfasında açıklanan opencodex yapılandırmasında kalır. Üst sağlayıcının anahtarını bu Pi bloğuna koymayın. Uzak erişim için proxy erişim kimlik doğrulamasını destekleyen bir entegrasyon kullanın. Yer tutucuyu değiştirmek Pi için uzak dışa aktarımı etkinleştirmez.
 
 ## Model metadata
 
@@ -118,19 +102,13 @@ window. When it does not, both fields are omitted for that model and Pi applies
 its own defaults;
 `ocx export` prints how many rows fell into that case.
 
-`maxTokens` is a schema-satisfying budget of `32000`, clamped down to the
-context window so a
-small-context model is never given more output than context. It is not a claim
-about any specific
-model's true maximum.
+Çıktı sınırı, katalogdaki veya oluşturulan meta verilerdeki bilinen model sınırını kullanır. Yalnızca sınır bilinmiyorsa `32000` kullanılır. Çıktı sınırı her zaman bağlam penceresiyle sınırlanır; `32000` altındaki bilinen sınırlar da korunur.
 
-Two fields are deliberately absent. `cost` requires all four price fields and
-opencodex has no
-price data for routed models — emitting zeros would assert that every model is
-free. `reasoning` is
-a boolean in Pi while the catalog carries an effort ladder, and mapping one onto
-the other would be
-a guess.
+`cost` bilerek atlanır: dört fiyat alanının tamamını gerektirir ve opencodex yönlendirilen modellerin fiyatlarını bilmez. Sıfır yazmak bütün modellerin ücretsiz olduğunu yanlış biçimde belirtirdi.
+
+Katalogdaki effort listesi **boş değilse** `"reasoning": true` dışa aktarılır; liste yoksa veya açıkça boşsa bu özellik bildirilmez. `thinkingLevelMap`, hedefi tanımlanmamış Pi düzeylerini `null` ile gizler; Pi listede olmayan düzeyleri sunmaz veya göndermez. `max` olmadan `ultra` tanımlanmışsa Pi’nin `max` düzeyi `ultra` ile eşleşir. Başka bir eşleme için Pi belgelerine göre `thinkingLevelMap` alanını elle düzenleyin.
+
+`reasoning`, katalogdan türetilen Pi arayüz metaverisidir; sağlayıcının yerel desteğini kanıtlamaz. Gerçek `reasoning_effort`, adaptöre ve modele göre aktarılabilir, dönüştürülebilir, sınırlandırılabilir, emüle edilebilir veya atlanabilir (örneğin `noReasoningModels`). Bu boolean yalnızca Pi’nin kontrolü sunup sunmayacağını belirler.
 
 ## Schema status
 

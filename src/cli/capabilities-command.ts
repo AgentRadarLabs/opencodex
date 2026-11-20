@@ -13,6 +13,7 @@ import {
   type Capability,
 } from "./capabilities";
 import { takeFlag } from "./runtime-api";
+import { CAPABILITY_CONTRACTS } from "./capability-contracts";
 
 function takeValueFlag(args: string[], flag: string): string | undefined {
   // Order-independent by construction: scan for the flag anywhere in argv rather than
@@ -45,15 +46,23 @@ function renderHuman(caps: readonly Capability[], includeHead: boolean): void {
   }
 }
 
+/** Render declared capabilities; reject invalid arguments with 64 and report unmatched routes with 4. */
 export async function runCapabilities(argv: string[]): Promise<number> {
   const args = [...argv];
   const json = takeFlag(args, "--json");
+  const contracts = takeFlag(args, "--contracts");
   const mutatingOnly = takeFlag(args, "--mutating-only");
   const route = takeValueFlag(args, "--route");
 
-  if (route !== undefined && route.length === 0) {
-    console.error("Usage: ocx capabilities --route <path>");
+  if (args.length > 0 || (route !== undefined && route.trim().length === 0) || (contracts && (mutatingOnly || route !== undefined))) {
+    console.error("Usage: ocx capabilities [--json] [--contracts] [--mutating-only] [--route <path>]");
     return 64;
+  }
+
+  if (contracts) {
+    if (json) console.log(JSON.stringify({ schemaVersion: 1, contracts: CAPABILITY_CONTRACTS }));
+    else for (const contract of CAPABILITY_CONTRACTS) console.log(contract);
+    return 0;
   }
 
   let selected: readonly Capability[] = route === undefined ? CAPABILITIES : capabilitiesForRoute(route);
@@ -63,7 +72,7 @@ export async function runCapabilities(argv: string[]): Promise<number> {
     // An unmatched route is a real answer, not an error: the route may be exempt or may
     // not exist. Say which, rather than exiting 0 with silence.
     if (json) {
-      console.log(JSON.stringify({ schemaVersion: 1, route, capabilities: [] }, null, 2));
+      console.log(JSON.stringify({ schemaVersion: 1, contracts: CAPABILITY_CONTRACTS, route, capabilities: [] }, null, 2));
     } else {
       console.error(`No CLI capability drives ${route}.`);
     }
@@ -73,6 +82,7 @@ export async function runCapabilities(argv: string[]): Promise<number> {
   if (json) {
     console.log(JSON.stringify({
       schemaVersion: 1,
+      contracts: CAPABILITY_CONTRACTS,
       ...(route === undefined ? {} : { route }),
       capabilities: selected.map(cap => ({
         command: cap.command,
@@ -82,6 +92,7 @@ export async function runCapabilities(argv: string[]): Promise<number> {
         flags: cap.flags,
         mutates: cap.mutates,
         json: cap.json,
+        ...(cap.usage !== undefined ? { usage: cap.usage } : {}),
         ...(cap.details ? { details: cap.details } : {}),
       })),
       ...(route === undefined && !mutatingOnly ? { headCapabilities: HEAD_CAPABILITIES } : {}),

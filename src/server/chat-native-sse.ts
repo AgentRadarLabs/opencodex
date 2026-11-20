@@ -1,5 +1,9 @@
-import { chatCompletionsErrorBody } from "../chat/outbound";
-import { classifyError, cyberPolicyErrorType, CYBER_POLICY_ERROR_CODE, isCyberPolicyCode } from "../lib/errors";
+import { normalizeNativeChatContent } from "../adapters/openai-chat/native-content";
+import type { OcxProviderConfig } from "../types";
+import { ownedChatErrorPayload, canonicalSseErrorBlock } from "../lib/client-error-body";
+import { legacyFailureVerdict, type FailureVerdictSink } from "../chat/failure-verdict";
+import { chatCompletionsErrorBody, type ChatCompletionsCollectorSource } from "../chat/outbound";
+import { classifyError, cyberPolicyErrorType, CYBER_POLICY_ERROR_CODE, isCyberPolicyCode, UNDECLARED_TOOL_CALL_ERROR_CODE } from "../lib/errors";
 import { redactSecretString } from "../lib/redact";
 import {
   isTranslatorBudgetExceededError,
@@ -7,12 +11,46 @@ import {
   type TranslatorBudget,
 } from "../lib/translator-budget";
 import type { OcxUsage } from "../types";
-import { nextSseBlock, replaceSseDataPayload, sseDataPayload } from "./sse-payload-rewrite";
+import { resolveStallTimeoutSec } from "../stall-timeout";
+import { createSseBlockBuffer, replaceSseDataPayload, sseDataPayload } from "./sse-payload-rewrite";
 
 type Rec = Record<string, unknown>;
 
 function isRec(value: unknown): value is Rec {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+export const UNDECLARED_CHAT_TOOL_MESSAGE = "Upstream emitted a client tool call outside this request's declared tool catalog.";
+
+function* chatToolCalls(value: Rec): Generator<{ key: string; name: string; snapshot: boolean; invalid?: boolean }> {
+  const choices = Array.isArray(value.choices) ? value.choices : [];
+  for (const [position, choice] of choices.entries()) {
+    if (!isRec(choice)) continue;
+    const choiceIndex = typeof choice.index === "number" ? choice.index : position;
+    for (const [payload, snapshot] of [[choice.delta, false], [choice.message, true]] as const) {
+      if (!isRec(payload)) continue;
+      const tools = Array.isArray(payload.tool_calls) ? payload.tool_calls : [];
+      for (const [index, tool] of tools.entries()) {
+        const fn = isRec(tool) && isRec(tool.function) ? tool.function : {};
+        const toolIndex = isRec(tool) && typeof tool.index === "number" ? tool.index : index;
+        yield {
+          key: `${choiceIndex}:tool:${toolIndex}`, name: typeof fn.name === "string" ? fn.name : "", snapshot,
+          invalid: !isRec(tool) || (tool.type !== undefined && tool.type !== "function"),
+        };
+      }
+      if (payload.function_call !== undefined && payload.function_call !== null) {
+        const fn = isRec(payload.function_call) ? payload.function_call : {};
+        yield { key: `${choiceIndex}:legacy`, name: typeof fn.name === "string" ? fn.name : "", snapshot };
+      }
+    }
+  }
+}
+
+export function chatResponseHasUndeclaredToolCalls(value: Rec, declared: ReadonlySet<string>): boolean {
+  for (const call of chatToolCalls(value)) {
+    if (call.invalid || !declared.has(call.name)) return true;
+  }
+  return false;
 }
 
 export function usageFromChat(value: unknown): OcxUsage | undefined {
@@ -30,6 +68,10 @@ export function usageFromChat(value: unknown): OcxUsage | undefined {
       ? { reasoningOutputTokens: completionDetails.reasoning_tokens }
       : {}),
   };
+}
+
+function namedErrorControlBlock(data: string | null): string {
+  return "event: error\n" + (data === null ? "" : data.split("\n").map(line => `data: ${line}\n`).join("")) + "\n";
 }
 
 export function structuredError(value: unknown): {
@@ -51,6 +93,19 @@ export function structuredError(value: unknown): {
   };
 }
 
+/** Preserve the ordinary relay representation, replacing only choice error objects. */
+export function normalizeChatChoiceErrors(value: Rec): Rec {
+  if (!Array.isArray(value.choices)) return value;
+  return { ...value, choices: value.choices.map(choice => {
+    if (!isRec(choice) || choice.error === undefined || choice.error === null) return choice;
+    const original = structuredError({ error: choice.error }) ?? { message: "upstream error" };
+    const status = original.status ?? 502;
+    const { message, type, code } = ownedChatErrorPayload({ status, type: original.type, code: original.code,
+      evidence: { ...original, status, code: original.code ?? undefined } }).error;
+    return { ...choice, error: { message, type, code } };
+  }) };
+}
+
 function normalizedChunk(value: Rec, requestedModel: string): Rec {
   return {
     ...value,
@@ -61,10 +116,14 @@ function normalizedChunk(value: Rec, requestedModel: string): Rec {
   };
 }
 
-export function jsonCompletionSse(value: Rec, requestedModel: string): string {
+export function jsonCompletionSse(value: Rec, requestedModel: string, budget?: TranslatorBudget): string {
   const id = typeof value.id === "string" ? value.id : `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
   const created = typeof value.created === "number" ? value.created : Math.floor(Date.now() / 1000);
   const model = requestedModel;
+  // Relay the upstream service-tier echo on every chunk, matching how OpenAI/xAI
+  // annotate streamed chat chunks, so streaming callers see the same confirmation
+  // the non-streaming body carries.
+  const serviceTier = typeof value.service_tier === "string" ? { service_tier: value.service_tier } : {};
   const choices = Array.isArray(value.choices) ? value.choices : [];
   const choice = isRec(choices[0]) ? choices[0] : {};
   const message = isRec(choice.message) ? choice.message : {};
@@ -73,36 +132,70 @@ export function jsonCompletionSse(value: Rec, requestedModel: string): string {
     object: "chat.completion.chunk",
     created,
     model,
+    ...serviceTier,
     choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
   }];
   const delta: Rec = {};
   if (typeof message.content === "string" && message.content.length > 0) delta.content = message.content;
+  if (typeof message.refusal === "string") delta.refusal = message.refusal;
   if (typeof message.reasoning_content === "string" && message.reasoning_content.length > 0) {
     delta.reasoning_content = message.reasoning_content;
   }
   if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
-    delta.tool_calls = message.tool_calls.map((tool, index) => isRec(tool) ? { index, ...tool } : tool);
+    delta.tool_calls = message.tool_calls.filter(isRec).map((tool, index) => ({ ...tool, index }));
   }
   if (Object.keys(delta).length > 0) {
-    frames.push({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta, finish_reason: null }] });
+    frames.push({ id, object: "chat.completion.chunk", created, model, ...serviceTier, choices: [{ index: 0, delta, finish_reason: null }] });
   }
   frames.push({
     id,
     object: "chat.completion.chunk",
     created,
     model,
+    ...serviceTier,
     choices: [{ index: 0, delta: {}, finish_reason: typeof choice.finish_reason === "string" ? choice.finish_reason : "stop" }],
     ...(value.usage !== undefined ? { usage: value.usage } : {}),
   });
-  return `${frames.map(frame => `data: ${JSON.stringify(frame)}\n\n`).join("")}data: [DONE]\n\n`;
+  // Keep the frame strings charged while the joined body is allocated. The final
+  // string and Response's UTF-8 body coexist until response ownership ends.
+  const scope = { kind: "live_transient" as const };
+  let frameBytes = 0;
+  const serialized: string[] = [];
+  try {
+    for (const frame of frames) {
+      const text = `data: ${JSON.stringify(frame)}\n\n`;
+      const bytes = Buffer.byteLength(text);
+      budget?.chargeRetained(bytes, scope);
+      frameBytes += bytes;
+      serialized.push(text);
+    }
+    const done = "data: [DONE]\n\n";
+    const outputBytes = frameBytes + Buffer.byteLength(done);
+    budget?.chargeRetained(outputBytes * 2, scope);
+    return serialized.join("") + done;
+  } finally {
+    budget?.releaseRetained(frameBytes, scope);
+  }
 }
 
 interface NativeChatSseOptions {
+  provider?: Pick<OcxProviderConfig, "adapter" | "authMode" | "baseUrl">;
   requestedModel: string;
+  failureVerdictSink?: FailureVerdictSink;
+  collectorSource?: ChatCompletionsCollectorSource;
   translatorBudget: TranslatorBudget;
   signal: AbortSignal;
+  stallTimeoutSec?: number;
+  /**
+   * The upstream is local infrastructure (loopback / private / `.local` / `.lan`); an unset
+   * `stallTimeoutSec` then resolves to disabled so a slow local model is not cut mid-turn.
+   */
+  localUpstream?: boolean;
+  clientDeclaredEmptyToolCatalog?: boolean;
+  declaredLegacyFunctionNames?: ReadonlySet<string>;
   onFirstOutput?: () => void;
   onUsage: (usage: OcxUsage) => void;
+  onChunk?: (value: Rec) => void;
   onTerminal?: (status: number, message?: string) => void;
   onCancel?: () => void;
 }
@@ -115,61 +208,96 @@ export function nativeChatSse(
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const scope = { kind: "live_transient" as const };
-  let buffer = "";
-  let bufferBytes = 0;
-  let bufferSearchFrom = 0;
+  const buffer = createSseBlockBuffer(options.translatorBudget, nextBytes => {
+    if (nextBytes > TRANSLATOR_MAX_SSE_EVENT_BYTES) {
+      throw new Error("upstream SSE event exceeded the safe limit", { cause: { code: "translation_buffer_limit" } });
+    }
+  });
   let queuedBytes = 0;
+  const declared = options.declaredLegacyFunctionNames ?? new Set<string>();
+  const toolNames = new Map<string, string>();
+  const pendingToolNames = new Set<string>();
+  const heldFrames: string[] = [];
+  let heldBytes = 0;
+  let toolNameBytes = 0;
+  const hasPendingToolName = () => pendingToolNames.size > 0;
+  const inspectToolCalls = (value: Rec): boolean => {
+    for (const call of chatToolCalls(value)) {
+      if (call.invalid) return false;
+      const previous = toolNames.get(call.key);
+      const name = call.snapshot ? call.name : (previous ?? "") + call.name;
+      if (!declared.has(name) && ![...declared].some(allowed => allowed.startsWith(name))) return false;
+      const bytes = previous === undefined ? 128 + Buffer.byteLength(call.key) * 2 + Buffer.byteLength(name) * 2
+        : Math.max(0, Buffer.byteLength(name) - Buffer.byteLength(previous)) * 2;
+      options.translatorBudget.chargeRetained(bytes, scope);
+      toolNameBytes += bytes;
+      toolNames.set(call.key, name);
+      if (declared.has(name)) pendingToolNames.delete(call.key);
+      else pendingToolNames.add(call.key);
+    }
+    return true;
+  };
   let sawFinish = false;
   let sawDone = false;
   let firstOutput = false;
+  let sawTextOutput = false;
+  let sawToolCalls = false;
   let settled = false;
   let cancelled = false;
   let cancelledBySignal = false;
+  const stallSec = resolveStallTimeoutSec(options.stallTimeoutSec, { localUpstream: options.localUpstream });
+  // 0 is an explicit disabled budget (local upstream, or the operator's stallTimeoutSec: 0). Map
+  // it to an Infinity deadline so every `now >= pullDeadline` / `remaining <= 0` check stays
+  // false and the read race is skipped, instead of arming an immediate kill on the first pull.
+  const stallEnabled = stallSec > 0;
+  const stallMs = stallEnabled ? stallSec * 1_000 : Number.POSITIVE_INFINITY;
+  // Count only active upstream consumption; downstream backpressure must not
+  // consume the provider's inactivity allowance. Comments and empty deltas do.
+  let remainingStallMs = stallMs;
+  let pullDeadline = 0;
+  const stalled = new Error("upstream stream stalled without meaningful progress");
 
   const releaseQueued = () => {
     if (queuedBytes === 0) return;
     options.translatorBudget.releaseRetained(queuedBytes, scope);
     queuedBytes = 0;
   };
-  const replaceBuffer = (next: string) => {
-    const nextBytes = encoder.encode(next).byteLength;
-    const reservation = options.translatorBudget.reserveTransient(nextBytes, scope);
-    reservation.commitRetained();
-    options.translatorBudget.releaseRetained(bufferBytes, scope);
-    buffer = next;
-    bufferBytes = nextBytes;
-    bufferSearchFrom = 0;
-  };
-  const appendBuffer = (fragment: string) => {
-    if (!fragment) return;
-    const fragmentBytes = encoder.encode(fragment).byteLength;
-    const nextBytes = bufferBytes + fragmentBytes;
-    if (nextBytes > TRANSLATOR_MAX_SSE_EVENT_BYTES) {
-      throw new Error("upstream SSE event exceeded the safe limit", { cause: { code: "translation_buffer_limit" } });
-    }
-    const reservation = options.translatorBudget.reserveTransient(nextBytes, scope);
+  const enqueue = (controller: ReadableStreamDefaultController<Uint8Array>, text: string) => {
+    const byteLength = Buffer.byteLength(text);
+    const reservation = options.translatorBudget.reserveTransient(byteLength, scope);
     try {
-      buffer += fragment;
+      controller.enqueue(encoder.encode(text));
       reservation.commitRetained();
-      options.translatorBudget.releaseRetained(bufferBytes, scope);
-      bufferBytes = nextBytes;
+      queuedBytes += byteLength;
     } catch (error) {
       reservation.release();
       throw error;
     }
   };
-  const enqueue = (controller: ReadableStreamDefaultController<Uint8Array>, text: string) => {
-    const bytes = encoder.encode(text);
-    const reservation = options.translatorBudget.reserveTransient(bytes.byteLength, scope);
-    controller.enqueue(bytes);
-    reservation.commitRetained();
-    queuedBytes += bytes.byteLength;
+  const releaseHeld = () => {
+    options.translatorBudget.releaseRetained(heldBytes, scope);
+    heldBytes = 0;
+    heldFrames.length = 0;
+  };
+  const relay = (controller: ReadableStreamDefaultController<Uint8Array>, text: string) => {
+    if (hasPendingToolName()) {
+      const bytes = Buffer.byteLength(text) * 2;
+      options.translatorBudget.chargeRetained(bytes, scope);
+      heldBytes += bytes;
+      heldFrames.push(text);
+      return;
+    }
+    for (const frame of heldFrames) enqueue(controller, frame);
+    releaseHeld();
+    enqueue(controller, text);
   };
   const releaseBuffer = () => {
-    options.translatorBudget.releaseRetained(bufferBytes, scope);
-    buffer = "";
-    bufferBytes = 0;
-    bufferSearchFrom = 0;
+    buffer.clear();
+    releaseHeld();
+    options.translatorBudget.releaseRetained(toolNameBytes, scope);
+    toolNameBytes = 0;
+    toolNames.clear();
+    pendingToolNames.clear();
   };
   const settle = (status: number, message?: string) => {
     if (settled) return;
@@ -185,12 +313,16 @@ export function nativeChatSse(
     type = "upstream_error",
   ) => {
     const safeMessage = redactSecretString(message);
+    releaseBuffer();
     try {
-      const frame = `data: ${JSON.stringify(chatCompletionsErrorBody(status, safeMessage, type, code))}\n\n`;
+      const legacy = chatCompletionsErrorBody(status, safeMessage, type, code);
+      const error = legacy.error as { type: string; code: string | null };
+      const frame = canonicalSseErrorBlock(ownedChatErrorPayload({ status, type: error.type, code: error.code,
+        evidence: { status, type, code, message: safeMessage } }));
       if (code === "translation_buffer_limit") controller.enqueue(encoder.encode(frame));
       else enqueue(controller, frame);
+      if (options.failureVerdictSink) options.failureVerdictSink.verdict = legacyFailureVerdict(legacy);
     } catch { /* controller may already be closed */ }
-    releaseBuffer();
     settle(status, safeMessage);
     try { void reader.cancel(new Error(safeMessage)).catch(() => {}); } catch { /* already closed */ }
     try { controller.close(); } catch { /* already closed */ }
@@ -200,15 +332,31 @@ export function nativeChatSse(
     block: string,
     delimiter: string,
   ): void => {
+    let eventName = "";
+    for (const line of block.split(/\r\n|\r|\n/)) {
+      if (line === "event") eventName = "";
+      else if (line.startsWith("event:")) eventName = line.slice(6).replace(/^ /, "");
+    }
     const payload = sseDataPayload(block);
     if (payload === null) {
-      enqueue(controller, block + delimiter);
+      if (performance.now() >= pullDeadline) throw stalled;
+      relay(controller, eventName === "error" ? namedErrorControlBlock(payload) : block + delimiter);
       return;
     }
     const trimmed = payload.trim();
+    if (trimmed === "") {
+      if (performance.now() >= pullDeadline) throw stalled;
+      relay(controller, eventName === "error" ? namedErrorControlBlock(payload) : block + delimiter);
+      return;
+    }
     if (trimmed === "[DONE]") {
+      if (hasPendingToolName()) {
+        fail(controller, UNDECLARED_CHAT_TOOL_MESSAGE, UNDECLARED_TOOL_CALL_ERROR_CODE);
+        return;
+      }
       sawDone = true;
-      enqueue(controller, replaceSseDataPayload(block, "[DONE]") + delimiter);
+      enqueue(controller, eventName === "error" ? namedErrorControlBlock("[DONE]") : replaceSseDataPayload(block, "[DONE]") + delimiter);
+      releaseBuffer();
       settle(200);
       try { void reader.cancel().catch(() => {}); } catch { /* already closed */ }
       controller.close();
@@ -225,7 +373,10 @@ export function nativeChatSse(
       fail(controller, "upstream returned an invalid SSE event", "upstream_sse_invalid");
       return;
     }
-    const error = structuredError(parsed);
+    const usage = usageFromChat(parsed.usage);
+    if (usage) options.onUsage(usage);
+    const chunk = normalizeNativeChatContent(parsed, options.provider);
+    const error = structuredError(chunk);
     if (error) {
       const status = error.status ?? 502;
       const classified = classifyError(status, error.type ?? "upstream_error", error.message);
@@ -236,33 +387,78 @@ export function nativeChatSse(
         classified.code = error.code;
       }
       const safe = chatCompletionsErrorBody(status, classified.message, classified.type, classified.code);
-      enqueue(controller, replaceSseDataPayload(block, JSON.stringify(safe)) + delimiter);
+      enqueue(controller, canonicalSseErrorBlock(ownedChatErrorPayload({ status, type: classified.type, code: classified.code,
+        evidence: { status, type: error.type, code: error.code ?? undefined, message: error.message } })));
+      if (options.failureVerdictSink) options.failureVerdictSink.verdict = legacyFailureVerdict(safe);
+      releaseBuffer();
       settle(isCyberPolicyCode(classified.code) ? 400 : status, classified.message);
       try { void reader.cancel(new Error(classified.message)).catch(() => {}); } catch { /* already closed */ }
       controller.close();
       return;
     }
-    const usage = usageFromChat(parsed.usage);
-    if (usage) options.onUsage(usage);
-    const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
-    if (choices.some(choice => isRec(choice) && typeof choice.finish_reason === "string" && choice.finish_reason.length > 0)) {
-      sawFinish = true;
+    options.onChunk?.(chunk);
+    if (options.clientDeclaredEmptyToolCatalog && !inspectToolCalls(chunk)) {
+      fail(controller, UNDECLARED_CHAT_TOOL_MESSAGE, UNDECLARED_TOOL_CALL_ERROR_CODE);
+      return;
     }
-    if (!firstOutput && choices.some(choice => {
+    const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+    const finished = choices.some(choice => isRec(choice) && typeof choice.finish_reason === "string" && choice.finish_reason.length > 0);
+    if (hasPendingToolName() && choices.some((choice, position) => isRec(choice)
+      && typeof choice.finish_reason === "string" && choice.finish_reason.length > 0
+      && [...pendingToolNames].some(key => key.startsWith(`${typeof choice.index === "number" ? choice.index : position}:`)))) {
+      fail(controller, UNDECLARED_CHAT_TOOL_MESSAGE, UNDECLARED_TOOL_CALL_ERROR_CODE);
+      return;
+    }
+    if (finished) sawFinish = true;
+    const hasText = choices.some(choice => {
       if (!isRec(choice) || !isRec(choice.delta)) return false;
       const delta = choice.delta;
       return (typeof delta.content === "string" && delta.content.length > 0)
         || (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0)
-        || (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0);
-    })) {
+        || (typeof delta.reasoning === "string" && delta.reasoning.length > 0)
+        || (Array.isArray(delta.reasoning_details) && delta.reasoning_details.some(detail =>
+          isRec(detail) && typeof detail.text === "string" && detail.text.length > 0))
+        || (typeof delta.refusal === "string" && delta.refusal.length > 0);
+    });
+    const hasTool = choices.some(choice => {
+      if (!isRec(choice) || !isRec(choice.delta)) return false;
+      const delta = choice.delta;
+      return Array.isArray(delta.tool_calls) && delta.tool_calls.some(tool => {
+        if (!isRec(tool)) return false;
+        const fn = isRec(tool.function) ? tool.function : {};
+        return (typeof tool.id === "string" && tool.id.length > 0)
+          || (typeof fn.name === "string" && fn.name.length > 0)
+          || (typeof fn.arguments === "string" && fn.arguments.length > 0);
+      });
+    });
+    if (hasText) sawTextOutput = true;
+    if (hasTool) sawToolCalls = true;
+    const hasProgress = hasText || hasTool;
+    if (hasProgress || finished) pullDeadline = performance.now() + stallMs;
+    else if (performance.now() >= pullDeadline) throw stalled;
+    if (!firstOutput && hasProgress && !hasPendingToolName()) {
       firstOutput = true;
       options.onFirstOutput?.();
     }
-    enqueue(controller, replaceSseDataPayload(block, JSON.stringify(normalizedChunk(parsed, options.requestedModel))) + delimiter);
+    if (eventName === "error" || chunk.type === "error") {
+      // These frames keep the ordinary relay's control flow; only client bytes change.
+      const flat = structuredError({ error: chunk })!;
+      const status = flat.status ?? 502;
+      const payload = ownedChatErrorPayload({ status, type: flat.type, code: flat.code,
+        evidence: { ...flat, status, code: flat.code ?? undefined } }).error;
+      options.collectorSource?.retain(JSON.stringify(payload), chunk);
+      relay(controller, (eventName === "error" ? "event: error\n" : "") + canonicalSseErrorBlock(payload));
+    } else {
+      const normalized = normalizedChunk(chunk, options.requestedModel);
+      const choiceError = choices.some(choice => isRec(choice) && choice.error !== undefined && choice.error !== null);
+      relay(controller, choiceError ? canonicalSseErrorBlock(normalizeChatChoiceErrors(normalized))
+        : replaceSseDataPayload(block, JSON.stringify(normalized)) + delimiter);
+    }
   };
 
   function onAbort() {
     cancelledBySignal = true;
+    releaseBuffer();
     if (!settled) {
       settled = true;
       options.onCancel?.();
@@ -275,16 +471,42 @@ export function nativeChatSse(
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       releaseQueued();
+      pullDeadline = performance.now() + remainingStallMs;
       try {
         for (;;) {
-          const next = nextSseBlock(buffer, bufferSearchFrom);
-          if (next) {
-            replaceBuffer(next.rest);
-            processBlock(controller, next.block, next.delimiter);
+          if (cancelledBySignal) {
+            releaseBuffer();
+            controller.close();
             return;
           }
-          bufferSearchFrom = Math.max(0, buffer.length - 3);
-          const { done, value } = await reader.read();
+          const next = buffer.next();
+          if (next) {
+            buffer.compact();
+            processBlock(controller, next.block, next.delimiter);
+            if (heldFrames.length > 0 && !settled) continue;
+            return;
+          }
+          if (performance.now() >= pullDeadline) throw stalled;
+          let timeout: ReturnType<typeof setTimeout> | undefined;
+          let read: Awaited<ReturnType<typeof reader.read>>;
+          try {
+            read = stallEnabled
+              ? await Promise.race([
+                  reader.read(),
+                  new Promise<never>((_, reject) => {
+                    const check = () => {
+                      const remaining = pullDeadline - performance.now();
+                      if (remaining <= 0) reject(stalled);
+                      else timeout = setTimeout(check, Math.min(remaining, 2_147_483_647));
+                    };
+                    check();
+                  }),
+                ])
+              : await reader.read();
+          } finally {
+            if (timeout !== undefined) clearTimeout(timeout);
+          }
+          const { done, value } = read;
           if (cancelled) return;
           if (cancelledBySignal) {
             releaseBuffer();
@@ -292,11 +514,15 @@ export function nativeChatSse(
             return;
           }
           if (!done) {
-            appendBuffer(decoder.decode(value, { stream: true }));
+            buffer.append(decoder.decode(value, { stream: true }));
             continue;
           }
-          appendBuffer(decoder.decode());
-          if (buffer.trim().length > 0) {
+          buffer.append(decoder.decode());
+          if (hasPendingToolName()) {
+            fail(controller, UNDECLARED_CHAT_TOOL_MESSAGE, UNDECLARED_TOOL_CALL_ERROR_CODE);
+            return;
+          }
+          if (buffer.tail().trim().length > 0) {
             fail(controller, "upstream SSE ended with an unterminated event", "upstream_sse_unterminated");
             return;
           }
@@ -305,19 +531,34 @@ export function nativeChatSse(
             if (!sawDone) enqueue(controller, "data: [DONE]\n\n");
             settle(200);
             controller.close();
+          } else if (sawToolCalls) {
+            // Mid tool-call truncation must fail closed to prevent downstream executing partial arguments.
+            fail(controller, "upstream SSE ended mid tool call without a terminal signal — possible truncation", "upstream_sse_truncated");
+          } else if (sawTextOutput) {
+            // Upstream produced text or reasoning output but missed the terminal frame; recover cleanly with [DONE].
+            enqueue(controller, "data: [DONE]\n\n");
+            settle(200);
+            controller.close();
           } else {
             fail(controller, "upstream SSE ended before a terminal event", "upstream_sse_truncated");
           }
           return;
         }
       } catch (error) {
+        if (cancelled || cancelledBySignal) {
+          releaseBuffer();
+          try { controller.close(); } catch { /* already closed */ }
+          return;
+        }
         const overflow = isTranslatorBudgetExceededError(error)
           || (error instanceof Error && (error.cause as { code?: unknown } | undefined)?.code === "translation_buffer_limit");
         fail(
           controller,
           overflow ? "upstream SSE event exceeded the safe limit" : error instanceof Error ? error.message : String(error),
-          overflow ? "translation_buffer_limit" : "upstream_sse_error",
+          overflow ? "translation_buffer_limit" : error === stalled ? "upstream_stall_timeout" : "upstream_sse_error",
         );
+      } finally {
+        remainingStallMs = Math.max(0, pullDeadline - performance.now());
       }
     },
     cancel(reason) {

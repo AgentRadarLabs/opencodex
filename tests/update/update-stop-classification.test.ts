@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { spawn } from "node:child_process";
+import * as childProcess from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { STOP_HISTORY_INCOMPLETE_EXIT_CODE } from "../../src/update/stop-contract.mjs";
+import { STOP_HISTORY_DEFERRED_EXIT_CODE, STOP_HISTORY_INCOMPLETE_EXIT_CODE } from "../../src/update/stop-contract.mjs";
 import { probeProxyLiveness } from "../../src/update/proxy-liveness-probe.mjs";
 import { decidePostStopUpdate } from "../../src/update/stop-decision.mjs";
 import { repoRoot as resolveRepoRoot } from "../helpers/repo-root";
@@ -34,10 +35,21 @@ describe("stop failure classification (#3008)", () => {
 
     const cliCodes = [...read("src/cli/index.ts").matchAll(/process\.exit(?:Code)?\s*(?:=|\()\s*(\d+)/g)]
       .map(match => Number(match[1]));
-    const dispatchCodes = [...read("src/cli/dispatch.ts").matchAll(/return (\d+);/g)]
+    const dispatchCodes = ["src/cli/dispatch.ts", "src/cli/sync-command.ts"].flatMap(path => [...read(path).matchAll(/return (\d+);/g)])
       .map(match => Number(match[1]));
     expect(cliCodes).not.toContain(STOP_HISTORY_INCOMPLETE_EXIT_CODE);
     expect(dispatchCodes).not.toContain(STOP_HISTORY_INCOMPLETE_EXIT_CODE);
+
+    // #4718 adds a second code, and it has to be distinct from the first as well as from
+    // everything else. Reusing 79 would tell a caller "teardown ran, only history metadata
+    // is outstanding" about a stop that restored nothing, and that caller discharges the
+    // receipt on the strength of it.
+    expect(STOP_HISTORY_DEFERRED_EXIT_CODE).toBe(80);
+    expect(STOP_HISTORY_DEFERRED_EXIT_CODE).not.toBe(STOP_HISTORY_INCOMPLETE_EXIT_CODE);
+    expect(STOP_HISTORY_DEFERRED_EXIT_CODE).toBeGreaterThan(78);
+    expect(STOP_HISTORY_DEFERRED_EXIT_CODE).toBeLessThan(128);
+    expect(cliCodes).not.toContain(STOP_HISTORY_DEFERRED_EXIT_CODE);
+    expect(dispatchCodes).not.toContain(STOP_HISTORY_DEFERRED_EXIT_CODE);
   });
 
   test("the shared contract is plain ESM so the Node launcher can import it", () => {
@@ -45,6 +57,7 @@ describe("stop failure classification (#3008)", () => {
     // places is how the two ends drift.
     const contract = read("src/update/stop-contract.mjs");
     expect(contract).toContain("export const STOP_HISTORY_INCOMPLETE_EXIT_CODE");
+    expect(contract).toContain("export const STOP_HISTORY_DEFERRED_EXIT_CODE");
     expect(read("bin/ocx.mjs")).toContain("stop-contract.mjs");
     expect(read("src/update/index.ts")).toContain("stop-contract.mjs");
   });
@@ -197,6 +210,107 @@ describe("stop failure classification (#3008)", () => {
     }
   });
 
+  test.each([false, true])("a silent dial uses a real bind fallback (port held=%s)", held => {
+    // Inject only the HTTP timeout to avoid depending on platform-specific accepted-socket
+    // port reuse. The child reserves its own port,
+    // then runs the unchanged production script against real released/held listeners.
+    const realSpawn = childProcess.spawnSync;
+    let events: Array<{ event: string; host?: string; port?: number; exclusive?: boolean }> = [];
+    const run = spyOn(childProcess, "spawnSync").mockImplementation(((file: string, args: readonly string[], options: childProcess.SpawnSyncOptionsWithStringEncoding) => {
+      const bootstrap = [
+        "const net = require('node:net'), http = require('node:http');",
+        "const { EventEmitter } = require('node:events');",
+        "const emit = data => process.stderr.write(JSON.stringify(data) + '\\n');",
+        "const reservation = net.createServer();",
+        "reservation.listen(0, '127.0.0.1', () => {",
+        "  const port = reservation.address().port; process.argv[2] = String(port);",
+        "  const start = () => {",
+        "    const createServer = net.createServer;",
+        "    net.createServer = (...args) => {",
+        "      const server = createServer(...args), listen = server.listen;",
+        "      server.listen = function(options, callback) {",
+        "        emit({ event: 'bind', ...options });",
+        "        return listen.call(this, options, callback);",
+        "      };",
+        "      server.once('listening', () => emit({ event: 'bound' }));",
+        "      server.once('error', () => { emit({ event: 'bind-error' }); reservation.close(); });",
+        "      return server;",
+        "    };",
+        "    http.get = options => {",
+        "      emit({ event: 'dial', host: options.host, port: options.port });",
+        "      const request = new EventEmitter(); request.destroy = () => {};",
+        "      queueMicrotask(() => { emit({ event: 'timeout' }); request.emit('timeout'); });",
+        "      return request;",
+        "    };",
+        `    eval(${JSON.stringify(args[1])});`,
+        "  };",
+        held ? "  start();" : "  reservation.close(start);",
+        "});",
+      ].join("\n");
+      const result = realSpawn(file, [args[0]!, bootstrap, ...args.slice(2)], options);
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(0);
+      events = String(result.stderr).trim().split("\n").map(line => JSON.parse(line));
+      return result;
+    }) as typeof childProcess.spawnSync);
+    try {
+      expect(probeProxyLiveness(12345, "127.0.0.1", 400)).toBe(held ? "unknown" : "dead");
+      expect(run).toHaveBeenCalledTimes(1);
+      expect(events.map(item => item.event)).toEqual(["dial", "timeout", "bind", held ? "bind-error" : "bound"]);
+      expect(events[0]!.port).toBeGreaterThan(0);
+      expect(events[0]!.host).toBe("127.0.0.1");
+      expect(events[2]).toEqual({ event: "bind", host: "127.0.0.1", port: events[0]!.port, exclusive: true });
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  test("a hostname never gets the bind fallback, because the dial and the bind may resolve differently", async () => {
+    // Keep a real connection silent, but address it by name: timeout must stay unknown
+    // without attempting a bind, regardless of whether the accepted socket permits reuse.
+    // A name can resolve differently for dial and bind. The fixture listens
+    // dual-stack (`::`, falling back to `0.0.0.0` where IPv6 is unavailable) so the dial
+    // is silent whichever address `localhost` resolves to first, instead of being refused
+    // on `::1` and returning `dead` before the hostname rule is reached.
+    const listener = spawn(process.execPath, ["-e", [
+      "const net = require('node:net');",
+      "const server = net.createServer(socket => { server.close(); socket.on('error', () => {}); });",
+      "const report = () => process.stdout.write(String(server.address().port));",
+      "server.once('error', () => { server.removeAllListeners('error'); server.listen(0, '0.0.0.0', report); });",
+      "server.listen({ port: 0, host: '::', ipv6Only: false }, report);",
+    ].join("\n")], { stdio: ["ignore", "pipe", "ignore"] });
+    const port = await new Promise<number>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("listener did not report a port")), 10_000);
+      listener.stdout.once("data", chunk => { clearTimeout(timer); resolve(Number(String(chunk))); });
+      listener.once("error", error => { clearTimeout(timer); reject(error); });
+    });
+    try {
+      expect(probeProxyLiveness(port, "localhost", 400)).toBe("unknown");
+    } finally {
+      listener.kill();
+      await new Promise<void>(resolve => listener.once("exit", () => resolve()));
+    }
+  });
+
+  test("a reset dial to a held local port stays unknown", async () => {
+    const listener = spawn(process.execPath, ["-e", [
+      "const net = require('node:net');",
+      "const server = net.createServer(socket => socket.destroy());",
+      "server.listen(0, '127.0.0.1', () => process.stdout.write(String(server.address().port)));",
+    ].join("\n")], { stdio: ["ignore", "pipe", "ignore"] });
+    const port = await new Promise<number>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("listener did not report a port")), 10_000);
+      listener.stdout.once("data", chunk => { clearTimeout(timer); resolve(Number(String(chunk))); });
+      listener.once("error", error => { clearTimeout(timer); reject(error); });
+    });
+    try {
+      expect(probeProxyLiveness(port, "127.0.0.1", 400)).toBe("unknown");
+    } finally {
+      listener.kill();
+      await new Promise<void>(resolve => listener.once("exit", () => resolve()));
+    }
+  });
+
   test("the shared decision covers the whole post-stop matrix", () => {
     // This is THE predicate both updaters call, not a copy of it: src/update/index.ts and
     // bin/ocx.mjs each import decidePostStopUpdate. Testing a local reimplementation would
@@ -229,6 +343,64 @@ describe("stop failure classification (#3008)", () => {
       .toEqual({ proceed: false, reason: "proxy-unknown" });
   });
 
+  /**
+   * #4718: the same abort, from the opposite direction.
+   *
+   * A paginated Codex history store makes the shared teardown refuse before it changes
+   * anything, so `ocx stop` restores nothing and keeps its receipt. Under #3008 that came
+   * out as exit 1 and a surviving obligation, which reads identically to a proxy that
+   * refused to die — so the update aborted with the service already stopped and the old
+   * package still installed, exactly the shape #3008 was opened about.
+   *
+   * The receipt genuinely IS outstanding here, so the fix cannot be "ignore the receipt".
+   * It is the child saying which obligations it deliberately kept, and that claim only
+   * buys past the teardown gate — never past runtime records or a proxy that might live.
+   */
+  test("a history-deferred stop proceeds past its own receipt and nothing else", () => {
+    const dead = { hasRuntimeState: false, liveness: "dead" } as const;
+
+    // The reported case: receipt outstanding because the stop chose to keep it.
+    expect(decidePostStopUpdate({ status: STOP_HISTORY_DEFERRED_EXIT_CODE, teardownOutstanding: true, ...dead }))
+      .toEqual({ proceed: true, reason: "history-deferred" });
+    // And with no receipt at all, which is the same decision for the same reason.
+    expect(decidePostStopUpdate({ status: STOP_HISTORY_DEFERRED_EXIT_CODE, ...dead }))
+      .toEqual({ proceed: true, reason: "history-deferred" });
+
+    // It is a distinct reason, not a second spelling of history-only: the two mean
+    // different things about whether the obligation was discharged.
+    expect(decidePostStopUpdate({ status: STOP_HISTORY_INCOMPLETE_EXIT_CODE, teardownOutstanding: true, ...dead }))
+      .toEqual({ proceed: false, reason: "teardown-outstanding" });
+
+    // Every other gate still stands. Replacing package files under a server that may be
+    // live is the danger this function exists to prevent, and a history refusal is
+    // evidence about history — it says nothing about whether the proxy is gone.
+    expect(decidePostStopUpdate({ status: STOP_HISTORY_DEFERRED_EXIT_CODE, hasRuntimeState: true, liveness: "dead" }))
+      .toEqual({ proceed: false, reason: "runtime-state" });
+    expect(decidePostStopUpdate({ status: STOP_HISTORY_DEFERRED_EXIT_CODE, hasRuntimeState: false, liveness: "live" }))
+      .toEqual({ proceed: false, reason: "proxy-live" });
+    expect(decidePostStopUpdate({ status: STOP_HISTORY_DEFERRED_EXIT_CODE, hasRuntimeState: false, liveness: "unknown" }))
+      .toEqual({ proceed: false, reason: "proxy-unknown" });
+
+    // And no neighbouring status inherits the exemption.
+    // 81 is the update handover code (#7423), pinned in update-teardown-handover.test.ts.
+    for (const status of [1, 2, 4, 64, 78, 82, 130, null]) {
+      expect(decidePostStopUpdate({ status, teardownOutstanding: true, ...dead }))
+        .toEqual({ proceed: false, reason: "stop-failed" });
+    }
+  });
+
+  test("both updater lanes report the deferred teardown as its own outcome", () => {
+    // The reported #4718 path is the npm launcher. A lane that proceeded without saying
+    // the teardown is still owed would leave the operator believing the restore happened.
+    for (const lane of ["src/update/index.ts", "bin/ocx.mjs"]) {
+      const source = read(lane);
+      expect(source).toContain('decision.reason === "history-deferred"');
+      // Not folded into the manifest warning: that one says history metadata is
+      // incomplete, which implies config and catalog already came back.
+      expect(source).toMatch(/restored nothing/);
+    }
+  });
+
   test("both updater lanes call the shared decision", () => {
     // The reported path is a dashboard npm update through the plain-Node launcher. Fixing
     // only the Bun updater would leave that lane broken while every focused test went
@@ -246,9 +418,18 @@ describe("stop failure classification (#3008)", () => {
     // Ordinary failure wins: it is the stronger signal.
     expect(cli).toMatch(/if \(stopFailed\) process\.exitCode = 1;\s*\n\s*else if \(historyOnlyFailure\) process\.exitCode = STOP_HISTORY_INCOMPLETE_EXIT_CODE;/);
     // The code is set rather than exited inline so the dispatcher still receives the
-    // return value and decides what happens next.
-    expect(cli).toMatch(/process\.exitCode = STOP_HISTORY_INCOMPLETE_EXIT_CODE;\s*\n\s*return !stopFailed;/);
-    // Config and catalog failures are real teardown failures: a client reads those.
-    expect(cli).toMatch(/artifacts\.config\.state === "failed" \|\| artifacts\.catalog\.state === "failed"/);
+    // return value and decides what happens next. The deferred code (#4718) sits between
+    // them and obeys the same rule, so the function still ends by returning. The return
+    // is a structured outcome since the stop summary landed: ok preserves the old
+    // boolean exactly, and the summary derives from the same signals.
+    expect(cli).toMatch(/process\.exitCode = STOP_HISTORY_INCOMPLETE_EXIT_CODE;[\s\S]*?\n\s*return \{ ok: !stopFailed, summary \};\n\}/);
+    // The deferred code never outranks an ordinary failure, and it is only reachable when
+    // this run can still prove the obligations left behind are the ones it chose to keep.
+    expect(cli).toMatch(/else if \(historyDeferredNonces\) \{/);
+    expect(cli).toMatch(/pendingTeardownsAreExactly\(historyDeferredNonces\)\s*\n?\s*\? STOP_HISTORY_DEFERRED_EXIT_CODE\s*\n?\s*: 1;/);
+    // Config and catalog failures are real teardown failures: a client reads those. The
+    // classification lives in the restore helper handleStop calls.
+    expect(cli).toContain("restoreSharedClientStateAfterStop(");
+    expect(read("src/cli/stop-restore.ts")).toMatch(/artifacts\.config\.state === "failed" \|\| artifacts\.catalog\.state === "failed"/);
   });
 });

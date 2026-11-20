@@ -20,6 +20,29 @@ la sécurité des réponses se produit toujours à la limite du proxy. Configure
 [Configuration](/fr/reference/configuration/); utilisez [Combos](/fr/guides/combos/) lorsqu'un identifiant de modèle public
 doit choisir parmi plusieurs cibles.
 
+## Redirections en amont
+
+Les requêtes de modèle, d’image, de vidéo et de recherche contenant des identifiants ne suivent pas automatiquement les redirections HTTP, même vers la même origine. Configurez l’URL finale de l’API plutôt qu’un alias qui redirige. Le serveur ne renvoie ni les identifiants ni le corps de la requête à la destination d’une redirection. Chaque chemin conserve sa gestion des erreurs ou son relais existant ; les routes Responses natives et compact peuvent renvoyer le 3xx et le `Location` d’origine au client. Le comportement de redirection du client est distinct de cette politique de transport du serveur.
+
+## xAI policy refusals
+
+Certains refus xAI de Chat Completions arrivent en HTTP 403 avec une phrase de refus exacte, par exemple `I can't help with that request.`, au lieu d'un HTTP 200 avec `finish_reason: content_filter`. Codex traite un 403 comme un échec de transport : le tour utilisateur n'est pas enregistré et la même requête est renvoyée.
+
+Sur une requête Responses hors combo, OpenCodex réécrit ce 403 de la liste autorisée en réponse Responses HTTP 200 avec `status: "incomplete"` et `incomplete_details.reason: "content_filter"`. La réécriture s'applique au chemin de l'adaptateur openai-chat et au passthrough openai-responses (OAuth grok-4.6 / grok-4.5). Le streaming utilise la même limite incomplete. Un corps 403 vide ou fait d'espaces reste une erreur. Les 403 d'abonnement, de crédits, de droits d'accès et `not allowed to use this model` restent des erreurs. Le basculement de combo voit toujours le HTTP 403 d'origine.
+
+## Appels d’outils non déclarés
+
+Sur le point de terminaison Responses, lorsqu’une requête déclare un catalogue d’outils, une réponse en passthrough natif qui appelle un outil exécuté par le client hors de ce catalogue fait échouer le tour au lieu de relayer l’appel : un événement `response.failed` avec le code d’erreur `undeclared_tool_call`, puis `data: [DONE]` ; le JSON mis en mémoire tampon renvoie HTTP 502 avec le même code. Le refus intervient avant que la réponse puisse entrer dans l’état de continuation, et il n’est désactivé que pour les fournisseurs avec `authMode: "forward"` ou pour une requête sans catalogue déclaré.
+
+Les points de terminaison Chat Completions et Messages honorent les catalogues d’outils différés : ces clients peuvent ne déclarer qu’un catalogue partiel et découvrir le reste à l’exécution via leur propre registre d’outils, qui — et non l’instantané de catalogue traduit — détient la frontière complète de déclaration. Un appel hors de la liste déclarée est relayé pour que le client le valide ; un appel inventé contre un `tools: []` explicitement vide est toujours refusé, car aucun registre différé n’existe sous une déclaration vide. Ces refus conservent le code `undeclared_tool_call` sur chaque voie :
+
+- **Chat Completions :** une trame `data:` contenant un objet `error` au format OpenAI portant le code, puis la fermeture du flux sans fin de succès ni `[DONE]` ; le JSON mis en mémoire tampon renvoie HTTP 502 avec le code.
+- **Messages :** une trame Anthropic `event: error` dont le corps est `{ "type": "error", "error": { "type": "api_error", "code": "undeclared_tool_call", ... } }`, sans `message_stop` réussi ni `[DONE]` ; le JSON mis en mémoire tampon renvoie HTTP 502 `api_error` avec le code. Une violation déterministe du catalogue n’est jamais rapportée comme un `overloaded_error` réessayable (HTTP 529).
+
+Par ailleurs, sur chaque voie entrante, un appel dans l’espace de noms `default.` d’un fournisseur est normalisé vers le nom d’outil nu déclaré par la requête (`default.Read` → `Read`).
+
+Messages natif reconnaît aussi les définitions d’outils en ligne dans les messages système avec `tools: []`. Ces noms restent appelables jusqu’à leur retrait permanent, sans autoriser d’autres outils clients. Les appels MCP hébergés et les flux d’arguments des outils serveur conservent leur format natif.
+
 ## Présentation du point de terminaison
 
 | Espace client | Point de terminaison | Résultat non-stream réussi | Résultat de flux ou de socket réussi |
@@ -28,7 +51,7 @@ doit choisir parmi plusieurs cibles.
 | OpenAI Chat Completions | `POST /v1/chat/completions` | `chat.completion` JSON | `chat.completion.chunk` SSE se terminant par `[DONE]` |
 | Anthropic Messages | `POST /v1/messages` | Anthropic `message` JSON | Anthropic Messages SSE |
 | Comptage des jetons Anthropic | `POST /v1/messages/count_tokens` | `{ "input_tokens": number }` | Sans objet |
-| Découverte de modèles | `GET /v1/models` | L'un des trois contrats du catalogue | Sans objet |
+| Découverte de modèles | `GET /v1/models` | Catalogue ou instantané Desktop explicite | Sans objet |
 | Voix et temps réel | `POST /v1/live`, `POST /v1/realtime/calls` | Réponse de création d'appel relayée | Une bande latérale séparée WebSocket relaie les trames dans les deux sens |
 | Compactage des réponses | `POST /v1/responses/compact` | Historique de remplacement JSON | Sans objet |
 
@@ -64,6 +87,16 @@ Avec `stream: true`, la réponse est `text/event-stream`. Le pont émet des év�
 
 Avec `stream: false` ou pas de `stream`, les mêmes événements d'adaptateur sont collectés dans une seule réponse JSON
 objet. Les deux formulaires préservent le modèle sélectionné, les éléments de sortie, l'état du terminal et l'utilisation.
+
+La route canonique ChatGPT Codex n'accepte que SSE en amont ; seul l'appel amont utilise donc
+`stream: true`. OpenCodex valide le flux terminal dans des limites bornées, puis le replie dans la
+forme JSON demandée par le client sans modifier une valeur `store` explicite. Un échec de validation
+renvoie une erreur plutôt qu'un JSON partiel avec HTTP 200. Les limites sont de 4 Mio par trame,
+32 Mio pour le transcript et la source de reconstruction, 100 000 trames SSE et 10 000 éléments de
+sortie reconstruits. `stallTimeoutSec` régit le premier octet du corps et les silences suivants.
+Lorsqu'il vaut `0`, y compris par défaut pour un upstream local, il n'expire pas immédiatement : seul
+le plafond indépendant de 15 minutes pour le tour mis en mémoire reste actif. Les clients streaming
+restent inchangés.
 
 Les trames SSE des réponses destinées au client sont limitées à 4 Mio par trame, mesuré en octets bruts avant la
 SSE délimiteur de bloc. Sur HTTP, une trame amont non terminée qui dépasse la limite échoue fermée
@@ -192,6 +225,15 @@ La sortie sans streaming a `object: "chat.completion"`. La sortie streaming util
 `data: [DONE]`. Les informations d'appel d'outil et d'utilisation sont traduites là où les événements source sont transportés.
 eux.
 
+Les réponses d'erreur et les trames d'erreur en streaming de ce point de terminaison utilisent des
+messages rédigés par le proxy. Le proxy classe l'échec du fournisseur dans une condition fixe, par
+exemple limite de débit atteinte, quota ou crédits épuisés, fenêtre de contexte dépassée, modèle
+indisponible, emplacement non pris en charge ou vérification du compte requise, et renvoie le message
+fixe de cette condition. Les refus de politique, les refus de rejeu et les limites du proxy ont leurs
+propres messages fixes. Le statut HTTP, `error.type`, `error.code` et `Retry-After` gardent leur
+signification : les clients qui s'appuient sur des codes comme `context_length_exceeded`,
+`insufficient_quota` ou `rate_limit_exceeded` se comportent comme avant.
+
 Étant donné que le chemin d'exécution interne est basé sur les réponses, un adaptateur de fournisseur peut imposer un chemin d'exécution plus étroit.
 ensemble de fonctionnalités. Par exemple, une fonctionnalité de demande qui ne peut pas être représentée par l'adaptateur sélectionné est
 renvoyé comme une erreur au lieu de changer silencieusement sa signification.
@@ -227,10 +269,17 @@ estimation documentée du contenu du système, des messages et des outils et ret
 { "input_tokens": 123 }
 ```
 
+Un ID Desktop de forme datée non résolu peut aussi être un véritable modèle natif absent de
+la découverte. Messages et count-tokens renvoient HTTP 503 avec l’erreur fixe `desktop_model_mapping_unavailable` lorsque les informations disponibles ne permettent pas de résoudre cet ID ; cela ne
+prouve pas que le modèle est invalide. Les anciens alias de type hash inconnus restent rejetés
+avec HTTP 400. Aucun des deux cas ne retire la date ni ne choisit une autre route. Les ID connus,
+les correspondances enregistrées et les entrées exactes de `modelMap`, dont les véritables ID
+natifs reconnus, conservent leur traitement. Actualisez la découverte ou réappliquez le profil du
+hub connecté avant de réessayer ; une simple nouvelle tentative ne garantit pas la résolution.
+
 ## `GET /v1/models`
 
-Le même itinéraire dessert trois clients qui attendent des enveloppes de catalogue incompatibles.
-La variante Anthropic est prioritaire, sauf si `client_version` est également présent.
+Sans `format=desktop-config`, les contrats de catalogue ordinaires sont les suivants :
 
 | Contrat | Déclencheur | Forme de niveau supérieur | Comportement de l’identifiant du modèle |
 | --- | --- | --- | --- |
@@ -238,7 +287,36 @@ La variante Anthropic est prioritaire, sauf si `client_version` est également p
 | Codex catalogue | `client_version` paramètre de requête | `{ "models": [...] }` | Les entrées natives et routées contiennent les champs de catalogue Codex les plus riches, la visibilité, l'effort, WebSocket et les métadonnées multi-agents |
 | Liste simple OpenAI | Ni l'un ni l'autre déclencheur | `{ "object": "list", "data": [...] }` | Les identifiants natifs visibles sont nus ; les identifiants routés sont des alias ou `provider/model` |
 
+### Instantané de configuration Desktop
+
+`GET /v1/models?ids=desktop&format=desktop-config` sélectionne explicitement le snapshot
+Desktop, indépendamment du user-agent. La réponse est `{ "version": 1, "models": [...] }`
+avec `Cache-Control: no-store`. Le client envoie `Accept: application/json`,
+`anthropic-version: 2023-06-01` et ses identifiants existants d'accès aux données, sans jeton
+administrateur ni envoi de profil. Les entrées sont les modèles de configuration Desktop émis
+par le hub, pas les lignes du catalogue Codex.
+
+Avec `ids=cli` ou un paramètre `client_version`, ce format renvoie HTTP 400. Sans le sélecteur
+de format, les contrats ordinaires ci-dessus restent inchangés. Si Claude est désactivé,
+`{ "version": 1, "models": [] }` indique l'indisponibilité à Desktop apply, qui n'écrit aucun
+profil de remplacement. Un ancien hub renvoyant un catalogue ordinaire au lieu de la version 1
+n'est pas pris en charge ; aucun identifiant local de secours n'est généré.
+
+Le snapshot reste une lecture de modèles, pas une API de rotation ou d'envoi de profil.
+Migration des clés Desktop, récupération et déconnexion utilisent le cycle de vie client existant.
+La rotation conserve modèles et sélection ; le champ CLI `rotation` distingue `committed` et
+`rolled_back`. La déconnexion restaure les paramètres gérés ou signale un repli standard pour un
+ancien profil reconnu, en préservant champs utilisateur et choix valides ultérieurs. Conflits et
+récupération incomplète empêchent de déclarer l'opération terminée. Redémarrez Desktop pour lire
+les changements ; la déconnexion ne révoque pas automatiquement la clé du hub.
+Voir [le guide Desktop](/fr/guides/claude-code/). Relecture thinking et cache restent dans
+[#3719](https://github.com/lidge-jun/opencodex/issues/3719).
+
 ## `POST /v1/live` et bande latérale en temps réel
+
+La liaison de compte ci-dessous concerne les clients Codex natifs. Pour la dictée et GPT-Live avec une clé API externe, consultez la [spécification audio en anglais](/reference/proxy-formats/#streaming-dictation).
+
+Connections > API keys propose deux sections, Dictée et Voix en direct. La clé de données reste uniquement en mémoire dans le formulaire. La dictée envoie le fichier choisi ; la vérification vocale attend une confirmation de session sans microphone. Une configuration présente ne garantit pas la connexion.
 
 `POST /v1/live` accepte la surface de création d'appel ChatGPT/Codex App sans cadre.
 `POST /v1/realtime/calls` accepte la surface de création d'appel OpenAI Realtime. opencodex sélectionne un
@@ -285,16 +363,20 @@ utilisez la matrice ci-dessous. « Dédié » signifie `X-OpenCodex-API-Key` ; l
 
 | Surfaces | Dédié | Porteur | `x-api-key` |
 | --- | --- | --- | --- |
-| `/v1/responses` HTTP et WebSocket | Obligatoire | Rejeté pour l’admission au proxy | Rejeté |
-| `/v1/responses/compact` | Obligatoire | Rejeté pour l’admission au proxy | Rejeté |
-| `/v1/chat/completions` | Obligatoire | Rejeté pour l’admission au proxy | Rejeté |
+| `/v1/responses` HTTP et WebSocket | Accepté | Accepté | Rejeté |
+| `/v1/responses/compact` | Accepté | Accepté | Rejeté |
+| `/v1/chat/completions` | Accepté | Accepté | Rejeté |
 | `/v1/messages` et `/v1/messages/count_tokens` | Accepté | Accepté | Accepté |
 | `/v1/models` | Accepté | Accepté | Accepté |
 | `/v1/live`, `/v1/realtime/calls` et jointures de bande latérale | Accepté | Accepté | Accepté |
 
-Réponses-famille et demandes de chat réservées `Authorization` au fournisseur ou Codex Direct
-passthrough, donc une clé proxy distante doit utiliser l'en-tête dédié. Messages et surfaces en temps réel
-ont besoin d’une compatibilité client plus large et acceptent donc les trois formes.
+Les requêtes Responses et Chat acceptent une clé du proxy dans l’en-tête dédié ou dans Bearer. Sur une route native, l’identifiant Codex stocké sélectionné remplace le bearer d’admission ; sur les autres routes, ce bearer est supprimé. Il ne sert jamais d’identifiant upstream. Utilisez l’en-tête dédié si vous fournissez aussi un bearer distinct pour le fournisseur.
+
+Une route Cursor sans clé et sans OAuth peut utiliser ce bearer distinct de l’appelant, mais jamais un secret du proxy ni l’authentification ChatGPT main ajoutée automatiquement. La sélection Combo/policy et les réécritures effectives shadow/thread-spawn ne transmettent pas les identifiants bruts de l’appelant aux nouvelles cibles. Le routage OpenAI canonique peut restaurer l’unique bearer de l’appelant qui n’est pas une clé du proxy après un changement de route interne uniquement si son JWT contient un claim de compte ChatGPT et si tout en-tête de compte explicite correspond à ce claim. La transmission de l’authentification de l’appelant aux sidecars OpenAI facultatifs exige un unique JWT et un `chatgpt-account-id` explicite et correspondant. Les bearers opaques ne sont pas restaurés lors des changements de route, même avec un en-tête de compte explicite. Dans les autres cas, la cible finale doit disposer de son propre identifiant configuré, OAuth ou stocké ; sinon, la requête échoue localement. Un simple marqueur thread-spawn sans changement de route ne supprime pas les identifiants.
+
+Pour une requête Chat vers Cursor sans clé configurée, l’enrichissement facultatif par l’authentification main stockée est différé jusqu’à ce qu’un auxiliaire OpenAI soit réellement prévu et qu’un candidat Direct canonique soit disponible. Une requête Cursor indépendante ne réserve donc pas native main par cette voie et ne retarde pas le changement de profil. Les identifiants auxiliaires respectent les protections de démarrage et de changement de profil et restent séparés du bearer Cursor. Les auxiliaires Pool ou associés à un compte précis conservent leur sélection de compte.
+
+Le replay Claude ne conserve l’authentification main que dans un snapshot en mémoire dont le turn a acquis la propriété, et ne la reconstruit que pour une route ChatGPT canonique finale.
 
 :::caution
 Les clés du plan de données ne sont pas des informations d’identification de gestion. La gestion API utilise un secret d'administration distinct ;
@@ -327,3 +409,25 @@ cette réparation, cela devient un message utilisateur normal. Si une tâche v2 
 mais la cible routé sélectionnée ne peut pas lire le texte chiffré natif ChatGPT, opencodex échoue avec
 `unreadable_encrypted_agent_task` au lieu d'envoyer des octets illisibles à ce fournisseur. Voir
 [Surface du sous-agent](/fr/guides/sub-agent-surface/) pour le comportement du client autour des tâches des travailleurs.
+
+### Changer de fournisseur dans une conversation existante
+
+Un élément de raisonnement rejoué transporte un `encrypted_content` que seuls le fournisseur et
+l’identifiant qui l’ont produit peuvent lire. Quand opencodex sait que la conversation a été servie en
+dernier par un autre fournisseur, il retire ce blob avant l’envoi et conserve le résumé de l’élément.
+Si ce fournisseur utilisait aussi un autre point de terminaison ou un autre identifiant, l’identifiant
+`rs_…` de l’élément est retiré également, car il désigne un élément que la nouvelle destination ne peut
+pas retrouver. Quand opencodex ne peut pas le savoir, par exemple après un redémarrage du proxy, la
+nouvelle destination rejette le blob : OpenAI et Azure OpenAI répondent `400 invalid_encrypted_content`.
+opencodex renvoie alors la requête une seule fois sans l’état de raisonnement du fournisseur précédent,
+c’est-à-dire sans le blob ni l’identifiant `rs_…`, qui provoquerait sinon
+`Item with id 'rs_…' not found`.
+
+Cette récupération s’applique à tout adaptateur qui parle le protocole Responses, donc
+`openai-responses` et `azure-openai` se comportent de la même façon. Après une récupération réussie, les
+tours suivants de cette conversation sur la même destination retirent cet état avant le premier envoi
+pendant les cinq minutes suivantes. Le renvoi est compté dans le budget d’envoi normal de la requête. Un
+400 ordinaire et un 429 ne sont jamais renvoyés de cette manière, pas plus qu’un 5xx, à une exception
+près : un 502 dont le corps est exactement le rejet de déchiffrement d’une sortie d’outil chiffrée, pour
+une requête qui en contient une, obtient le même renvoi unique. Un second rejet parvient au client sans
+modification. Dans ce cas, démarrez une nouvelle conversation chez le fournisseur de destination.

@@ -37,6 +37,14 @@ function errorHtml(message: string): string {
 
 export type CallbackResult = { code: string; state: string };
 
+/** Close every response so pooled sockets cannot send the next login to a retired flow. */
+function closingResponse(body: string, status: number, contentType = "text/html"): Response {
+  return new Response(body, {
+    status,
+    headers: { "Content-Type": contentType, "Connection": "close" },
+  });
+}
+
 /**
  * The redirect URI advertised to providers must stay `localhost` (it is what the OAuth
  * apps have registered), but Windows commonly resolves `localhost` to `::1` first while
@@ -58,6 +66,15 @@ export interface OAuthCallbackFlowOptions {
   callbackBindHostname?: string;
   /** Exact redirect URI advertised to the provider; disables port fallback. */
   redirectUri?: string;
+  /**
+   * Code-display mode: the provider renders the authorization code for the user to paste, so
+   * this process never receives a redirect and must NOT open a listener. Requires `redirectUri`
+   * (the provider-hosted code page) and an `onManualCodeInput` channel — without one the flow
+   * would wait for a callback that can never arrive.
+   */
+  skipCallbackServer?: boolean;
+  /** Overrides the 300s wait for the code; code-display pastes are hand-typed and slower. */
+  timeoutMs?: number;
 }
 
 type BunServer = ReturnType<typeof Bun.serve>;
@@ -69,6 +86,8 @@ export abstract class OAuthCallbackFlow {
   callbackHostname: string;
   callbackBindHostname: string;
   redirectUri?: string;
+  skipCallbackServer: boolean;
+  timeoutMs: number;
   #callbackResolve?: (result: CallbackResult) => void;
   #callbackReject?: (error: string) => void;
 
@@ -78,6 +97,8 @@ export abstract class OAuthCallbackFlow {
     callbackPath: string = CALLBACK_PATH,
   ) {
     this.ctrl = ctrl;
+    this.skipCallbackServer = false;
+    this.timeoutMs = DEFAULT_TIMEOUT;
     if (typeof preferredPortOrOptions === "number") {
       this.preferredPort = preferredPortOrOptions;
       this.callbackPath = callbackPath;
@@ -90,6 +111,11 @@ export abstract class OAuthCallbackFlow {
     this.callbackHostname = preferredPortOrOptions.callbackHostname ?? DEFAULT_HOSTNAME;
     this.callbackBindHostname = preferredPortOrOptions.callbackBindHostname ?? DEFAULT_BIND_HOSTNAME;
     this.redirectUri = preferredPortOrOptions.redirectUri;
+    this.skipCallbackServer = preferredPortOrOptions.skipCallbackServer === true;
+    this.timeoutMs = preferredPortOrOptions.timeoutMs ?? DEFAULT_TIMEOUT;
+    if (this.skipCallbackServer && !this.redirectUri) {
+      throw new Error("skipCallbackServer requires an explicit redirectUri");
+    }
   }
 
   /** Build provider-specific authorization URL. */
@@ -124,6 +150,14 @@ export abstract class OAuthCallbackFlow {
   }
 
   async #startCallbackServer(expectedState: string): Promise<{ servers: BunServer[]; redirectUri: string }> {
+    if (this.skipCallbackServer) {
+      // The paste channel is the ONLY way this flow can complete. Fail loudly here rather than
+      // hanging until the timeout on a controller that can never deliver a code.
+      if (!this.ctrl.onManualCodeInput) {
+        throw new Error("Code-display login requires a manual code input channel");
+      }
+      return { servers: [], redirectUri: this.redirectUri! };
+    }
     try {
       const servers = this.#createServers(this.preferredPort, expectedState);
       if (this.redirectUri) {
@@ -177,7 +211,7 @@ export abstract class OAuthCallbackFlow {
   #handleCallback(req: Request, expectedState: string): Response {
     const url = new URL(req.url);
     if (url.pathname !== this.callbackPath) {
-      return new Response("Not Found", { status: 404 });
+      return closingResponse("Not Found", 404, "text/plain");
     }
 
     const code = url.searchParams.get("code");
@@ -214,14 +248,11 @@ export abstract class OAuthCallbackFlow {
       });
     }
 
-    return new Response(ok ? SUCCESS_HTML : errorHtml(errMessage), {
-      status: ok ? 200 : consumeFlow ? 500 : 400,
-      headers: { "Content-Type": "text/html" },
-    });
+    return closingResponse(ok ? SUCCESS_HTML : errorHtml(errMessage), ok ? 200 : consumeFlow ? 500 : 400);
   }
 
   #waitForCallback(expectedState: string): Promise<CallbackResult> {
-    const timeoutSignal = AbortSignal.timeout(DEFAULT_TIMEOUT);
+    const timeoutSignal = AbortSignal.timeout(this.timeoutMs);
     const signal = this.ctrl.signal ? AbortSignal.any([this.ctrl.signal, timeoutSignal]) : timeoutSignal;
 
     const callbackPromise = new Promise<CallbackResult>((resolve, reject) => {
@@ -247,9 +278,10 @@ export abstract class OAuthCallbackFlow {
                 if (!parsed.code) return null;
                 // Kind-aware state enforcement: url/query-shaped input is an authorization
                 // RESPONSE and must carry a matching state — missing state is rejected, not
-                // downgraded to raw. Only a syntactically raw code (same PKCE session) is
-                // exempt, so the CLI/GUI paste fallback still works.
-                if (parsed.kind !== "raw" && expectedState && parsed.state !== expectedState) return null;
+                // downgraded to raw. A raw paste with an explicit code#state suffix is
+                // state-bearing too. Only a syntactically raw code WITHOUT a state suffix
+                // (same PKCE session) is exempt, so the CLI/GUI paste fallback still works.
+                if ((parsed.kind !== "raw" || parsed.state !== undefined) && expectedState && parsed.state !== expectedState) return null;
                 return { code: parsed.code, state: parsed.state ?? expectedState };
               })
               .catch((): CallbackResult | null => null),

@@ -164,6 +164,8 @@ beforeEach(() => {
       const url = String(input);
       if (url.includes("/api/provider-quotas") && rejectQuotaFetch) throw new Error("quota unavailable");
       if (url.includes("/api/provider-quotas") && quotaFetchOverride) return quotaFetchOverride();
+      if (url.endsWith("/api/models")) return Response.json([]);
+      if (url.endsWith("/api/selected-models")) return Response.json({ selected: {}, available: {}, liveModelCounts: {} });
       const body = url.includes("/api/provider-quotas") ? quotaPayload : {};
       return quotaResponse(body);
     },
@@ -182,15 +184,17 @@ afterEach(async () => {
   Object.defineProperty(globalThis, "fetch", { configurable: true, value: originalFetch });
 });
 
-async function mountShell(quotaRefreshEpoch = 0) {
+async function mountShell(quotaRefreshEpoch = 0, targetKey?: string) {
   const { createRoot } = await import("react-dom/client");
   await act(async () => {
     root ??= createRoot(host);
     root.render(
       <LanguageProvider>
         <ProviderWorkspaceShell
+          key={targetKey ?? ""}
           providers={providers}
           apiBase=""
+          targetKey={targetKey}
           defaultProvider="openai"
           selectedName={null}
           onSelect={() => {}}
@@ -223,6 +227,20 @@ test("provider quota fetch preserves aggregate capacity through shell state and 
   }).format(new Date(RECOVERY_AT));
   expect(text).toContain(expectedRecoveryAt);
   expect(text).not.toMatch(/configured units|weighted units|units remaining|projected/i);
+});
+
+test("quota cache is target-scoped and resets immediately on target change", async () => {
+  const payload = aggregatePayload();
+  payload.reports[0].quota.weeklyPercent = 77;
+  payload.reports[0].aggregation.weekly.usedPercent = 77;
+  payload.reports[0].aggregation.currentAccount.quota.weeklyPercent = 77;
+  writeSessionListCache("ocx.providers.quotas.v1:hub-b", { openai: payload.reports[0] });
+  globalThis.fetch = (async () => await new Promise<Response>(() => {})) as typeof fetch;
+
+  await mountShell(0, "hub-b");
+  expect(host.textContent).toContain("77% used");
+  await mountShell(0, "hub-a");
+  expect(host.textContent).not.toContain("77% used");
 });
 
 test("successful empty quota response removes cached providers and updates session cache", async () => {
@@ -297,7 +315,6 @@ test("a cancelled superseded quota rejection cannot rewrite state or session cac
 });
 
 test("all-stale response renders coverage only without a numeric fallback", async () => {
-  const old = Date.now() - 31 * 60_000;
   quotaPayload = {
     reports: [{
       provider: "openai",

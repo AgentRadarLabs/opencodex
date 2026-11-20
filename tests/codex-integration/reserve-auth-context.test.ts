@@ -25,6 +25,7 @@ import type { DataPlaneAdmission } from "../../src/server/auth-cors";
 import type { WhamUsageResponse } from "../../src/codex/quota-types";
 import type { OcxConfig } from "../../src/types";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 
 const MAIN = mainAccount.MAIN_CODEX_ACCOUNT_ID;
 const accountId = "reserve-workspace-fixture";
@@ -88,6 +89,8 @@ function prohibitPhysicalReads(): void {
   spyOn(mainAccount, "getValidMainAccountToken").mockImplementation(fail);
 }
 
+let releaseSpendHome: (() => void) | undefined;
+
 beforeEach(() => {
   oldHome = process.env.OPENCODEX_HOME;
   oldCodexHome = process.env.CODEX_HOME;
@@ -133,9 +136,16 @@ beforeEach(() => {
     }
     throw new Error("unexpected outbound fixture destination");
   }, { preconnect() {} }));
+  // Dispatches without starting a server, so it takes the spend-journal lease itself. Taken
+  // last because the lease binds the home in effect at the moment it is taken.
+  releaseSpendHome = acquireOwnedSpendHome();
 });
 
 afterEach(async () => {
+  // Released before this case's home is removed: an open lease inside a directory being
+  // deleted fails the removal on Windows and leaves an unlinked live database on POSIX.
+  releaseSpendHome?.();
+  releaseSpendHome = undefined;
   mock.restore();
   clearAccountQuota(); // Cancels this fixture's pending persistence timer before deleting its home.
   clearMainAccountInfoCache();
@@ -158,6 +168,24 @@ afterEach(async () => {
 });
 
 describe("Reserve owned auth admission", () => {
+  test("opt-in caller Reserve remains keyless even after ordinary affinity is bound", async () => {
+    const cfg = config();
+    cfg.codexPool = { requestOwnedAffinity: true };
+    const headers = caller();
+    headers.set("session-id", "test-session");
+    headers.set("thread-id", "test-thread");
+    const options = { requestScopedMainCredential: true, primeCodexPoolQuotas: async () => {} };
+    const first = await resolveCodexAuthContext(headers, cfg, "pool", options);
+    const second = await resolveCodexAuthContext(headers, cfg, "pool", options);
+    expect(first.affinityDecision?.move).toBe("new_bind");
+    expect(second.affinityDecision?.move).toBe("reused");
+    const reserve = await resolveCodexAuthContext(headers, cfg, "pool", { ...reserveOptions, ...options });
+    expect(reserve.kind).toBe("main");
+    expect(reserve.affinityKey).toBeUndefined();
+    expect(reserve.affinityDecision).toBeUndefined();
+    const { getThreadAffinity } = await import("../../src/codex/routing/thread-affinity");
+    expect(getThreadAffinity(first.affinityKey!, "reserve")).toBeUndefined();
+  });
   test("unqualified Reserve pins stored main, requires capability WHAM, and carries private proof", async () => {
     const cfg = config();
     const ctx = await resolveCodexAuthContext(new Headers(), cfg, "direct", reserveOptions);

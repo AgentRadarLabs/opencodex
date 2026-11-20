@@ -1,9 +1,21 @@
+import type { VendorContextInference } from "./vendor-context";
+import type { MultiAgentMode } from "../../types/multi-agent";
+export type { MultiAgentMode } from "../../types/multi-agent";
+import { retainedNativeInheritanceTemplate } from "./native-template";
+export { findSupportedNativeTemplate } from "./native-template";
+import { isCodexControlPlaneModel } from "../control-plane-models";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
-import { atomicWriteFile, expandUserPath, getConfigDir, loadConfig, ultraFastTierEnabled, websocketsEnabled } from "../../config";
-import { CODEX_CONFIG_PATH, CODEX_MODELS_CACHE_PATH, DEFAULT_CATALOG_PATH, readRootTomlString, resolveCodexConfigPath } from "../paths";
+import { atomicWriteFile, getConfigDir, loadConfig, ultraFastTierEnabled, websocketsEnabled } from "../../config";
+import {
+  activeCodexConfigPath,
+  activeCodexModelsCachePath,
+  isDefaultCatalogPath,
+  readCodexCatalogPath,
+  readRootTomlString,
+} from "../paths";
 import { clearModelCache, DEFAULT_MODEL_CACHE_TTL_MS, getFreshCached, getStaleCached, isModelsFetchCoolingDown, markModelsFetchFailure, setCached } from "../model-cache";
 import { buildModelsRequest, resolveModelsAuthToken } from "../../oauth";
 import type { OcxConfig, OcxProviderConfig } from "../../types";
@@ -31,11 +43,13 @@ import { redactSecretString } from "../../lib/redact";
 import upstreamModelsSnapshot from "../data/upstream-models.json";
 
 
-import { NATIVE_OPENAI_CONTEXT_OVERRIDES, SUPPORTED_NATIVE_OPENAI_SLUGS, UPSTREAM_NATIVE_ENTRIES, hasNativeOpenAiCapabilityMetadata, nativeMultiAgentVersion, nativeOpenAiAutoCompactTokenLimit, nativeOpenAiContextWindow, nativeOpenAiMaxInputTokens, type NativeContextLimitsInput } from "./metadata";
+import { NATIVE_OPENAI_CONTEXT_OVERRIDES, SUPPORTED_NATIVE_OPENAI_SLUGS, UPSTREAM_NATIVE_ENTRIES, hasNativeOpenAiCapabilityMetadata, nativeMultiAgentVersion, nativeOpenAiAutoCompactTokenLimit, nativeOpenAiConfiguredContextLimit, nativeOpenAiContextWindow, nativeOpenAiMaxInputTokens, type NativeContextLimitsInput } from "./metadata";
 import { clampAutoCompactTokenLimit } from "../../providers/auto-compact-budget";
 import { trustedAccountBoundNativeCatalogSlug } from "./account-models";
 import { CODEX_NATIVE_ALIAS_CATALOG_KIND } from "./kinds";
+import { hasComboRoutedOriginMarker, hasOcxRoutedAuthorship } from "./ownership";
 import { NATIVE_GPT6_ASTRA_MODEL } from "./native-models";
+import { recordOwnedConfigPath } from "../../lib/config-ownership";
 
 export function legacyCatalogBackupPath(): string {
   return join(getConfigDir(), "catalog-backup.json");
@@ -47,46 +61,22 @@ export function catalogBackupPathFor(catalogPath: string): string {
   return join(getConfigDir(), `catalog-backup-${id}.json`);
 }
 
-export function samePath(a: string, b: string): boolean {
-  const left = resolve(a);
-  const right = resolve(b);
-  return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
-}
-
-export function activeCodexHome(): string | null {
-  const raw = process.env.CODEX_HOME?.trim();
-  if (!raw) return null;
-  const path = resolve(expandUserPath(raw));
-  try {
-    return realpathSync.native(path);
-  } catch {
-    return path;
-  }
-}
-
-export function activeCodexConfigPath(): string {
-  const home = activeCodexHome();
-  return home ? join(home, "config.toml") : CODEX_CONFIG_PATH;
-}
-
-export function activeDefaultCatalogPath(): string {
-  const home = activeCodexHome();
-  return home ? join(home, "opencodex-catalog.json") : DEFAULT_CATALOG_PATH;
-}
-
-export function activeCodexModelsCachePath(): string {
-  const home = activeCodexHome();
-  return home ? join(home, "models_cache.json") : CODEX_MODELS_CACHE_PATH;
-}
-
-export function resolveActiveCodexConfigPath(path: string): string {
-  const home = activeCodexHome();
-  return home ? resolve(home, path) : resolveCodexConfigPath(path);
-}
-
-export function isDefaultCatalogPath(path: string): boolean {
-  return samePath(path, activeDefaultCatalogPath());
-}
+/**
+ * Active-home path resolution now lives in `../paths`, next to the constants it
+ * falls back to. It is re-exported here so existing importers keep working; new
+ * code that only needs a path should import from `../paths` directly.
+ */
+export {
+  samePath,
+  activeCodexHome,
+  activeCodexConfigPath,
+  activeDefaultCatalogPath,
+  activeCodexModelsCachePath,
+  resolveActiveCodexConfigPath,
+  isDefaultCatalogPath,
+  readCodexCatalogPath,
+  readCodexCatalogPathForHome,
+} from "../paths";
 
 /** Stable nonsemantic ownership marker for rows projected from config.customModels. */
 export const CODEX_CUSTOM_MODEL_CATALOG_KIND = "custom-model-v1";
@@ -110,10 +100,26 @@ export interface CatalogModel {
    * which carries no CatalogModel, so a configured displayName can never override a native name.
    */
   displayName?: string;
+  /**
+   * Display-only Codex catalog `description` override, honored for combo rows only (#7229).
+   * Unset keeps the generated "Routed via opencodex → …" text; a set value stamps the row with
+   * the ownership marker in ./ownership so removal and template selection still recognize it.
+   */
+  description?: string;
   owned_by?: string;
   reasoningEfforts?: string[];
+  supportsReasoning?: boolean;
+  supportsThinkingToggle?: boolean;
+  supportsReasoningEffort?: boolean;
+  defaultThinkingEnabled?: boolean;
+  /** Exact CCA family evidence, retained through the in-memory discovery cache. */
+  antigravityEffortWireModelIds?: Partial<Record<"low" | "medium" | "high", string>>;
+  /** Suppress only catalog synthesis of a missing max rung; provider-declared max survives. */
+  suppressSyntheticMax?: boolean;
   defaultReasoningEffort?: string;
   contextWindow?: number;
+  /** Bundled fallback only; never a serving-provider capability assertion. */
+  contextWindowInference?: VendorContextInference;
   maxInputTokens?: number;
   /** Model-scoped output-token ceiling; omitted when no authoritative value is known. */
   maxOutputTokens?: number;
@@ -133,6 +139,10 @@ export interface CatalogModel {
   supportsVerbosity?: boolean;
   /** Whether this exact routed model has a verified OpenAI-compatible service tier. */
   supportsServiceTier?: boolean;
+  /** Captured eligible service-tier wire explicitly maps ultrafast to ultrafast. */
+  supportsUltraFastTier?: boolean;
+  /** Explicitly verified exact Flex wire and foreign caller-tier forwarding on this route. */
+  supportsFlexTier?: boolean;
   /** Optional provider-specific copy for the advertised Fast tier. */
   fastTierDescription?: string;
   supportsReasoningSummaries?: boolean;
@@ -144,6 +154,29 @@ export interface CatalogModel {
   codexToolMode?: "code_mode_only" | "shell";
   /** Normalized upstream capability names retained for management/API consumers (#485 follow-up). */
   capabilities?: string[];
+  /**
+   * This row is listed but cannot currently serve a request (#1711). Today the only value is
+   * "no_credit", set when every usable target has positive quota-exhaustion evidence.
+   *
+   * It is NOT visibility. The row stays `visibility: "list"` on purpose: the issue explicitly
+   * rejects hiding, and Codex Desktop only understands "list" and "hide" anyway, so hiding would
+   * be the one outcome the reporter asked not to have. An OpenCodex-aware consumer greys the
+   * entry; the native picker ignores the field, which is the honest limit of what a custom
+   * catalog field can do.
+   */
+  quotaInactiveReason?: "no_credit";
+  /**
+   * Discovered per-token cost class for this routed model (#3666). "free" means the provider's
+   * own /models row reported a numeric zero for BOTH the prompt and the completion rate;
+   * "paid" means at least one rate is above zero. ABSENT means unknown — the provider published
+   * no usable pair, or this row never came from a models API at all.
+   *
+   * Fail closed: a partial, non-numeric, or negative rate leaves the field absent, never "free",
+   * because showing a paid model under a Free filter costs the user money while hiding a free
+   * one costs a click. This is a management/Dashboard projection only — deriveEntry never
+   * serializes it into the Codex catalog, and it never affects routing or visibility.
+   */
+  pricingStatus?: "free" | "paid";
   /** OpenCodex-only catalog ownership marker; Codex ignores the serialized extension field. */
   catalogKind?: typeof CODEX_CUSTOM_MODEL_CATALOG_KIND | typeof CODEX_PROVIDER_MODEL_CATALOG_KIND;
 }
@@ -160,6 +193,21 @@ export const ROUTED_MODEL_COMPATIBILITY_EXCLUSIONS = new Set([
   // Issue #2330: OpenCode Go models absent from current documentation or returning terminal HTTP 400 errors.
   "opencode-go/mimo-v2-omni",
   "opencode-go/mimo-v2-pro",
+  /*
+   * These third-party exclusions originated in the superseded V4 Pro retirement plan.
+   * First-party service continues (api-docs.deepseek.com/updates/); these gateway routes
+   * remain excluded pending provider-specific verification. Live discovery can reintroduce
+   * a model removed from a static registry, so these exclusions act on the routed catalog.
+   */
+  "opencode-go/deepseek-v4-pro",
+  "command-code/deepseek-deepseek-v4-pro",
+  "commandcode/deepseek-deepseek-v4-pro",
+  "orcarouter/deepseek-deepseek-v4-pro",
+  "cline-pass/cline-pass-deepseek-v4-pro",
+  "baseten/deepseek-ai-DeepSeek-V4-Pro",
+  "digitalocean/deepseek-v4-pro",
+  "qoder/DeepSeek-V4-Pro",
+  "codebuddy/deepseek-v4-pro",
 ]);
 
 export function isRoutedModelCompatibilityExcluded(slug: string): boolean {
@@ -201,33 +249,6 @@ export function shouldExposeRoutedModel(model: CatalogModel): boolean {
   return !isMediaGenerationModelId(model.id);
 }
 
-export function readCodexCatalogPath(): string {
-  const home = activeCodexHome();
-  if (home) return readCodexCatalogPathForHome(home);
-  try {
-    const configPath = activeCodexConfigPath();
-    if (existsSync(configPath)) {
-      const toml = readFileSync(configPath, "utf-8");
-      const path = readRootTomlString(toml, "model_catalog_json");
-      if (path) return resolveActiveCodexConfigPath(path);
-    }
-  } catch { /* ignore */ }
-  return activeDefaultCatalogPath();
-}
-
-/** Resolve the configured catalog without consulting ambient CODEX_HOME again. */
-export function readCodexCatalogPathForHome(codexHome: string): string {
-  try {
-    const configPath = join(codexHome, "config.toml");
-    if (existsSync(configPath)) {
-      const toml = readFileSync(configPath, "utf-8");
-      const path = readRootTomlString(toml, "model_catalog_json");
-      if (path) return resolve(codexHome, path);
-    }
-  } catch { /* ignore */ }
-  return join(codexHome, "opencodex-catalog.json");
-}
-
 /**
  * Read the configured auto-review model from the root of Codex's config.toml (issue #1225).
  * Stamped onto catalog entries as `auto_review_model_override` during sync so the auto-review
@@ -239,6 +260,30 @@ export function readConfiguredAutoReviewModel(): string | null {
     if (existsSync(configPath)) {
       const toml = readFileSync(configPath, "utf-8");
       return readRootTomlString(toml, "auto_review_model");
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+/**
+ * Read the root `model` pin from Codex's config.toml (issue #4646).
+ *
+ * Codex starts every new session on this id, and nothing in opencodex checks that the id is one
+ * the proxy actually exposes: the pin lives in Codex's config, while exposure is decided here by
+ * `disabledModels`, provider `selectedModels`, and account entitlements. When the two disagree
+ * every turn fails and no surface says why, which is what the `ocx doctor` section added for
+ * #4646 reports.
+ *
+ * Read-only, and deliberately the same shape and the same swallow-and-return-null error policy as
+ * `readConfiguredAutoReviewModel` above: a diagnostic must degrade to "unknown" on an unreadable
+ * or absent config rather than throw out of the surface that called it.
+ */
+export function readConfiguredDefaultModel(): string | null {
+  try {
+    const configPath = activeCodexConfigPath();
+    if (existsSync(configPath)) {
+      const toml = readFileSync(configPath, "utf-8");
+      return readRootTomlString(toml, "model");
     }
   } catch { /* ignore */ }
   return null;
@@ -265,46 +310,9 @@ export function findNativeTemplate(catalog: RawCatalog | null): RawEntry | null 
       && "base_instructions" in m
       && m.opencodex_catalog_kind !== CODEX_NATIVE_ALIAS_CATALOG_KIND
       && m.owned_by !== COMBO_NAMESPACE
-      && !(typeof m.description === "string" && m.description.startsWith("Routed via opencodex → ")),
-  ) ?? null;
+      && !hasOcxRoutedAuthorship(m),
+  ) ?? retainedNativeInheritanceTemplate(catalog);
 }
-
-/**
- * Template selection, as opposed to catalog VALIDITY.
- *
- * `findNativeTemplate` answers "does this look like a real catalog?" and must stay
- * permissive: four call sites use it as a validity gate, and a catalog holding only a
- * newly launched native model has to keep passing or sync falls back to stale data.
- *
- * This answers a different question — "which row should every routed model inherit
- * from?" — and must be strict. `deriveEntry` deep-clones the chosen row, so an unknown
- * bare row carrying `base_instructions` would become the template for every routed
- * model and hand them its native eligibility metadata. #2813 is the report that made
- * that concrete: a Reserve-shaped row injected by the client is exactly such a row.
- *
- * Returning null is safe and expected; `deriveEntry` falls back to a conservative
- * synthetic template.
- */
-export function findSupportedNativeTemplate(catalog: RawCatalog | null): RawEntry | null {
-  return catalog?.models?.find(
-    m => typeof m.slug === "string"
-      && SUPPORTED_NATIVE_OPENAI_SLUGS.has(m.slug)
-      && !m.slug.includes("/")
-      && "base_instructions" in m
-      && m.opencodex_catalog_kind !== CODEX_NATIVE_ALIAS_CATALOG_KIND
-      && m.owned_by !== COMBO_NAMESPACE
-      && !(typeof m.description === "string" && m.description.startsWith("Routed via opencodex → ")),
-  ) ?? null;
-}
-
-/**
- * Native OpenAI slugs that do NOT support the Fast (priority) service tier.
- * Upstream may advertise service_tiers for these models, but the tier is not
- * actually available — strip it so the Codex UI does not offer a dead toggle.
- */
-const NO_FAST_TIER_NATIVE_SLUGS = new Set([
-  "gpt-5.3-codex-spark",
-]);
 
 /** Does this row already carry an `ultrafast` tier the operator put there themselves? */
 /**
@@ -398,14 +406,6 @@ export function normalizeServiceTiers(entry: RawEntry): RawEntry {
         ? { ...tier, description: "2x speed, increased usage" } : tier,
     );
   }
-  // Strip service tiers for models that do not actually support the Fast tier.
-  if (typeof entry.slug === "string" && NO_FAST_TIER_NATIVE_SLUGS.has(entry.slug)) {
-    delete entry.service_tier;
-    delete entry.service_tiers;
-    delete entry.default_service_tier;
-    delete entry.additional_speed_tiers;
-    return entry;
-  }
   // Codex stores the user-facing config spelling as "fast", but the catalog/request
   // service tier id is "priority" in current codex-rs. Keep legacy catalogs working.
   if (entry.service_tier === "fast") entry.service_tier = "priority";
@@ -439,7 +439,7 @@ export function isNativeOpenAiEntry(entry: RawEntry): boolean {
  * Narrow any already-resolved native window by the user levers.
  *
  * Used for the fields the accessors do not own (`max_context_window`, and preserved rows
- * that carry no static override) so every field on a row lands at the same width.
+ * that carry no static override). The advertised maximum may exceed the default window.
  */
 function narrowNativeMaxContextWindow(
   slug: string,
@@ -447,12 +447,7 @@ function narrowNativeMaxContextWindow(
   limits?: NativeContextLimitsInput,
 ): number | undefined {
   if (typeof value !== "number" || value <= 0) return value;
-  const resolved = nativeOpenAiContextWindow(slug, limits);
-  const authoritative = nativeOpenAiContextWindow(slug);
-  // The accessor pair tells us how far the levers moved this slug; apply the same delta to a
-  // field the accessor does not model, without ever raising it.
-  if (resolved === undefined || authoritative === undefined) return value;
-  return Math.min(value, Math.max(resolved, 1));
+  return applyProviderContextCap(value, nativeOpenAiConfiguredContextLimit(slug, limits));
 }
 
 export function applyNativeOpenAiContextOverride(entry: RawEntry, limits?: NativeContextLimitsInput): void {
@@ -477,8 +472,8 @@ export function applyNativeOpenAiContextOverride(entry: RawEntry, limits?: Nativ
     }
   }
   // providerContextCaps.openai is a ceiling for native OpenAI rows regardless of where the
-  // advertised window came from (#1430): preserved rows without a hardcoded override (e.g.
-  // gpt-5.4-mini) must stay under the cap too, and auto-compaction follows the capped window.
+  // advertised window came from (#1430): preserved rows without a hardcoded override
+  // must stay under the cap too, and auto-compaction follows the capped window.
   // The per-model window narrows the same rows for the same reason.
   const currentContext = typeof entry.context_window === "number" ? entry.context_window : undefined;
   const cappedContext = narrowNativeMaxContextWindow(nativeSlug, currentContext, limits);
@@ -523,9 +518,10 @@ export function applyNativeOpenAiContextOverride(entry: RawEntry, limits?: Nativ
   }
 }
 
+/** Normalize a row for Codex's catalog parser, stripping native eligibility from routed rows unless explicitly preserved. */
 export function ensureStrictCatalogFields(
   entry: RawEntry,
-  options: { preserveExactInputModalities?: boolean; isRouted?: boolean } = {},
+  options: { preserveExactInputModalities?: boolean; isRouted?: boolean; preserveNativeAccessPrograms?: boolean } = {},
 ): RawEntry {
   if (entry.shell_type === "default" || entry.shell_type === "local" || entry.shell_type === "shell_command") {
     entry.shell_type = "unified_exec";
@@ -568,14 +564,18 @@ export function ensureStrictCatalogFields(
   if (
     typeof entry.max_context_window !== "number"
     || entry.max_context_window <= 0
-    || ((options.isRouted === true || !isNativeOpenAiEntry(entry)) && entry.max_context_window > contextWindow)
+    || ((options.isRouted === true || (!isNativeOpenAiEntry(entry)
+      && trustedAccountBoundNativeCatalogSlug(entry) === undefined)) && entry.max_context_window > contextWindow)
   ) {
     entry.max_context_window = contextWindow;
   }
   if (typeof entry.effective_context_window_percent !== "number") entry.effective_context_window_percent = 95;
-  if (typeof entry.comp_hash !== "string") entry.comp_hash = "opencodex";
+  // Unknown compatibility is not an incompatibility marker. Codex compares hashes only
+  // when both turns supply one; a synthetic value forces native/routed switches to compact
+  // even below the token limit. Keep authoritative strings and represent unknown as null.
+  if (typeof entry.comp_hash !== "string") entry.comp_hash = null;
   // Routed rows must not carry NATIVE eligibility metadata. `deriveEntry` deep-clones a
-  // native template and deletes a fixed denylist, so these five survive onto rows backed
+  // native template and deletes a fixed denylist, so these eligibility fields survive onto rows backed
   // by unrelated provider credentials — advertising ChatGPT plan eligibility for a model
   // that never touches a ChatGPT account (#2813).
   //
@@ -585,6 +585,9 @@ export function ensureStrictCatalogFields(
   // leave already-contaminated rows contaminated forever.
   if (options.isRouted === true) {
     entry.supported_in_api = true;
+    // Exact Codex-forward aliases still use a ChatGPT credential and may retain their native
+    // source metadata. Other routed rows cannot claim that account's access programs.
+    if (!options.preserveNativeAccessPrograms) delete entry.available_access_programs;
     delete entry.available_in_plans;
     delete entry.minimal_client_version;
     delete entry.availability_nux;
@@ -592,8 +595,6 @@ export function ensureStrictCatalogFields(
   }
   return ensureAutoCompactTokenLimit(entry);
 }
-
-export type MultiAgentMode = "v1" | "default" | "v2";
 
 export interface MultiAgentModeOptions {
   /** Caller-owned source metadata already defines the default for these projected rows. */
@@ -604,6 +605,14 @@ export interface MultiAgentModeOptions {
    * so they can still spawn Grok/Claude — ChatGPT encrypts v2 NEW_TASK bodies.
    */
   keepNativeChatGptOnV1?: boolean;
+  /**
+   * Pristine installed-catalog pins keyed by bare native slug. When provided, the
+   * backup — not the bundled snapshot — is authoritative for the rows it contains,
+   * and a preserved live/native row outside it keeps the pin it already carries:
+   * an absent baseline entry cannot distinguish a stale forced stamp from a
+   * legitimate user- or provider-preserved pin, so the non-destructive read wins.
+   */
+  nativeDefaults?: ReadonlyMap<string, string | null>;
 }
 
 /** Catalog rows that run on the ChatGPT backend (encrypt v2 child tasks). */
@@ -624,7 +633,7 @@ export function catalogEntryIsNativeChatGpt(entry: RawEntry): boolean {
     && entry.use_responses_lite === true
     && hasNativeOpenAiCapabilityMetadata(routedNativeSlug)
   ) return true;
-  if (UPSTREAM_NATIVE_ENTRIES.has(slug) || SUPPORTED_NATIVE_OPENAI_SLUGS.has(slug)) return true;
+  if (isCodexControlPlaneModel(slug) || UPSTREAM_NATIVE_ENTRIES.has(slug) || SUPPORTED_NATIVE_OPENAI_SLUGS.has(slug)) return true;
   return false;
 }
 
@@ -656,6 +665,9 @@ export function applyRoutedCodexToolMode(
  * `keepNativeChatGptOnV1` only applies when `mode === "v2"`. It leaves Sol/Terra
  * (and other ChatGPT-native rows) on v1 so a native parent can still spawn a
  * routed child. See issue #92.
+ *
+ * `"v2-plaintext"` stamps every row v2, ChatGPT-native rows included -- the mode is
+ * the plaintext-delivery opt-in, so no native/routed split applies.
  */
 export function applyMultiAgentMode(
   entries: RawEntry[],
@@ -665,6 +677,7 @@ export function applyMultiAgentMode(
 ): RawEntry[] {
   if (mode === "v2" && options.keepNativeChatGptOnV1 === true) {
     for (const entry of entries) {
+      recordMultiAgentOrigin(entry);
       entry.multi_agent_version = catalogEntryIsNativeChatGpt(entry) ? "v1" : "v2";
     }
     return entries;
@@ -673,6 +686,9 @@ export function applyMultiAgentMode(
     // Restore upstream defaults: clear any stale forced multi_agent_version and
     // re-apply upstream pins from the snapshot for native entries that have one.
     for (const entry of entries) {
+      // A forced mode recorded what this row carried before it was overwritten; returning
+      // to default consumes that record whichever branch below decides the row.
+      const origin = takeMultiAgentOrigin(entry);
       if (options.preserveDefaultMultiAgentVersion?.(entry)) continue;
       const slug = typeof entry.slug === "string" ? entry.slug : "";
       const nativeAlias = entry.opencodex_catalog_kind === CODEX_NATIVE_ALIAS_CATALOG_KIND;
@@ -684,13 +700,44 @@ export function applyMultiAgentMode(
         && hasNativeOpenAiCapabilityMetadata(routedNativeSlug)
         ? routedNativeSlug
         : undefined;
+      const accountBoundNativeSlug = trustedAccountBoundNativeCatalogSlug(entry);
+      const nativeLookupSlug = accountBoundNativeSlug ?? slug;
+      // The baseline is built from bare native slugs only, so "absent from the
+      // baseline" is not evidence about a routed row — it is guaranteed. Only a
+      // native row can carry a pin the baseline legitimately failed to mention;
+      // a routed row keeps the documented default-mode normalization.
+      const isNativeCatalogEntry = accountBoundNativeSlug !== undefined || !slug.includes("/");
+      const hasNativeDefault = !nativeAlias
+        && codexForwardCapabilityAlias === undefined
+        && options.nativeDefaults?.has(nativeLookupSlug) === true;
       const upstreamPin = nativeAlias
         ? nativeMultiAgentVersion(slug)
         : codexForwardCapabilityAlias
           ? nativeMultiAgentVersion(codexForwardCapabilityAlias)
-          : UPSTREAM_NATIVE_ENTRIES.get(trustedAccountBoundNativeCatalogSlug(entry) ?? slug)?.multi_agent_version;
+          : hasNativeDefault
+            ? options.nativeDefaults?.get(nativeLookupSlug)
+            : options.nativeDefaults === undefined
+              ? UPSTREAM_NATIVE_ENTRIES.get(nativeLookupSlug)?.multi_agent_version
+              : undefined;
       if (typeof upstreamPin === "string") {
         entry.multi_agent_version = upstreamPin;
+      } else if (options.nativeDefaults !== undefined
+        && !nativeAlias
+        && codexForwardCapabilityAlias === undefined
+        && isNativeCatalogEntry
+        && !hasNativeDefault
+        && typeof entry.multi_agent_version === "string") {
+        // The baseline predates this native row, so it cannot say whether the live pin
+        // is genuine. With a recorded origin it no longer has to guess: restore what the
+        // row carried before the first forced mode (issue 5636). A row without a record
+        // (older catalogs) keeps the non-destructive read.
+        if (origin === undefined) continue;
+        if (typeof origin === "string") {
+          entry.multi_agent_version = origin;
+          continue;
+        }
+        if (v2FeatureEnabled) entry.multi_agent_version = "v2";
+        else delete entry.multi_agent_version;
       } else if (v2FeatureEnabled) {
         entry.multi_agent_version = "v2";
       } else {
@@ -699,10 +746,35 @@ export function applyMultiAgentMode(
     }
     return entries;
   }
+  const forcedVersion = mode === "v2-plaintext" ? "v2" : mode;
   for (const entry of entries) {
-    entry.multi_agent_version = mode;
+    recordMultiAgentOrigin(entry);
+    entry.multi_agent_version = forcedVersion;
   }
   return entries;
+}
+
+/**
+ * Provenance for a forced multi-agent stamp: the value the row carried before the first
+ * forced v1/v2 pass, or null when it carried none. Repeated forced passes never replace it,
+ * so a v1 -> v2 -> default round trip still restores the original. Codex ignores unknown
+ * catalog fields, as it does opencodex_catalog_kind.
+ */
+export const MULTI_AGENT_ORIGIN_FIELD = "opencodex_multi_agent_version_origin";
+
+function recordMultiAgentOrigin(entry: RawEntry): void {
+  if (Object.hasOwn(entry, MULTI_AGENT_ORIGIN_FIELD)) return;
+  (entry as Record<string, unknown>)[MULTI_AGENT_ORIGIN_FIELD] = typeof entry.multi_agent_version === "string"
+    ? entry.multi_agent_version
+    : null;
+}
+
+/** Remove and return the recorded origin: a string pin, null for "no pin", undefined when unrecorded. */
+function takeMultiAgentOrigin(entry: RawEntry): string | null | undefined {
+  if (!Object.hasOwn(entry, MULTI_AGENT_ORIGIN_FIELD)) return undefined;
+  const raw = (entry as Record<string, unknown>)[MULTI_AGENT_ORIGIN_FIELD];
+  delete (entry as Record<string, unknown>)[MULTI_AGENT_ORIGIN_FIELD];
+  return typeof raw === "string" ? raw : raw === null ? null : undefined;
 }
 
 export function normalizeRoutedCatalogEntry(
@@ -717,7 +789,18 @@ export function normalizeRoutedCatalogEntry(
   delete entry.multi_agent_version;
   delete entry.multi_agent_reasoning_effort;
   delete entry.use_responses_lite;
+  // Codex 0.164 sends positional `configuration_update` effort items only for rows declaring this
+  // and freezes the request-level effort for the context window. A routed provider never
+  // negotiated that contract, so a row cloned from a GPT-6 template must not inherit it.
+  delete entry.supports_reasoning_effort_updates;
   delete entry.supports_websockets;
+  // Routed rows cloned from native templates must not inherit OpenAI-only experimental context
+  // delivery. Codex reads the flag as "this model accepts experimental context history" and drives
+  // its context-management cadence from it, so a third-party provider that never negotiated it gets
+  // a compact-after-every-step loop instead (observed on a routed DeepSeek row: 1,600+ compactions
+  // in a single thread). Nothing re-applies the field from provider metadata during this step, so
+  // the row leaves this normalization without it.
+  delete entry.supports_experimental_context;
   /*
    * Tier metadata is stripped from routed rows because a row cloned from a native template
    * would otherwise hand a third-party provider OpenAI's tiers.
@@ -833,18 +916,23 @@ export function readCatalogBackup(catalogPath: string): RawCatalog | null {
 
 export function catalogHasRoutedEntries(catalog: RawCatalog | null): boolean {
   return (catalog?.models ?? []).some(m => typeof m.slug === "string"
-    && (m.slug.includes("/") || m.opencodex_catalog_kind === CODEX_NATIVE_ALIAS_CATALOG_KIND));
+    && (m.slug.includes("/")
+      || m.opencodex_catalog_kind === CODEX_NATIVE_ALIAS_CATALOG_KIND
+      || hasComboRoutedOriginMarker(m)));
 }
 
 export function writePristineCatalogBackup(backupPath: string, catalogPath: string, catalog: RawCatalog): void {
+  // An existing name is not evidence of ownership; keep pre-ledger/user backups unclaimed.
   if (existsSync(backupPath)) return;
   const onDisk = readCatalog(catalogPath);
   if (onDisk && !catalogHasRoutedEntries(onDisk)) {
     copyFileSync(catalogPath, backupPath);
+    recordOwnedConfigPath(getConfigDir(), backupPath);
     return;
   }
   if (!catalogHasRoutedEntries(catalog)) {
     atomicWriteFile(backupPath, JSON.stringify(catalog, null, 2) + "\n");
+    recordOwnedConfigPath(getConfigDir(), backupPath);
   }
 }
 
@@ -862,6 +950,22 @@ export function readNativeBaseline(catalogPath: string): Map<string, number> {
     if (typeof e.slug === "string" && !e.slug.includes("/") && typeof e.priority === "number") {
       out.set(e.slug, e.priority);
     }
+  }
+  return out;
+}
+
+/**
+ * Extract the pristine baseline's per-slug multi-agent pins. A bare native row that
+ * carried no pin maps to null so "baseline says unpinned" stays distinguishable
+ * from "baseline never contained this row".
+ */
+export function nativeMultiAgentDefaults(
+  models: readonly Readonly<Record<string, unknown>>[] | null | undefined,
+): Map<string, string | null> {
+  const out = new Map<string, string | null>();
+  for (const entry of models ?? []) {
+    if (typeof entry.slug !== "string" || entry.slug.includes("/")) continue;
+    out.set(entry.slug, typeof entry.multi_agent_version === "string" ? entry.multi_agent_version : null);
   }
   return out;
 }

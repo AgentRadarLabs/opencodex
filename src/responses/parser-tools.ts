@@ -16,6 +16,7 @@ export function mapToolChoice(value: unknown): OcxRequestOptions["toolChoice"] {
     if (t === "image_generation" || t === "image_gen") {
       return { name: IMAGE_GEN_TOOL_NAME };
     }
+    if (t === "tool_search") return { name: "tool_search" };
     if (t === "allowed_tools" && Array.isArray(value.tools)) {
       const names = value.tools
         .map(allowedToolName)
@@ -61,6 +62,9 @@ export function buildTools(tools: unknown[] | undefined): OcxTool[] | undefined 
       parameters: normalizeParameters(t.parameters),
     };
     if (t.strict !== undefined) tool.strict = t.strict as boolean;
+    if (Array.isArray(t.allowed_callers)) {
+      tool.allowedCallers = (t.allowed_callers as unknown[]).filter((c): c is string => typeof c === "string");
+    }
     if (namespace) tool.namespace = namespace;
     out.push(tool);
   };

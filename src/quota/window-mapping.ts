@@ -26,7 +26,8 @@ type ProviderLikeQuota = {
   weeklyResetAt?: number;
   monthlyPercent?: number;
   monthlyResetAt?: number;
-  customWindows?: ReadonlyArray<{ label: string; percent: number; resetAt?: number }>;
+  customWindows?: ReadonlyArray<{ label: string; percent: number; resetAt?: number; modelId?: string }>;
+  unknownBudgetWindows?: ReadonlyArray<{ label: string; resetAt?: number }>;
 };
 
 function window(
@@ -65,12 +66,15 @@ const NOMINAL_WINDOW_SECONDS: Readonly<Record<string, number>> = {
 };
 
 function customWindows(
-  entries: ReadonlyArray<{ label: string; percent: number; resetAt?: number }> | undefined,
+  entries: ReadonlyArray<{ label: string; percent: number; resetAt?: number; modelId?: string }> | undefined,
 ): QuotaWindowObservation[] {
   if (!entries) return [];
   const out: QuotaWindowObservation[] = [];
   for (const entry of entries) {
     if (typeof entry?.label !== "string") continue;
+    // Exact-model rows (Antigravity diagnostics) restate the pool their family window already
+    // reports. Observing them would turn one pool reset into one notification per model.
+    if (entry.modelId !== undefined) continue;
     const mapped = window(`custom:${entry.label}`, entry.percent, entry.resetAt);
     if (mapped) out.push(mapped);
   }

@@ -14,12 +14,19 @@ trafiğini yönetmenin en kısa yoludur.
 ocx gui
 ```
 
-Bu, gerekirse önce proxy'yi otomatik olarak başlatarak tarayıcınızda
-`http://localhost:<port>` adresini açar. Geliştirme sırasında GUI geliştirme
+Bu komut tarayıcınızda çalışan proxy'nin adresini açar: varsayılan olarak `http://127.0.0.1:<port>`,
+IPv6 loopback adresi `::1` için ise `http://[::1]:<port>`. Bu adresler, yerel tarayıcı eşleştirmesi için
+gereken yapılandırılmış origin'i korur. Hub'da yönetim ingress'i etkinse `http://127.0.0.1:<yönetim portu>`
+adresini açar. Gerekirse önce proxy otomatik olarak başlatılır. Geliştirme sırasında GUI geliştirme
 sunucusunu çalışan bir proxy'ye karşı ayrı olarak çalıştırabilirsiniz:
 
 ```bash
 ocx start
+```
+
+Proxy bu terminalde çalışmaya devam etsin. İkinci bir terminalde GUI geliştirme sunucusunu başlatın:
+
+```bash
 bun run dev:gui
 ```
 
@@ -39,6 +46,36 @@ yalnızca bellekte tutar ve `localStorage` veya `sessionStorage`'a yazmaz;
 kaydedilip kaydedilmeyeceği tamamen tarayıcının veya şifre yöneticisinin
 kararıdır.
 
+**Bu cihazı hatırla** varsayılan olarak kapalıdır. Doğrudan HTTPS panelinde (veya yerel loopback üzerinden) yönetici belirteci, sunucunun verdiği HttpOnly, SameSite=Strict cihaz çerezi ve bu sitenin localStorage alanında saklanan ayrı bir cihaz kanıtıyla değiştirilir. HTTPS çerezi Secure ve ana makineyle sınırlıdır. Çerez de kanıt da yönetici belirteci değildir; hiçbiri tek başına çalışmaz. Aynı ana makine adının portları çerezleri paylaşır; origin kapsamındaki kanıt, hatırlanan cihazı bu panelin origin’ine bağlar. Yine de ayrı bir ana makine adı tercih edin. Yönetici belirteci localStorage veya sessionStorage içine yazılmaz. Tarayıcı depolaması kullanılamıyorsa veya kanıt kaydedilemiyorsa Hatırla işlemi kullanılamadığını bildirir. TLS'i sonlandıran bir ters proxy arkasındaki bağımsız bir panelde OpenCodex düz bir HTTP isteği görür ve bu adres için Hatırla'yı reddeder; oturum açma penceresi bunu açıklar ve seçeneği kapatır, Hatırla olmadan oturum açmak çalışmaya devam eder. Güvenilen bir Hub yönetim dinleyicisi istisnadır ve cihazları hatırlamaya devam edebilir. İstisna: bağımsız modda `dashboardTrustedProxy` ayarı, hatırlamayı bu tek proxy üzerinden de mümkün kılar (tam HTTPS origin, proxy IP adresleri ve güvenilen başlıklar belirtilir; ayrıntılar için kılavuzun İngilizce sürümündeki "Remember behind a reverse proxy" bölümüne bakın).
+
+Özel dashboard-sessions.json çerezin, kanıtın, yönetici kimlik bilgisinin ve tarayıcı kimliğinin özetlerini, sunucu origin’ini ve sabit 30 günlük süreyi saklar. Safari ana ekran uygulaması yeniden açılınca geçerli cihaz kaydı kısa bir oturumu yeniler. Hatırlanan oturumlar onay gerektiren işlemleri yetkilendiremez: GitHub yıldızı, sıfırlama kredisi tüketimi, istem katmanı düzenlemeleri, Meta Muse girişi, masaüstü uyumluluk değişiklikleri veya kota doğrulaması. Bunlar için yeni bir yerel veya eşleştirilmiş oturum kullanın. Relay, başka origin ve uzak düz HTTP Hatırla seçeneğini desteklemez. Süre dolması, tarayıcı kimliği değişmesi veya belirtecin değiştirilip sunucunun yeniden başlatılması yeniden giriş gerektirir.
+
+Kenar çubuğu veya mobil işlemlerde başarılı **Bu cihazı unut** ya da başarılı çıkış, kaydı ve türetilen tüm oturumları hemen iptal eder ve tarayıcı kanıtını siler. Başarısız çıkışta yeniden deneme için kanıt korunur. Sunucu değişikliği yayımlamadan önce kayıt içeriğini diske eşitler; çökme sonrası dizin girdisinin kalıcılığı mümkün olduğunca sağlanır. Eski belirteç anahtarları okunmadan veya taşınmadan silinir. Yalnızca güvenilir cihazda kullanın; Safari AutoFill özelliğini geri getirmez.
+
+## Kota özeti çubuğu
+
+Başlangıç güvenliği sayfası dışındaki her sayfanın üst kısmındaki tek satırlık özet, her
+sağlayıcının geçerli kota kullanımını gösterir; örneğin
+`OpenAI 31% | Claude 54% | xAI 12% | Google 8%`. Sağlayıcı çalışma alanıyla aynı kota
+raporlarını okur (`GET /api/provider-quotas`, sekme görünürken 60 saniyede bir) ve hiçbir
+zaman yukarı akışta yenilemeye zorlamaz.
+
+- Her etiket, bildirilen pencereler arasında tercih edileni gösterir: önce haftalık, sonra
+  aylık, sonra 5 saatlik, sonra sağlayıcı adlı bir pencere veya ön ödemeli krediler.
+- Ön ödemeli kredilerin en az %90'ı kullanılmışsa ve tercih edilen normal pencere kritik
+  değilse etikette krediler gösterilir. Normal pencere de kritikse önceliğini korur.
+- Etiket %70 kullanımda amber rengine, %90 kullanımda kırmızıya döner.
+- Bildirilen tüm pencereleri sıfırlama saati ve okuma zamanıyla görmek için etiketin
+  üzerine gelin veya klavyeyle odaklayın. Dokunmatik ekranda ilk dokunuş bu ayrıntıları gösterir.
+- Etikete tıklamak (dokunmatik ekranda ikinci dokunuş) Sağlayıcılar'da o sağlayıcının Hesaplar
+  sekmesini açar; hesaplar veya API anahtarları orada yönetilir.
+- Çubuk her zaman tek satırdır. Etiketler sığmadığında yatay kaydırın veya iki uçtaki « ve »
+  düğmelerini kullanın.
+- Kota penceresi bildirmeyen sağlayıcılar gösterilmez. Hiçbir sağlayıcı bildirmiyorsa
+  çubuk gizlenir.
+- Sağ kenar, kontrol panelinin raporları en son ne zaman okuduğunu gösterir. Son okuma
+  başarısız olduğunda ve önceki değer hâlâ gösterildiğinde amber renge döner.
+
 ## Neler yapabilirsiniz
 
 | Alan | Ne yapar |
@@ -46,19 +83,40 @@ kararıdır.
 | **Kontrol paneli özeti** | Çoklu ajan modu, çevrimiçi durum, sürüm, çalışma süresi, sağlayıcı sayısı, 30 günlük token toplamı, aktif sağlayıcılar ve kullanılabilir yerel/yönlendirilen modeller. |
 | **Alt ajan yetkilendirmesi** | OpenCodex yetkilendirme rehberliği ve ayrı yerel varsayılan katılımı tarafından paylaşılan yerel veya yönlendirilen bir model ve isteğe bağlı akıl yürütme çabası seçin. Bu, proxy tarafında spawn başına bir yönlendirici değildir; aşağıya bakın. |
 | **Sidecar'lar** | Web arama modelini ve çabasını artı vizyon açıklama modelini seçin. Değişiklikler bir sonraki istekte geçerli olur. |
-| **Bakım** | Codex model kataloğunu yeniden senkronize edin, projeye özel yapılandırma atlama uyarılarını inceleyin, en son veya önizleme sürümünü kontrol edin ve isteğe bağlı proxy yeniden başlatmasıyla bir güncelleme çalıştırın. |
+| **Bakım** | Codex model kataloğunu yeniden senkronize edin, projeye özel yapılandırma atlama uyarılarını inceleyin, en son veya önizleme sürümünü kontrol edin ve isteğe bağlı proxy yeniden başlatmasıyla bir güncelleme çalıştırın. Masaüstü kabuğunda güncelleme öğesi, paket güncelleyicisini çalıştırmak yerine yerel uygulama güncelleme sayfasını açar. |
 | **Başlangıç güvenliği** | Ayrı servis ve başlatıcı dolgu sağlığı artı tam onarım komutlarıyla enjekte edilen Codex yönlendirmesinin yeniden başlatmada hayatta kalıp kalmadığını gösterin. |
 | **Windows sistem tepsisi** | Tek tıklamayla proxy başlatma, durdurma, yeniden başlatma, kontrol paneli erişimi ve durum için kullanıcı başına bir oturum açma tepsisi yükleyin. Tepsi bir kontrolördür, bir proxy yeniden başlatma servisi değildir. |
 | **Codex otomatik başlatma** | Zaten kurulu bir Codex başlatıcı dolgusunun `ocx ensure` çalıştırmasına izin verin. Bu anahtar bir dolgu veya arka plan servisi kurmaz. |
+| **Telemetri** | **Proxy ayrıntıları** (`#proxy-telemetry`) altında **Anonim kullanım istatistiklerini paylaş** anahtarını değiştirin ve **JSON önizlemesi** görünümünü inceleyin. Onay açılır penceresi yalnızca **Devam** tıklandığında (`PUT /api/telemetry`) seçimi kaydeder; kapatılması hiçbir şey kaydetmez. Bkz. [Telemetri ve Gizlilik](/tr/guides/telemetry/). |
 | **Sağlayıcılar** | Sağlayıcıları ekleyin, düzenleyin, varsayılanı ayarlayın (yalnızca etkin sağlayıcılar), etkinleştirin/devre dışı bırakın ve kaldırın; desteklendiğinde OAuth hesap havuzlarını ve API anahtarı havuzlarını yönetin. Geçerli varsayılanı kaldırmak, bir tane varsa kalan ilk etkin sağlayıcıya geçer; aksi takdirde silme reddedilir ve geçerli varsayılan tutulur. Sağlayıcı Ayarları, eksik, yavaş veya aşırı büyük `/models` kataloglarına sahip uç noktalar için canlı model keşfini devre dışı bırakabilir. Claude (Anthropic) OAuth havuzları için oturum açmış her hesap kendi 5 saatlik ve haftalık hız sınırı çubuklarını gösterir (kullanım kimlik bilgisi başınadır); başarısız bir araştırma bilinen son çubukları tutar ve bir sonraki başarılı yenilemeye kadar bunları kullanılamaz olarak işaretler. |
 | **Sağlayıcı ekle** | Hesap girişi, API anahtarı hizmetleri, yerel sunucular veya özel bir uç nokta için kayıt defteri destekli önayarları arayın. |
 | **Codex Auth** | ChatGPT/Codex havuz hesapları ekleyin, sonraki oturum hesabını seçin, 5 saatlik / haftalık / 30 günlük kotaları yenileyin, kota otomatik geçişini etkinleştirin veya devre dışı bırakın, %1–100 eşiğini ayarlayın ve geçici arıza yük devretmesini yapılandırın. |
 | **Alt Ajanlar** | `spawn_agent` geçersiz kılma listesinde en fazla beş yalın yerel veya ad alanlı yönlendirilen modeli öne çıkarın. |
-| **Modeller** | Yerel GPT ve yönlendirilen modelleri açıp kapatın, sağlayıcı izin listelerini ve bağlam sınırlarını ayarlayın, v1/base/v2'yi seçin ve v2 iş parçacığı sınırını yapılandırın. Yapılandırılmış sağlayıcılar, keşif kapalı olduğunda veya hiçbir satır döndürmediğinde sıfır modelli gruplar olarak görünür kalır. |
+| **Modeller** | Yerel GPT ve yönlendirilen modelleri açıp kapatın, sağlayıcı izin listelerini ve bağlam sınırlarını ayarlayın, v1/base/v2'yi seçin ve v2 iş parçacığı sınırını yapılandırın. Sayfa hub'a kaydedilen kataloğu, bu istemcinin getirdiği kataloğu ve çalışan bir istemcideki etkinleştirmeyi ayrı durumlar olarak gösterir. Getirme zamanı en son hub kaydının alındığını kanıtlamaz; çalışma zamanı etkinleştirmesi doğrulanmamış olarak gösterilir. Yapılandırılmış sağlayıcılar, keşif kapalı olduğunda veya hiçbir satır döndürmediğinde sıfır modelli gruplar olarak görünür kalır. |
 | **Günlükler** | Belirteçler, talep edilen çaba ve (varsa) etkili giden çaba, çözümlenen model, sağlayıcı, durum, istek kimliği, süre ve hata ayrıntılarıyla son istekleri otomatik yenileyin. Ayrıntı görünümü, adaptör bir tane yaydığında tam akıl yürütme hat alanını içerir. Yüklenen Günlükler halkası için toplam belirteçleri ve tahmini liste fiyatı maliyetini görmek üzere donuk görüşme/oturum kimliğine göre (istemci bir tane gönderdiğinde) filtreleyin. |
 | **Kullanım / Hata Ayıklama** | Belirteç kullanımı kapsamını ve eğilimlerini inceleyin veya isteğe bağlı sağlayıcı aktarımı ve kullanım çıkarma tanılamalarını etkinleştirin. |
 | **Depolama** | Salt okunur CODEX_HOME disk dökümü (oturumlar, arşivler, DB'ler, ekler). İsteğe bağlı arşivlenmiş temizleme: en eski %N'yi önizleyin, ardından `CODEX_HOME/.trash` konumuna karantinaya alın (varsayılan) veya açık bir onay kutusu arkasında kalıcı olarak silin. **Otomatik temizleme politikası** isteğe bağlıdır ve **varsayılan olarak KAPALIDIR** (`storageCleanupPolicy.enabled`); Depolama sayfasında eşik/hedef/zamanlama/mod yapılandırın veya **Şimdi çalıştır (Run now)**'ı tetikleyin. Karantinaya alınan girdiler Depolama sayfasından geri yüklenebilir (JSONL + iş parçacıkları). Aktif oturumlar salt okunur kalır. Codex en yeni/aktif `state_*.sqlite` dosyasını kilitli tuttuğu sürece temizleme ve geri yükleme reddedilir. |
 | **Durdur** | Proxy'yi ve kurulu arka plan servisini zarif bir şekilde durdurun, yerel Codex'i geri yükleyin ve çıkın (`POST /api/stop`). Windows'ta Görev Zamanlayıcı arka ucunda panel reddeder ve `ocx stop` çalıştırmanızı ister: görev bittikten sonra sarmalayıcı proxy'yi yeniden başlatabilir ve bu yeniden başlatma penceresini istemci yapılandırmanız geri yüklenmeden önce yalnızca proxy dışında çalışan bir stop doğrulayabilir. Reddedildiğinde hiçbir şey değiştirilmez. |
+
+Kullanım, panel, sağlayıcı çalışma alanı, sağlayıcı kataloğu ve API anahtarı görünümleri, okunabilir kayıt kalmasa bile dışlanan kayıtlar için uyarı gösterir. Sayılar, tarihler ve kullanım sıralamaları yalnızca okunabilir kayıtlara dayanır. Geçmiş eksikse en çok kullanılan model sırası kaydedilmez; başka bir sıra seçin veya yeniden denemeden önce geçmişi onarın.
+
+### Uygulamaya göre kullanım
+
+Usage, geçerli erişim kapsamı içinde **Tüm uygulamalar**, **Tüm cihazlar** ve **30 gün** seçili olarak açılır. Sayfa açıkken uygulama, cihaz veya zaman aralığını daraltabilirsiniz; yeniden açıldığında varsayılanlar geri gelir.
+
+Tüm uygulamalar seçiliyken Models ve Providers bölümlerinden sonra **Uygulamalar** dökümü görünür. Seçilen cihazlar ve dönem için uygulama başına toplam jetonlardaki payı, jeton sayısını, tahmini API liste fiyatı maliyetini, istek sayısını ve kullanımı ölçülen istek sayısını gösterir. Codex CLI, masaüstü ve IDE kullanımı Codex altında birleştirilir. İstemci bilgisi olmayan eski kayıtlar **Sınıflandırılmamış** olarak gösterilir; **Bilinmeyen** ve **Diğer** kategorilerinden ayrıdır. Tek bir uygulama seçildiğinde döküm gizlenir. Dökümü sağlamayan proxy için kullanılamadığı belirtilir; boş döküm, raporda uygulama kullanımı olmadığı anlamına gelir.
+
+### İstek günlüklerini filtreleme
+
+İstek ayrıntıları, genel proxy hatası metni yerine kaydedilmiş upstream hata nedenini öncelikli gösterir. Fiziksel gönderim sayısı geçerliyse her zaman gösterilir; eksik veya geçersiz muhasebe bilgisi sıfır yerine **Unavailable** olarak görüntülenir. **Retries**, yalnızca muhasebesi tamamen kesinleşmiş ve tutarlı tek bir deneme kaydı bulunduğunda ilk gönderimden sonraki ek gönderim sayısını gösterir. Birden fazla deneme, çözümlenmemiş veya tutarsız muhasebe ve kayıplı attempt normalizasyonu, uydurma yeniden deneme sayısı yerine retries alanını gizler. Bilinmeyen kalıcı nedenler, ham atıf olmadan durum tabanlı başlığa döner. **Upstream reason**, sınıflandırılmış bir sağlayıcı durumunu (örneğin hız sınırı, kota veya kredinin tükenmesi, bağlam penceresinin aşılması, desteklenmeyen konum, hesap doğrulaması gerekmesi veya modelin kullanılamaması), **Failure detail** ise takılma zaman aşımı veya bayt sınırı gibi proxy tarafından yazılan metni gösterir; yeni satırlar sağlayıcının kendi hata metnini saklamaz. Eski `usage.jsonl` dosyalarında hâlâ bulunabilir, ancak pano okurken bu metni atar.
+
+Logs, uygulama sekmeleri yerine tüm uygulamaların isteklerini birlikte gösterir ve her isteğe yalnızca simge içeren bir istemci rozeti ekler. Tanınan istemciler SVG logolarını, bilinmeyen veya diğer istemciler ise nötr bir soru işareti simgesini kullanır. Uygulama adları görünür metin olmadan ekran okuyuculara sunulmaya devam eder. İstemci bilgisinin olmaması, Codex veya istek hatası anlamına gelmez. Rozet, sağlayıcı ve protokolden bağımsız olarak istemci uygulamasını belirtir; uygulama filtresi değildir.
+
+Filtreler yüklü günlükte yakalanan istekler, sağlayıcı, tam model adı, durum, zaman, hız ve konuşma kimliğini birleştirir. Seçenekler yedek denemeleri de içerir; model eşleşmesi büyük/küçük harfi ve dış boşlukları yok sayar, kısmi adları eşleştirmez. Kaybolan seçenek tüm kayıtlara döner.
+
+Son 15 dakika, saat ve gün pencereleri Logs sekmesinde otomatik yenileme kapalıyken de 30 saniyede bir güncellenir. Hız, tam istek süresindeki saniyelik çıktı jetonudur: 15 altı, 15 dahil 50 altı, en az 50; hız filtresi açıkken ölçülemeyenler dışlanır. Başarı 2xx, hata 4xx/5xx anlamındadır.
+
+Sayaç eşleşen ve yüklü toplam sayıları gösterir; sıfırlama tüm satırları geri getirir. Eşleşme olmaması boş günlükten ayrılır. Yüklü günlüğün dışındaki geçmiş sorgulanmaz.
 
 ### Bir bölüme bağlantı verme
 
@@ -81,6 +139,25 @@ model yalnızca sağlayıcı izin listesi onu içerdiğinde (veya hiçbir izin l
 ayarlanmadığında) ve devre dışı bırakılmadığında açıktır. Bir modeli açmak her
 iki filtreyi de atomik olarak uzlaştırır; **Tümünü aç (All on)** sağlayıcı izin
 listesini temizler, böylece yeni keşfedilen modeller de açık olur.
+
+### Sağlayıcı çalışma alanında modelleri yönetme
+
+Sağlayıcının **Modeller** sekmesinde **Sil**, kayıtlı özel tanımı kaldırır. Alttaki yerel veya canlı
+keşfedilmiş model yeniden görünebilir; bu nedenle model sayısı aynı kalabilir. **Gizle** yalnızca
+katalog görünürlüğünü değiştirir; tanımı silmez veya doğrudan yönlendirme ilkesini değiştirmez.
+**Modeller bölümünde görünürlüğü yönet**, görünürlüğü geri yükleyebileceğiniz **Modeller** sayfasını
+açar. Sağlayıcı sekmesinde hiç satır kalmasa da bu bağlantı kullanılabilir.
+
+**Ekle**, özel tanımı kaydeder; mevcut gizleme durumunu veya sağlayıcı seçim kurallarını kaldırmaz.
+Kaydedilen model gizli kalabilir. Model zaten biliniyorsa görünürlüğünü **Modeller** bölümünden
+yönetin. Kayıt doğrulandıysa katalog yenilemesi başarısız olsa bile tanım kaydedilmiştir. Yeniden
+eklemek yerine yenileme mesajını izleyin. Değişiklik doğrulanamıyorsa tekrar denemeden önce
+modellerin durumunu yenileyin.
+
+Sağlayıcının model sayısı, sunucunun döndürdüğü güncel model envanterindeki devre dışı olmayan
+benzersiz girdileri, arama ve görüntüleme sınırı uygulanmadan önce sayar. Bu sayı izin listesinin
+boyutu veya canlı keşif sayısı değildir; girdinin sağlayıcıdan keşfedildiğini de kanıtlamaz.
+Seçim rozetleri ve keşif bilgileri bu sayıdan ayrıdır.
 
 ## Yetkilendirme seçicisi ve spawn yönlendirmesi
 
@@ -111,7 +188,27 @@ için [Alt Ajan Arayüzü](/tr/guides/sub-agent-surface/) sayfasına bakın.
 
 ## Remote Hub oturumları, anahtarları ve kullanımı
 
-Pano yönetim düzlemi doğrudan client→hub model trafiğinden ayrıdır. **Integrations → API Keys** bekleyen döndürmeyi gösterir, yeni sırrı bir kez görüntüler ve açık onay veya iptal ister. Tarayıcı logout yalnızca mevcut oturumu geçersiz kılar. Bağlı kullanım hub üzerinde `apiKeyId` ile filtrelenir; bağlantı kesilince yerel kayıt kullanılır ve yansıtma yapılmaz.
+Pano yönetim düzlemi doğrudan client→hub model trafiğinden ayrıdır. **Bağlantı → API Anahtarları** bekleyen döndürmeyi gösterir, yeni sırrı bir kez görüntüler ve açık onay veya iptal ister. Tarayıcı logout yalnızca mevcut oturumu geçersiz kılar. Bağlı kullanım hub üzerinde `apiKeyId` ile filtrelenir; bağlantı kesilince yerel kayıt kullanılır ve yansıtma yapılmaz.
+
+### Kaydedilmiş bir API anahtarını görüntüleme
+
+Kaydedilmiş bir anahtarın tam değerini göstermek için açık eşleştirme veya güvenilir Tailscale
+kimlik doğrulamasıyla oluşturulmuş bir pano oturumu gerekir. Otomatik yerel oturum maskelenmiş
+listeyi okuyabilir, ancak kaydedilmiş değerleri gösteremez. Yönetici belirteci de yalnızca oturumlara
+izin verilen bu işlemi çağıramaz. Mevcut Remote Hub eşleştirme akışını veya varsa güvenilir Tailscale girişini kullanın.
+
+Yerel eşleştirme formu yalnızca HTTP üzerinden doğrudan `127.0.0.1` veya `[::1]` IP adresinde açılmış,
+aynı origin'e sahip bağımsız panoda sunulur. Origin, sunucunun yapılandırılmış geri döngü IP bağlama
+adresine uymalıdır. `localhost` veya bir takma adres kullanıyorsanız sunucunun bağlama adresini kontrol edin:
+`127.0.0.1` için `http://127.0.0.1:<port>`, `::1` için `http://[::1]:<port>` adresinde yeniden açıp
+eşleştirin. hostname değeri `localhost` olan sunucuda uygun bir yerel eşleştirme origin'i yoktur.
+Pano, takma adresli URL'den gerçek bağlama adresini belirleyemediği için başka bir URL önermeden genel ret açıklamasını gösterir.
+
+Eşleştirmeden sonra değeri istemek için anahtara yeniden tıklayın. Eşleştirme tek başına anahtarı göstermez.
+Paylaşılan oturum temizlendiğinde veya değiştirildiğinde, eşleştirme başladığında, panelden ayrıldığınızda,
+tarayıcı sekmesi ya da masaüstü penceresi gizlendiğinde veya sunucu değiştiğinde gösterilen değerler ve
+kopyalama durumu temizlenir. Bir kez gösterilen yeni ve yedek anahtar değerleri de temizlenir.
+Yetkili oturumun süresi dolarsa veya iptal edilirse yeniden eşleştirin.
 
 Spawn geçersiz kılma garantisi **yerleşik** v2 rehberlik metni için geçerlidir.
 Özel bir `injectionPrompt` bu metnin yerini tamamen alır ve `{{model}}` ve
@@ -138,6 +235,10 @@ ve diğer sağlayıcılardan ayrıdır.
   **PINNED** rozeti gösterir ve boşaltılana, başka bir hesap seçene kadar veya
   herhangi bir hesabın seçim sırasını değiştirene kadar daha yüksek bir seçim
   sırası bu hesabı öncelikleyemez.
+  Rozete yeniden tıklamak sabitlemeyi kaldırmak için onay ister. Onay seçim bilgisini temizler;
+  bağlı iş parçacıkları mevcut hesaplarını korur, yeni veya bağlanmamış istekler yeniden seçim
+  sırasını ve eşikleri izler.
+  Onay açıkken sabitlenen hesap değişirse bu onay yeni sabitlemeyi kaldıramaz. İşlem reddedilirse veya sonuç belirsizse hesap görünümü yenilenir; yeniden onaylamadan önce mevcut seçimi kontrol edin.
 - Her hesap kartı bir **Seçim sırası (Selection order)** kontrolü taşır (İlk,
   Daha Önce, Normal, Daha Sonra, Son). Daha yüksek sıra önce kullanılır ve havuz
   ancak üzerindeki her hesap boşaldığında veya kullanılamaz olduğunda daha düşük
@@ -146,10 +247,12 @@ ve diğer sağlayıcılardan ayrıdır.
   (ana) hesabı diğerleri gibi sıralanır, böylece **Son** olarak ayarlanabilir ve
   yedek olarak tutulabilir. Bu beş önayarın dışındaki `ocx account priority`'den
   ayarlanan bir sıra kartta görünür ve seçilebilir kalır.
-- İş parçacığı bağlılığı istek başına dalgalanmayı önler. Kota otomatik geçişi
-  etkinken uzun süredir çalışan bir iş parçacığı düzenli olarak yeniden
-  değerlendirilir ve ilgili kullanımı eşiğe ulaştıktan ve kesinlikle daha düşük
-  kullanımlı uygun bir hesap mevcut olduğunda yeniden bağlanabilir.
+- İş parçacığı bağlılığı istek başına dalgalanmayı önler. `pool.cacheAffinity`
+  varsayılan olarak açıkken uzun süredir çalışan bir iş parçacığı, kullanım eşiğe
+  ulaştı diye yeniden bağlanmaz; hesap tükenene veya hizmet veremez hale gelene
+  kadar kalır ve o zaman yalnızca kullanımı kesin olarak daha düşük ve gerçek kota
+  payı olan bir hesaba geçer. Bayrağı kapatınca, kesinlikle daha düşük kullanımlı
+  uygun bir hesap varsa eşik yeniden bağlaması geri gelir.
 - Yeni oturumlar en düşük kullanımlı uygun hesabı seçebilir. Ücretli planlar
   bilinen en sıcak 5 saatlik, haftalık veya 30 günlük pencereyi puanlar;
   Go/Ücretsiz planlar yalnızca 30 günlük pencereyi kullanır.
@@ -191,7 +294,7 @@ Sağlayıcılar genel bakışı, etkin hesabın ham kotası ve bir sonraki kapas
 kurtarmasının yanı sıra Havuz modu kullanımını salt görüntüleme amaçlı ağırlıklı
 bir kapasite tahmini olarak ayrı ayrı özetler. Görünür alanlar, eksik kapsam
 anlamı ve yönlendirme sınırı için [Sağlayıcılar genel bakış havuz
-kapasitesi](/tr/guides/providers/#saglayicilar-genel-bakis-havuz-kapasitesi)
+kapasitesi](/tr/guides/providers/#sağlayıcılar-genel-bakış-havuz-kapasitesi)
 bölümüne bakın.
 
 ## Yıldız vermek ajanın değil sizin kararınızdır
@@ -247,7 +350,7 @@ noktalar şunları içerir:
 | `PUT /api/codex-auth/active` · `PUT /api/codex-auth/auto-switch` · `PUT /api/codex-auth/failover` | Bir sonraki istek için hesabı seçin ve havuz yönlendirmesini yapılandırın. |
 | `GET /api/codex-auth/active` · `PUT /api/codex-auth/accounts/priority` | Geçerli hesabı okuyun (`pinned` ve hangi hesabın `pinnedAccountId` olduğu dahil) ve bir hesabın seçim sırasını ayarlayın. |
 | `POST /api/codex-auth/login` · `GET /api/codex-auth/login-status` | Tarayıcı girişi aracılığıyla bir havuz hesabı ekleyin. |
-| `GET /api/logs?tail=50&limit=20&offset=0&provider=...&status=5xx` | İsteğe bağlı kuyruk, sağlayıcı ve tam/sınıf durum filtreleriyle son istek meta verilerini okuyun. `limit`/`offset` ile sayfalama en yeni satırdan geriye doğru ilerler (`offset=0` en son sayfayı döndürür). Yanıt şekli: `{ timeZone, total, logs }` burada `total`, sayfalamadan önceki filtrelenmiş satır sayısıdır. |
+| `GET /api/logs?tail=50&limit=20&offset=0&provider=...&status=5xx` | İsteğe bağlı kuyruk, sağlayıcı ve tam/sınıf durum filtreleriyle son istek meta verilerini okuyun. `limit`/`offset` ile sayfalama en yeni satırdan geriye doğru ilerler (`offset=0` en son sayfayı döndürür). Yanıt şekli: `{ timeZone, generatedAt, total, logs }` burada `total`, sayfalamadan önceki filtrelenmiş satır sayısıdır. |
 | `GET` / `PUT /api/subagent-models` | Öne çıkan beş `spawn_agent` geçersiz kılma modelini okuyun veya ayarlayın. |
 | `POST /api/stop` | Proxy'yi/servisi durdurun, yerel Codex'i geri yükleyin ve çıkın. Windows Görev Zamanlayıcı arka ucunda `respawnable_service`, bu durum okunamadığında `service_state_unknown` ile reddedilir; her iki durumda da hiçbir şey değiştirilmez. |
 
@@ -257,4 +360,3 @@ metin ve vizyon sınıflandırmasını kaydedilen sağlayıcı yapılandırması
 kopyalar, böylece [vizyon sidecar'ı](/tr/guides/sidecars/) manuel sınıflandırma
 olmadan doğru şekilde geçişlenir.
 :::
-

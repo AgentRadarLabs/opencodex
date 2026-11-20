@@ -9,13 +9,16 @@ description: opencodex 개발 환경, 구조, 컨벤션, 프로바이더와 어�
 git clone https://github.com/lidge-jun/opencodex.git
 cd opencodex
 bun install
+bun run setup:hooks  # 기존 관리형 pre-push·post-merge 제거
 bun run dev:proxy    # 개발 모드 프록시 API
 bun run dev:gui      # 대시보드 dev 서버(다른 터미널)
-bun run typecheck    # bun x tsc --noEmit
-bun run test:changed              # routine import-graph test selection
-bun test tests/routing/router.test.ts     # routine focused test
-bun run test                      # complete suite (PR-ready / explicit ask)
+bun run typecheck    # bun check --no-script --noEmit
+bun run test        # 전체 테스트 스위트 (기본)
 ```
+
+`bun run setup:hooks`는 수정되지 않은 기존 관리형 `pre-push`와 `post-merge` 훅을
+제거합니다. 사용자 정의 훅은 보존합니다. `pre-push` 훅은 더 이상 필수가 아니며,
+`bun run prepush`는 선택적으로 직접 실행할 수 있습니다.
 
 `bun run dev`는 계속 `bun run dev:proxy`의 별칭으로 동작합니다. 대시보드 dev 서버는
 `bun run dev:gui`이며, `GET /`에서 제공하는 패키지 대시보드는 `bun run build:gui`로 빌드해
@@ -28,6 +31,7 @@ bun run test                      # complete suite (PR-ready / explicit ask)
 
 ```bash
 bun run typecheck                 # 엄격한 TypeScript 검사
+bun run test:changed              # dev merge base 기준 import graph 테스트
 bun run test                      # tests/ 전체 스위트
 bun test tests/routing/router.test.ts     # 특정 테스트 파일
 bun run build:gui                 # Vite GUI 빌드 + 패키지 준비
@@ -35,10 +39,17 @@ bun run privacy:scan              # CI에서 쓰는 자격 증명/개인정보 �
 bun run prepare:package           # 패키지 런처/asset 갱신
 ```
 
+기본적으로 `bun run test`로 전체 테스트 스위트를 실행하세요. 작업 규모, 머신 자원 또는 동시에
+사용 중인 워크트리 때문에 전체 실행 비용이 지나치게 크다면, 최소한 변경한 동작을 실제로 검증하는
+집중 회귀 테스트를 실행해야 합니다. 예를 들어 `bun test tests/<domain>/<name>.test.ts`를 사용할 수
+있습니다. 범위를 줄인 이유와 정확한 실행 명령, 결과, 테스트하지 않은 범위를 명시하세요.
+`bun run test:changed`는 보완 수단이며 모든 간접 의존성을 찾지는 못합니다. CI에만 맡기거나
+로컬 테스트를 생략하는 일괄 면제는 없습니다. 병합 전에는 현재 PR 헤드의 정확한 커밋에서
+모든 필수 CI 검사가 통과해야 합니다.
+
 테스트는 `src/`를 따라 나눈 도메인 디렉터리(`tests/<domain>/`)에 놓인 Bun 테스트이며, 지도는 `scripts/test-layout/layout.json`입니다. 공용 fixture는
 `tests/helpers/`, 범위가 넓은 네이티브 동등성 시나리오는 `tests/e2e-style/`에 있습니다. 바꾼
-subsystem의 기존 테스트 근처에 집중된 회귀 테스트를 추가하세요. 공용 라우팅, 어댑터, 설정, 서버
-동작을 건드렸다면 전체 스위트도 실행합니다.
+subsystem의 기존 테스트 근처에 집중된 회귀 테스트를 추가하세요.
 
 지금 읽고 있는 문서 사이트는 `docs-site/`에 있습니다(Astro + Starlight).
 
@@ -46,59 +57,10 @@ subsystem의 기존 테스트 근처에 집중된 회귀 테스트를 추가하�
 cd docs-site && bun install && bun dev
 ```
 
-## 문서 배포
+## CI / Release / Pages
 
-공개 문서는 GitHub Pages의 <https://opencodex.me/ko/>에 게시됩니다.
-`.github/workflows/deploy-docs.yml`은 `main` push에서 `docs-site/**`나 워크플로 자체가 바뀌면
-실행됩니다. `docs-site`를 빌드한 뒤 생성된 사이트를 배포합니다. 문서 변경을 push하기 전에 다음을
-실행하세요.
+문서 배포, CI, 릴리스 및 브랜치 정책은 [영어 원문](/contributing/)을 참고하세요.
 
-```bash
-cd docs-site
-bun install --frozen-lockfile
-bun run build
-```
-
-## CI와 릴리즈
-
-GitHub Actions는 필요한 작업만 수행합니다.
-
-- **Cross-platform CI**(`.github/workflows/ci.yml`)는 런타임, 테스트, 패키지, 스크립트,
-  TypeScript, 워크플로 파일이 바뀐 pull request와 `main` push에서 실행됩니다. Bun matrix는 Linux,
-  Windows, macOS에서 install, typecheck, tests, privacy scan, release helper build smoke, GUI build,
-  `ocx help`를 검사합니다. 별도의 3개 OS lane은 번들 런타임을 사용해 Bun을 따로 설치하지 않아도
-  npm global install이 동작하는지 확인합니다.
-- **Release**(`.github/workflows/release.yml`)는 수동으로 실행합니다. 두 번째 전체 CI 파이프라인이
-  아니며, dry-run이나 publish 전에 정확한 릴리즈 커밋(`GITHUB_SHA`)에서 Cross-platform CI가
-  성공했는지 확인합니다.
-
-릴리즈에는 helper를 사용하세요.
-
-
-helper 실행 전에 릴리즈할 버전을 정하고, 기본 브랜치에서
-`.github/workflows/dev-version-bump.yml`을 `intended-version=<version>`,
-`mode=pre-move`로 실행하세요. 생성된 PR을 검토해 `dev`에 머지한 뒤
-`main` 또는 `preview`로 승격하고 helper를 실행하세요. `dev` 버전이 이미 더
-높으면 워크플로가 `changed=false`를 반환하므로 버전 이동 PR은 필요 없습니다.
-배포에는 정확한 릴리즈 커밋의 CI 통과가 여전히 필요합니다.
-
-```bash
-bun run release <version>           # 버전 bump를 commit/push, publish workflow는 기본 dry-run
-bun run release --bump minor        # tag와 npm channel에서 다음 patch, minor, major 버전을 계산
-bun run release <version> --publish # CI-gated dry-run을 확인한 뒤 실제 publish
-bun run release:watch               # 가장 최근 Release workflow run 감시
-```
-
-명시적 버전 대신 `--bump patch|minor|major`를 사용할 수 있습니다. 더 높은 core의 preview tag가
-열린 뒤에는 `--bump patch`가 이전 stable patch 라인의 계속을 거부합니다. 해당 수정은 열린 preview
-core에 포함해 릴리즈하세요.
-
-## 브랜치
-
-- `dev` — 유일한 통합 대상. 모든 PR을 여기로 올립니다.
-- `main` — 릴리즈 전용. `dev`에서 메인테이너가 승격시킬 때만 움직이며, 기능 PR을 직접
-  올리지 않습니다.
-- `preview` — 프리릴리즈 트레인.
 
 Go 네이티브 포트를 담당했던 `dev2-go`는 정리했고, 두 라인을 동시에 유지하던 정책도
 함께 끝났습니다. 히스토리는
@@ -110,19 +72,19 @@ Go 네이티브 포트를 담당했던 `dev2-go`는 정리했고, 두 라인을 
 
 ## 컨벤션
 
-- **ES Modules 전용**(`import`/`export`), TypeScript, `strict` 모드. `bun x tsc --noEmit`을 깨끗하게
+- **ES Modules 전용**(`import`/`export`), TypeScript, `strict` 모드. `bun run typecheck`을 깨끗하게
   유지하세요.
 - **파일당 최대 약 500줄** — 책임별로 나누세요. 단일 `index.ts` 뒤에 작고 집중된 모듈을 둔
   `web-search/`와 `vision/` 사이드카가 좋은 예입니다.
 - **비동기 오류는 경계에서 처리** — 사이드카는 요청 경로로 오류를 던지지 않고 적절한 marker로
   저하됩니다.
 - **Structure SOT** — 현재 유지보수 불변식은 `structure/`에 둡니다. 공개 사용자 워크플로는
-  `docs-site/`, 과거 조사/진단 기록은 `docs/`에 둡니다.
+  `docs-site/`, 계획과 조사 기록은 `devlog/`에 둡니다.
 - **export 보존** — 다른 모듈이 의존할 수 있습니다.
 
 ## 카탈로그에 프로바이더 추가하기
 
-모든 프로바이더 선택기와 seed는 canonical registry(`src/providers/registry.ts`)에서 파생됩니다.
+모든 프로바이더 선택기와 seed는 canonical registry(`src/providers/registry/entries-extended.ts`)에서 파생됩니다.
 
 ```ts
 {
@@ -162,12 +124,15 @@ wire format을 쓴다는 이유만으로 다른 프로바이더 또는 목적지
 `passthrough`가 아닌 주장에는 구체적인 제한을 적고, fixture 기반 주장에는 이를 입증하는 정확한 assertion id를
 명시하세요. 비밀정보가 없는 request vector를 `tests/fixtures/compatibility/`에 추가하고 production adapter를
 대상으로 실행하는 집중 테스트를 작성합니다.
+`passthrough` claim은 manifest test에서 그 feature에 묶인 selector 위의 `equals` assertion 가운데,
+기대값이 같은 위치의 호출자 값 그대로인 것만 인용할 수 있습니다. 그래서 제거되거나 바뀌었거나 관계없는
+필드를 무손실로 표시할 수 없습니다. custom tool과 그 grammar처럼 한쪽만 보존될 수 있는 측면은 별도
+claim으로 나누세요.
 
 호환성 매니페스트는 수동적인 데이터입니다. 일반 router, Responses handler, server startup path가 manifest
 catalog를 import하거나 Compatibility Lab을 활성화해서는 안 됩니다.
 
 ## 완료를 주장하기 전에 검증하기
 
-변경을 증명하는 가장 좁은 명령부터 실행하세요. 타입은 `bun run typecheck`, 동작은 집중된
-`bun test tests/<name>.test.ts` 또는 런타임 probe로 확인한 뒤 영향 범위에 맞는 넓은 gate를
-실행합니다. opencodex는 큰 batch보다 작고 검증 가능한 commit을 선호합니다.
+위 테스트 정책을 따르고, 타입 변경에는 `bun run typecheck`를 포함해 영향 범위에 필요한 검사를
+실행하세요. 실행 명령, 결과, 테스트하지 않은 범위를 보고하고 실제로 완료한 검증만 주장하세요.

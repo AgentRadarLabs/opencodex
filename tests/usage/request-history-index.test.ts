@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import {
   appendFileSync,
   existsSync,
@@ -15,6 +16,8 @@ import { handleManagementAPI } from "../../src/server/management-api";
 import { ManagementRequest } from "../helpers/management-auth";
 import {
   appendUsageEntry,
+  currentUsageLogRevision,
+  normalizeUsageEntryForTest,
   resetUsageReadCacheForTests,
   usageLogPath,
   type PersistedUsageAttempt,
@@ -26,13 +29,17 @@ import {
   rebuildRequestHistoryIndex,
   requestHistoryDb,
   requestHistoryRowById,
+  sourceIdentityMatches,
   REQUEST_HISTORY_MAX_RECORD_BYTES,
   REQUEST_HISTORY_MAX_PAGE_SIZE,
   REQUEST_HISTORY_READ_CHUNK_BYTES,
 } from "../../src/routing/history/indexer";
 import { InvalidCursorError } from "../../src/routing/history/cursor";
+import { metaValue, recordSourceMeta, resetAndCreateSchema, setMeta } from "../../src/routing/history/ingest";
 import { HISTORY_DB_FILENAME, HISTORY_SCHEMA_VERSION } from "../../src/routing/history/schema";
 import { getConfigDir } from "../../src/config";
+import { flushConfigDirHardeningForTests } from "../../src/config/paths";
+import { flushWindowsSecretAclReapsBeforeRemoval } from "../../src/lib/windows-secret-acl";
 import type { OcxConfig } from "../../src/types";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 
@@ -74,8 +81,11 @@ beforeEach(() => {
   closeRequestHistoryIndex();
 });
 
-afterEach(() => {
+afterEach(async () => {
   closeRequestHistoryIndex();
+  // Management/config reads may still own a Windows ACL child after the query ends.
+  await flushConfigDirHardeningForTests();
+  await flushWindowsSecretAclReapsBeforeRemoval(testDir);
   if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = previousHome;
   if (testDir) removeTreeWithRetry(testDir);
@@ -99,6 +109,64 @@ async function apiGet(path: string): Promise<Response> {
 }
 
 describe("request-history index (RI-02)", () => {
+  test("SQLite source identities distinguish adjacent device and inode ids above 2^53", () => {
+    appendUsageEntry(entry("exact-id", 1234, "a", "m1"));
+    const revision = currentUsageLogRevision()!;
+    const low = "9007199254740992";
+    const high = "9007199254740993";
+    expect(Number(low)).toBe(Number(high));
+    const db = new Database(":memory:");
+    try {
+      resetAndCreateSchema(db);
+      for (const field of ["dev", "ino"] as const) {
+        const exact = { ...revision, [field]: high };
+        recordSourceMeta(db, exact);
+        expect(metaValue(db, `source_${field}`)).toBe(high);
+        expect(sourceIdentityMatches(db, exact)).toBe(true);
+        expect(sourceIdentityMatches(db, { ...exact, [field]: low })).toBe(false);
+        // The old Number-based writer rounded the high id to its neighbour.
+        setMeta(db, `source_${field}`, Number(high));
+        expect(sourceIdentityMatches(db, exact)).toBe(false);
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  test("legacy rounded source metadata rebuilds once and then reuses the corrected index", async () => {
+    appendUsageEntry(entry("legacy-id", 1234, "a", "m1"));
+    await queryRequestHistory({}, undefined, 10);
+    closeRequestHistoryIndex();
+    const dbFile = join(getConfigDir(), HISTORY_DB_FILENAME);
+    let db = new Database(dbFile);
+    try {
+      setMeta(db, "source_ino", Number("9007199254740993"));
+    } finally {
+      db.close();
+    }
+    const page = await queryRequestHistory({}, undefined, 10);
+    expect(page.rows.map(row => row.requestId)).toEqual(["legacy-id"]);
+    expect(page.meta.lastError).toBe("rebuilt after identity/schema mismatch");
+    closeRequestHistoryIndex();
+    db = new Database(dbFile);
+    try {
+      const revision = currentUsageLogRevision()!;
+      expect(metaValue(db, "source_dev")).toBe(revision.dev);
+      expect(metaValue(db, "source_ino")).toBe(revision.ino);
+      setMeta(db, "reuse_marker", "preserve");
+    } finally {
+      db.close();
+    }
+    expect((await queryRequestHistory({}, undefined, 10)).rows).toHaveLength(1);
+    closeRequestHistoryIndex();
+    db = new Database(dbFile);
+    try {
+      expect(metaValue(db, "reuse_marker")).toBe("preserve");
+    } finally {
+      db.close();
+    }
+  });
+
   test("missing database and empty history produce an empty page", async () => {
     const page = await queryRequestHistory({}, undefined, 10);
     expect(page.rows).toEqual([]);
@@ -165,7 +233,12 @@ describe("request-history index (RI-02)", () => {
 
   test("large history indexes fully and paginates without duplicates or misses", async () => {
     const rows = seedRows(1500, 10_000);
-    for (const row of rows) appendUsageEntry(row);
+    // Exercise all 1,500 indexed rows and 15 pages without timing 1,500 filesystem opens.
+    // This is byte-for-byte the append writer's normalization + JSON + LF representation;
+    // the incremental-append cases above continue to exercise appendUsageEntry itself.
+    writeFileSync(usageLogPath(), rows.map(row => `${JSON.stringify(normalizeUsageEntryForTest(row))}\n`).join(""), {
+      encoding: "utf-8", mode: 0o600,
+    });
     const seen = new Set<string>();
     let cursor: string | undefined;
     let pages = 0;
@@ -205,6 +278,24 @@ describe("request-history index (RI-02)", () => {
     const page = await queryRequestHistory({}, undefined, 10);
     expect(page.rows.length).toBe(4);
     expect(page.meta.schemaVersion).toBe(HISTORY_SCHEMA_VERSION);
+  });
+
+  test("upgrading a version-one index reprojects long requested selectors from canonical JSONL", async () => {
+    const selector = `policy/${"long-selector".repeat(20)}`;
+    // Model a pre-encoding ledger and index: both originally carried the raw selector.
+    appendFileSync(usageLogPath(), `${JSON.stringify(entry("legacy-selector", 1234, "a", "m1", { requestedModel: selector }))}\n`);
+    await queryRequestHistory({}, undefined, 10);
+    closeRequestHistoryIndex();
+    const { Database } = await import("bun:sqlite");
+    const db = new Database(join(getConfigDir(), HISTORY_DB_FILENAME));
+    db.query("UPDATE requests SET requested_model = ? WHERE request_id = 'legacy-selector'").run(selector);
+    db.query("UPDATE schema_meta SET value = '1' WHERE key = 'schema_version'").run();
+    db.close();
+
+    const page = await queryRequestHistory({ requestedModel: selector }, undefined, 10);
+    expect(page.rows.map(row => row.requestId)).toEqual(["legacy-selector"]);
+    expect(page.meta.schemaVersion).toBe(HISTORY_SCHEMA_VERSION);
+    expect(page.meta.lastError).toContain("rebuilt");
   });
 
   test("partial final JSONL line is skipped until it completes", async () => {
@@ -302,55 +393,33 @@ describe("request-history index (RI-02)", () => {
     expect(byRange.rows.map(row => row.requestId)).toEqual(["f2"]);
   });
 
-  test("fallback and attempt count use only distinct physical attempts", async () => {
-    const attempt = (ordinal: number, overrides: Partial<PersistedUsageAttempt> = {}): PersistedUsageAttempt => ({
-      ordinal,
-      provider: "a",
-      model: "m1",
-      adapter: "openai-chat",
-      status: 200,
-      durationMs: 5,
-      sendCount: 1,
-      recoveryKinds: [],
-      usageStatus: "reported",
-      ...overrides,
-    });
-    appendUsageEntry(entry("attempts-absent", 1000));
-    appendUsageEntry(entry("attempts-empty", 1001, "a", "m1", { attempts: [] }));
-    appendUsageEntry(entry("attempts-nonphysical", 1002, "a", "m1", {
-      attempts: [attempt(1, { sendCount: 0 }), attempt(2, { locallyAnswered: true })],
-    }));
-    appendUsageEntry(entry("attempts-duplicate", 1003, "a", "m1", {
-      attempts: [attempt(1), attempt(1, { provider: "duplicate" })],
-    }));
-    appendFileSync(usageLogPath(), `${JSON.stringify(entry("attempts-fallback", 1004, "a", "m1", {
-      attempts: [
-        attempt(1, { sendCount: 0 }),
-        attempt(1),
-        attempt(2),
-        attempt(2, { provider: "duplicate" }),
-      ],
-    }))}\n`, "utf-8");
-    appendFileSync(usageLogPath(), `${JSON.stringify(entry("attempts-invalid", 1005, "a", "m1", {
-      attempts: [
-        { ordinal: 1, provider: "a", model: "m1", status: 503, durationMs: 5 },
-        { ordinal: 2, provider: "b", model: "m2", status: 200, durationMs: 5 },
-      ] as PersistedUsageAttempt[],
-    }))}\n`, "utf-8");
+  test("requestedModel filter matches the encoded form of over-long selectors", async () => {
+    // Two valid selectors sharing the first 130 chars must stay distinguishable:
+    // the persisted form is prefix + digest, and the filter encodes identically.
+    const sharedPrefix = `a/${"m".repeat(200)}`;
+    const selectorA = `${sharedPrefix}-alpha`;
+    const selectorB = `${sharedPrefix}-omega`;
+    appendUsageEntry(entry("sel-a", 1000, "a", "m1", { requestedModel: selectorA }));
+    appendUsageEntry(entry("sel-b", 2000, "a", "m1", { requestedModel: selectorB }));
 
-    const fallback = await queryRequestHistory({ fallback: true }, undefined, 10);
-    expect(fallback.rows.map(row => row.requestId)).toEqual(["attempts-fallback"]);
-    const counts = requestHistoryDb().query(
-      "SELECT request_id, attempt_count FROM requests ORDER BY request_id",
-    ).all() as Array<{ request_id: string; attempt_count: number }>;
-    expect(counts).toEqual([
-      { request_id: "attempts-absent", attempt_count: 1 },
-      { request_id: "attempts-duplicate", attempt_count: 1 },
-      { request_id: "attempts-empty", attempt_count: 0 },
-      { request_id: "attempts-fallback", attempt_count: 2 },
-      { request_id: "attempts-invalid", attempt_count: 0 },
-      { request_id: "attempts-nonphysical", attempt_count: 0 },
-    ]);
+    const pageA = await queryRequestHistory({ requestedModel: selectorA }, undefined, 10);
+    expect(pageA.rows.map(row => row.requestId)).toEqual(["sel-a"]);
+    const pageB = await queryRequestHistory({ requestedModel: selectorB }, undefined, 10);
+    expect(pageB.rows.map(row => row.requestId)).toEqual(["sel-b"]);
+
+    // Rows surface the bounded persisted form; filtering by that displayed value
+    // round-trips because the encoding is idempotent.
+    const persistedA = pageA.rows[0]!.requestedModel!;
+    expect(persistedA).not.toBe(selectorA);
+    expect(persistedA.length).toBeLessThanOrEqual(130);
+    const roundTrip = await queryRequestHistory({ requestedModel: persistedA }, undefined, 10);
+    expect(roundTrip.rows.map(row => row.requestId)).toEqual(["sel-a"]);
+
+    // Documented limit of an idempotent encoding: a literal selector equal to another selector's
+    // persisted form shares that persisted identity, so the exact filter returns both rows.
+    appendUsageEntry(entry("sel-literal", 3000, "a", "m1", { requestedModel: persistedA }));
+    const aliased = await queryRequestHistory({ requestedModel: persistedA }, undefined, 10);
+    expect(aliased.rows.map(row => row.requestId).sort()).toEqual(["sel-a", "sel-literal"]);
   });
 
   test("row-by-id returns the canonical entry and unknown ids 404 through the API", async () => {
@@ -445,5 +514,56 @@ describe("request-history index (RI-02)", () => {
     const ids = [...first.rows, ...second.rows].map(row => row.requestId);
     expect(ids).toEqual(["req-5", "req-4", "req-3", "req-2", "req-1", "req-0"]);
     expect(second.hasMore).toBe(false);
+  });
+
+  test("fallback and attempt count use only distinct physical attempts", async () => {
+    const attempt = (ordinal: number, overrides: Partial<PersistedUsageAttempt> = {}): PersistedUsageAttempt => ({
+      ordinal,
+      provider: "a",
+      model: "m1",
+      adapter: "openai-chat",
+      status: 200,
+      durationMs: 5,
+      sendCount: 1,
+      recoveryKinds: [],
+      usageStatus: "reported",
+      ...overrides,
+    });
+    appendUsageEntry(entry("attempts-absent", 1000));
+    appendUsageEntry(entry("attempts-empty", 1001, "a", "m1", { attempts: [] }));
+    appendUsageEntry(entry("attempts-nonphysical", 1002, "a", "m1", {
+      attempts: [attempt(1, { sendCount: 0 }), attempt(2, { locallyAnswered: true })],
+    }));
+    appendUsageEntry(entry("attempts-duplicate", 1003, "a", "m1", {
+      attempts: [attempt(1), attempt(1, { provider: "duplicate" })],
+    }));
+    appendFileSync(usageLogPath(), `${JSON.stringify(entry("attempts-fallback", 1004, "a", "m1", {
+      attempts: [
+        attempt(1, { sendCount: 0 }),
+        attempt(1),
+        attempt(2),
+        attempt(2, { provider: "duplicate" }),
+      ],
+    }))}\n`, "utf-8");
+    appendFileSync(usageLogPath(), `${JSON.stringify(entry("attempts-invalid", 1005, "a", "m1", {
+      attempts: [
+        { ordinal: 1, provider: "a", model: "m1", status: 503, durationMs: 5 },
+        { ordinal: 2, provider: "b", model: "m2", status: 200, durationMs: 5 },
+      ] as PersistedUsageAttempt[],
+    }))}\n`, "utf-8");
+
+    const fallback = await queryRequestHistory({ fallback: true }, undefined, 10);
+    expect(fallback.rows.map(row => row.requestId)).toEqual(["attempts-fallback"]);
+    const counts = requestHistoryDb().query(
+      "SELECT request_id, attempt_count FROM requests ORDER BY request_id",
+    ).all() as Array<{ request_id: string; attempt_count: number }>;
+    expect(counts).toEqual([
+      { request_id: "attempts-absent", attempt_count: 1 },
+      { request_id: "attempts-duplicate", attempt_count: 1 },
+      { request_id: "attempts-empty", attempt_count: 0 },
+      { request_id: "attempts-fallback", attempt_count: 2 },
+      { request_id: "attempts-invalid", attempt_count: 0 },
+      { request_id: "attempts-nonphysical", attempt_count: 0 },
+    ]);
   });
 });

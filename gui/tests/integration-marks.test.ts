@@ -12,8 +12,8 @@ function bodyOf(src: string): string {
 }
 
 function inksOf(body: string): Set<string> {
-  const matches = body.match(/(?:fill|stop-color)\s*[:=]\s*"?#[0-9a-fA-F]{3,8}/g) ?? [];
-  return new Set(matches.map(raw => raw.split(/[:=]/).pop()!.replace(/"/g, "").trim().toLowerCase()));
+  const matches = body.matchAll(/(?:fill|stop-color)\s*[:=]\s*"?(#[0-9a-fA-F]{3,8}|oklch\([^)]+\))/g);
+  return new Set([...matches].map(match => match[1]!.toLowerCase()));
 }
 
 /*
@@ -30,15 +30,16 @@ test("every Integrations row has a mark that resolves to a committed file", () =
 
 /*
  * A null value is a legitimate answer -- it renders a monogram -- but none of the
- * current rows should be taking it. If one does, either an asset was dropped or a
+ * existing rows should be taking it, except Gentle Shell (no verified square asset). If one does, either an asset was dropped or a
  * client was added without a mark decision, and both look like a rendering bug
  * from the outside.
  */
-test("no Integrations row falls back to a monogram today", () => {
+// The two WorkBuddy editions also take the monogram until a mark is wired for each (#7665).
+test("only Gentle Shell and the WorkBuddy editions deliberately fall back to a monogram", () => {
   const monogram = Object.entries(INTEGRATION_MARKS)
     .filter(([, src]) => src === null)
     .map(([id]) => id);
-  expect(monogram).toEqual([]);
+  expect(monogram).toEqual(["gentle-shell", "workbuddy", "workbuddy-ai"]);
 });
 
 /*
@@ -61,15 +62,16 @@ test("no multi-color asset is masked", () => {
 /*
  * The inverse rule, and the one that cannot be derived from the file: a mark may
  * be a single ink and still not be a masking candidate, because that ink is the
- * brand. openai.svg is #10A37F and deepseek-harness.svg is #4d6bfe; masking
- * either repaints a trademark in the theme's text color. Pinned with their inks
- * so a vendor changing its asset shows up here rather than silently satisfying
- * the assertion.
+ * brand. openai.svg is #10A37F, deepseek-harness.svg is #4d6bfe and raycast.svg
+ * is #FF6363; masking any of them repaints a trademark in the theme's text
+ * color. Pinned with their inks so a vendor changing its asset shows up here
+ * rather than silently satisfying the assertion.
  */
 test("a single-ink asset whose ink is a brand color is not masked", () => {
   for (const [src, ink] of [
     ["/provider-icons/openai.svg", "#10a37f"],
     ["/provider-icons/deepseek-harness.svg", "#4d6bfe"],
+    ["/provider-icons/raycast.svg", "#ff6363"],
   ] as const) {
     expect(MASKED_MARKS.has(src), `${src} must not be masked`).toBe(false);
     expect([...inksOf(bodyOf(src))], `${src} ink changed upstream`).toEqual([ink]);

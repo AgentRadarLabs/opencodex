@@ -6,19 +6,22 @@ description: Développez opencodex — installation, structure, conventions et a
 ## Configuration
 
 Le développement depuis les sources exige la CLI `bun` dans votre `PATH`. Le paquet npm publié fournit son propre
-runtime Bun aux utilisateurs, mais les scripts de ce dépôt utilisent votre installation locale de Bun.
+runtime Bun aux utilisateurs ; les scripts du paquet peuvent résoudre Bun via cette dépendance incluse.
 
 ```bash
 git clone https://github.com/lidge-jun/opencodex.git
 cd opencodex
 bun install
+bun run setup:hooks  # retirer les anciens hooks gérés pre-push et post-merge
 bun run dev:proxy    # proxy API in dev mode
 bun run dev:gui      # dashboard dev server (another terminal)
-bun run typecheck    # bun x tsc --noEmit
-bun run test:changed              # routine import-graph test selection
-bun test tests/routing/router.test.ts     # routine focused test
-bun run test                      # complete suite (PR-ready / explicit ask)
+bun run typecheck    # bun check --no-script --noEmit
+bun run test        # suite complète (par défaut)
 ```
+
+`bun run setup:hooks` supprime les anciens hooks gérés `pre-push` et `post-merge` non modifiés,
+tout en préservant les hooks personnalisés. Le hook `pre-push`
+n’est plus obligatoire. `bun run prepush` reste une vérification manuelle facultative.
 
 `bun run dev` reste un alias pour `bun run dev:proxy`. Le serveur de développement du tableau de bord est `bun run dev:gui` ;
 le tableau de bord packagé en `GET /` est produit par `bun run build:gui` (`gui/dist`).
@@ -31,17 +34,25 @@ distincte. Utilisez les scripts enregistrés afin que les commandes locales corr
 ```bash
 bun run typecheck                 # strict TypeScript check
 bun run test:changed              # import-graph tests against the resolved dev merge base
-bun run test                      # complete tests/ suite (PR-ready / explicit ask)
+bun run test                      # suite complète (par défaut)
 bun test tests/routing/router.test.ts     # focused test file
 bun run build:gui                 # Vite GUI build + package preparation
 bun run privacy:scan              # credential/privacy scan used by CI
 bun run prepare:package           # refresh package launchers/assets
 ```
 
+Exécutez `bun run test` par défaut. Si une exécution complète est disproportionnée par rapport
+à la taille de la tâche, aux ressources de la machine ou aux worktrees utilisés en parallèle, vous
+devez au minimum exécuter des tests de régression ciblés qui exercent le comportement modifié, par
+exemple `bun test tests/<domain>/<name>.test.ts`. Expliquez ce choix et indiquez les commandes
+exactes, leurs résultats et le périmètre non testé. `bun run test:changed` peut compléter cette
+couverture, mais ne détecte pas toutes les dépendances indirectes. Se reposer uniquement sur la CI
+ou omettre les tests locaux ne constitue pas une exemption générale. Avant la fusion, tous les
+contrôles CI obligatoires doivent réussir sur le commit exact de la tête actuelle de la PR.
+
 Les tests Bun vivent dans des répertoires par domaine calqués sur `src/` (`tests/<domain>/`), la carte étant `scripts/test-layout/layout.json`. `tests/helpers/` contient les fixtures
 partagées et `tests/e2e-style/` des scénarios plus larges de parité native. Placez une régression ciblée près
-des tests existants du sous-système modifié. Exécutez la suite complète pour le routage partagé, les adaptateurs,
-la configuration ou le comportement du serveur.
+des tests existants du sous-système modifié.
 
 Le site de documentation que vous lisez se trouve dans `docs-site/` (Astro + Starlight) :
 
@@ -49,33 +60,20 @@ Le site de documentation que vous lisez se trouve dans `docs-site/` (Astro + Sta
 cd docs-site && bun install && bun dev
 ```
 
-## Publication de la documentation
+## CI / Release / Pages
 
-La documentation publique est publiée sur GitHub Pages à l’adresse <https://opencodex.me/>. Le workflow
-`.github/workflows/deploy-docs.yml` s’exécute lors des push sur `main` qui modifient `docs-site/**` ou le
-workflow lui-même. Il construit `docs-site` et déploie le site généré. Avant de pousser une modification,
-exécutez :
+Consultez la [version anglaise canonique](/contributing/) pour la publication, la CI, les versions et les branches.
 
-```bash
-cd docs-site
-bun install --frozen-lockfile
-bun run build
-```
 
-## CI et versions
+La branche `dev2-go`, qui portait l’ancien runtime natif Go, a été retirée, tout comme la politique à deux
+lignes d’exécution. Son historique est publié en lecture seule sur
+[lidge-jun/opencodex-go-archive](https://github.com/lidge-jun/opencodex-go-archive).
+Le TypeScript natif pour Bun sur `dev` est désormais l’unique ligne d’exécution.
 
-Les workflows GitHub Actions restent volontairement limités :
+Les pull requests de rebase sont les bienvenues. Rebaser une branche ancienne sur la tête actuelle constitue
+une contribution normale ; indiquez les commits sources dans la description.
 
-- **CI multiplateforme** (`.github/workflows/ci.yml`) s’exécute sur toutes les pull requests et sur les push vers
-  `dev`, `preview` et `main`. Un filtre interne limite les tâches coûteuses aux changements qui touchent le runtime,
-  les tests, les paquets, les scripts, TypeScript ou les workflows, tout en produisant un contrôle agrégé explicite
-  pour les PR documentaires. La suite principale est répartie sur Linux et exécutée intégralement sur macOS ; sa
-  voie Windows, actuellement non bloquante, ne s’exécute que sur lancement manuel avec `workflow_dispatch`. Des
-  tests ciblés du trousseau système et, lorsque le paquet change, de l’installation npm globale couvrent néanmoins
-  les trois systèmes. Cette dernière voie vérifie l’installation sans Bun préinstallé grâce au runtime fourni.
-- **Version** (`.github/workflows/release.yml`) est un workflow manuel. Il ne remplace pas une seconde CI complète :
-  avant une simulation ou une publication, il exige qu’une CI multiplateforme ait déjà réussi pour le commit
-  exact de la version (`GITHUB_SHA`).
+
 - **Expiration des demandes d’informations** (`.github/workflows/stale-needs-info.yml`) s’exécute chaque jour
   sur la branche par défaut. Une issue ouverte portant `needs-info` sans activité depuis 14 jours reçoit un
   avertissement, puis est fermée après 7 jours supplémentaires d’inactivité. Toute mise à jour efface
@@ -90,77 +88,42 @@ Les workflows GitHub Actions restent volontairement limités :
   `documentation`. Après promotion du workflow vers la branche par défaut, les responsables peuvent réappliquer
   les zones à toutes les issues ouvertes avec le workflow_dispatch `backfill_open_areas`.
 
-Utilisez l'assistant pour les versions :
-
-
-Avant d’exécuter le helper, choisissez la version prévue et lancez
-`.github/workflows/dev-version-bump.yml` depuis la branche par défaut avec
-`intended-version=<version>` et `mode=pre-move`. Relisez et fusionnez la PR créée
-vers `dev`, puis promouvez vers `main` ou `preview` avant de lancer le helper.
-Si `dev` dépasse déjà la version prévue, le workflow renvoie `changed=false` et
-aucune PR de version n’est nécessaire. La publication exige toujours une CI
-réussie sur le commit exact de la release.
-
-```bash
-bun run release <version>           # commits/pushes the bump; publish workflow is dry-run by default
-bun run release --bump minor        # calcule la prochaine version patch, minor ou major depuis les tags et canaux npm
-bun run release <version> --publish # publish after the CI-gated dry run is understood
-bun run release:watch               # watch the newest Release workflow run
-```
-
-`--bump patch|minor|major` remplace une version explicite. Dès qu’un tag de préversion ouvre un
-core supérieur, `--bump patch` refuse de prolonger l’ancienne ligne stable ; publiez plutôt le
-correctif dans le core de préversion ouvert.
-
-## Branches
-
-- `dev` — l’unique branche d’intégration. Ciblez-la avec votre pull request.
-- `main` — réservée aux versions. Elle avance par promotion de `dev`, sous le contrôle des responsables ;
-  n’y ouvrez aucune pull request de fonctionnalité.
-- `preview` — la branche des préversions.
-
-La branche `dev2-go`, qui portait l’ancien runtime natif Go, a été retirée, tout comme la politique à deux
-lignes d’exécution. Son historique est publié en lecture seule sur
-[lidge-jun/opencodex-go-archive](https://github.com/lidge-jun/opencodex-go-archive).
-Le TypeScript natif pour Bun sur `dev` est désormais l’unique ligne d’exécution.
-
-Les pull requests de rebase sont les bienvenues. Rebaser une branche ancienne sur la tête actuelle constitue
-une contribution normale ; indiquez les commits sources dans la description.
-
 ## Demandes d'extraction
 
-- Ciblez **`dev`**. N’ouvrez aucune pull request de fonctionnalité ou de correctif contre **`main`**.
-- Partez de la tête actuelle de **`dev`**, pas de **`main`**. Le contrôle obligatoire **`enforce-target`**
-  rejette les branches dont la base de fusion se trouve sur la tête de **`main`** alors qu’elles sont très en
-  retard sur la branche cible, le mode d’échec observé dans #644.
+- Ciblez **`dev`**, qui est aussi la branche par défaut du dépôt. **`main`** et **`preview`** ont été
+  supprimées une fois le modèle à branche unique en place. Le contrôle obligatoire **`enforce-target`**
+  rejette les pull requests dont la base n’est pas **`dev`** (les PR enfants empilées font exception).
 - Rédigez une vraie description : un **Résumé** de la modification et de sa raison, ainsi qu’un **Plan de test**
   ou un contenu équivalent. Les corps vides, les textes composés seulement d’espaces réservés et les descriptions
   contenant des `\n` échappés au lieu de véritables sauts de ligne échouent au contrôle.
-- Si le titre ou la description mentionne `gui`, incluez dans la description une capture d’écran de la modification
-  de l’interface. `enforce-target` est réexécuté après chaque modification de la description jusqu’à sa présence.
+- Si la pull request modifie des fichiers sous `gui/`, ajoutez une capture d’écran de la modification de
+  l’interface dans sa description. `enforce-target` est réexécuté après chaque modification de la description
+  jusqu’à sa présence. Glissez l’image dans la description au lieu de la committer sur la branche : elle serait
+  incluse dans le squash merge vers `dev`. Pour un envoi en ligne de commande, les responsables utilisent la
+  branche `pr-assets` avec un lien vers le SHA du commit.
 - Les workflows de ce dépôt utilisent **`pull_request_target`**. Une nouvelle logique d’application ne prend effet
   qu’après la promotion du workflow vers la branche par défaut, conformément à l’avertissement opérationnel de #631.
 
 ## Responsables du projet
 
 Les responsables actuels, leurs attributions et les règles de revue et de fusion sont décrits dans
-[`MAINTAINERS.md`](https://github.com/lidge-jun/opencodex/blob/main/MAINTAINERS.md). La propriété GitHub
+[`MAINTAINERS.md`](https://github.com/lidge-jun/opencodex/blob/dev/MAINTAINERS.md). La propriété GitHub
 du dépôt et des chemins sensibles du point de vue de la sécurité est déclarée dans `.github/CODEOWNERS`.
 
 ## Conventions
 
-- **Modules ES uniquement** (`import`/`export`), TypeScript, mode `strict`. Gardez `bun x tsc --noEmit` propre.
+- **Modules ES uniquement** (`import`/`export`), TypeScript, mode `strict`. Gardez `bun run typecheck` propre.
 - **Environ 500 lignes au maximum par fichier** — répartissez le code par responsabilité. Les services auxiliaires `web-search/` et `vision/` sont
   bons exemples de petits modules ciblés derrière un seul `index.ts`).
 - **Gérer les erreurs asynchrones aux frontières** — les services auxiliaires ne propagent jamais d’exception dans le
   chemin de requête ; ils se dégradent en un marqueur explicite.
 - **Structure, source de vérité** — les invariants actuels des responsables résident dans `structure/`. Conservez
-  les parcours utilisateurs publics dans `docs-site/` et les notes d’enquête historiques dans `docs/`.
+  les parcours utilisateurs publics dans `docs-site/` et les notes de planification et d’enquête dans `devlog/`.
 - **Préserver les exportations** — d'autres modules peuvent en dépendre.
 
 ## Ajout d'un fournisseur au catalogue
 
-Tous les sélecteurs de fournisseurs et les graines proviennent du registre canonique (`src/providers/registry.ts`) :
+Tous les sélecteurs de fournisseurs et les graines proviennent du registre canonique (`src/providers/registry/entries-extended.ts`) :
 
 ```ts
 {
@@ -224,6 +187,6 @@ la fabrique depuis `src/index.ts` lorsqu’elle appartient à l’API publique d
 
 ## Vérifiez avant de déclarer que c'est fait
 
-Exécutez la commande la plus étroite qui prouve votre changement — `bun run typecheck` pour les types, un
-`bun test tests/<name>.test.ts` ou une sonde d'exécution pour le comportement, puis les portes plus larges appropriées à
-la surface affectée. opencodex privilégie les petits commits vérifiables plutôt que les gros lots.
+Suivez la politique de test ci-dessus et exécutez `bun run typecheck` pour les changements de types,
+ainsi que les vérifications requises pour la zone concernée. Indiquez les commandes, les résultats
+et le périmètre non testé ; ne revendiquez que les validations réellement effectuées.

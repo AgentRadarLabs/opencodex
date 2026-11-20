@@ -1,4 +1,8 @@
-import type { StorageCleanupPolicy } from "../types";
+import { existsSync } from "node:fs";
+import type { OcxConfig, StorageCleanupPolicy } from "../types";
+import { registerCodexLowQuotaProtection, type LowQuotaRegistration } from "../codex/low-quota-protection";
+import { resolveLowQuotaDesktopSink } from "../codex/low-quota-desktop-notifier";
+import type { LowQuotaEvent } from "../codex/low-quota-events";
 import { startStateStoreSweeper } from "../lib/state-store-sweeper";
 import {
   abortStorageCleanupPolicyJobAsync,
@@ -12,6 +16,12 @@ import {
 } from "../storage/policy-scheduler";
 import { startQuotaResetPoller, stopQuotaResetPoller } from "../quota/reset-poller";
 import {
+  setCatalogAutoRefreshClientFanout,
+  startCatalogAutoRefresh,
+  stopCatalogAutoRefresh,
+  syncCatalogAutoRefreshCadence,
+} from "../codex/catalog-auto-refresh";
+import {
   cancelQueuedStorageWorkerSpawns,
   drainStorageWorkers,
 } from "../storage/worker-lifecycle";
@@ -23,6 +33,11 @@ import {
   startMemoryWatchdog,
   type MemoryWatchdog,
 } from "./memory-watchdog";
+import { ensureQuotaPoolIdentity } from "../quota-pool/identity";
+import { isTelemetryEnvOptOut } from "../telemetry/consent";
+// The state module alone: the scheduler and its aggregation stay behind the dynamic import below.
+import { TELEMETRY_ENV_OPT_OUT_REFRESH_MS, endTelemetryEnvOptOut, recordTelemetryEnvOptOut } from "../telemetry/state";
+import { telemetryProfilePath } from "../telemetry/profile/paths";
 
 type PolicyApply = (policy: StorageCleanupPolicy) => void;
 
@@ -33,12 +48,16 @@ type ProcessLoops = {
 
 type LeaseOwner = {
   token: symbol;
+  fanoutRevoked: boolean;
   applyPolicy: PolicyApply;
   resources: ServerResourceOwnerLease;
+  lowQuota: LowQuotaRegistration;
 };
 
 export type ServerBackgroundLifecycleLease = {
   scheduleStartupRun(): void;
+  listLowQuotaEvents(limit?: number): LowQuotaEvent[];
+  revokeClientFanout(): void;
   release(): Promise<void>;
   releaseAfterFailedStart(): void;
 };
@@ -46,10 +65,45 @@ export type ServerBackgroundLifecycleLease = {
 const owners: LeaseOwner[] = [];
 let processLoops: ProcessLoops | null = null;
 let cleanupInProgress = false;
+let telemetryLoopGeneration = 0;
+let stopTelemetryLoop: (() => void) | null = null;
+let stopProfileLoop: (() => void) | null = null;
+// This process started under an env opt-out; its clean stop closes the opt-out period (D2).
+let telemetryEnvOptOutObserved = false;
+let telemetryEnvOptOutRefreshMsOverride: number | null = null;
+let telemetryEnvOptOutRefresh: ReturnType<typeof setInterval> | null = null;
+
+export function setTelemetryEnvOptOutRefreshMsForTests(ms: number | null): void {
+  telemetryEnvOptOutRefreshMsOverride = ms;
+}
+
+function clearTelemetryEnvOptOutRefresh(): void {
+  if (telemetryEnvOptOutRefresh) clearInterval(telemetryEnvOptOutRefresh);
+  telemetryEnvOptOutRefresh = null;
+}
 
 function setLivePolicyOwner(applyPolicy: PolicyApply | null): void {
   setStorageCleanupPolicyLiveSink(applyPolicy);
   setStorageCleanupPolicyJobLiveApply(applyPolicy);
+}
+
+/** Resolve the current process owner at delivery time so lease hand-over cannot retain an old port. */
+async function refreshConnectedClientsAfterCatalogChange(isCurrent: () => boolean) {
+  const captured = owners.findLast(owner => !owner.fanoutRevoked);
+  if (!captured) return [];
+  const current = () => isCurrent() && !captured.fanoutRevoked && owners.includes(captured);
+  const [{ readRuntimePort }, { loadConfig }, { localClientSyncAllowed }, { syncEnabledClientIntegrations }] =
+    await Promise.all([
+      import("../config/process-state"),
+      import("../config"),
+      import("../codex/desired-state"),
+      import("./management/config-routes"),
+    ]);
+  const runtime = readRuntimePort(process.pid);
+  const config = loadConfig();
+  // An explicit catalog tick on a hub is not permission to enroll its local clients.
+  if (!runtime || !current() || !localClientSyncAllowed(config)) return [];
+  return syncEnabledClientIntegrations(runtime.port, config, {}, { unattended: { isCurrent: current } });
 }
 
 function startProcessLoops(applyPolicy: PolicyApply): ProcessLoops {
@@ -70,6 +124,18 @@ function startProcessLoops(applyPolicy: PolicyApply): ProcessLoops {
       .catch(() => {
         // The next tick adopts it.
       });
+    // Default-on: explicit false or a zero cadence makes ticks dormant. Both startup
+    // and interval timers are unref'd. The scheduler
+    // module keeps every heavy import inside its tick, so naming it statically here
+    // costs a module record and nothing else.
+    setCatalogAutoRefreshClientFanout(refreshConnectedClientsAfterCatalogChange);
+    startCatalogAutoRefresh();
+    // The scheduler starts at its default cadence because resolving the operator's value
+    // reads the config barrel. Fire-and-forget: startup must not await an optional
+    // subsystem, and the next tick adopts the cadence anyway.
+    void syncCatalogAutoRefreshCadence().catch(() => {
+      // The next tick adopts it.
+    });
     // Install the delivery sink now rather than waiting out the first poll interval, which is 15
     // minutes by default. Without this, an enabled install would observe nothing for its first
     // quarter hour — including the live request path, which is gated on the sink existing.
@@ -79,24 +145,78 @@ function startProcessLoops(applyPolicy: PolicyApply): ProcessLoops {
       .catch(() => {
         // The next poll tick retries.
       });
+    const generation = ++telemetryLoopGeneration;
+    if (isTelemetryEnvOptOut(process.env) === null) {
+      void import("../telemetry/scheduler")
+        .then(scheduler => {
+          if (generation !== telemetryLoopGeneration) return;
+          stopTelemetryLoop = scheduler.startTelemetryScheduler();
+        })
+        .catch(() => {
+          // Optional background loop.
+        });
+    } else {
+      telemetryEnvOptOutObserved = true;
+      // Recorded under this pid, so a proxy sharing the home cannot end the period while this one runs.
+      try { recordTelemetryEnvOptOut(undefined, undefined, process.pid); } catch { /* best-effort */ }
+      telemetryEnvOptOutRefresh = setInterval(() => {
+        try { recordTelemetryEnvOptOut(undefined, undefined, process.pid); } catch { /* best-effort */ }
+      }, telemetryEnvOptOutRefreshMsOverride ?? TELEMETRY_ENV_OPT_OUT_REFRESH_MS);
+      telemetryEnvOptOutRefresh.unref?.();
+    }
+    // The opt-in public profile loop runs only when a profile file exists, and independently of
+    // the anonymous env gate above: a disconnect that could not reach the collector is retried
+    // here even while anonymous telemetry is off. Sending stays gated on anonymous telemetry.
+    if (existsSync(telemetryProfilePath())) {
+      void import("../telemetry/profile/sync")
+        .then(sync => {
+          if (generation !== telemetryLoopGeneration) return;
+          stopProfileLoop = sync.startProfileScheduler();
+        })
+        .catch(() => {
+          // Optional background loop.
+        });
+    }
     return { memoryWatchdog, stateStoreSweeper };
   } catch (error) {
+    telemetryLoopGeneration += 1;
+    stopTelemetryLoop?.();
+    stopTelemetryLoop = null;
+    stopProfileLoop?.();
+    stopProfileLoop = null;
+    clearTelemetryEnvOptOutRefresh();
     memoryWatchdog?.stop();
     stateStoreSweeper?.stop();
     stopStorageCleanupScheduler();
     stopQuotaResetPoller();
+    stopCatalogAutoRefresh();
+    setCatalogAutoRefreshClientFanout(null);
     setLivePolicyOwner(null);
     throw error;
   }
 }
 
 function stopProcessLoops(): void {
+  telemetryLoopGeneration += 1;
+  const stopTelemetry = stopTelemetryLoop;
+  stopTelemetryLoop = null;
+  stopTelemetry?.();
+  const stopProfile = stopProfileLoop;
+  stopProfileLoop = null;
+  stopProfile?.();
+  clearTelemetryEnvOptOutRefresh();
+  if (telemetryEnvOptOutObserved) {
+    telemetryEnvOptOutObserved = false;
+    try { endTelemetryEnvOptOut(undefined, undefined, process.pid); } catch { /* best-effort; the next tick ends it once this pid has exited */ }
+  }
   const loops = processLoops;
   processLoops = null;
   loops?.memoryWatchdog.stop();
   loops?.stateStoreSweeper.stop();
   stopStorageCleanupScheduler();
   stopQuotaResetPoller();
+  stopCatalogAutoRefresh();
+  setCatalogAutoRefreshClientFanout(null);
   setLivePolicyOwner(null);
 }
 
@@ -130,6 +250,7 @@ function removeOwner(owner: LeaseOwner): boolean {
 
 function releaseOwnerSynchronously(owner: LeaseOwner): "inactive" | "shared" | "last" {
   if (!removeOwner(owner)) return "inactive";
+  owner.lowQuota();
   owner.resources.release();
   const nextOwner = owners.at(-1);
   if (nextOwner) {
@@ -150,15 +271,21 @@ function releaseOwnerSynchronously(owner: LeaseOwner): "inactive" | "shared" | "
  */
 export function acquireServerBackgroundLifecycle(
   applyPolicy: PolicyApply,
+  config: OcxConfig,
 ): ServerBackgroundLifecycleLease {
   if (cleanupInProgress) {
     throw new Error("server background lifecycle cleanup is still in progress");
   }
+  // The quota-pool identity (homeId and the accountRef key) is minted here, per server and off
+  // the request path, so GET /api/quota-pool only ever reads it.
+  try { ensureQuotaPoolIdentity(); } catch { /* the read reports quota_pool_identity_unavailable */ }
 
   const owner: LeaseOwner = {
     token: Symbol("server-background-lifecycle"),
+    fanoutRevoked: false,
     applyPolicy,
     resources: acquireServerResourceOwner(),
+    lowQuota: registerCodexLowQuotaProtection(config, { desktopSink: () => resolveLowQuotaDesktopSink() }),
   };
   try {
     if (!processLoops) {
@@ -168,12 +295,21 @@ export function acquireServerBackgroundLifecycle(
     }
     owners.push(owner);
   } catch (error) {
+    owner.lowQuota();
     owner.resources.release();
     throw error;
   }
 
   let releaseFlight: Promise<void> | null = null;
+  function finishRelease(): Promise<void> {
+    const outcome = releaseOwnerSynchronously(owner);
+    if (outcome !== "last") return Promise.resolve();
+    cleanupInProgress = true;
+    return stopStoragePolicyWorker().finally(() => { cleanupInProgress = false; });
+  }
   return {
+    revokeClientFanout() { owner.fanoutRevoked = true; },
+    listLowQuotaEvents(limit) { return owner.lowQuota.listEvents(limit); },
     scheduleStartupRun() {
       if (owners.some(candidate => candidate.token === owner.token)) {
         scheduleStorageCleanupStartupRun();
@@ -181,19 +317,15 @@ export function acquireServerBackgroundLifecycle(
     },
     release() {
       if (releaseFlight) return releaseFlight;
-      const outcome = releaseOwnerSynchronously(owner);
-      if (outcome !== "last") {
-        releaseFlight = Promise.resolve();
-        return releaseFlight;
-      }
-      cleanupInProgress = true;
-      releaseFlight = stopStoragePolicyWorker().finally(() => {
-        cleanupInProgress = false;
-      });
+      // Default installs have no low-quota write. Preserve synchronous owner removal;
+      // an unconditional await here extends process-global ownership into later starts.
+      if (!owner.lowQuota.hasPendingSave()) releaseFlight = finishRelease();
+      else releaseFlight = owner.lowQuota.flush().then(finishRelease, finishRelease);
       return releaseFlight;
     },
     releaseAfterFailedStart() {
       if (releaseFlight) return;
+      owner.lowQuota();
       // Startup evaluation is scheduled only after both listeners bind, so a
       // failed start cannot have spawned a Worker for this lease. Keep rollback
       // synchronous so a caller may immediately retry a different port.

@@ -30,7 +30,7 @@ opencodex는 요청된 model을 다음 순서로 해석합니다:
 
 ### 차단된 모델 리디렉션
 
-`blockedModelRedirects`는 기본적으로 설정되지 않는 선택적 최상위 `Record<string, string>`이며, 정확히 일치하는 해석된 모델 ID의 대체값을 정의합니다. 위 해석 순서가 끝난 후 적용됩니다. 일치하면 이미 선택된 공급자와 계정 경로는 유지하고 업스트림 모델 ID만 교체하며, 경로 사유를 `blocked-model-redirect`로 기록합니다. 이 키를 생략하면 라우팅이 바뀌지 않습니다.
+`blockedModelRedirects`는 기본적으로 설정되지 않는 정확히 일치하는 대체 표입니다. 베어 모델 키는 공급자, 계정, 별칭을 해석한 뒤 적용됩니다. 다른 설정된 공급자를 명시하지 않은 대상은 `/`가 포함되어도 선택된 공급자와 계정에서 업스트림 모델 ID만 한 번 바꿉니다. 다른 설정된 공급자를 명시한 대상만 해당 공급자로 이동하며, 이 경우 `<원본 공급자>/<해석된 모델>` 키가 베어 키보다 우선합니다. 연쇄 리디렉션은 최대 5홉이고 순환을 감지합니다. 고정 계정 선택자는 다른 공급자로 이동할 수 없습니다. 대상은 자체 인증 정보와 할당량을 사용하며 사유는 `blocked-model-redirect`입니다.
 
 ```json
 {
@@ -66,9 +66,10 @@ Codex Auth 페이지에서 이 picker 동작을 opt-in할 수 있습니다. 비�
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `targets` | `{ provider: string; model: string; weight?: number }[]` | required | 순서가 있는 concrete route입니다. `weight`는 1–10000이며 기본값은 `1`입니다. |
-| `strategy?` | `"failover" \| "round-robin" \| "random" \| "least-used" \| "reset-window"` | `"failover"` | 선택 전략입니다. 대상 순서는 `failover` 우선순위이고, 가중치는 `round-robin`과 `random` 추첨 비율을 결정하며, `least-used`는 기록된 성공 횟수를 따르고, `reset-window`는 가장 가까운 할당량 재설정을 따릅니다. |
+| `strategy?` | `"failover" \| "round-robin" \| "random" \| "least-used" \| "reset-window" \| "jev"` | `"failover"` | 선택 전략입니다. 대상 순서는 `failover` 우선순위이고, 가중치는 `round-robin`과 `random` 추첨 비율을 결정하며, `least-used`는 기록된 성공 횟수를 따르고, `reset-window`는 가장 가까운 할당량 재설정을 따릅니다. `jev`는 첫 번째 적격 대상과 effort를 한 번의 제한된 결정으로 선택한 뒤 일반적인 순서 기반 fallback을 사용합니다. |
 | `stickyLimit?` | `number` | `1` | 한 round-robin 배치에서 유지되는 성공 요청 수입니다. 범위는 1–100입니다. |
-| `defaultEffort?` | `"low" \| "medium" \| "high" \| "xhigh" \| "max" \| "ultra" \| null` | unset | 호출자가 effort를 생략했고 선택된 대상이 요청한 rung를 광고할 때만 적용됩니다. |
+| `defaultEffort?` | `"low" \| "medium" \| "high" \| "xhigh" \| "max" \| "ultra" \| null` | unset | `defaultEffort`는 콤보 기본값이 null이 아니고, 선택한 대상의 지원 목록이 알려져 있으며 비어 있지 않을 때 생략된 `reasoning.effort`를 채웁니다. 설정값을 지원하면 그대로 사용합니다. 그렇지 않으면 설정값 이하의 가장 높은 지원 단계를 사용하고, 그런 단계가 없으면 가장 낮은 지원 단계를 사용합니다. 지원 목록이 없거나 비어 있으면 기본값을 생략합니다. |
+| `reasoningEffortMode?` | `"strict" \| "adaptive"` | `"strict"` | `"strict"`는 빈 목록을 포함한 알려진 대상 지원 목록의 교집합을 사용하고, `"adaptive"`는 빈 목록을 제외합니다. 알 수 없는 목록은 두 모드 모두 교집합을 제한하지 않습니다. 전송 시 명시적 빈 목록은 두 모드에서 effort·thinking 제어를 제거하고, 알 수 없는 목록은 adaptive에서만 제거합니다. `reasoning.summary`는 보존됩니다. 알려진 비어 있지 않은 대상의 effort 결정과 대상 선택·순서는 그대로입니다. |
 | `alias?` | `string` | — | 정규화된 picker slug 대신 쓰는 선택적 공개 model id입니다. |
 | `nativeAlias?` | `boolean` | `false` | 현재 지원되는 bare native id가 해당 비수식 id에만 우선하도록 합니다. 계정 또는 프로바이더로 수식된 OpenAI route는 별도로 유지됩니다. |
 | `displayName?` | `string` | — | catalog 표시 전용 label이며 native alias에서는 비어 있지 않아야 합니다. |
@@ -119,6 +120,27 @@ CLI: `ocx route policy list`, `ocx route policy show <id>`, `ocx route policy dr
 반환되는 히스토리와 라우트 결정 페이로드는 마스킹된 요청 메타데이터만 노출합니다(예: 불투명한 `apiKeyId` 라벨). 자격 증명, 원본 프롬프트 본문, 공급자 시크릿은 포함하지 않습니다.
 
 CLI: `ocx logs explain <request-id>`, `ocx logs rebuild-index`, `ocx logs index-status`.
+
+### 인덱스 검사와 복구
+
+기존 기록 인덱스를 처음 열면 읽기 전용 워커에서 무결성을 검사합니다.
+기록 조회는 이 초기 검사를 기다리며, 프록시의 요청 처리 스레드를 막지 않습니다.
+동기식 라우팅 조회는 검사 중에 busy를 반환하므로 라우팅 프로필의
+`unknownEvidence.health` 정책이 적용됩니다. 작은 인덱스를 인라인으로 재구축한 경우에는
+성공 직후 사용할 수 있으며, 워커에서 재구축한 인덱스는 게시 전에 검사를 마칩니다.
+
+검사나 재구축에 성공한 뒤 최소 5분이 지나면 다음 조회가 백그라운드 무결성 검사 하나를
+시작합니다. 이미 검증된 인덱스는 검사 중에도 조회할 수 있습니다. 일반 갱신은 스키마,
+원본 파일 식별자와 바이트 오프셋을 확인하지만 전체 동기식 검사를 반복하지 않으며,
+조회가 없는 동안에는 타이머를 실행하지 않습니다. 데이터베이스 잠금이나 워커 실행 실패
+같은 일시적인 검사 오류는 인덱스를 삭제하지 않고, 30초가 지난 뒤의 조회에서 다시 시도합니다.
+초기 검증을 마치지 못한 인덱스는 그동안 사용할 수 없습니다.
+
+손상이 탐지되면 `usage.jsonl`에서 자동으로 재구축하며, 영향을 받은 비동기 기록·분석
+조회는 복구 후 한 번 재시도합니다. 인덱스를 닫거나 재구축할 때에는 이전 검사 결과를
+폐기하고 검사 워커가 파일을 해제한 뒤 인덱스를 교체합니다. 검사와 복구는 원본 기록을
+다시 쓰지 않습니다. 초기 검사에는 인덱스 크기에 비례하는 시간이 걸리며,
+이후 백그라운드 검사는 인덱스를 사용하는 동안에만 실행됩니다.
 
 ## 마이그레이션
 

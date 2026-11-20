@@ -4,12 +4,11 @@
  *
  * WHY THIS EXISTS
  *
- * `scripts/release.ts` runs only on `main` or `preview` (`allowedBranches`), bumps
- * `package.json` there, and pushes that branch. `release.yml` ends at "Create GitHub
- * release". Nothing advances `dev`. So the moment a release publishes, `dev` carries a
- * version that is at or behind a published one, and
- * `tests/ci-workflows/release-version-line.test.ts` fails on `dev` and on every pull request opened
- * against it — inherited red that a contributor cannot fix from their own diff.
+ * The former branch-based release flow advanced a release branch without advancing
+ * `dev`, leaving its planned version at or behind the published version. The current
+ * release flow builds from a green `dev` commit and stamps the version in each build;
+ * it does not require a committed pre-move. This helper remains available for an
+ * explicit maintainer-controlled version adjustment.
  *
  * That has been repaired by hand four times: `32529c2b2`, `e4a85d134`, `076ad3036`,
  * `befcac3e1`. The second of those ADDED the detector, and two more repairs followed
@@ -20,8 +19,8 @@
  * This decides a version. It does no git and no network work, which is what makes it
  * unit-testable and what keeps the credential surface in the workflow that calls it.
  * It does not merge anything: `.github/workflows/dev-version-bump.yml` uses the
- * output to open a pull request, and a human still merges that. Until they do, the
- * red persists. This is a prepared repair, not an automatic one.
+ * output to open a pull request, and a human still merges that. This is a prepared
+ * adjustment, not an automatic release step.
  *
  * THE RULE
  *
@@ -50,11 +49,19 @@
  * opened, and the job goes red asking for a human decision. This file only enforces
  * what it can prove without I/O — that the candidate ranks strictly ahead of both
  * inputs by the repository's own comparator.
+ *
+ * THE VERSION SOURCES
+ *
+ * The CLI moves every version source, not only `package.json`: the desktop app reads its
+ * version from `desktop/src-tauri/tauri.conf.json` and `Cargo.toml`/`Cargo.lock`, so a
+ * `package.json`-only bump let `dev` carry 2.62.0 for npm while the desktop sources still said
+ * 2.61.0. `scripts/release-version-sources.ts` owns that list; the workflow stages exactly it.
  */
 
-import { existsSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 
 import { compareReleaseTags } from "./release-notes";
+import { writeVersionSources } from "./release-version-sources";
 import { nextDevelopmentVersion } from "./version-line";
 
 /**
@@ -164,33 +171,18 @@ if (import.meta.main) {
   }
 
   if (decision.changed) {
-    // Rewrite only the version line. A full JSON round-trip would reformat the file
-    // and turn a one-line bump into an unreviewable diff.
-    const rewritten = raw.replace(
-      /("version"\s*:\s*")[^"]+(")/,
-      (_match, open: string, close: string) => `${open}${decision.version}${close}`,
-    );
-    if (rewritten === raw) {
-      console.error("✗ could not locate the version line to rewrite");
-      process.exit(1);
-    }
-    // Atomic replacement, per scripts/AGENTS.md: package metadata is exactly the class of
-    // file whose partial write corrupts a checkout. This script is also the documented
-    // manual recovery path, so it can run on a developer machine where an interrupt or a
-    // full disk mid-write would leave a truncated package.json and no way to install.
-    // Write a sibling temp file, rename it into place (atomic within one filesystem), and
-    // remove the temp on any failure so a crash leaves no debris.
-    const temp = `${packageJsonPath}.tmp-${process.pid}`;
+    // Move package.json and the desktop sources beside it together. The writer rewrites only
+    // each file's version line, because a full JSON or TOML round-trip would reformat the file
+    // and turn a one-line bump into an unreviewable diff. It computes every rewrite before
+    // writing, so a missing or unrecognisable desktop source fails with nothing changed, and
+    // it replaces each file atomically, per scripts/AGENTS.md: package metadata is exactly the
+    // class of file whose partial write corrupts a checkout. This script is also the
+    // documented manual recovery path, so it can run on a developer machine where an interrupt
+    // or a full disk mid-write would otherwise leave a truncated package.json.
     try {
-      writeFileSync(temp, rewritten, "utf8");
-      renameSync(temp, packageJsonPath);
+      writeVersionSources(dirname(packageJsonPath), decision.version);
     } catch (err) {
-      try {
-        if (existsSync(temp)) unlinkSync(temp);
-      } catch {
-        // Nothing more to do: the original file is untouched, which is the point.
-      }
-      console.error(`✗ could not write ${packageJsonPath}: ${err instanceof Error ? err.message : String(err)}`);
+      console.error(`✗ could not move the version sources: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
   }

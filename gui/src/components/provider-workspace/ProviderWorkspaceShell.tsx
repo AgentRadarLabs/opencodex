@@ -7,7 +7,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useKeyedClientResource } from "../../client-resource";
 import { createBoundedFetch } from "../../bounded-fetch";
-import { usageSummary30dResourceKey } from "../../usage-summary-resource";
+import { readUsageMetadata, readUsageResponseJson, usageSummary30dResourceKey, type UsageReadMetadata } from "../../usage-summary-resource";
+import { UsageIncompleteNotice } from "../usage-incomplete-notice";
 import { useT } from "../../i18n/shared";
 import { IconFilter, IconSearch, IconBoxes, IconGlobe, IconLock, IconKey, IconTrash } from "../../icons";
 import {
@@ -24,7 +25,7 @@ import {
 import { providerKind } from "../../provider-workspace/kind";
 import { readJsonIfOk, readJsonOrThrow } from "../../fetch-json";
 import { readSessionListCache, writeSessionListCache } from "../../session-list-cache";
-import { buildProviderModelUsage, buildProviderUsageTotals, countAvailableModels, parseAvailableModels, parseLiveModelCounts, parseSelectedModels, type ProviderAvailableModels, type ProviderLiveModelCounts, type ProviderModelCounts, type ProviderSelectedModels } from "../../provider-workspace/usage";
+import { buildProviderModelUsage, buildProviderUsageTotals } from "../../provider-workspace/usage";
 import {
   freshQuotaReportRecord,
   freshQuotaReportsFromResponse,
@@ -35,6 +36,11 @@ import { RailRow } from "./ProviderRail";
 import type { PricingFilter, ProviderModelUsageRow, ProviderUsageTotals, StatusFilter, TypeFilter } from "./types";
 import ProviderOverviewDashboard from "./ProviderOverviewDashboard";
 import ProviderJsonEditor, { type JsonEditorState } from "./ProviderJsonEditor";
+import { providerDraftTargetLabel } from "../../provider-workspace/target-drafts";
+
+import type { ModelRow } from "../../pages/models-shared";
+import { parseModelInventory, countModelInventory, parseModelSelection, parseProviderDiscoveryMap } from "../../provider-workspace/model-inventory";
+import type { ProviderDiscoverySummary } from "../../models-groups";
 
 export type AddProviderIntent = { tier?: "accounts" | "free" | "paid"; custom?: boolean };
 
@@ -47,6 +53,9 @@ export interface DetailSlotData {
   /** Did the last successful discovery return rows? Server-reported, never inferred. */
   hasLiveModels: boolean;
   selectedModels: string[];
+  modelRows: ModelRow[] | null;
+  modelRevision: string;
+  modelRowsReady: boolean;
   modelsLoading: boolean;
   modelsLoadFailed: boolean;
   onRetryModels?: () => void;
@@ -70,6 +79,8 @@ function readFreshQuotaReportCache(key: string): Record<string, ProviderQuotaRep
 export default function ProviderWorkspaceShell({
   providers,
   apiBase,
+  targetKey,
+  targetLabel,
   defaultProvider,
   selectedName,
   onSelect,
@@ -79,6 +90,7 @@ export default function ProviderWorkspaceShell({
   jsonEditor,
   jsonSaving = false,
   modelsRefreshToken = 0,
+  fetchDiscovery = false,
   onModelsSettled,
   activeAccountNeedsReauth,
   /** Stable key of active OAuth account ids — refetch overview quotas after account switch. */
@@ -90,6 +102,10 @@ export default function ProviderWorkspaceShell({
 }: {
   providers: Record<string, WorkspaceProvider>;
   apiBase: string;
+  /** Logical target identity for target-scoped usage caches. */
+  targetKey?: string;
+  /** Nonsecret logical target label for draft/save-target copy. */
+  targetLabel?: string;
   defaultProvider: string;
   selectedName: string | null;
   onSelect: (name: string | null) => void;
@@ -101,6 +117,8 @@ export default function ProviderWorkspaceShell({
   jsonSaving?: boolean;
   /** Bump after login/config changes so /api/selected-models is refetched. */
   modelsRefreshToken?: number;
+  /** Join per-provider `/api/providers` discovery status into the revision-bound model snapshot. */
+  fetchDiscovery?: boolean;
   /** Registration feedback re-reads config only after this discovery actually settles. */
   onModelsSettled?: (ok: boolean) => void;
   activeAccountNeedsReauth?: Record<string, boolean>;
@@ -113,10 +131,12 @@ export default function ProviderWorkspaceShell({
   /**
    * Called when a FORCED quota read settles, with whether it succeeded.
    *
-   * The shell owns the only `/api/provider-quotas` read, so it owns the only truthful
-   * completion signal. An operator-facing refresh button that resolved on its own would
-   * report success before the response landed — `fetchProviderQuotas(true)` is a
-   * synchronous state bump, not a request.
+   * The shell owns the only `/api/provider-quotas` read in this workspace, forced
+   * `?refresh=1` included — the header QuotaSummaryBar keeps a separate passive 60s read
+   * that never forces one — so the shell owns the only truthful completion signal for a
+   * forced refresh. An operator-facing refresh button that resolved on its own would report
+   * success before the response landed: `fetchProviderQuotas(true)` is a synchronous state
+   * bump, not a request.
    */
   onQuotaRefreshSettled?: (ok: boolean, epoch: number) => void;
   /** True when the bump came from a mutation that needs the server to bypass its TTL. */
@@ -131,20 +151,24 @@ export default function ProviderWorkspaceShell({
 }) {
   const t = useT();
   const [search, setSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>({ ready: true, needsSetup: true, disabled: true });
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>({ ready: true, needsSetup: true, unverified: true, disabled: true });
   const [pricingFilter, setPricingFilter] = useState<PricingFilter>({ free: true, paid: true });
   const [typeFilter, setTypeFilter] = useState<TypeFilter>({ cloud: true, local: true, selfHosted: true, login: true });
   const [sortMode, setSortMode] = useState<ProviderSortMode>("az");
   const [filterOpen, setFilterOpen] = useState(false);
   const [railFocusName, setRailFocusName] = useState<string | null>(null);
-  const [modelCounts, setModelCounts] = useState<ProviderModelCounts>({});
-  const [availableModels, setAvailableModels] = useState<ProviderAvailableModels>({});
-  const [liveModelCounts, setLiveModelCounts] = useState<ProviderLiveModelCounts>({});
-  const [selectedModels, setSelectedModels] = useState<ProviderSelectedModels>({});
+  const [modelSnapshot, setModelSnapshot] = useState<{
+    revision: string; rows: ModelRow[]; selection: ReturnType<typeof parseModelSelection>;
+    discovery?: Record<string, ProviderDiscoverySummary>;
+  } | null>(null);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsLoadFailed, setModelsLoadFailed] = useState(false);
-  const quotasCacheKey = `ocx.providers.quotas.v1:${apiBase}`;
-  const usageCacheKey = `ocx.providers.usage.v2:${apiBase}`;
+  const cacheTarget = targetKey ?? apiBase;
+  const quotasCacheKey = `ocx.providers.quotas.v1:${cacheTarget}`;
+  const usageCacheKey = `ocx.providers.usage.v2:${cacheTarget}`;
+  const [usageMetadata, setUsageMetadata] = useState<UsageReadMetadata>(() => (
+    readUsageMetadata(readSessionListCache(usageCacheKey))
+  ));
   const [usageTotals, setUsageTotals] = useState<Record<string, ProviderUsageTotals>>(() => (
     readSessionListCache<{ totals: Record<string, ProviderUsageTotals> }>(usageCacheKey)?.totals ?? {}
   ));
@@ -160,9 +184,17 @@ export default function ProviderWorkspaceShell({
     return !cached || Object.keys(cached).length === 0;
   });
   const [modelsLoadEpoch, setModelsLoadEpoch] = useState(0);
+  const modelRevision = JSON.stringify([apiBase, cacheTarget, modelsRefreshToken, modelsLoadEpoch]);
+  const modelRowsReady = modelSnapshot?.revision === modelRevision && !modelsLoading && !modelsLoadFailed;
+  const modelCounts = useMemo(() => countModelInventory(modelSnapshot?.rows ?? []), [modelSnapshot]);
+  const modelsSettled = useRef(onModelsSettled);
+  useEffect(() => { modelsSettled.current = onModelsSettled; }, [onModelsSettled]);
   const filterWrapRef = useRef<HTMLDivElement>(null);
   // Shared usage-summary key: all four subscribers raise the deadline together (30d usage is ~5s cold).
-  const usageResource = useKeyedClientResource(usageSummary30dResourceKey(apiBase), [apiBase], async (signal) => { const res = await fetch(apiBase + "/api/usage?range=30d", { signal }); if (!res.ok) throw new Error(String(res.status)); return await res.json(); }, { deadlineMs: 60_000 });
+  const usageResource = useKeyedClientResource(usageSummary30dResourceKey(apiBase, "all", targetKey), [apiBase, targetKey], async (signal) => {
+    const res = await fetch(apiBase + "/api/usage?range=30d", { signal });
+    return await readUsageResponseJson(res);
+  }, { deadlineMs: 60_000 });
 
   const sections = useMemo(() => {
     const base = buildProviderWorkspace(hideRedundantChatGptForwardProviders(providers));
@@ -170,40 +202,54 @@ export default function ProviderWorkspaceShell({
   }, [providers, activeAccountNeedsReauth]);
 
   const retryModels = useCallback(() => {
+    setModelsLoading(true);
+    setModelsLoadFailed(false);
     setModelsLoadEpoch(epoch => epoch + 1);
   }, []);
 
   useEffect(() => {
-    // Deferred load (matches Models/Usage/ClaudeCode): avoids synchronous setState
-    // inside the effect, per the react-hooks/set-state-in-effect lint gate.
     let cancelled = false;
+    const bounded = createBoundedFetch(60_000);
     const timeout = window.setTimeout(() => {
       setModelsLoading(true);
       void (async () => {
         let succeeded = false;
         try {
-          const res = await fetch(`${apiBase}/api/selected-models`);
-          const data = await readJsonOrThrow(res);
+          // Adopt this pair together. The server does not promise a transaction across reads.
+          const [selection, rows] = await Promise.all([
+            fetch(`${apiBase}/api/selected-models`, { signal: bounded.signal })
+              .then(readJsonOrThrow).then(parseModelSelection),
+            fetch(`${apiBase}/api/models`, { signal: bounded.signal })
+              .then(readJsonOrThrow).then(parseModelInventory),
+          ]);
+          // Fetch /api/providers after discovery has run inside /api/selected-models + /api/models,
+          // and commit it in the same revision-bound snapshot so discovery status can never lag or
+          // survive a later refresh pass.
+          const discovery = fetchDiscovery
+            ? await fetch(`${apiBase}/api/providers`, { signal: bounded.signal })
+                .then(readJsonOrThrow).then(parseProviderDiscoveryMap)
+            : undefined;
           if (cancelled) return;
-          setModelCounts(countAvailableModels(data));
-          setAvailableModels(parseAvailableModels(data));
-          setLiveModelCounts(parseLiveModelCounts(data));
-          setSelectedModels(parseSelectedModels(data));
+          setModelSnapshot({ revision: modelRevision, selection, rows, ...(discovery ? { discovery } : {}) });
           setModelsLoadFailed(false);
           succeeded = true;
         } catch {
           if (cancelled) return;
           setModelsLoadFailed(true);
         } finally {
-          if (!cancelled) { setModelsLoading(false); onModelsSettled?.(succeeded); }
+          bounded.controller.abort();
+          bounded.clear();
+          if (!cancelled) { setModelsLoading(false); modelsSettled.current?.(succeeded); }
         }
       })();
     }, 0);
     return () => {
       cancelled = true;
       window.clearTimeout(timeout);
+      bounded.controller.abort();
+      bounded.clear();
     };
-  }, [apiBase, modelsRefreshToken, modelsLoadEpoch, onModelsSettled]);
+  }, [apiBase, fetchDiscovery, modelRevision]);
 
   useEffect(() => {
     let cancelled = false;
@@ -218,7 +264,9 @@ export default function ProviderWorkspaceShell({
       setUsageTotals(byProvider);
       const byProviderModels = buildProviderModelUsage(data.models ?? [], byProvider);
       setUsageModels(byProviderModels);
-      writeSessionListCache(usageCacheKey, { totals: byProvider, models: byProviderModels });
+      const metadata = readUsageMetadata(data);
+      setUsageMetadata(metadata);
+      writeSessionListCache(usageCacheKey, { totals: byProvider, models: byProviderModels, ...metadata });
       setUsageLoading(false);
     }, 0);
     return () => { cancelled = true; window.clearTimeout(timeout); };
@@ -288,7 +336,7 @@ export default function ProviderWorkspaceShell({
   }, [filterOpen]);
 
   const allItems = useMemo(
-    () => [...sections.ready, ...sections.needsSetup, ...sections.disabled],
+    () => [...sections.ready, ...sections.needsSetup, ...sections.unverified, ...sections.disabled],
     [sections],
   );
   const freeCount = useMemo(() => allItems.filter(isFreeProvider).length, [allItems]);
@@ -315,18 +363,19 @@ export default function ProviderWorkspaceShell({
     return {
       ready: statusFilter.ready ? byQueryAndFacets(sections.ready) : [],
       needsSetup: statusFilter.needsSetup ? byQueryAndFacets(sections.needsSetup) : [],
+      unverified: statusFilter.unverified ? byQueryAndFacets(sections.unverified) : [],
       disabled: statusFilter.disabled ? byQueryAndFacets(sections.disabled) : [],
     };
   }, [sections, search, statusFilter, pricingFilter, typeFilter, sortMode]);
 
   const filterActive =
-    !statusFilter.ready || !statusFilter.needsSetup || !statusFilter.disabled
+    !statusFilter.ready || !statusFilter.needsSetup || !statusFilter.unverified || !statusFilter.disabled
     || !pricingFilter.free || !pricingFilter.paid
     || !typeFilter.cloud || !typeFilter.local || !typeFilter.selfHosted || !typeFilter.login
     || sortMode !== "az";
 
   const resetFilters = () => {
-    setStatusFilter({ ready: true, needsSetup: true, disabled: true });
+    setStatusFilter({ ready: true, needsSetup: true, unverified: true, disabled: true });
     setPricingFilter({ free: true, paid: true });
     setTypeFilter({ cloud: true, local: true, selfHosted: true, login: true });
     setSortMode("az");
@@ -357,11 +406,13 @@ export default function ProviderWorkspaceShell({
   const statusFilterOptions = [
     { key: "ready" as const, label: t("pws.status.ready"), count: sections.ready.length },
     { key: "needsSetup" as const, label: t("pws.status.needsSetup"), count: sections.needsSetup.length },
+    { key: "unverified" as const, label: t("pws.vertexUnverified"), count: sections.unverified.length },
     { key: "disabled" as const, label: t("prov.disabledBadge"), count: sections.disabled.length },
   ];
   const railGroups = [
     { id: "ready", label: t("pws.status.ready"), count: filteredSections.ready.length, ariaLabel: t("pws.groupReady", { count: filteredSections.ready.length }), items: filteredSections.ready },
     { id: "needs-setup", label: t("pws.status.needsSetup"), count: filteredSections.needsSetup.length, ariaLabel: t("pws.groupNeedsSetup", { count: filteredSections.needsSetup.length }), items: filteredSections.needsSetup },
+    { id: "unverified", label: t("pws.vertexUnverified"), count: filteredSections.unverified.length, ariaLabel: `${t("pws.vertexUnverified")} (${filteredSections.unverified.length})`, items: filteredSections.unverified },
     { id: "disabled", label: t("prov.disabledBadge"), count: filteredSections.disabled.length, ariaLabel: t("pws.groupDisabled", { count: filteredSections.disabled.length }), items: filteredSections.disabled },
   ];
   const visibleRailNames = railGroups.flatMap(group => group.items.map(item => item.name));
@@ -509,7 +560,7 @@ export default function ProviderWorkspaceShell({
                       item={item}
                       selected={selectedName === item.name}
                       tabbable={railTabbableName === item.name}
-                      modelCount={modelCounts[item.name]}
+                      modelCount={modelSnapshot ? (Object.hasOwn(modelCounts, item.name) ? modelCounts[item.name] : 0) : undefined}
                       isDefault={defaultProvider === item.name}
                       showConfigId={duplicateDisplayNames.has(formatProviderDisplayName(item.name, t))}
                       onClick={() => onSelect(item.name)}
@@ -544,25 +595,35 @@ export default function ProviderWorkspaceShell({
         </div>
         </aside>
         <main className="pws-main" aria-label={t("pws.workspaceMainAria")}>
+        {!jsonEditor?.open && <UsageIncompleteNotice data={usageMetadata} />}
         {jsonEditor?.open ? (
           <ProviderJsonEditor
             editor={jsonEditor}
             providerName={t("nav.providers")}
+            targetLabel={targetLabel ?? providerDraftTargetLabel(apiBase)}
             saving={jsonSaving}
             onSave={() => { void jsonEditor.onSave(); }}
           />
         ) : selectedItem ? (
-          detail?.(selectedItem, {
+          detail?.(
+            modelRowsReady && selectedItem.discovery === undefined && modelSnapshot?.discovery?.[selectedItem.name]
+              ? { ...selectedItem, discovery: modelSnapshot.discovery[selectedItem.name] }
+              : selectedItem,
+            {
             usageTotals: usageTotals[selectedItem.name],
             modelUsage: usageModels[selectedItem.name],
             quotaReport: quotaReports[selectedItem.name],
-            availableModels: availableModels[selectedItem.name] ?? [],
-            hasLiveModels: (liveModelCounts[selectedItem.name] ?? 0) > 0,
-            selectedModels: selectedModels[selectedItem.name] ?? [],
-            modelsLoading,
+            availableModels: modelSnapshot?.selection.available[selectedItem.name] ?? [],
+            hasLiveModels: (modelSnapshot?.selection.liveModelCounts[selectedItem.name] ?? 0) > 0,
+            selectedModels: modelSnapshot?.selection.selected[selectedItem.name] ?? [],
+            modelRows: modelSnapshot?.rows.filter(row => row.provider === selectedItem.name) ?? null,
+            modelRevision,
+            modelRowsReady,
+            modelsLoading: modelsLoading || (!modelRowsReady && !modelsLoadFailed),
             modelsLoadFailed,
             onRetryModels: retryModels,
-          }) ?? (
+          },
+          ) ?? (
             <div className="pws-detail-placeholder">
               <h3>{formatProviderDisplayName(selectedItem.name, t)}</h3>
               <p className="muted">{t("pws.detailComingSoon")}</p>

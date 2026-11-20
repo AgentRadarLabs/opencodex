@@ -1,5 +1,9 @@
 /** `ocx account` — list and switch provider credentials (issue #180). */
+import { apiKeyQuotaText, quotaUnknownReasonText } from "./account-key-quota";
+import { redactSecretArgs } from "./secret-args";
+import { emptyAccountNextAction, recoveryAccountLabel } from "./account-next-actions";
 import { loadConfig } from "../config";
+import { explainCodexUseOutcome, reportCodexAccountTargetError, resolveCodexUseTarget } from "./account-target";
 import { providerCodexAccountMode } from "../providers/registry";
 import type { OcxConfig } from "../types";
 import {
@@ -14,9 +18,10 @@ import {
   cmdRefresh,
   cmdRemove,
   cmdSticky,
+  cmdRoutes,
   cmdStrategy,
 } from "./account-extended";
-import { apiError, apiJson, classifyAccount, fetchRows, proxyUnreachable, resolveBaseUrl, type AccountDeps, type AccountRow, type AccountType, type ApiResult }
+import { accountClassificationConfig, apiError, apiJson, classifyAccount, fetchRows, proxyUnreachable, resolveBaseUrl, type AccountDeps, type AccountRow, type AccountType, type ApiResult }
   from "./account-api";
 
 export { classifyAccount } from "./account-api";
@@ -41,29 +46,46 @@ const REPLACEMENT_STYLE_OAUTH = new Set<string>();
 
 const ACCOUNT_USAGE = `Usage:
   ocx account list [provider] [--json] [--all] [--quota [--refresh]]
+  ocx account history openai <pool-account-id> [--limit <1-200>] [--json]
   ocx account current <provider> [--json]
-  ocx account use <provider> <account-or-key-id|main> [--json]
+  ocx account use <provider> <account-or-key-id|alias|main|auto> [--json]
+  ocx account clear <provider> [--json]
   ocx account refresh <provider> [--json]
   ocx account auto-switch <provider> <on|off|status|threshold <0-100>> [--json]
-  ocx account alias <provider> <account-or-key-id> <display-name|-> [--json]
-  ocx account priority <provider> <account-id|main> [<-100..100|first|earlier|normal|later|last|reset>] [--json]
-  ocx account pause <provider> <account-id|main> [--json]
-  ocx account resume <provider> <account-id|main> [--json]
+  ocx account auto-switch <anthropic|anthropic2> <on|off|status|inherit|threshold <0-100>> --account <id> [--json]
+  ocx account alias <provider> <account-or-key-id|alias> <display-name|-> [--json]
+  ocx account preserve-signed-in openai [on|off|status] [--apply-to-bound] [--json]
+  ocx account priority <provider> <account-id|alias|main> [<-100..100|first|earlier|normal|later|last|reset>] [--json]
+  ocx account pause <provider> <account-id|alias|main> [--json]
+  ocx account resume <provider> <account-id|alias|main> [--if-healthy] [--json]
+  ocx account reset-affinity <anthropic|anthropic2> [--json]
   ocx account pause-exhausted <provider> [--json]
-  ocx account strategy <provider> [<quota|round-robin|fill-first>] [--json]
+  ocx account strategy <provider> [<quota|round-robin|fill-first|least-loaded|reset-first>] [--json]
   ocx account sticky <provider> [<1-100>] [--json]
-  ocx account remove <provider> <account-or-key-id|main> --yes [--json]
-  ocx account clear-cooldown <provider> <account-id|main> [--json]
+  ocx account routes <anthropic|anthropic2> [--file <json-file>|--clear] [--json]
+  ocx account remove <provider> <account-or-key-id|alias|main> --yes [--json]
+  ocx account clear-cooldown <provider> <account-id|alias|main> [--json]
   ocx account add-key <provider> [--label <label>] [--json]
   ocx account import <provider> --format <format> (--file <path>|--stdin) [--json]
-  ocx account login <provider> [--id <account-id>] [--reauth] [--code -] [--no-wait] [--json]
+  ocx account import-orca --source <orca-data-directory> --registry <orca-data.json> [--apply] [--json]
+  ocx account login <provider> [--id <account-id>] [--reauth] [--open-browser on|off] [--add-account on|off] [--code -] [--no-wait] [--json]
+  ocx account pool <provider> [--enabled on|off] [--threshold N] [--strategy NAME] [--sticky N] [--quota-window W] [--json]
+  ocx account credits openai <ID on|off|--all on|off> [--json]
+  ocx account use-remaining openai <ID|main> <on|off|status> [--json]
+  ocx account quota-activation openai ID --window fiveHour|weekly <on|off> [--json]
+  ocx account anthropic-reset-grants [ID] [--provider anthropic|anthropic2] [--json]
   ocx account code <provider> [--flow <flow-id>] [--json]   (reads the code from stdin)
-  ocx account cancel <provider> [--flow <flow-id>] [--json]
+  ocx account cancel <provider> [--flow <flow-id>] [--json] (--flow required for codex)
   ocx account reset-credits <account-id|main> [--consume --yes] [--json]
-  ocx account main <doctor|list|register|add|switch|recover> ...
+  ocx account grok-reset-coupons [<account-id>] [--consume --yes] [--token-id <token-id>] [--json]
+  ocx account main <doctor|list|register|add|reauth|switch|recover> ...
 
 List and switch provider accounts and API-key pools (masked output only).
-'main' selects the Codex App login for the openai account pool.`;
+'main' selects the Codex App login for the openai account pool; 'auto' clears the
+selection so the pool places work by its own strategy — unless an account actually
+carries that id, which wins, so 'ocx account clear' is the spelling that always
+clears. A Codex account can be named by the alias set with 'ocx account alias'
+wherever an id is accepted.`;
 
 function consumeFlag(args: string[], flag: string): boolean {
   const idx = args.indexOf(flag);
@@ -75,10 +97,12 @@ function consumeFlag(args: string[], flag: string): boolean {
 /** Returns an error message for leftover args, or null when clean. */
 function leftoverArgsError(args: string[]): string | null {
   if (args.length === 0) return null;
-  const unknown = args.filter(a => a.startsWith("-"));
+  const shown = redactSecretArgs(args);
+  // Flags plus redaction markers only: a stray positional may be a credential operand.
+  const unknown = shown.filter(a => a.startsWith("-") || a === "<redacted>");
   return unknown.length > 0
     ? `Unknown flag(s): ${unknown.join(", ")}`
-    : `Unexpected argument(s): ${args.join(", ")}`;
+    : `Unexpected argument(s): ${shown.join(", ")}`;
 }
 
 function candidateNames(config: OcxConfig): string {
@@ -96,9 +120,20 @@ function statusText(row: AccountRow): string {
   // `paused` leads, and does NOT replace `selected`. A paused-but-selected account is the
   // state an operator most needs named -- requests route to it while the pool believes it is
   // held out -- so printing only one of the two would hide exactly the confusing case (#2703).
-  if (row.paused) parts.push("paused");
+  if (row.paused) parts.push(row.pauseDetails ? `paused(${row.pauseDetails.reason})` : "paused");
   if (row.active) parts.push(row.type === "codex" ? "selected" : "active");
-  if (row.needsReauth) parts.push("needs-reauth");
+  if (row.needsReauth && !(row.provider === "kiro" && row.skipReason === "needs_reauth")) {
+    parts.push(row.needsReauthReason === "verify_account" ? "needs-reauth(verify)" : "needs-reauth");
+  }
+  // A paused Kiro row already says "paused"; repeating it as a skip reason adds nothing.
+  if (row.provider === "kiro" && row.autoSelectable === false && !(row.paused && row.skipReason === "paused"))
+    parts.push(row.skipReason ? `not-auto-selected(${row.skipReason})` : "not-auto-selected");
+  if (row.validationPending) parts.push("validation-pending");
+  if (row.health && row.health !== "Healthy" && !row.needsReauth && !row.validationPending) parts.push(row.health.toLowerCase());
+  if (row.creditsAfterLimit === true) parts.push("paid-credits: on");
+  if (row.selectionExcludedReason === "plan_excluded") {
+    parts.push(`not-auto-selected(plan=${row.selectionExcludedPlan ?? row.plan ?? "unknown"})`);
+  }
   return parts.join(" ");
 }
 
@@ -113,9 +148,10 @@ function priorityText(row: AccountRow): string {
  * decides on before a long session. The full breakdown stays in `--json`.
  */
 function quotaText(row: AccountRow): string {
-  if ((row as { quotaUnavailable?: boolean }).quotaUnavailable) return "unavailable";
+  if (row.type === "api-key") return apiKeyQuotaText(row);
+  if (row.quotaUnavailable) return row.quotaFailure ? `unavailable (${row.quotaFailure})` : "unavailable";
   const quota = row.quota;
-  if (!quota) return "-";
+  if (!quota) return row.quotaUnknownReason ? `UNKNOWN (${quotaUnknownReasonText(row.quotaUnknownReason)})` : "-";
   const parts: string[] = [];
   // Two spellings reach this DTO: the per-account provider probe reports `fiveHourPercent`,
   // while the Codex pool reports the same idea as `shortPercent`.
@@ -125,6 +161,8 @@ function quotaText(row: AccountRow): string {
   // Kiro bills a monthly allowance and reports no shorter window, so without this arm a
   // perfectly healthy Kiro account prints "-" and reads as broken.
   if (typeof quota.monthlyPercent === "number") parts.push(`mo ${Math.round(quota.monthlyPercent)}%`);
+  // #8574: the stored weekly reading follows whichever of two live windows came last; say so.
+  if (row.weeklyQuotaConflicts?.length) parts.push("(weekly windows conflict)");
   return parts.length > 0 ? parts.join(" ") : "-";
 }
 
@@ -146,7 +184,8 @@ export function formatAccountTable(rows: AccountRow[], withQuota = false): strin
   });
   const widths = header.map((h, i) => Math.max(h.length, ...data.map(d => d[i]!.length)));
   const line = (cols: string[]) => cols.map((c, i) => c.padEnd(widths[i]!)).join("  ").trimEnd();
-  return [line(header), ...data.map(line)].join("\n");
+  const actions = rows.flatMap(row => row.healthAction ? [`${row.provider} ${recoveryAccountLabel(row.id, displayId(row.id))}: ${row.health?.toLowerCase() ?? "needs attention"}. Next: ${row.healthAction}`] : []);
+  return [line(header), ...data.map(line), ...actions].join("\n");
 }
 
 async function cmdList(rest: string[], deps: AccountDeps): Promise<number> {
@@ -156,14 +195,21 @@ async function cmdList(rest: string[], deps: AccountDeps): Promise<number> {
   // stays a cheap local read (#2566). --refresh bypasses the server-side TTL.
   const wantsQuota = consumeFlag(rest, "--quota");
   const refreshQuota = consumeFlag(rest, "--refresh");
-  const name = rest.shift();
+  // An option-shaped token is never the provider: leave it for the leftover check so a
+  // credential option keeps its operand redacted.
+  const name = rest[0]?.startsWith("-") ? undefined : rest.shift();
   const leftover = leftoverArgsError(rest);
   if (leftover) {
     console.error(leftover);
     console.error(ACCOUNT_USAGE);
     return 1;
   }
-  const config = deps.loadConfigImpl?.() ?? loadConfig();
+  const classification = await accountClassificationConfig(deps, deps.loadConfigImpl?.() ?? loadConfig());
+  if ("error" in classification) {
+    console.error(`Error: ${classification.error}`);
+    return 1;
+  }
+  const config = classification.config;
   const baseUrl = await resolveBaseUrl(deps);
   if (!baseUrl) return proxyUnreachable();
 
@@ -216,7 +262,7 @@ async function cmdList(rest: string[], deps: AccountDeps): Promise<number> {
       return apiError(r.errorJson, `failed to list ${t.name}`, r.status);
     }
     if (r.rows.length === 0) {
-      if (showAll) notes.push(`${t.name}: no stored accounts or keys`);
+      if (showAll || name) notes.push(`${t.name}: no stored accounts or keys`, emptyAccountNextAction(t.name, t.type));
       continue;
     }
     rows.push(...r.rows);
@@ -231,6 +277,7 @@ async function cmdList(rest: string[], deps: AccountDeps): Promise<number> {
     }
   }
 
+  if (rows.length === 0 && !name) notes.push("No stored accounts or keys.", emptyAccountNextAction());
   if (wantsJson) {
     console.log(JSON.stringify({ accounts: rows, notes }, null, 2));
     return 0;
@@ -243,14 +290,21 @@ async function cmdList(rest: string[], deps: AccountDeps): Promise<number> {
 
 async function cmdCurrent(rest: string[], deps: AccountDeps): Promise<number> {
   const wantsJson = consumeFlag(rest, "--json");
-  const name = rest.shift();
+  // An option-shaped token is never the provider: leave it for the leftover check so a
+  // credential option keeps its operand redacted.
+  const name = rest[0]?.startsWith("-") ? undefined : rest.shift();
   const leftover = leftoverArgsError(rest);
   if (!name || leftover) {
     if (leftover) console.error(leftover);
     console.error(ACCOUNT_USAGE);
     return 1;
   }
-  const config = deps.loadConfigImpl?.() ?? loadConfig();
+  const classification = await accountClassificationConfig(deps, deps.loadConfigImpl?.() ?? loadConfig());
+  if ("error" in classification) {
+    console.error(`Error: ${classification.error}`);
+    return 1;
+  }
+  const config = classification.config;
   const c = classifyAccount(config, name);
   if ("error" in c) {
     console.error(`Error: ${c.error}. Known candidates: ${candidateNames(config)}`);
@@ -293,7 +347,20 @@ async function cmdUse(rest: string[], deps: AccountDeps): Promise<number> {
     console.error(ACCOUNT_USAGE);
     return 1;
   }
-  const config = deps.loadConfigImpl?.() ?? loadConfig();
+  // #6957: an account change on a link Child is refused before any Home read.
+  if (!deps.baseUrl) {
+    const refusal = (await import("./link-child")).linkChildProviderChangeRefusal("ocx account use");
+    if (refusal) {
+      console.error(`Error: ${refusal}`);
+      return 1;
+    }
+  }
+  const classification = await accountClassificationConfig(deps, deps.loadConfigImpl?.() ?? loadConfig());
+  if ("error" in classification) {
+    console.error(`Error: ${classification.error}`);
+    return 1;
+  }
+  const config = classification.config;
   const c = classifyAccount(config, name);
   if ("error" in c) {
     console.error(`Error: ${c.error}. Known candidates: ${candidateNames(config)}`);
@@ -303,9 +370,12 @@ async function cmdUse(rest: string[], deps: AccountDeps): Promise<number> {
   if (!baseUrl) return proxyUnreachable();
 
   let res: ApiResult;
-  let activeId: string;
+  let activeId: string | null;
   if (c.type === "codex") {
-    activeId = id === MAIN_ALIAS ? MAIN_CODEX_ID : id;
+    const target = await resolveCodexUseTarget(deps, baseUrl, id);
+    if ("networkDown" in target) return proxyUnreachable(target.transportError);
+    if ("error" in target) return reportCodexAccountTargetError(target);
+    activeId = target.accountId;
     res = await apiJson(deps, baseUrl, "PUT", "/api/codex-auth/active", { accountId: activeId });
   } else if (c.type === "oauth") {
     activeId = id;
@@ -317,44 +387,130 @@ async function cmdUse(rest: string[], deps: AccountDeps): Promise<number> {
   if (res.status === 0) return proxyUnreachable(res.transportError);
   if (res.status !== 200) return apiError(res.json, `failed to switch ${name}`, res.status);
 
-  if (wantsJson) console.log(JSON.stringify({ ok: true, provider: name, type: c.type, activeId }, null, 2));
-  else console.log(`${name}: active ${c.type === "api-key" ? "key" : "account"} is now ${displayId(activeId)}`);
-  if (c.type === "codex") {
-    console.error("Takes effect immediately; running threads move on their next request, and in-flight requests keep the account they captured.");
-    const active = await apiJson(deps, baseUrl, "GET", "/api/codex-auth/active");
-    if (active.status === 200 && typeof active.json.autoSwitchThreshold === "number" && active.json.autoSwitchThreshold > 0) {
-      console.error(`Note: auto-switch (threshold ${active.json.autoSwitchThreshold}%) may override this pin.`);
+  // The route reports this only when routing would drop the pin it just recorded, so an
+  // absent field means the pin survives (#4521).
+  const pinDrainReason = typeof res.json.pinDrainReason === "string" ? res.json.pinDrainReason : undefined;
+  if (wantsJson) {
+    console.log(JSON.stringify({
+      ok: true,
+      provider: name,
+      type: c.type,
+      activeId,
+      ...(pinDrainReason !== undefined ? { pinDrained: true, pinDrainReason } : {}),
+    }, null, 2));
+  } else {
+    console.log(activeId === null
+      ? `${name}: automatic account selection (pin cleared)`
+      : `${name}: active ${c.type === "api-key" ? "key" : "account"} is now ${displayId(activeId)}`);
+  }
+  if (c.type === "codex") await explainCodexUseOutcome(deps, baseUrl, name, activeId, pinDrainReason);
+  return 0;
+}
+
+/** `ocx account clear` never resolves its argument as an account id, so an account literally
+ * named `auto` cannot shadow the verb that returns the pool to automatic selection. */
+async function cmdClear(rest: string[], deps: AccountDeps): Promise<number> {
+  const wantsJson = consumeFlag(rest, "--json");
+  // An option-shaped token is never the provider: leave it for the leftover check so a
+  // credential option keeps its operand redacted.
+  const name = rest[0]?.startsWith("-") ? undefined : rest.shift();
+  const leftover = leftoverArgsError(rest);
+  if (!name || leftover) {
+    if (leftover) console.error(leftover);
+    console.error(ACCOUNT_USAGE);
+    return 1;
+  }
+  // #6957: an account change on a link Child is refused before any Home read.
+  if (!deps.baseUrl) {
+    const refusal = (await import("./link-child")).linkChildProviderChangeRefusal("ocx account clear");
+    if (refusal) {
+      console.error(`Error: ${refusal}`);
+      return 1;
     }
   }
+  const classification = await accountClassificationConfig(deps, deps.loadConfigImpl?.() ?? loadConfig());
+  if ("error" in classification) {
+    console.error(`Error: ${classification.error}`);
+    return 1;
+  }
+  const config = classification.config;
+  const c = classifyAccount(config, name);
+  if ("error" in c) {
+    console.error(`Error: ${c.error}. Known candidates: ${candidateNames(config)}`);
+    return 1;
+  }
+  if (c.type !== "codex") {
+    console.error(`Error: ${name} has no automatic-selection pin to clear; clear applies to Codex account pools`);
+    return 1;
+  }
+  const baseUrl = await resolveBaseUrl(deps);
+  if (!baseUrl) return proxyUnreachable();
+  const res = await apiJson(deps, baseUrl, "PUT", "/api/codex-auth/active", { accountId: null });
+  if (res.status === 0) return proxyUnreachable(res.transportError);
+  if (res.status !== 200) return apiError(res.json, `failed to clear ${name}`, res.status);
+  const pinDrainReason = typeof res.json.pinDrainReason === "string" ? res.json.pinDrainReason : undefined;
+  if (wantsJson) {
+    console.log(JSON.stringify({
+      ok: true, provider: name, type: c.type, activeId: null,
+      ...(pinDrainReason !== undefined ? { pinDrained: true, pinDrainReason } : {}),
+    }, null, 2));
+  } else {
+    console.log(`${name}: automatic account selection (pin cleared)`);
+  }
+  await explainCodexUseOutcome(deps, baseUrl, name, null, pinDrainReason);
   return 0;
 }
 
 export async function cmdAccount(args: string[], deps: AccountDeps = {}): Promise<number> {
   const [sub, ...rest] = args;
   try {
+    if (["pool", "credits", "quota-activation", "anthropic-reset-grants", "use-remaining"].includes(sub ?? "")
+      || (sub === "auto-switch" && rest[0]?.trim().toLowerCase() === "openai"
+        && rest.some(arg => arg === "--account" || arg.startsWith("--account=")))) {
+      const { handleAccountPolicyCommand } = await import("./account-policy");
+      return handleAccountPolicyCommand(sub as "pool" | "auto-switch" | "credits" | "quota-activation" | "anthropic-reset-grants" | "use-remaining", rest, deps);
+    }
     if (sub === "list") return await cmdList(rest, deps);
+    if (sub === "history") {
+      const { cmdAccountHistory } = await import("./account-history");
+      return await cmdAccountHistory(rest, deps);
+    }
     if (sub === "current") return await cmdCurrent(rest, deps);
     if (sub === "use") return await cmdUse(rest, deps);
+    if (sub === "clear") return await cmdClear(rest, deps);
     if (sub === "refresh") return await cmdRefresh(rest, deps);
     if (sub === "auto-switch") return await cmdAutoSwitch(rest, deps);
     if (sub === "alias" || sub === "rename") return await cmdAlias(rest, deps);
+    if (sub === "preserve-signed-in") {
+      const { cmdPreserveSignedIn } = await import("./account-preservation");
+      return cmdPreserveSignedIn(rest, deps);
+    }
     if (sub === "priority") return await cmdPriority(rest, deps);
     // #2702: the server routes existed and only the CLI caller was missing, so these were
     // dashboard-only capabilities.
     if (sub === "pause") return await cmdPause(rest, deps, true);
     if (sub === "resume") return await cmdPause(rest, deps, false);
+    if (sub === "reset-affinity") {
+      const { cmdResetAffinity } = await import("./account-affinity-reset");
+      return await cmdResetAffinity(rest, deps);
+    }
     if (sub === "pause-exhausted") return await cmdPauseExhausted(rest, deps);
     if (sub === "strategy") return await cmdStrategy(rest, deps);
     if (sub === "sticky") return await cmdSticky(rest, deps);
+    if (sub === "routes") return await cmdRoutes(rest, deps);
     if (sub === "remove") return await cmdRemove(rest, deps);
     if (sub === "clear-cooldown") return await cmdClearCooldown(rest, deps);
     if (sub === "add-key") return await cmdAddKey(rest, deps);
     if (sub === "import") return await cmdImport(rest, deps);
+    if (sub === "import-orca") {
+      const { cmdOrcaImport } = await import("./account-orca-import");
+      return await cmdOrcaImport(rest);
+    }
     if (sub === "main") {
       const { cmdNativeMainAccount } = await import("./account-main");
       return await cmdNativeMainAccount(rest, deps);
     }
-    if (["login", "reauth", "code", "cancel", "reset-credits"].includes(sub ?? "")) {
+    if (["login", "reauth", "code", "cancel", "reset-credits", "grok-reset-coupons"].includes(sub ?? "")) {
       const { handleAccountAuthCommand } = await import("./account-auth");
       return await handleAccountAuthCommand(sub!, rest, deps) ?? 1;
     }

@@ -8,6 +8,7 @@ This file applies to `gui/` and inherits the repository-wide rules in `/AGENTS.m
 - `gui/dist/` is generated packaged output. Do not edit it by hand.
 - Use the existing component, state, routing, styling, and data-access patterns before introducing a new abstraction.
 - Keep dashboard behavior aligned with the management API and provider configuration model.
+- `gui/design-system/` is the token and component contract for `src/styles.css` and `src/ui.tsx`; read it before adding a visual value or a shared component, and update it in the same change when a token moves.
 
 ## Text and i18n
 
@@ -31,6 +32,7 @@ This file applies to `gui/` and inherits the repository-wide rules in `/AGENTS.m
 ## Implementation rules
 
 - Preserve accessibility: keyboard operation, labels, focus behavior, semantic controls, and readable validation errors.
+- No native `<select>`: use `Select` from `src/ui.tsx` (extend it there if it lacks something). Every text-like `<input>` and `<textarea>` carries a `className` (`input` or v2 classes). Unstyled browser controls are unreadable in dark mode; `tests/form-controls-rule.test.ts` enforces both.
 - Do not introduce a dependency for behavior already provided by the current stack or a small local implementation.
 - Dependency changes require explicit security review.
 - Update `docs-site/` when dashboard behavior, setup, or configuration changes for users.

@@ -1,13 +1,26 @@
+import { UNDECLARED_TOOL_CALL_MESSAGE } from "../lib/client-error-body";
+import { UNDECLARED_TOOL_CALL_ERROR_CODE } from "../lib/errors";
+import { hasItemProvenance, isHistoricalItem } from "../responses/item-provenance";
 import {
-  CODE_MODE_EXEC_TOOL_NAME,
+  collectAmbiguousDottedAliases,
+  dottedAliasIsUnambiguous,
+  isSchemaValidResponsesToolName,
+  wireToolInnerName,
+} from "../responses/tool-name-aliases";
+import {
   dottedToolName,
+  NAMESPACED_BARE_ALIAS_EXCLUDED_NAMES,
   namespacedToolName,
   normalizeDeclaredToolName,
 } from "../types";
-import { sseDataPayload, type SseBlockRewrite } from "./sse-payload-rewrite";
+import { replaceSseDataPayload, sseDataPayload, type SseBlockRewrite } from "./sse-payload-rewrite";
+import { TOOL_SEARCH_FUNCTION_NAME } from "../responses/tool-search-compat";
 
 /** Item types the client executes through a request-declared wire name. */
-const CLIENT_EXECUTED_CALL_TYPES = new Set(["function_call", "custom_tool_call"]);
+export const CLIENT_EXECUTED_CALL_TYPES: ReadonlySet<string> = new Set([
+  "function_call",
+  "custom_tool_call",
+]);
 /** Codex groups ordinary top-level tools here; unlike an MCP namespace, it has no wire prefix. */
 const BUILTIN_FUNCTIONS_NAMESPACE = "functions";
 
@@ -66,39 +79,10 @@ const NAMELESS_TOOL_SPEC_TYPES = new Set([
   "x_search",
 ]);
 
-/** An upstream-supplied name reaches the error message; keep it bounded. */
-const MAX_REPORTED_NAME_CHARS = 100;
-
-export const UNDECLARED_TOOL_CALL_ERROR_CODE = "undeclared_tool_call";
+export { UNDECLARED_TOOL_CALL_ERROR_CODE };
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
-/**
- * A dotted spelling is a safe alias only when it cannot ALSO be read as some other identity's
- * canonical `ns__name`.
- *
- * `{namespace: "x__y", name: "z"}` produces the dotted spelling "x__y.z", which is exactly the
- * canonical wire name of `{namespace: "x", name: "y.z"}`. If only the latter is declared, an
- * echoed call for the former would still find "x__y.z" in the declared set and be authorized as
- * a tool the caller never granted. Requiring both halves to be free of the `__` separator keeps
- * a dotted alias from ever impersonating a canonical name.
- */
-function dottedAliasIsUnambiguous(namespace: string, name: string): boolean {
-  return !namespace.includes("__") && !name.includes("__");
-}
-
-function wireToolInnerName(tool: unknown): string | undefined {
-  if (!isPlainObject(tool)) return undefined;
-  const nestedFunction = tool.type === "function" && isPlainObject(tool.function)
-    ? tool.function
-    : undefined;
-  return typeof tool.name === "string" && tool.name.length > 0
-    ? tool.name
-    : typeof nestedFunction?.name === "string" && nestedFunction.name.length > 0
-      ? nestedFunction.name
-      : undefined;
 }
 
 function addWireToolName(
@@ -106,6 +90,7 @@ function addWireToolName(
   tool: unknown,
   namespace?: string,
   ambiguousDottedAliases?: ReadonlySet<string>,
+  canonicalOnly = false,
 ): void {
   if (!isPlainObject(tool)) return;
   const name = wireToolInnerName(tool);
@@ -118,6 +103,7 @@ function addWireToolName(
     return;
   }
   names.add(namespacedToolName(namespace, name));
+  if (canonicalOnly) return;
   // Some routed providers echo the flattened wire name with a dot (`ns.name`, observed with
   // muse-spark via opencode-go) instead of `ns__name`. It is the same tool identity, so register
   // the dotted spelling too, mirroring `toolChoiceAliases` (#3402) -- but only while that
@@ -129,10 +115,14 @@ function addWireToolName(
   if (dottedAliasIsUnambiguous(namespace, name) && !ambiguousDottedAliases?.has(dotted)) {
     names.add(dotted);
   }
-  // `exec` is the one name that also switches on nested-helper normalization, so a bare alias
-  // for a namespaced MCP tool would silently authorize `exec_command`/`shell_command`/
-  // `apply_patch` the request never declared. Every other inner name keeps the bare alias.
-  if (name !== CODE_MODE_EXEC_TOOL_NAME) names.add(name);
+  // The code-mode helper spellings do not get a bare alias for a namespaced tool. Bare `exec`
+  // switches nested-helper normalization on for a catalog that never declared the shell; bare
+  // `exec_command`/`shell_command` switch it off for one that did; bare `write_stdin`/
+  // `apply_patch`/`view_image` are simply accepted as declared under a name the caller only ever
+  // authorized inside a namespace. This guard named only `exec` and let the other five through,
+  // which is the same drift the bridge-side copy had; both now read one list
+  // (src/types/tools.ts). Every other inner name keeps the bare alias.
+  if (!NAMESPACED_BARE_ALIAS_EXCLUDED_NAMES.has(name)) names.add(name);
 }
 
 /**
@@ -148,6 +138,9 @@ export function currentTurnWireToolCatalogBody(
   replayPrefixLength: number | undefined,
 ): unknown {
   if (!isPlainObject(body) || !Array.isArray(body.input)) return body;
+  if (body.input.some(hasItemProvenance)) {
+    return { ...body, input: body.input.filter(item => !isHistoricalItem(item)) };
+  }
   if (typeof replayPrefixLength !== "number" || !Number.isFinite(replayPrefixLength)) return body;
   const start = Math.min(body.input.length, Math.max(0, Math.trunc(replayPrefixLength)));
   if (start === 0) return body;
@@ -158,59 +151,18 @@ function addWireToolSpecs(
   names: Set<string>,
   specs: unknown,
   ambiguousDottedAliases?: ReadonlySet<string>,
+  canonicalOnly = false,
 ): void {
   if (!Array.isArray(specs)) return;
   for (const spec of specs) {
     if (!isPlainObject(spec)) continue;
     if (spec.type === "namespace" && Array.isArray(spec.tools)) {
       const namespace = typeof spec.name === "string" ? spec.name : undefined;
-      for (const inner of spec.tools) addWireToolName(names, inner, namespace, ambiguousDottedAliases);
+      for (const inner of spec.tools) addWireToolName(names, inner, namespace, ambiguousDottedAliases, canonicalOnly);
       continue;
     }
-    addWireToolName(names, spec, undefined, ambiguousDottedAliases);
+    addWireToolName(names, spec, undefined, ambiguousDottedAliases, canonicalOnly);
   }
-}
-
-/**
- * Dotted aliases that more than one declared identity would claim, plus dotted aliases that
- * collide with a canonical or bare declared name.
- *
- * Resolved over the WHOLE catalog before any name is registered, so which identity "wins" can
- * never depend on declaration order -- an order the caller controls.
- */
-function collectAmbiguousDottedAliases(specGroups: readonly unknown[]): Set<string> {
-  const owners = new Map<string, string | null>();
-  const claim = (alias: string, identity: string): void => {
-    const owner = owners.get(alias);
-    if (owner === undefined) owners.set(alias, identity);
-    else if (owner !== identity) owners.set(alias, null);
-  };
-  for (const specs of specGroups) {
-    if (!Array.isArray(specs)) continue;
-    for (const spec of specs) {
-      if (!isPlainObject(spec)) continue;
-      if (spec.type === "namespace" && Array.isArray(spec.tools)) {
-        const namespace = typeof spec.name === "string" ? spec.name : undefined;
-        if (!namespace || namespace === BUILTIN_FUNCTIONS_NAMESPACE) continue;
-        for (const inner of spec.tools) {
-          const name = wireToolInnerName(inner);
-          if (!name) continue;
-          const identity = JSON.stringify([namespace, name]);
-          claim(dottedToolName(namespace, name), identity);
-          // A canonical or bare name already owned by a different identity poisons the dotted
-          // alias that would shadow it.
-          claim(namespacedToolName(namespace, name), identity);
-          claim(name, identity);
-        }
-        continue;
-      }
-      const name = wireToolInnerName(spec);
-      if (name) claim(name, JSON.stringify([undefined, name]));
-    }
-  }
-  const ambiguous = new Set<string>();
-  for (const [alias, owner] of owners) if (owner === null) ambiguous.add(alias);
-  return ambiguous;
 }
 
 /**
@@ -221,7 +173,7 @@ function collectAmbiguousDottedAliases(specGroups: readonly unknown[]): Set<stri
  * inside `input`, routed custom-tool rewrites) that the internal list flattens or renames, and
  * only the wire names can be compared against what the provider echoes back.
  */
-export function collectDeclaredWireToolNames(body: unknown): Set<string> {
+export function collectDeclaredWireToolNames(body: unknown, options?: { canonicalOnly?: boolean }): Set<string> {
   const names = new Set<string>();
   if (!isPlainObject(body)) return names;
   const specGroups: unknown[] = [body.tools];
@@ -234,7 +186,101 @@ export function collectDeclaredWireToolNames(body: unknown): Set<string> {
     }
   }
   const ambiguousDottedAliases = collectAmbiguousDottedAliases(specGroups);
-  for (const specs of specGroups) addWireToolSpecs(names, specs, ambiguousDottedAliases);
+  for (const specs of specGroups) addWireToolSpecs(names, specs, ambiguousDottedAliases, options?.canonicalOnly);
+  return names;
+}
+
+/**
+ * Function names that translated adapters give to nameless hosted declarations in this catalog.
+ * The parser exposes a declared `{type:"tool_search"}` to Chat-style providers as the function
+ * `tool_search`, so only a declaration present in this (current-turn) body authorizes that name.
+ */
+export function collectTranslatedHostedToolNames(body: unknown): Set<string> {
+  const names = new Set<string>();
+  if (!isPlainObject(body)) return names;
+  const specGroups: unknown[] = [body.tools];
+  if (Array.isArray(body.input)) {
+    for (const item of body.input) {
+      if (isPlainObject(item) && item.type === "additional_tools") specGroups.push(item.tools);
+    }
+  }
+  for (const specs of specGroups) {
+    if (Array.isArray(specs) && specs.some(spec => isPlainObject(spec) && spec.type === "tool_search")) {
+      names.add(TOOL_SEARCH_FUNCTION_NAME);
+    }
+  }
+  return names;
+}
+
+/**
+ * Collects explicitly declared bare wire tool names from a Responses request body.
+ *
+ * Bare wire tools are top-level declarations (or grouped under the builtin `functions`
+ * namespace) that are not namespaced and do not carry a flattened namespace delimiter (`__`)
+ * or dotted namespace alias (`.`).
+ *
+ * @param body - The outbound or inbound request body.
+ * @returns A set of declared bare tool names.
+ */
+export function collectDeclaredBareWireToolNames(body: unknown): Set<string> {
+  const names = new Set<string>();
+  if (!isPlainObject(body)) return names;
+  const specGroups: unknown[] = [body.tools];
+  if (Array.isArray(body.input)) {
+    for (const item of body.input) {
+      if (
+        isPlainObject(item)
+        && (item.type === "additional_tools" || item.type === "tool_search_output")
+      ) specGroups.push(item.tools);
+    }
+  }
+  for (const specs of specGroups) {
+    if (!Array.isArray(specs)) continue;
+    for (const spec of specs) {
+      if (!isPlainObject(spec)) continue;
+      if (spec.type === "namespace" && Array.isArray(spec.tools)) {
+        if (spec.name === BUILTIN_FUNCTIONS_NAMESPACE) {
+          for (const inner of spec.tools) {
+            if (!isPlainObject(inner)) continue;
+            const name = wireToolInnerName(inner);
+            if (name && !name.includes("__") && !name.includes(".")) names.add(name);
+          }
+        }
+        continue;
+      }
+      const name = wireToolInnerName(spec);
+      if (name && !name.includes("__") && !name.includes(".")) names.add(name);
+    }
+  }
+  return names;
+}
+
+/** Custom declarations with no foreign namespace, for code-mode exec recovery. */
+export function collectDeclaredBareCustomWireToolNames(body: unknown): Set<string> {
+  const names = new Set<string>();
+  if (!isPlainObject(body)) return names;
+  const specGroups: unknown[] = [body.tools];
+  if (Array.isArray(body.input)) {
+    for (const item of body.input) {
+      if (isPlainObject(item) && (item.type === "additional_tools" || item.type === "tool_search_output")) {
+        specGroups.push(item.tools);
+      }
+    }
+  }
+  const add = (tool: unknown): void => {
+    if (isPlainObject(tool) && tool.type === "custom" && typeof tool.name === "string") names.add(tool.name);
+  };
+  for (const specs of specGroups) {
+    if (!Array.isArray(specs)) continue;
+    for (const spec of specs) {
+      if (!isPlainObject(spec)) continue;
+      if (spec.type === "namespace") {
+        if (spec.name === BUILTIN_FUNCTIONS_NAMESPACE && Array.isArray(spec.tools)) {
+          for (const inner of spec.tools) add(inner);
+        }
+      } else add(spec);
+    }
+  }
   return names;
 }
 
@@ -280,7 +326,7 @@ export function collectProviderExecutedCallTypes(body: unknown): Set<ProviderExe
   return callTypes;
 }
 
-function isAuthorizedProviderExecutedCall(
+export function isAuthorizedProviderExecutedCall(
   item: Record<string, unknown>,
   callTypes: ProviderExecutedCallTypes,
 ): boolean {
@@ -353,11 +399,42 @@ export function hasExplicitWireToolCatalog(body: unknown): boolean {
   );
 }
 
+/**
+ * Whether the caller declared an explicitly EMPTY catalog — `tools: []` or an
+ * `additional_tools` item with `tools: []`. Unlike an absent or partial catalog this is an
+ * unambiguous deny-all: no deferred registry can exist under it, so even deferred wires
+ * enforce it. A hosted-only catalog is NOT empty — it still defers like an absent one.
+ */
+export function hasExplicitEmptyToolCatalog(body: unknown): boolean {
+  if (!isPlainObject(body)) return false;
+  if (Array.isArray(body.tools) && body.tools.length === 0) return true;
+  if (!Array.isArray(body.input)) return false;
+  return body.input.some(item =>
+    isPlainObject(item)
+    && item.type === "additional_tools"
+    && Array.isArray(item.tools)
+    && item.tools.length === 0
+  );
+}
+
+/**
+ * Evaluates whether an individual output item represents an undeclared tool call.
+ *
+ * @param item - The item to check.
+ * @param declared - All wire tool names declared in the request catalog.
+ * @param declaredNamelessClientCallTypes - Nameless client call types declared by the request.
+ * @param providerExecutedCallTypes - Call types executed by the provider.
+ * @param declaredBare - Explicitly declared bare tool names without namespace provenance.
+ * @param declaredCustom - Current bare custom declarations eligible for code-mode recovery.
+ * @returns The undeclared tool call name if unauthorized, or undefined if permitted.
+ */
 function undeclaredNameInItem(
   item: unknown,
   declared: ReadonlySet<string>,
   declaredNamelessClientCallTypes: ReadonlySet<string>,
   providerExecutedCallTypes: ProviderExecutedCallTypes = EMPTY_PROVIDER_EXECUTED_CALL_TYPES,
+  declaredBare?: ReadonlySet<string>,
+  declaredCustom?: ReadonlySet<string>,
 ): string | undefined {
   if (!isPlainObject(item)) return undefined;
   if (typeof item.type !== "string") return undefined;
@@ -386,56 +463,264 @@ function undeclaredNameInItem(
       dottedAliasIsUnambiguous(item.namespace, name)
       && declared.has(dottedToolName(item.namespace, name))
     ) return undefined;
+    const bareDeclared = declaredBare ?? declared;
+    const bare = name.startsWith("default.") ? name.slice("default.".length) : name;
+    if (
+      item.namespace === "default"
+      && bare.length > 0
+      && bareDeclared.has(bare)
+      && !declared.has(namespacedToolName(item.namespace, bare))
+      && !declared.has(dottedToolName(item.namespace, bare))
+    ) return undefined;
     return name;
   }
-  const effectiveName = normalizeDeclaredToolName(name, declared);
+  const effectiveName = normalizeDeclaredToolName(name, declared, declaredBare, declaredCustom);
   if (declared.has(effectiveName)) return undefined;
   return name;
 }
 
-/** First undeclared client tool named by a Responses SSE payload, or undefined. */
+/**
+ * First undeclared client tool named by a Responses SSE payload, or undefined.
+ *
+ * @param payload - The parsed SSE event payload.
+ * @param declared - All wire tool names declared in the request catalog.
+ * @param declaredNamelessClientCallTypes - Nameless client call types declared by the request.
+ * @param providerExecutedCallTypes - Call types executed by the provider.
+ * @param declaredBare - Explicitly declared bare tool names without namespace provenance.
+ * @param declaredCustom - Current bare custom declarations eligible for code-mode recovery.
+ * @returns The name of the first undeclared tool call, or undefined.
+ */
 export function undeclaredToolCallName(
   payload: unknown,
   declared: ReadonlySet<string>,
   declaredNamelessClientCallTypes: ReadonlySet<string> = EMPTY_DECLARED_NAMELESS_CLIENT_CALL_TYPES,
   providerExecutedCallTypes: ProviderExecutedCallTypes = EMPTY_PROVIDER_EXECUTED_CALL_TYPES,
+  declaredBare?: ReadonlySet<string>,
+  declaredCustom?: ReadonlySet<string>,
 ): string | undefined {
   if (!isPlainObject(payload)) return undefined;
   if (payload.type === "response.output_item.added" || payload.type === "response.output_item.done") {
-    return undeclaredNameInItem(payload.item, declared, declaredNamelessClientCallTypes, providerExecutedCallTypes);
+    return undeclaredNameInItem(payload.item, declared, declaredNamelessClientCallTypes, providerExecutedCallTypes, declaredBare, declaredCustom);
+  }
+  if (payload.type === "response.function_call_arguments.done" && typeof payload.name === "string") {
+    const fakeItem = { type: "function_call", name: payload.name, namespace: payload.namespace };
+    return undeclaredNameInItem(fakeItem, declared, declaredNamelessClientCallTypes, providerExecutedCallTypes, declaredBare, declaredCustom);
   }
   // Sparse gateways skip incremental items and only ever ship the terminal snapshot.
   if (payload.type === "response.completed" || payload.type === "response.incomplete") {
-    return undeclaredToolCallNameInResponse(payload.response, declared, declaredNamelessClientCallTypes, providerExecutedCallTypes);
+    return undeclaredToolCallNameInResponse(payload.response, declared, declaredNamelessClientCallTypes, providerExecutedCallTypes, declaredBare, declaredCustom);
   }
   return undefined;
 }
 
-/** First undeclared client tool in a Responses object's `output` array, or undefined. */
+/**
+ * First undeclared client tool in a Responses object's `output` array, or undefined.
+ *
+ * @param response - The Responses result object containing `output`.
+ * @param declared - All wire tool names declared in the request catalog.
+ * @param declaredNamelessClientCallTypes - Nameless client call types declared by the request.
+ * @param providerExecutedCallTypes - Call types executed by the provider.
+ * @param declaredBare - Explicitly declared bare tool names without namespace provenance.
+ * @param declaredCustom - Current bare custom declarations eligible for code-mode recovery.
+ * @returns The name of the first undeclared tool call, or undefined.
+ */
 export function undeclaredToolCallNameInResponse(
   response: unknown,
   declared: ReadonlySet<string>,
   declaredNamelessClientCallTypes: ReadonlySet<string> = EMPTY_DECLARED_NAMELESS_CLIENT_CALL_TYPES,
   providerExecutedCallTypes: ProviderExecutedCallTypes = EMPTY_PROVIDER_EXECUTED_CALL_TYPES,
+  declaredBare?: ReadonlySet<string>,
+  declaredCustom?: ReadonlySet<string>,
 ): string | undefined {
   if (!isPlainObject(response) || !Array.isArray(response.output)) return undefined;
   for (const item of response.output) {
-    const name = undeclaredNameInItem(item, declared, declaredNamelessClientCallTypes, providerExecutedCallTypes);
+    const name = undeclaredNameInItem(item, declared, declaredNamelessClientCallTypes, providerExecutedCallTypes, declaredBare, declaredCustom);
     if (name !== undefined) return name;
   }
   return undefined;
 }
 
-export function undeclaredToolCallMessage(name: string): string {
-  const reported = name.slice(0, MAX_REPORTED_NAME_CHARS);
-  return `routed provider emitted undeclared client tool "${reported}"; only request-declared tools may be called`;
+/**
+ * Formats an error message indicating that a routed provider emitted an undeclared tool call.
+ *
+ * @returns A formatted error message string.
+ */
+export function undeclaredToolCallMessage(): string {
+  return UNDECLARED_TOOL_CALL_MESSAGE;
 }
 
-function failedBlocks(name: string, newline: string): readonly string[] {
+/**
+ * Normalizes a single output item's default-namespaced tool call back to declared bare tool.
+ *
+ * Strips invented `default.` prefixes or `namespace: "default"` from tool calls when the bare
+ * tool name was declared and neither dotted nor flattened namespaced forms were declared (#4176).
+ *
+ * @param item - The output item to normalize.
+ * @param declared - All wire tool names declared in the request catalog.
+ * @param declaredBare - Explicitly declared bare tool names without namespace provenance.
+ * @returns An object with the normalized value and a boolean indicating if changes occurred.
+ */
+export function normalizeDefaultNamespaceInItem(
+  item: unknown,
+  declared: ReadonlySet<string>,
+  declaredBare?: ReadonlySet<string>,
+): { value: unknown; changed: boolean } {
+  if (!isPlainObject(item)) return { value: item, changed: false };
+  if (!CLIENT_EXECUTED_CALL_TYPES.has(item.type as string)) {
+    return { value: item, changed: false };
+  }
+  const name = item.name;
+  if (typeof name !== "string" || name.length === 0) {
+    return { value: item, changed: false };
+  }
+  const bareDeclared = declaredBare ?? declared;
+  if (item.namespace === "default") {
+    const bare = name.startsWith("default.") ? name.slice("default.".length) : name;
+    if (
+      bare.length > 0
+      && bareDeclared.has(bare)
+      && !declared.has(namespacedToolName("default", bare))
+      && !declared.has(dottedToolName("default", bare))
+    ) {
+      const next: Record<string, unknown> = { ...(item as Record<string, unknown>), name: bare };
+      delete next.namespace;
+      return { value: next, changed: true };
+    }
+    return { value: item, changed: false };
+  }
+  if (item.namespace === undefined || item.namespace === BUILTIN_FUNCTIONS_NAMESPACE) {
+    if (name.startsWith("default.")) {
+      const bare = name.slice("default.".length);
+      if (
+        bare.length > 0
+        && bareDeclared.has(bare)
+        && !declared.has("default." + bare)
+        && !declared.has("default__" + bare)
+      ) {
+        return { value: { ...item, name: bare }, changed: true };
+      }
+    }
+    // Authorization and emission were reading two different resolvers for the same question.
+    // `undeclaredNameInItem` resolves an emitted name through `normalizeDeclaredToolName`, which
+    // maps a `default.`-prefixed code-mode helper onto the declared `exec` (#4412) as well as a
+    // `default.`-prefixed bare tool (#4176); the rewrite above learned only the second case. So a
+    // routed Muse turn under a code-mode catalog had `default.view_image` ACCEPTED as `exec` and
+    // then relayed under the name the upstream schema rejects. Codex stored
+    // `{"type":"function_call","name":"default.view_image"}`, answered "unsupported call", and
+    // every later replay of that history — a side chat, a compaction — was refused on
+    // `input[N].name` for the lifetime of the conversation (#5095).
+    //
+    // Emit the name the guard authorized rather than a second, weaker opinion about it. The two
+    // must agree: a name good enough to admit is the name the client has to receive.
+    //
+    // Gated on the name actually being unusable, so this branch cannot touch a name the upstream
+    // accepts whatever the resolver would have said about it. The routed-custom-tool and
+    // namespace restores run earlier in the same chain and already rewrite the shapes they own,
+    // which leaves this as the boundary check for the names no restore claimed.
+    if (!isSchemaValidResponsesToolName(name)) {
+      const authorized = normalizeDeclaredToolName(name, declared, declaredBare);
+      if (
+        authorized !== name
+        && declared.has(authorized)
+        && isSchemaValidResponsesToolName(authorized)
+      ) return { value: { ...item, name: authorized }, changed: true };
+    }
+  }
+  return { value: item, changed: false };
+}
+
+/**
+ * Normalizes default-namespaced tool calls in a Responses object's `output` array.
+ *
+ * @param response - The Responses result object containing `output`.
+ * @param declared - All wire tool names declared in the request catalog.
+ * @param declaredBare - Explicitly declared bare tool names without namespace provenance.
+ * @returns An object with the normalized response and a boolean indicating if changes occurred.
+ */
+export function normalizeDefaultNamespaceInResponse(
+  response: unknown,
+  declared: ReadonlySet<string>,
+  declaredBare?: ReadonlySet<string>,
+): { value: unknown; changed: boolean } {
+  if (!isPlainObject(response) || !Array.isArray(response.output)) {
+    return { value: response, changed: false };
+  }
+  let changed = false;
+  const newOutput = response.output.map(item => {
+    const res = normalizeDefaultNamespaceInItem(item, declared, declaredBare);
+    if (res.changed) changed = true;
+    return res.value;
+  });
+  if (!changed) return { value: response, changed: false };
+  return { value: { ...response, output: newOutput }, changed: true };
+}
+
+/**
+ * Normalizes default-namespaced tool calls in a Responses SSE payload object.
+ *
+ * @param payload - The parsed SSE event payload.
+ * @param declared - All wire tool names declared in the request catalog.
+ * @param declaredBare - Explicitly declared bare tool names without namespace provenance.
+ * @returns An object with the normalized payload and a boolean indicating if changes occurred.
+ */
+export function normalizeDefaultNamespaceInPayload(
+  payload: unknown,
+  declared: ReadonlySet<string>,
+  declaredBare?: ReadonlySet<string>,
+): { value: unknown; changed: boolean } {
+  if (!isPlainObject(payload)) return { value: payload, changed: false };
+  if (payload.type === "response.output_item.added" || payload.type === "response.output_item.done") {
+    const res = normalizeDefaultNamespaceInItem(payload.item, declared, declaredBare);
+    if (!res.changed) return { value: payload, changed: false };
+    return { value: { ...payload, item: res.value }, changed: true };
+  }
+  if (payload.type === "response.function_call_arguments.done" && typeof payload.name === "string") {
+    const fakeItem = { type: "function_call", name: payload.name, namespace: payload.namespace };
+    const res = normalizeDefaultNamespaceInItem(fakeItem, declared, declaredBare);
+    if (res.changed) {
+      const normalizedItem = res.value as Record<string, unknown>;
+      const next: Record<string, unknown> = { ...payload, name: normalizedItem.name };
+      if ("namespace" in next && !("namespace" in normalizedItem)) {
+        delete next.namespace;
+      }
+      return { value: next, changed: true };
+    }
+  }
+  if (payload.type === "response.completed" || payload.type === "response.incomplete") {
+    const res = normalizeDefaultNamespaceInResponse(payload.response, declared, declaredBare);
+    if (!res.changed) return { value: payload, changed: false };
+    return { value: { ...payload, response: res.value }, changed: true };
+  }
+  return { value: payload, changed: false };
+}
+
+/**
+ * Normalizes default-namespaced tool calls in a raw Responses JSON string.
+ *
+ * @param jsonText - Raw JSON string representing a Responses object.
+ * @param declared - All wire tool names declared in the request catalog.
+ * @param declaredBare - Explicitly declared bare tool names without namespace provenance.
+ * @returns The normalized JSON string, or original text if unchanged or invalid JSON.
+ */
+export function normalizeDefaultNamespaceInJson(
+  jsonText: string,
+  declared: ReadonlySet<string>,
+  declaredBare?: ReadonlySet<string>,
+): string {
+  try {
+    const parsed = JSON.parse(jsonText);
+    const normalized = normalizeDefaultNamespaceInResponse(parsed, declared, declaredBare);
+    return normalized.changed ? JSON.stringify(normalized.value) : jsonText;
+  } catch {
+    return jsonText;
+  }
+}
+
+function failedBlocks(newline: string): readonly string[] {
   const failure = {
     type: "upstream_error",
     code: UNDECLARED_TOOL_CALL_ERROR_CODE,
-    message: undeclaredToolCallMessage(name),
+    message: undeclaredToolCallMessage(),
   };
   const payload = JSON.stringify({
     type: "response.failed",
@@ -445,23 +730,37 @@ function failedBlocks(name: string, newline: string): readonly string[] {
 }
 
 /**
- * Fail closed when a routed provider calls a tool the request never declared (#1700).
+ * Fail closed when a routed provider calls a tool the request never declared (#1700),
+ * and normalize provider-invented default namespaces back to declared bare tools (#4176).
  *
  * The bridged paths already refuse such a call (`declaredToolNames` in src/bridge.ts), but the
  * native Responses passthrough relayed it verbatim: Codex received a `function_call` for a tool
  * it has no top-level handler for — `apply_patch`, which under code mode exists only as a nested
  * `tools.apply_patch(...)` helper inside `exec` — and the turn surfaced as a bare `aborted` with
  * no output and no explanation. Replacing the offending event with an explicit `response.failed`
- * turns that silent dead end into a compatibility error naming the tool.
+ * turns that silent dead end into a compatibility error describing the request catalog restriction.
  *
  * Everything after the trip is dropped so a later `response.completed` cannot contradict the
  * terminal already sent. Non-JSON and non-item blocks pass through untouched.
+ *
+ * @param declared - All wire tool names declared in the request catalog.
+ * @param declaredNamelessClientCallTypes - Nameless client call types declared by the request.
+ * @param providerExecutedCallTypes - Call types executed by the provider.
+ * @param declaredBare - Explicitly declared bare tool names without namespace provenance.
+ * @param declaredCustom - Current bare custom declarations eligible for code-mode recovery.
+ * @returns An SSE block rewrite function.
  */
 export function createUndeclaredToolCallGuardBlockRewrite(
   declared: ReadonlySet<string>,
   declaredNamelessClientCallTypes: ReadonlySet<string> = EMPTY_DECLARED_NAMELESS_CLIENT_CALL_TYPES,
   providerExecutedCallTypes: ProviderExecutedCallTypes = EMPTY_PROVIDER_EXECUTED_CALL_TYPES,
+  declaredBare?: ReadonlySet<string>,
+  declaredCustom?: ReadonlySet<string>,
+  options?: { refuseUndeclared?: boolean; onRefusal?: (message: string) => void },
 ): SseBlockRewrite {
+  // Deferred-catalog wires (Chat/Anthropic) keep the default-namespace normalization — the
+  // client can only resolve the bare name it declared — while the refusal itself stays off.
+  const refuse = options?.refuseUndeclared !== false;
   let tripped = false;
   return (block: string) => {
     if (tripped) return [];
@@ -473,9 +772,18 @@ export function createUndeclaredToolCallGuardBlockRewrite(
     } catch {
       return [block];
     }
-    const name = undeclaredToolCallName(parsed, declared, declaredNamelessClientCallTypes, providerExecutedCallTypes);
-    if (name === undefined) return [block];
-    tripped = true;
-    return failedBlocks(name, block.includes("\r\n") ? "\r\n" : "\n");
+    if (refuse) {
+      const name = undeclaredToolCallName(parsed, declared, declaredNamelessClientCallTypes, providerExecutedCallTypes, declaredBare, declaredCustom);
+      if (name !== undefined) {
+        tripped = true;
+        options?.onRefusal?.(undeclaredToolCallMessage());
+        return failedBlocks(block.includes("\r\n") ? "\r\n" : "\n");
+      }
+    }
+    const normalized = normalizeDefaultNamespaceInPayload(parsed, declared, declaredBare);
+    if (normalized.changed) {
+      return [replaceSseDataPayload(block, JSON.stringify(normalized.value))];
+    }
+    return [block];
   };
 }

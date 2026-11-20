@@ -10,7 +10,7 @@
  * how that affects eligibility.
  */
 
-import { modelInList, type OcxConfig } from "../types";
+import { modelInList, type OcxConfig, type OcxProviderConfig } from "../types";
 import { isCanonicalOpenAiForwardProvider, OPENAI_CODEX_PROVIDER_ID } from "../providers/openai-tiers";
 import { serviceTierSupportForModel } from "../providers/service-tier";
 import { PROVIDER_REGISTRY } from "../providers/registry";
@@ -149,14 +149,20 @@ function localRemoteEvidence(baseUrl: string | undefined): Pick<RouteCapabilityE
  * Assemble canonical capability evidence for one `provider/model` candidate.
  * Sources (in priority order): provider config maps, provider registry hints,
  * cached Codex catalog row, native-model metadata.
+ * Policy assembly supplies the resolved provider so every transport capability
+ * describes the destination dispatch will use. Its maps already include applicable
+ * registry defaults; name-only registry fallbacks must not override that authority.
  */
 export function candidateCapabilityEvidence(
   config: OcxConfig,
   providerName: string,
   modelId: string,
+  resolvedProvider?: OcxProviderConfig,
 ): RouteCapabilityEvidence {
-  const provider = config.providers[providerName];
-  const registryEntry = PROVIDER_REGISTRY.find(entry => entry.id === providerName);
+  const provider = resolvedProvider ?? config.providers[providerName];
+  const registryEntry = resolvedProvider === undefined
+    ? PROVIDER_REGISTRY.find(entry => entry.id === providerName)
+    : undefined;
   const catalogRow = cachedCatalogModels().find(model => model.provider === providerName && model.id === modelId);
   const isNative = providerName === OPENAI_CODEX_PROVIDER_ID && !modelId.includes("/");
 
@@ -176,7 +182,8 @@ export function candidateCapabilityEvidence(
     ? (nativeOpenAiContextWindow(modelId, nativeContextLimits(config)) ?? rawContextWindow)
     : rawContextWindow;
 
-  // `noVisionModels` is checked before the modality chain because that is the order
+  // Exact capability declarations precede legacy vision hints, matching runtime eligibility.
+  // `noVisionModels` is checked before the remaining modality chain because that is the order
   // `isModelTextOnly` uses: it matches the no-vision list and returns true before it
   // ever reads `modelInputModalities` (`src/vision/index.ts:32`). So a `gpt-oss`
   // no-vision entry beats an exact `gpt-oss:120b` entry that lists "image", and
@@ -185,10 +192,15 @@ export function candidateCapabilityEvidence(
   // #2086: routing *acts* on this evidence, so it would select the candidate for image
   // work that execution then rejects.
   const noVision = modelInList(provider?.noVisionModels, modelId);
-  const modalities = noVision
+  const explicitModalities = Object.hasOwn(provider?.modelCapabilities ?? {}, modelId)
+    ? provider?.modelCapabilities?.[modelId]?.inputModalities : undefined;
+  const modalities = explicitModalities?.length ? explicitModalities : noVision
     ? ["text"]
     : (modelRecordValue(provider?.modelInputModalities, modelId)
       ?? modelRecordValue(registryEntry?.modelInputModalities, modelId)
+      // Provider-wide declaration, for ids the per-model maps do not list. Read from the
+      // provider only: a name-only registry lookup would apply it to a custom destination.
+      ?? provider?.inputModalities
       ?? catalogRow?.inputModalities
       ?? (isNative ? nativeInputModalities(modelId) : undefined));
   const image = Array.isArray(modalities)
@@ -224,6 +236,7 @@ export function candidateCapabilityEvidence(
     ? []
     : modelRecordValue(provider?.modelReasoningEfforts, modelId)
       ?? modelRecordValue(registryEntry?.modelReasoningEfforts, modelId)
+      ?? provider?.reasoningEfforts
       ?? (isNative ? nativeReasoningEfforts(modelId) : undefined);
 
   const tierSupport = provider

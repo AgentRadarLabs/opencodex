@@ -22,6 +22,8 @@ import {
   upsertOAuthProvider,
 } from "../../oauth";
 import { removeCredential } from "../../oauth/store";
+import { getFailureProjection } from "../../usage/failure-projection-cache";
+import { MAX_USAGE_CONFIGURED_KEYS, parseUsageSource, snapshotConfiguredKeyIds } from "../../usage/source-filter";
 import { providerDestinationResolvedError } from "../../lib/destination-policy";
 import { enrichProviderFromCatalog, listKeyLoginProviders } from "../../oauth/key-providers";
 import { deriveProviderPresets } from "../../providers/derive";
@@ -51,6 +53,7 @@ import {
   usageLogRevisionKey,
 } from "../../usage/log";
 import { getUsageDebugLogEntries } from "../../usage/debug";
+import { parseUsageTimeWindow, type UsageTimeWindow } from "../../usage/time-range";
 import { USAGE_RANGES, USAGE_SURFACES, parseRange, parseUsageSurface, rangeWindow, type UsageRange, type UsageSummary, type UsageSurface } from "../../usage/summary";
 import { stripCodexRuntimeProviderFields } from "../../codex/auth-context";
 import { getProviderRegistryEntry } from "../../providers/registry";
@@ -65,7 +68,8 @@ import {
 } from "../../lib/debug-settings";
 import type { OcxClaudeCodeConfig, OcxConfig, OcxCustomModel, OcxProviderConfig } from "../../types";
 import { drainAndShutdown } from "../lifecycle";
-import { filterRequestLogs, filteredRequestLogCount, getRequestLogEntries, type RequestLogEntry } from "../request-log";
+import { getRequestLogEntries, queryRequestLogs, type RequestLogEntry } from "../request-log";
+import { decodeRequestLogCursor, selectRequestLogPoll } from "../request-log-cursor";
 import { estimateComboCost, estimateRequestCost, normalizeCostTokens, tokensPerSecond } from "../../usage/cost";
 import { userCostOverlayVersion } from "../../usage/user-cost-overlays";
 import type { PersistedUsageAttempt } from "../../usage/log";
@@ -81,7 +85,12 @@ import {
   getUsageSummaryCacheEntry,
   setUsageSummaryCacheEntry,
 } from "./usage-summary-cache";
-import { getFilteredUsageAggregate, getUsageAggregate } from "./usage-aggregate-cache";
+import {
+  getFilteredUsageAggregate,
+  getJevStatsAggregate,
+  getUsageAggregate,
+} from "./usage-aggregate-cache";
+import { normalizeJevStatsComboId } from "../../usage/jev-stats";
 
 function nextLocalMidnight(now: number): number {
   const next = new Date(now);
@@ -102,17 +111,39 @@ function refreshedUsageSummary<T extends UsageSummary & { historyTruncated: bool
   return { ...summary, since, generatedAt: now };
 }
 
+function configuredUsageKeyIds(config: OcxConfig): string[] {
+  const keys = config.apiKeys ?? [];
+  if (keys.length > MAX_USAGE_CONFIGURED_KEYS) throw new Error("configured key snapshot exceeds limit");
+  return snapshotConfiguredKeyIds(keys.map(key => key.id));
+}
+
+/** Only used after a previously authorized session expires during an async read. */
+function expiredUsageSession(): Response {
+  return Response.json({ error: "session_expired" }, { status: 401, headers: { "cache-control": "no-store" } });
+}
+
 export async function handleLogsUsageRoutes(ctx: ManagementContext): Promise<Response | null> {
   const { req, url, config, deps, syncClaudeAgentDefsBestEffort } = ctx;
 
   if (url.pathname === "/api/logs" && req.method === "GET") {
+    const rawCursor = url.searchParams.get("cursor");
+    const cursor = rawCursor === null ? null : decodeRequestLogCursor(rawCursor);
+    if (rawCursor !== null && cursor === null) {
+      return jsonResponse({ error: { code: "invalid_cursor", message: "invalid cursor" } }, 400);
+    }
     const all = getRequestLogEntries();
-    const total = filteredRequestLogCount(all, url.searchParams);
-    const logs = filterRequestLogs(all, url.searchParams);
+    const queried = queryRequestLogs(all, url.searchParams);
+    const total = queried.total;
+    // Not point-free: requestLogDto takes an options object second, and Array.map would pass the
+    // element INDEX into it. An explicit arrow keeps the default (decode rate included) and is
+    // what /api/logs wants; /api/request-history opts out at its own call sites.
+    const logs = queried.logs.map(entry => requestLogDto(entry));
+    const poll = selectRequestLogPoll(logs, url.searchParams, cursor);
     return jsonResponse({
       timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      generatedAt: Date.now(),
       total,
-      logs: logs.map(requestLogDto),
+      ...poll,
     });
   }
 
@@ -166,9 +197,118 @@ export async function handleLogsUsageRoutes(ctx: ManagementContext): Promise<Res
     return jsonResponse(setDebugSettings(partial));
   }
 
+  if (url.pathname === "/api/usage/source-facets" && req.method === "GET") {
+    const { auth, readStoreFor } = await import("./link-route-state");
+    const denied = auth(ctx, "dashboard");
+    if (denied) return denied;
+    if (config.runtimeRole === "client") return jsonResponse({ error: "source facets unavailable on a child" }, 403);
+    const parsed = parseUsageSource(url.searchParams);
+    if (parsed.kind !== "filtered" || [...url.searchParams.keys()].some(key => !["client", "device", "apiKeyId"].includes(key))) {
+      return Response.json({ error: "invalid usage source filter" }, { status: 400, headers: { "cache-control": "no-store" } });
+    }
+    try {
+      const ids = configuredUsageKeyIds(config);
+      if (parsed.filter.device.kind === "key" && !ids.includes(parsed.filter.device.id)) {
+        return Response.json({ error: "unknown key" }, { status: 400, headers: { "cache-control": "no-store" } });
+      }
+      const links = JSON.stringify(readStoreFor(ctx).links.map(({ apiKeyId, alias }) => [apiKeyId, alias]).sort());
+      const { getUsageSourceFacets } = await import("./usage-source-facets");
+      const facets = await getUsageSourceFacets(parsed.filter, ids);
+      const revoked = auth(ctx, "dashboard");
+      if (revoked) return expiredUsageSession();
+      const currentIds = configuredUsageKeyIds(config);
+      const currentLinks = JSON.stringify(readStoreFor(ctx).links.map(({ apiKeyId, alias }) => [apiKeyId, alias]).sort());
+      if (JSON.stringify(ids) !== JSON.stringify(currentIds) || links !== currentLinks) throw new Error("inventory changed");
+      return Response.json(facets, { headers: { "cache-control": "no-store" } });
+    } catch {
+      if (auth(ctx, "dashboard")) return expiredUsageSession();
+      return Response.json({ error: "usage_facets_unavailable" }, { status: 503, headers: { "cache-control": "no-store", "retry-after": "1" } });
+    }
+  }
+
+  if (url.pathname === "/api/usage/devices" && req.method === "GET") {
+    const { auth, readStoreFor } = await import("./link-route-state");
+    const denied = auth(ctx, "dashboard");
+    if (denied) return denied;
+    if (ctx.config.runtimeRole === "client") return jsonResponse({ error: "device inventory unavailable on a child" }, 403);
+    try {
+      const aliases = new Map<string, string | null>();
+      for (const link of readStoreFor(ctx).links) {
+        aliases.set(link.apiKeyId, aliases.has(link.apiKeyId) ? null : link.alias);
+      }
+      const devices = [...aliases].sort(([left], [right]) => left.localeCompare(right))
+        .map(([apiKeyId, alias]) => ({ apiKeyId, alias }));
+      return Response.json({ devices }, { headers: { "cache-control": "no-store" } });
+    } catch {
+      return jsonResponse({ error: "link_store_unavailable" }, 503);
+    }
+  }
+
   if (url.pathname === "/api/usage" && req.method === "GET") {
+    const source = parseUsageSource(url.searchParams);
+    if (source.kind === "invalid") return jsonResponse({ error: "invalid usage source filter" }, 400);
+    const unconfigured = source.kind === "filtered" && source.filter.device.kind === "unconfigured";
+    const sessionGuard = unconfigured ? (await import("./link-route-state")).auth : null;
+    if (sessionGuard) {
+      const denied = sessionGuard(ctx, "dashboard");
+      if (denied) return denied;
+    }
+    let configuredIds: string[] | undefined;
+    if (unconfigured) {
+      try { configuredIds = configuredUsageKeyIds(config); }
+      catch { return Response.json({ error: "usage_inventory_unavailable" }, { status: 503, headers: { "cache-control": "no-store" } }); }
+    }
+    if (url.searchParams.get("jev") === "1") {
+      const range = parseRange(url.searchParams.get("range"));
+      const rawComboId = url.searchParams.get("comboId");
+      const comboId = rawComboId === null ? undefined : normalizeJevStatsComboId(rawComboId);
+      if (rawComboId !== null && (comboId === undefined || comboId !== rawComboId.trim())) {
+        return jsonResponse({ error: "invalid comboId" }, 400);
+      }
+      const now = Date.now();
+      const { since } = rangeWindow(range, now);
+      try {
+        const aggregate = await getJevStatsAggregate({ comboId, since });
+        return jsonResponse({
+          ...aggregate.accumulator.summarize(range, now),
+          ...(aggregate.usageIncomplete
+            ? { usageIncomplete: true as const, usageIncompleteReason: "oversized_rows" as const }
+            : {}),
+          historyTruncated: false,
+          truncatedPrefixBytes: 0,
+          entriesTruncated: false,
+          entriesDropped: 0,
+        });
+      } catch {
+        return jsonResponse({ error: "read_failed" }, 500);
+      }
+    }
+    // A sub-resource on the same route rather than a route of its own. It answers a different
+    // question -- which failures keep recurring, rather than what was spent -- and it costs a
+    // ledger scan, so it is opt-in: a dashboard asking for the usage summary must not pay for
+    // a projection it did not ask for.
+    if (url.searchParams.get("failures") === "1") {
+      const projection = await getFailureProjection();
+      return jsonResponse({
+        fingerprintVersion: projection.fingerprintVersion,
+        historyIncomplete: projection.historyIncomplete,
+        unattributedFailures: projection.unattributedFailures,
+        invalidTimestampFailures: projection.invalidTimestampFailures,
+        // Every field here is a closed roster member, a count or a timestamp. The scanner's
+        // checkpoint identity, the configured provider name, the model and the account label
+        // stay internal -- a grouping that promises to carry no content has to keep that
+        // promise at its boundary too.
+        failures: projection.groups,
+      });
+    }
     const range = parseRange(url.searchParams.get("range"));
     const surface = parseUsageSurface(url.searchParams.get("surface"));
+    let window: UsageTimeWindow | undefined;
+    try {
+      window = parseUsageTimeWindow(url.searchParams.get("since"), url.searchParams.get("until"));
+    } catch (error) {
+      return jsonResponse({ error: error instanceof Error ? error.message : "invalid usage time window" }, 400);
+    }
     // A filtered summary must never reach the cache or the warm loop below:
     // the key is `range:surface`, so a filtered entry stored under it would be
     // served to the next unfiltered caller, dashboard included.
@@ -176,8 +316,10 @@ export async function handleLogsUsageRoutes(ctx: ManagementContext): Promise<Res
       provider: url.searchParams.get("provider"),
       model: url.searchParams.get("model"),
       apiKeyId: url.searchParams.get("apiKeyId"),
+      ...(source.kind === "filtered" ? { sourceFilter: source.filter } : {}),
+      ...(configuredIds ? { configuredApiKeyIds: configuredIds } : {}),
     };
-    const filterRequested = [filter.provider, filter.model, filter.apiKeyId]
+    const filterRequested = source.kind === "filtered" || window !== undefined || [filter.provider, filter.model, filter.apiKeyId]
       .some(value => typeof value === "string" && value.trim() !== "");
     const now = Date.now();
     try {
@@ -203,17 +345,28 @@ export async function handleLogsUsageRoutes(ctx: ManagementContext): Promise<Res
       }
       if (cached && !filterRequested) discardUsageSummaryCacheEntry(cacheKey);
       if (filterRequested) {
-        const filteredAggregate = await getFilteredUsageAggregate(filter);
+        const filteredAggregate = await getFilteredUsageAggregate(filter, window);
+        if (sessionGuard) {
+          const denied = sessionGuard(ctx, "dashboard");
+          if (denied) return expiredUsageSession();
+          const currentIds = configuredUsageKeyIds(config);
+          if (JSON.stringify(currentIds) !== JSON.stringify(configuredIds)) {
+            return Response.json({ error: "usage_inventory_changed" }, { status: 503, headers: { "cache-control": "no-store" } });
+          }
+        }
         const accumulator = filteredAggregate.accumulator;
-        return jsonResponse({
+        const body = {
           ...accumulator.summarize(range, now, surface),
+          ...(filteredAggregate.usageIncomplete ? { usageIncomplete: true as const, usageIncompleteReason: "oversized_rows" as const }
+            : unconfigured && filteredAggregate.usageInvalidRows ? { usageIncomplete: true as const } : {}),
           historyTruncated: false,
           truncatedPrefixBytes: 0,
           entriesTruncated: false,
           entriesDropped: 0,
           snapshotWindowStart: accumulator.snapshotWindow.start,
           snapshotWindowEnd: accumulator.snapshotWindow.end,
-        });
+        };
+        return unconfigured ? Response.json(body, { headers: { "cache-control": "no-store" } }) : jsonResponse(body);
       }
 
       const configuredApiKeyIds = (config.apiKeys ?? []).map(key => key.id);
@@ -229,6 +382,7 @@ export async function handleLogsUsageRoutes(ctx: ManagementContext): Promise<Res
       const revisionKey = `${usageLogRevisionKey(aggregate.revision)}\0${effectiveReadLimit}`;
       const lastSeenSize = aggregate.revision?.size ?? 0;
       const baseReadMetadata = {
+        ...(aggregate.usageIncomplete ? { usageIncomplete: true as const, usageIncompleteReason: "oversized_rows" as const } : {}),
         historyTruncated: false,
         truncatedPrefixBytes: 0,
         entriesTruncated: false,
@@ -278,44 +432,12 @@ export async function handleLogsUsageRoutes(ctx: ManagementContext): Promise<Res
       }
       return jsonResponse(requestedSummary);
     } catch {
-      return jsonResponse({
-        range,
-        surface,
-        since: null,
-        generatedAt: now,
-        summary: {
-          requests: 0,
-          attemptCount: 0,
-          measuredRequests: 0,
-          reportedRequests: 0,
-          unreportedRequests: 0,
-          unsupportedRequests: 0,
-          estimatedRequests: 0,
-          inputTokens: 0,
-          outputTokens: 0,
-          cachedInputTokens: 0,
-          cacheReadInputTokens: 0,
-          cacheCreationInputTokens: 0,
-          reasoningOutputTokens: 0,
-          totalTokens: 0,
-          coverageRatio: 0,
-          estimatedCostUsd: 0,
-          pricedRequests: 0,
-          unpricedRequests: 0,
-          unmeteredRequests: 0,
-        },
-        days: [],
-        models: [],
-        providers: [],
-        accounts: [],
-        historyTruncated: false,
-        truncatedPrefixBytes: 0,
-        entriesTruncated: false,
-        entriesDropped: 0,
-        snapshotWindowStart: null,
-        snapshotWindowEnd: null,
-        error: "read_failed",
-      });
+      if (sessionGuard && sessionGuard(ctx, "dashboard")) return expiredUsageSession();
+      // A missing ledger is handled as an empty installation by the reader. Reaching this catch
+      // therefore means the report is unavailable, not that usage was measured as zero. Keep the
+      // transport status aligned with the JEV projection above so every dashboard consumer can
+      // retain its last valid snapshot instead of caching fabricated zero totals.
+      return jsonResponse({ error: "read_failed" }, 500);
     }
   }
 
@@ -409,6 +531,7 @@ export async function handleLogsUsageRoutes(ctx: ManagementContext): Promise<Res
         bytes: result.bytes,
         ...(result.trashDir ? { trashDir: result.trashDir } : {}),
         removedPaths: result.removedPaths,
+        ...(result.skippedReferencedPaths?.length ? { skippedReferencedPaths: result.skippedReferencedPaths } : {}),
       });
     } catch {
       return jsonResponse({

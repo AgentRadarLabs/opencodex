@@ -1,3 +1,5 @@
+import { rotateAnthropicAccountOn429 } from "../../helpers/anthropic-shared-quota";
+import { bindAnthropicRefusalCredential, rotateAnthropicAccountOnResponse } from "../../../src/oauth/anthropic-account-refusal";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync} from "node:fs";
 import { tmpdir } from "node:os";
@@ -5,6 +7,8 @@ import { join } from "node:path";
 import { clearPoolRotationState, notePoolRotationFailure, POOL_KEY_ANTHROPIC } from "../../../src/codex/pool-rotation";
 import {
   anthropicQuotaWindow,
+  pickAlternateAnthropicAccount,
+  rotateAnthropicAccountOnRefusal,
   anthropicSessionKeyFromParts,
   bindAnthropicSessionAffinity,
   clearAnthropicAccountPoolState,
@@ -15,22 +19,30 @@ import {
   parseAccountPoolQuotaWindow,
   resolveAnthropicAccountForSession,
   resetAnthropicRoutingForManualSelection,
-  rotateAnthropicAccountOn429,
-  rotateAnthropicAccountOnCredentialDenial,
+  getAnthropicPoolAccessSnapshot,
+  promoteAnthropicActiveAccount,
+  anthropicSessionAffinitySizeForTests,
 } from "../../../src/oauth/anthropic-routing";
-import {
-  credentialGeneration,
-  getAccountCredential,
-  getAccountSet,
-  saveCredential,
-  setActiveAccount,
-} from "../../../src/oauth/store";
+import { captureOAuthAccountSelection, getAccountSet, markAccountNeedsReauth, saveCredential, saveAccountCredential, setActiveAccount } from "../../../src/oauth/store";
+import { subscribeAccountSelections } from "../../../src/lib/account-selection-events";
 import { clearAccountQuotaCache, setCachedProviderAccountQuotaForTests } from "../../../src/providers/quota";
 import type { OcxAccountPoolQuotaWindow, OcxAccountPoolRotationStrategy, OcxConfig } from "../../../src/types";
 import { removeTreeWithRetry } from "../../helpers/remove-tree";
 
 const originalHome = process.env.OPENCODEX_HOME;
 let home: string;
+
+async function admitAnthropic(sessionKey: string, config: OcxConfig) {
+  const expected = captureOAuthAccountSelection("anthropic");
+  const choice = resolveAnthropicAccountForSession(sessionKey, config);
+  if (choice.accountId) {
+    const snapshot = await getAnthropicPoolAccessSnapshot(choice.accountId);
+    expect(await promoteAnthropicActiveAccount(choice.accountId, expected, {
+      config, sessionKey, reason: choice.reason, expectedCredentialGeneration: snapshot.generation,
+    })).not.toBeNull();
+  }
+  return choice;
+}
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "ocx-anthropic-pool-"));
@@ -70,6 +82,9 @@ async function seedTwoAccounts() {
   const a = set.accounts.find(acc => acc.credential.accountId === "uuid-aaaa")!;
   const b = set.accounts.find(acc => acc.credential.accountId === "uuid-bbbb")!;
   await setActiveAccount("anthropic", a.id);
+  // Ordinary policy cases start after the initial stored selection has been admitted.
+  // Restart cases explicitly clear runtime state below to exercise first admission again.
+  await admitAnthropic("", cfg(false));
   return { aId: a.id, bId: b.id };
 }
 
@@ -124,11 +139,123 @@ async function seedThreeAccounts() {
   const b = set.accounts.find(acc => acc.credential.accountId === "uuid-bbbb")!;
   const c = set.accounts.find(acc => acc.credential.accountId === "uuid-cccc")!;
   await setActiveAccount("anthropic", a.id);
+  await admitAnthropic("", cfg(false));
   return { aId: a.id, bId: b.id, cId: c.id };
 }
 
 describe("anthropic account pool", () => {
-  test("default off always returns the active account", async () => {
+  test.each(["round-robin", "quota"] as const)("persisted manual choice survives restart before the first %s dispatch", async strategy => {
+    const { aId, bId } = await seedTwoAccounts();
+    setCachedProviderAccountQuotaForTests("anthropic", aId, { fiveHourPercent: 11 });
+    setCachedProviderAccountQuotaForTests("anthropic", bId, { fiveHourPercent: 30 });
+    await setActiveAccount("anthropic", bId);
+    resetAnthropicRoutingForManualSelection(bId);
+    const persisted = captureOAuthAccountSelection("anthropic");
+    // A process restart loses both local preference and the shared RR cursor.
+    clearAnthropicAccountPoolState();
+    clearPoolRotationState();
+    const config = cfg(true, 20, { strategy, stickyLimit: 1 });
+    expect(resolveAnthropicAccountForSession("restart-first", config).accountId).toBe(bId);
+    expect(resolveAnthropicAccountForSession("restart-proposal", config).accountId).toBe(bId);
+    expect(captureOAuthAccountSelection("anthropic")).toEqual(persisted);
+    expect((await admitAnthropic("restart-first", config)).accountId).toBe(bId);
+    // Once the authoritative first selection commits, the ordinary algorithm resumes.
+    expect((await admitAnthropic("restart-next", config)).accountId).toBe(aId);
+    expect(resolveAnthropicAccountForSession("restart-first", config).accountId).toBe(bId);
+  });
+
+  test("pool-off 429 recovery commits the replacement and notifies before dispatch", async () => {
+    const { aId, bId } = await seedTwoAccounts();
+    const config = cfg(false);
+    const expected = captureOAuthAccountSelection("anthropic");
+    const next = rotateAnthropicAccountOn429(config, aId, "30", "off-retry");
+    expect(next).toBe(bId);
+    const snapshot = await getAnthropicPoolAccessSnapshot(bId);
+    let notifications = 0;
+    const unsubscribe = subscribeAccountSelections(event => {
+      if (event.provider === "anthropic") {
+        notifications++;
+        expect(captureOAuthAccountSelection("anthropic")?.accountId).toBe(bId);
+      }
+    });
+    try {
+      expect(await promoteAnthropicActiveAccount(bId, expected, {
+        config, sessionKey: "off-retry", expectedCredentialGeneration: snapshot.generation,
+      })).not.toBeNull();
+      expect(captureOAuthAccountSelection("anthropic")?.accountId).toBe(bId);
+      expect(notifications).toBe(1);
+      expect(anthropicSessionAffinitySizeForTests()).toBe(0);
+    } finally { unsubscribe(); }
+  });
+
+  test.each([false, true])("stale promotion cannot replace a newer manual choice (ABA=%s)", async aba => {
+    const { aId, bId } = await seedTwoAccounts();
+    const expected = captureOAuthAccountSelection("anthropic");
+    const snapshot = await getAnthropicPoolAccessSnapshot(bId);
+    await setActiveAccount("anthropic", bId);
+    if (aba) await setActiveAccount("anthropic", aId);
+    const manual = captureOAuthAccountSelection("anthropic");
+    resetAnthropicRoutingForManualSelection(manual!.accountId);
+    let notifications = 0;
+    const unsubscribe = subscribeAccountSelections(() => { notifications++; });
+    try {
+      expect(await promoteAnthropicActiveAccount(bId, expected, {
+        config: cfg(true), sessionKey: "stale", expectedCredentialGeneration: snapshot.generation,
+      })).toBeNull();
+      expect(captureOAuthAccountSelection("anthropic")).toEqual(manual);
+      expect(anthropicSessionAffinitySizeForTests()).toBe(0);
+      expect(notifications).toBe(0);
+      expect(resolveAnthropicAccountForSession("next", cfg(true)).accountId).toBe(manual!.accountId);
+    } finally { unsubscribe(); }
+  });
+
+  test("token rejection does not consume the manual preference or install affinity", async () => {
+    const { aId, bId } = await seedTwoAccounts();
+    await setActiveAccount("anthropic", aId);
+    resetAnthropicRoutingForManualSelection(aId);
+    const expected = captureOAuthAccountSelection("anthropic");
+    const snapshot = await getAnthropicPoolAccessSnapshot(aId);
+    await markAccountNeedsReauth("anthropic", aId, true);
+    expect(await promoteAnthropicActiveAccount(aId, expected, {
+      config: cfg(true), sessionKey: "rejected", expectedCredentialGeneration: snapshot.generation,
+    })).toBeNull();
+    expect(anthropicSessionAffinitySizeForTests()).toBe(0);
+    await markAccountNeedsReauth("anthropic", aId, false);
+    setCachedProviderAccountQuotaForTests("anthropic", aId, { fiveHourPercent: 30 });
+    setCachedProviderAccountQuotaForTests("anthropic", bId, { fiveHourPercent: 11 });
+    expect(resolveAnthropicAccountForSession("recovered", cfg(true, 20)).accountId).toBe(aId);
+  });
+
+  test("account snapshot refuses expired background local-CLI credentials without refreshing", async () => {
+    const { aId, bId } = await seedTwoAccounts();
+    const account = getAccountSet("anthropic")!.accounts.find(account => account.id === bId)!;
+    await saveAccountCredential("anthropic", bId, { ...account.credential, source: "local-cli", expires: 1 });
+    await expect(getAnthropicPoolAccessSnapshot(bId)).rejects.toThrow("background local-cli token expired");
+    expect(captureOAuthAccountSelection("anthropic")?.accountId).toBe(aId);
+  });
+
+  test("manual choice wins the next healthy quota dispatch above the automatic threshold", async () => {
+    const { aId, bId } = await seedTwoAccounts();
+    setCachedProviderAccountQuotaForTests("anthropic", aId, { fiveHourPercent: 30 });
+    setCachedProviderAccountQuotaForTests("anthropic", bId, { fiveHourPercent: 11 });
+    await setActiveAccount("anthropic", aId);
+    resetAnthropicRoutingForManualSelection(aId);
+    expect(resolveAnthropicAccountForSession("manual-quota", cfg(true, 20)).accountId).toBe(aId);
+  });
+
+  test("uncommitted proposals neither bind affinity nor advance round-robin", async () => {
+    const { aId, bId } = await seedTwoAccounts();
+    const config = cfg(true, 80, { strategy: "round-robin", stickyLimit: 1 });
+    const first = resolveAnthropicAccountForSession("uncommitted", config);
+    expect(resolveAnthropicAccountForSession("another-uncommitted", config).accountId).toBe(first.accountId);
+    // A failed candidate must not capture the task's affinity before its selection commits.
+    setCachedProviderAccountQuotaForTests("anthropic", aId, { fiveHourPercent: 90 });
+    setCachedProviderAccountQuotaForTests("anthropic", bId, { fiveHourPercent: 5 });
+    const quota = cfg(true);
+    expect(resolveAnthropicAccountForSession("uncommitted", quota).accountId).toBe(bId);
+  });
+
+  test("default off retains the healthy active account", async () => {
     const { aId, bId } = await seedTwoAccounts();
     expect(isAnthropicAccountPoolEnabled(cfg(false))).toBe(false);
     const sel = resolveAnthropicAccountForSession("session-1", cfg(false));
@@ -137,12 +264,23 @@ describe("anthropic account pool", () => {
     expect(sel.accountId).not.toBe(bId);
   });
 
+  test("pool-off ignores proactive preferences but names recovery from an upstream 429", async () => {
+    const { aId, bId } = await seedTwoAccounts();
+    const config = cfg(false, 80, { strategy: "round-robin" });
+    setCachedProviderAccountQuotaForTests("anthropic", aId, { fiveHourPercent: 95 });
+    setCachedProviderAccountQuotaForTests("anthropic", bId, { fiveHourPercent: 5 });
+    expect(resolveAnthropicAccountForSession("new", config)).toMatchObject({ accountId: aId, reason: "pool-disabled" });
+    expect(rotateAnthropicAccountOn429(config, aId, "60")).toBe(bId);
+    expect(resolveAnthropicAccountForSession("new", config)).toMatchObject({ accountId: bId, reason: "only-eligible" });
+    expect(getAccountSet("anthropic")!.activeAccountId).toBe(aId); // A proposal is not a committed send.
+  });
+
   test("affinity sticks across resolves until cooled", async () => {
     const { aId, bId } = await seedTwoAccounts();
     // Force lowest-usage toward B for a cold start with high active usage.
     setCachedProviderAccountQuotaForTests("anthropic", aId, { fiveHourPercent: 95 });
     setCachedProviderAccountQuotaForTests("anthropic", bId, { fiveHourPercent: 10 });
-    const first = resolveAnthropicAccountForSession("sess-sticky", cfg(true));
+    const first = await admitAnthropic("sess-sticky", cfg(true));
     expect(first.accountId).toBe(bId);
     // Even if A becomes "better", affinity keeps B.
     setCachedProviderAccountQuotaForTests("anthropic", aId, { fiveHourPercent: 1 });
@@ -159,28 +297,6 @@ describe("anthropic account pool", () => {
     expect(getEligibleAnthropicAccounts()).toEqual([bId]);
     const after = resolveAnthropicAccountForSession("sess-fail", cfg(true));
     expect(after.accountId).toBe(bId);
-  });
-
-  test("stale credential denial preserves and retries the replacement generation", async () => {
-    const { aId } = await seedTwoAccounts();
-    const rejectedGeneration = credentialGeneration(getAccountCredential("anthropic", aId)!);
-    await saveCredential("anthropic", {
-      access: "access-a-refreshed",
-      refresh: "refresh-a-refreshed",
-      expires: Date.now() + 7_200_000,
-      accountId: "uuid-aaaa",
-      email: "a@example.test",
-    });
-
-    const next = await rotateAnthropicAccountOnCredentialDenial(
-      cfg(true),
-      { accountId: aId, generation: rejectedGeneration },
-      "sess-refreshed",
-    );
-
-    expect(next).toBe(aId);
-    expect(getAccountCredential("anthropic", aId)?.access).toBe("access-a-refreshed");
-    expect(getAccountSet("anthropic")!.accounts.find(account => account.id === aId)?.needsReauth).toBeUndefined();
   });
 
   test("all cooled returns all-cooled rather than none", async () => {
@@ -217,6 +333,14 @@ describe("anthropic account pool", () => {
     })).toBe("sess-a");
   });
 
+  test("session key skips blank ids while preserving usable id priority", () => {
+    expect(anthropicSessionKeyFromParts({ clientThreadId: " ", sessionIdHeader: " session ", threadIdHeader: "thread" })).toBe("session");
+    expect(anthropicSessionKeyFromParts({ clientThreadId: "", sessionIdHeader: "\t", threadIdHeader: " thread ", promptCacheKeyIsSharedCohort: true })).toBe("thread");
+    expect(anthropicSessionKeyFromParts({ clientThreadId: " client ", sessionIdHeader: "session", threadIdHeader: "thread" })).toBe("client");
+    expect(anthropicSessionKeyFromParts({ clientThreadId: " ", sessionIdHeader: " ", threadIdHeader: " ", promptCacheKey: " cache " })).toBe("cache");
+    expect(anthropicSessionKeyFromParts({ clientThreadId: " ", sessionIdHeader: " ", threadIdHeader: " ", promptCacheKey: "cohort", promptCacheKeyIsSharedCohort: true })).toBeNull();
+  });
+
   test("shared Desktop cache cohort alone does not create affinity key", () => {
     expect(anthropicSessionKeyFromParts({
       promptCacheKey: "shared-cohort-hash",
@@ -242,9 +366,9 @@ describe("anthropic account pool", () => {
     const config = cfg(true, 80, { strategy: "round-robin" });
 
     const picks = [
-      resolveAnthropicAccountForSession("sess-1", config).accountId,
-      resolveAnthropicAccountForSession("sess-2", config).accountId,
-      resolveAnthropicAccountForSession("sess-3", config).accountId,
+      (await admitAnthropic("sess-1", config)).accountId,
+      (await admitAnthropic("sess-2", config)).accountId,
+      (await admitAnthropic("sess-3", config)).accountId,
     ];
     expect(new Set(picks).size).toBe(3);
   });
@@ -268,7 +392,7 @@ describe("anthropic account pool", () => {
     setCachedProviderAccountQuotaForTests("anthropic", cId, { fiveHourPercent: 10 });
     const config = cfg(true, 80, { strategy: "round-robin" });
 
-    const first = resolveAnthropicAccountForSession("T", config);
+    const first = await admitAnthropic("T", config);
     expect(first.accountId).toBeTruthy();
     const pinned = first.accountId!;
     await setActiveAccount("anthropic", pinned === aId ? bId : aId);
@@ -322,11 +446,11 @@ describe("anthropic account pool", () => {
     setCachedProviderAccountQuotaForTests("anthropic", cId, { fiveHourPercent: 10 });
     const config = cfg(true, 80, { strategy: "round-robin", stickyLimit: 3 });
 
-    const first = resolveAnthropicAccountForSession("s1", config).accountId;
+    const first = (await admitAnthropic("s1", config)).accountId;
     expect(first).toBeTruthy();
-    expect(resolveAnthropicAccountForSession("s2", config).accountId).toBe(first);
-    expect(resolveAnthropicAccountForSession("s3", config).accountId).toBe(first);
-    const fourth = resolveAnthropicAccountForSession("s4", config).accountId;
+    expect((await admitAnthropic("s2", config)).accountId).toBe(first);
+    expect((await admitAnthropic("s3", config)).accountId).toBe(first);
+    const fourth = (await admitAnthropic("s4", config)).accountId;
     expect(fourth).not.toBe(first);
   });
 
@@ -337,17 +461,17 @@ describe("anthropic account pool", () => {
     setCachedProviderAccountQuotaForTests("anthropic", cId, { fiveHourPercent: 10 });
     const config = cfg(true, 80, { strategy: "round-robin", stickyLimit: 10 });
 
-    const sticky = resolveAnthropicAccountForSession("sticky-1", config).accountId!;
+    const sticky = (await admitAnthropic("sticky-1", config)).accountId!;
     expect(resolveAnthropicAccountForSession("sticky-2", config).accountId).toBe(sticky);
 
     notePoolRotationFailure(POOL_KEY_ANTHROPIC, sticky);
-    const afterClear = resolveAnthropicAccountForSession("sticky-3", config).accountId;
+    const afterClear = (await admitAnthropic("sticky-3", config)).accountId;
     expect(afterClear).toBeTruthy();
     expect(afterClear).not.toBe(sticky);
 
     // Re-establish sticky, then 429-cool the sticky account — failover + ring must leave it.
     clearPoolRotationState();
-    const again = resolveAnthropicAccountForSession("again-1", config).accountId!;
+    const again = (await admitAnthropic("again-1", config)).accountId!;
     expect(resolveAnthropicAccountForSession("again-2", config).accountId).toBe(again);
     const failover = rotateAnthropicAccountOn429(config, again, "30");
     expect(failover).toBeTruthy();
@@ -398,7 +522,7 @@ describe("anthropic account pool", () => {
 
     const before = getAccountSet("anthropic")!.activeAccountId;
     const picks = Array.from({ length: 3 }, (_, i) => resolveAnthropicAccountForSession(`promo-${i}`, config));
-    expect(new Set(picks.map(p => p.accountId)).size).toBe(3);
+    expect(new Set(picks.map(p => p.accountId)).size).toBe(1);
     expect(getAccountSet("anthropic")!.activeAccountId).toBe(before);
   });
 
@@ -503,13 +627,14 @@ describe("anthropic account pool quota window scoring", () => {
     expect(resolveAnthropicAccountForSession("weekly-unknown-last", cfg(true, 80, { quotaWindow: "weekly" })).accountId).toBe(aId);
   });
 
-  test("weekly mode ranks known 100% before unknown weekly usage", async () => {
+  // .27 parity: a spent account outranking one that may have room was inverted.
+  test("weekly mode ranks unknown weekly usage before a known 100%", async () => {
     const { aId, bId } = await seedTwoAccounts();
     const updatedAt = Date.now();
     setCachedProviderAccountQuotaForTests("anthropic", aId, { fiveHourPercent: 90, weeklyPercent: 100, updatedAt });
     setCachedProviderAccountQuotaForTests("anthropic", bId, { fiveHourPercent: 0, updatedAt });
 
-    expect(resolveAnthropicAccountForSession("weekly-known-100-before-unknown", cfg(true, 80, { quotaWindow: "weekly" })).accountId).toBe(aId);
+    expect(resolveAnthropicAccountForSession("weekly-known-100-before-unknown", cfg(true, 80, { quotaWindow: "weekly" })).accountId).toBe(bId);
   });
 
   test("weekly tie breaks by lower five-hour usage", async () => {
@@ -698,4 +823,52 @@ describe("anthropic account pool quota window scoring", () => {
     expect(resolveAnthropicAccountForSession("weekly-empty-keep", config).accountId).toBe(aId);
     expect(rotateAnthropicAccountOn429(config, aId, "30", "weekly-empty-failover")).toBe(bId);
   });
+});
+
+
+describe("request-local alternate exclusions", () => {
+  for (const strategy of ["quota", "round-robin", "fill-first"] as const) {
+    test(`${strategy} filters tried accounts before ranking and preserves omitted behavior`, async () => {
+      const { aId, bId, cId } = await seedThreeAccounts();
+      const config = cfg(true, 80, { strategy });
+      setCachedProviderAccountQuotaForTests("anthropic", bId, { fiveHourPercent: 1 });
+      setCachedProviderAccountQuotaForTests("anthropic", cId, { fiveHourPercent: 50 });
+      const decision = { position: 1, accounts: [aId, bId, cId], fallback: false };
+      const now = Date.now();
+      const ordinary = pickAlternateAnthropicAccount(config, aId, now, decision);
+      expect(pickAlternateAnthropicAccount(config, aId, now, decision, undefined, new Set())).toBe(ordinary);
+      expect(pickAlternateAnthropicAccount(config, aId, now, decision, undefined, new Set([bId]))).toBe(cId);
+      expect(pickAlternateAnthropicAccount(config, aId, now, decision, undefined, new Set([bId, cId]))).toBeNull();
+    });
+    test(`${strategy} does not widen fallback because healthy routed accounts were tried`, async () => {
+      const { aId, bId, cId } = await seedThreeAccounts();
+      const config = cfg(true, 80, { strategy });
+      const decision = { position: 1, accounts: [aId, bId], fallback: true };
+      expect(pickAlternateAnthropicAccount(config, aId, Date.now(), decision, undefined, new Set([bId]))).toBeNull();
+      expect(pickAlternateAnthropicAccount(config, aId, Date.now(), { ...decision, accounts: ["fixture-missing"] }, undefined, new Set([bId]))).toBe(cId);
+    });
+  }
+  test("reactive pool-off refusal passes exclusions into the canonical quota picker", async () => {
+    const { aId, bId, cId } = await seedThreeAccounts();
+    const config = cfg(false, 80, { strategy: "fill-first" });
+    setCachedProviderAccountQuotaForTests("anthropic", bId, { fiveHourPercent: 1 });
+    setCachedProviderAccountQuotaForTests("anthropic", cId, { fiveHourPercent: 50 });
+    expect(rotateAnthropicAccountOnRefusal(config, aId, 403, "30", null, Date.now(), null, null, undefined, new Set([bId]))).toBe(cId);
+  });
+});
+
+test("tried-account exclusions preserve the shared same-account throttle retry", async () => {
+  const { aId, bId } = await seedTwoAccounts();
+  const config = cfg(true);
+  const snapshot = await getAnthropicPoolAccessSnapshot(aId);
+  const requestKey = {};
+  const excludedAccountIds = new Set([aId, bId]);
+  const refused = () => {
+    const response = new Response(null, { status: 429, headers: { "retry-after": "0.001" } });
+    bindAnthropicRefusalCredential(response, snapshot);
+    return response;
+  };
+  const options = { config, accountId: aId, canRetry: true, requestKey, excludedAccountIds };
+  expect(await rotateAnthropicAccountOnResponse(refused(), options)).toBe(aId);
+  expect(await rotateAnthropicAccountOnResponse(refused(), options)).toBeNull();
 });

@@ -19,12 +19,14 @@ export interface ProviderRewriteResult {
  * Re-point every config reference from one provider id to another.
  *
  * Three shapes exist and the difference matters: routed model strings
- * (`"<provider>/<model>"`), bare provider ids (`customModels[].provider`,
- * `combos[*].targets[].provider`), and keys that ARE provider ids or routes
- * (`providerContextCaps`, `claudeCode.desktopProfile.assignments`). A rewrite
- * that handles only the first leaves an orphaned context cap and — worse — a
- * combo target naming a provider that no longer exists, which fails validation
- * in `src/combos/types.ts` and makes `loadConfig` discard the whole config.
+ * (`"<provider>/<model>"`, including `combos[*].decisionModel`), bare provider ids (`customModels[].provider`,
+ * `combos[*].targets[].provider`, `combos[*].decisionProvider`, `routingProfiles[*].candidates[].provider`),
+ * and keys that ARE provider ids or routes (`providerContextCaps`,
+ * `claudeCode.desktopProfile.assignments`). A rewrite that handles only the
+ * first leaves an orphaned context cap and — worse — a combo target or routing
+ * candidate naming a provider that no longer exists, which fails validation in
+ * `src/combos/types.ts` / `src/routing/profile.ts` and makes `loadConfig`
+ * discard the whole config.
  *
  * `providers[*].selectedModels` is deliberately NOT rewritten: those are
  * per-provider native model ids, and upstream ids may themselves contain a
@@ -93,6 +95,14 @@ export function rewriteProviderReferences(config: OcxConfig, from: string, to: s
 
   routeRecordValues(config.claudeCode?.tierModels as Record<string, string> | undefined);
   routeRecordValues(config.claudeCode?.modelMap as Record<string, string> | undefined);
+  if (config.claudeCode?.appendOnlyToolLoadingModels) {
+    config.claudeCode.appendOnlyToolLoadingModels = config.claudeCode.appendOnlyToolLoadingModels.map(id => route(id) ?? id);
+  }
+  if (config.claudeCode?.chatToolDispatchModels) {
+    config.claudeCode.chatToolDispatchModels = config.claudeCode.chatToolDispatchModels.map(id => route(id) ?? id);
+  }
+  // First-party picker bindings hold routes too; their keys are Anthropic picker ids.
+  routeRecordValues(config.claudeCode?.intercept?.modelMap);
 
   // Bare provider ids.
   for (const model of config.customModels ?? []) {
@@ -102,9 +112,29 @@ export function rewriteProviderReferences(config: OcxConfig, from: string, to: s
     }
   }
   for (const combo of Object.values(config.combos ?? {})) {
+    const decisionModel = route(typeof combo.decisionModel === "string" ? combo.decisionModel.trim() : combo.decisionModel);
+    if (decisionModel) combo.decisionModel = decisionModel;
     for (const target of combo.targets ?? []) {
       if (target.provider === from) {
         target.provider = to;
+        changed += 1;
+      }
+    }
+    // A JEV Combo's decision service is validated against configured providers too.
+    if (typeof combo.decisionProvider === "string" && combo.decisionProvider.trim() === from) {
+      combo.decisionProvider = to;
+      changed += 1;
+    }
+  }
+
+  // Routing-profile candidates carry a bare provider id next to a bare model
+  // id (OcxRoutingProfileCandidate), and profile validation requires the
+  // provider to be configured — so an unrewritten candidate is the same
+  // load-failing dangling reference a stale combo target is.
+  for (const profile of Object.values(config.routingProfiles ?? {})) {
+    for (const candidate of profile.candidates ?? []) {
+      if (candidate.provider === from) {
+        candidate.provider = to;
         changed += 1;
       }
     }
@@ -112,14 +142,16 @@ export function rewriteProviderReferences(config: OcxConfig, from: string, to: s
 
   // Keys. `providerContextCaps` is KEYED by provider id — a prefix rewrite would
   // silently orphan the cap — and a destination key may already be occupied.
-  const caps = config.providerContextCaps;
-  if (caps && Object.hasOwn(caps, from)) {
-    if (Object.hasOwn(caps, to)) {
-      collisions.push(`providerContextCaps.${to}`);
-    } else {
-      caps[to] = caps[from]!;
-      delete caps[from];
-      changed += 1;
+  for (const field of ["providerContextCaps", "providerContextCapValues"] as const) {
+    const caps = config[field];
+    if (caps && Object.hasOwn(caps, from)) {
+      if (Object.hasOwn(caps, to)) {
+        collisions.push(`${field}.${to}`);
+      } else {
+        caps[to] = caps[from]!;
+        delete caps[from];
+        changed += 1;
+      }
     }
   }
 

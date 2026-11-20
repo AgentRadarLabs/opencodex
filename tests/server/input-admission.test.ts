@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import {
   ADMISSION_TOLERANCE,
+  checkComboTargetInputAdmission,
   checkInputAdmission,
   estimateInputTokens,
   resolveInputCeiling,
+  resolveOutputCeiling,
 } from "../../src/server/responses/input-admission";
 import { modelRecordValue } from "../../src/reasoning-effort";
+import { messagesToChatFormat } from "../../src/adapters/openai-chat/messages";
 import type { OcxMessage, OcxParsedRequest, OcxProviderConfig, OcxTool } from "../../src/types";
 
 const CANONICAL_NATIVE: OcxProviderConfig = {
@@ -25,6 +28,20 @@ function request(messages: OcxMessage[], tools?: OcxTool[]): OcxParsedRequest {
 
 function userText(text: string): OcxMessage {
   return { role: "user", content: text, timestamp: 0 };
+}
+
+/** Create a replay whose thinking alone exceeds the test model's context window. */
+function replayedThinking(): OcxParsedRequest {
+  return {
+    ...request([
+      userText("Continue."),
+      { role: "assistant", timestamp: 0, content: [
+        { type: "thinking", thinking: asciiTokens(30_000) },
+        { type: "text", text: "Done." },
+      ] },
+    ]),
+    modelId: "m",
+  };
 }
 
 /** Roughly `tokens` worth of plain ASCII at the default 4 chars/token ratio. */
@@ -167,6 +184,17 @@ describe("estimateInputTokens", () => {
     expect(estimateInputTokens(parsed, "test-model")).toBe(Math.ceil(decoded / 750));
   });
 
+  test("charges inline audio by decoded size rather than its short marker", () => {
+    const base64 = "A".repeat(75_000);
+    const parsed = request([{
+      role: "user",
+      timestamp: 0,
+      content: [{ type: "audio", data: base64, format: "wav", text: "[audio: wav]" }],
+    }]);
+    const decoded = Math.floor((75_000 * 3) / 4);
+    expect(estimateInputTokens(parsed, "test-model")).toBe(Math.ceil(decoded / 256));
+  });
+
   test("charges a remote image a flat cost, not its URL length", () => {
     const short = request([{
       role: "user",
@@ -194,6 +222,22 @@ describe("checkInputAdmission", () => {
     baseUrl: "https://example.test/v1",
     modelContextWindows: { "m": 10_000 },
   };
+
+  /** Compare direct admission with the actual serialized reasoning payload. */
+  test("ignores reasoning that openai-chat drops but counts preserved and native reasoning", () => {
+    const parsed = replayedThinking();
+    const dropped = checkInputAdmission(parsed, provider, "custom", "m");
+    expect(dropped.admitted).toBe(true);
+    expect(dropped.estimatedTokens).toBeLessThan(100);
+    expect(JSON.stringify(messagesToChatFormat(parsed, provider))).not.toContain("reasoning_content");
+    expect(JSON.stringify(messagesToChatFormat(parsed, provider))).not.toContain(asciiTokens(30_000));
+
+    const preserved = { ...provider, preserveReasoningContentModels: ["m"] };
+    expect(JSON.stringify(messagesToChatFormat(parsed, preserved))).toContain("reasoning_content");
+    expect(JSON.stringify(messagesToChatFormat(parsed, preserved))).toContain(asciiTokens(30_000));
+    expect(checkInputAdmission(parsed, preserved, "custom", "m").admitted).toBe(false);
+    expect(checkInputAdmission(parsed, { ...provider, adapter: "openai-responses" }, "custom", "m").admitted).toBe(false);
+  });
 
   test("admits input under the ceiling", () => {
     const result = checkInputAdmission(request([userText(asciiTokens(5_000))]), provider, "custom", "m");
@@ -255,5 +299,219 @@ describe("checkInputAdmission", () => {
       for (const [name, fn] of originals) fs[name] = fn;
     }
     expect(calls).toBe(0);
+  });
+});
+
+describe("combo target input admission", () => {
+  const capped: OcxProviderConfig = {
+    adapter: "openai-chat",
+    baseUrl: "https://example.test/v1",
+    modelContextWindows: { m: 128_000 },
+    modelMaxOutputTokens: { m: 32_000 },
+  };
+
+  /** Verify each combo target counts only reasoning retained by its wire compiler. */
+  test("uses the target's reasoning replay policy before reserving output space", () => {
+    const parsed = { ...replayedThinking(), options: { maxOutputTokens: 1_000 } };
+    const target = { ...capped, modelContextWindows: { m: 10_000 }, modelMaxOutputTokens: { m: 1_000 } };
+    expect(checkComboTargetInputAdmission(parsed, target, "custom", "m").admitted).toBe(true);
+    expect(JSON.stringify(messagesToChatFormat(parsed, target))).not.toContain(asciiTokens(30_000));
+    const preserved = { ...target, preserveReasoningContentModels: ["m"] };
+    expect(checkComboTargetInputAdmission(parsed, preserved, "custom", "m").admitted).toBe(false);
+    expect(JSON.stringify(messagesToChatFormat(parsed, preserved))).toContain(asciiTokens(30_000));
+  });
+
+  const withMaxOutput = (inputTokens: number, maxOutputTokens = 64_000): OcxParsedRequest => ({
+    ...request([userText(asciiTokens(inputTokens))]),
+    modelId: "m",
+    options: { maxOutputTokens },
+  });
+  // A separate builder, because passing `undefined` to the one above would silently take its
+  // default and the row below would assert the opposite of what it claims to cover.
+  const withoutMaxOutput = (inputTokens: number): OcxParsedRequest => ({
+    ...request([userText(asciiTokens(inputTokens))]),
+    modelId: "m",
+    options: {},
+  });
+
+  test("skips a target that cannot hold the turn plus its own output ceiling", () => {
+    // 100k input + 32k of reachable output does not fit 128k, so this target would have
+    // answered 200, emitted a few hundred tokens and stopped on finish_reason: length.
+    const result = checkComboTargetInputAdmission(withMaxOutput(100_000), capped, "custom", "m");
+    expect(result.admitted).toBe(false);
+    expect(result.ceiling).toBe(128_000);
+    expect(result.requiredOutputHeadroom).toBe(32_000);
+  });
+
+  test("reserves no more than the target can actually emit", () => {
+    // The caller asked for 64k, but this model tops out at 32k, so reserving the caller's
+    // number would skip a target that fits.
+    const result = checkComboTargetInputAdmission(withMaxOutput(90_000), capped, "custom", "m");
+    expect(result.admitted).toBe(true);
+    expect(result.requiredOutputHeadroom).toBe(32_000);
+  });
+
+  test("an input-only cap is not charged the output reserve twice", () => {
+    // modelMaxInputTokens tightens the admissible INPUT; the output reserve belongs against
+    // the window. Charging both against the tightened number would refuse a turn that fits.
+    const inputCapped: OcxProviderConfig = { ...capped, modelMaxInputTokens: { m: 90_000 } };
+    const fits = checkComboTargetInputAdmission(withMaxOutput(85_000), inputCapped, "custom", "m");
+    expect(fits.admitted).toBe(true);
+    expect(fits.ceiling).toBe(90_000);
+    // The input cap itself still refuses on its own terms.
+    expect(checkComboTargetInputAdmission(withMaxOutput(95_000), inputCapped, "custom", "m").admitted).toBe(false);
+  });
+
+  test("unknown context stays fail-open", () => {
+    const unknown: OcxProviderConfig = { adapter: "openai-chat", baseUrl: "https://example.test/v1" };
+    const result = checkComboTargetInputAdmission(withMaxOutput(2_000_000), unknown, "custom", "m");
+    expect(result.admitted).toBe(true);
+    expect(result.ceiling).toBeNull();
+  });
+
+  test("no declared output allowance keeps the loose direct contract", () => {
+    const result = checkComboTargetInputAdmission(withoutMaxOutput(150_000), capped, "custom", "m");
+    expect(result.admitted).toBe(true); // still inside the existing 2.5x pathological gate
+    expect(result.requiredOutputHeadroom).toBeUndefined();
+  });
+
+  test("a canonical native slug missing from the override table resolves from generated metadata", () => {
+    // Spark carries 128k/32k in the generated bundle but is absent from the narrower pinned
+    // native table, which left the gate completely blind on exactly this route. It is retired
+    // from the picker and still dispatchable when an operator names it in a combo target.
+    expect(resolveInputCeiling(CANONICAL_NATIVE, "openai", "gpt-5.3-codex-spark")).toBe(128_000);
+    expect(resolveOutputCeiling(CANONICAL_NATIVE, "openai", "gpt-5.3-codex-spark")).toBe(32_000);
+    // The native Codex catalog is consulted first, and it is keyed "openai-codex" — which is NOT
+    // the routing provider id, because that one is the string "openai". `gpt-5-codex-mini` exists
+    // only in the native catalog, so resolving it proves the right key is being read.
+    expect(resolveInputCeiling(CANONICAL_NATIVE, "openai", "gpt-5-codex-mini")).toBe(272_000);
+    // A slug the override table does know keeps its own pinned window.
+    expect(resolveInputCeiling(CANONICAL_NATIVE, "openai", "gpt-5.6-sol")).toBe(272_000);
+    // An operator cap may only narrow the generated value, never widen it.
+    expect(resolveInputCeiling(CANONICAL_NATIVE, "openai", "gpt-5.3-codex-spark", 64_000)).toBe(64_000);
+    // A provider merely named openai still inherits nothing.
+    const impostor: OcxProviderConfig = { adapter: "openai-chat", baseUrl: "https://impostor.test/v1", authMode: "key" };
+    expect(resolveInputCeiling(impostor, "openai", "gpt-5.3-codex-spark")).toBeNull();
+    expect(resolveOutputCeiling(impostor, "openai", "gpt-5.3-codex-spark")).toBeNull();
+  });
+});
+
+for (const headroom of [false, true]) test(`input ceiling messages retain the actual context window headroom=${headroom}`, async () => {
+  const { inputAdmissionRefusalMessage } = await import("../../src/server/responses/input-admission");
+  const { clientFacingModelLabel } = await import("../../src/lib/error-destination");
+  const parsed = request([userText("a".repeat(4000))]);
+  if (headroom) parsed.options.maxOutputTokens = 8;
+  const provider: OcxProviderConfig = { adapter: "openai-chat", baseUrl: "https://provider.example/v1", contextWindow: 200, modelMaxInputTokens: { "test-model": 16 } };
+  const result = headroom ? checkComboTargetInputAdmission(parsed, provider, "fixture", "test-model") : checkInputAdmission(parsed, provider, "fixture", "test-model");
+  expect(result.admitted).toBe(false); expect(result.ceiling).toBe(16); expect(result.contextWindow).toBe(200);
+  const message = inputAdmissionRefusalMessage(result, clientFacingModelLabel("client-model"));
+  expect(message).toContain("input limit of client-model (16 tokens; context window: 200 tokens)");
+});
+
+test("output headroom compares against the shared window after the input cap", async () => {
+  const { inputAdmissionRefusalMessage } = await import("../../src/server/responses/input-admission");
+  const { clientFacingModelLabel } = await import("../../src/lib/error-destination");
+  const parsed = request([userText("hi")]); parsed.options.maxOutputTokens = 200;
+  const result = checkComboTargetInputAdmission(parsed, { adapter: "openai-chat", baseUrl: "https://provider.example/v1", contextWindow: 100, modelMaxInputTokens: { "test-model": 16 } }, "fixture", "test-model");
+  expect(result.admitted).toBe(false); expect(result.estimatedTokens).toBeLessThanOrEqual(16);
+  expect(inputAdmissionRefusalMessage(result, clientFacingModelLabel("client-model"))).toContain("context window of client-model (100 tokens; input limit: 16 tokens)");
+});
+
+describe("devin adapter window fallback", () => {
+  const devin: OcxProviderConfig = { adapter: "devin", baseUrl: "https://server.codeium.com" };
+  const devinRequest = (inputTokens: number, modelId: string): OcxParsedRequest => ({
+    ...request([userText(asciiTokens(inputTokens))]),
+    modelId,
+    options: { maxOutputTokens: 64_000 },
+  });
+
+  test("resolves the adapter window when provider config declares none", () => {
+    // swe-2-flash serves ~256KiB even though the live catalog advertises 850k;
+    // observed turns terminate at totalTokens 262,140.
+    expect(resolveInputCeiling(devin, "devin", "swe-2-flash")).toBe(262_000);
+    // Effort-suffixed catalog UIDs collapse to the base row.
+    expect(resolveInputCeiling(devin, "devin", "swe-2-flash-medium")).toBe(262_000);
+    expect(resolveInputCeiling(devin, "devin", "swe-2")).toBe(850_000);
+  });
+
+  test("a turn that cannot fit is skipped before any upstream bytes", () => {
+    // 250k estimated input + 64k declared output exceeds the 262k serving window --
+    // the shape that used to answer 200, emit a few hundred tokens and stop on
+    // max_output_tokens with output already committed and no target left to try.
+    const result = checkComboTargetInputAdmission(devinRequest(250_000, "swe-2-flash"), devin, "devin", "swe-2-flash");
+    expect(result.admitted).toBe(false);
+    expect(result.ceiling).toBe(262_000);
+  });
+
+  test("explicit provider windows still win over the adapter table", () => {
+    const wider: OcxProviderConfig = { ...devin, contextWindow: 900_000 };
+    expect(checkComboTargetInputAdmission(devinRequest(250_000, "swe-2-flash"), wider, "devin", "swe-2-flash").admitted).toBe(true);
+    const narrower: OcxProviderConfig = { ...devin, modelContextWindows: { "swe-2-flash": 200_000 } };
+    expect(resolveInputCeiling(narrower, "devin", "swe-2-flash")).toBe(200_000);
+  });
+
+  test("dotted devin ids resolve the hyphenated window", () => {
+    const provider: OcxProviderConfig = { adapter: "devin", baseUrl: "https://devin.test" };
+    expect(resolveInputCeiling(provider, "devin", "swe-1.7")).toBe(262_000);
+  });
+
+  test("dotted id honors a configured window on the normalized spelling", () => {
+    const provider: OcxProviderConfig = {
+      adapter: "devin", baseUrl: "https://devin.test",
+      modelContextWindows: { "swe-1-7-medium": 111_000 },
+    };
+    expect(resolveInputCeiling(provider, "devin", "swe-1.7-medium")).toBe(111_000);
+  });
+
+  test("dotted id honors a configured input cap on the normalized spelling", () => {
+    const provider: OcxProviderConfig = {
+      adapter: "devin", baseUrl: "https://devin.test",
+      modelMaxInputTokens: { "swe-1-7": 100_000 },
+    };
+    expect(resolveInputCeiling(provider, "devin", "swe-1.7")).toBe(100_000);
+  });
+
+  test("an effort-suffixed dotted id honors an override on its dotted base", () => {
+    const provider: OcxProviderConfig = {
+      adapter: "devin", baseUrl: "https://devin.test",
+      modelContextWindows: { "swe-1.7": 111_000 },
+    };
+    expect(resolveInputCeiling(provider, "devin", "swe-1.7-medium")).toBe(111_000);
+    expect(checkComboTargetInputAdmission(devinRequest(150_000, "swe-1.7-medium"), provider, "devin", "swe-1.7-medium").admitted).toBe(false);
+  });
+
+  test("a per-model override on any devin spelling binds before the provider-wide window", () => {
+    const provider: OcxProviderConfig = {
+      adapter: "devin", baseUrl: "https://devin.test", contextWindow: 900_000,
+      modelContextWindows: { "swe-1-7-medium": 111_000 },
+    };
+    expect(resolveInputCeiling(provider, "devin", "swe-1.7-medium")).toBe(111_000);
+    expect(checkComboTargetInputAdmission(devinRequest(200_000, "swe-1.7-medium"), provider, "devin", "swe-1.7-medium").admitted).toBe(false);
+  });
+
+  test("a hyphenated id honors overrides keyed by the dotted spelling", () => {
+    const provider: OcxProviderConfig = {
+      adapter: "devin", baseUrl: "https://devin.test", contextWindow: 900_000,
+      modelContextWindows: { "swe-1.7": 111_000 },
+      modelMaxInputTokens: { "swe-1.7": 100_000 },
+    };
+    expect(resolveInputCeiling(provider, "devin", "swe-1-7-medium")).toBe(100_000);
+    expect(checkComboTargetInputAdmission(devinRequest(150_000, "swe-1-7-medium"), provider, "devin", "swe-1-7-medium").admitted).toBe(false);
+    const windowOnly: OcxProviderConfig = { ...provider, modelMaxInputTokens: undefined };
+    expect(resolveInputCeiling(windowOnly, "devin", "swe-1-7")).toBe(111_000);
+  });
+
+  test("the dotted-key fallback folds case like the exact-spelling lookup", () => {
+    const provider: OcxProviderConfig = {
+      adapter: "devin", baseUrl: "https://devin.test", contextWindow: 900_000,
+      modelMaxInputTokens: { "SWE-1.7": 100_000 },
+    };
+    expect(resolveInputCeiling(provider, "devin", "swe-1-7-medium")).toBe(100_000);
+    expect(resolveInputCeiling(provider, "devin", "SWE-1-7-MEDIUM")).toBe(100_000);
+  });
+
+  test("non-devin adapters stay unresolved", () => {
+    const other: OcxProviderConfig = { adapter: "openai-chat", baseUrl: "https://example.test/v1" };
+    expect(resolveInputCeiling(other, "custom", "swe-2-flash")).toBeNull();
   });
 });

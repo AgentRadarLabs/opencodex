@@ -1,10 +1,13 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as derivedRegistries from "../../src/config/derived-registries";
+import * as mutationLock from "../../src/config/mutation-lock";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { managementFetch as fetch } from "../helpers/management-auth";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { handleCodexAuthAPI } from "../../src/codex/auth-api";
-import { saveConfig } from "../../src/config";
+import { handleCodexAuthAPI } from "../../src/codex/auth-api/routes";
+import { setPersistedConfigMutationBeforeCommitForTests } from "../../src/config/persisted-mutation";
+import { loadConfig, saveConfig } from "../../src/config";
 import { startServer } from "../../src/server";
 import type { OcxConfig } from "../../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
@@ -177,6 +180,57 @@ describe("Anthropic account pool strategy management API", () => {
     isolatedCodexHome?.restore();
     isolatedCodexHome = null;
     if (testDir) removeTreeWithRetry(testDir);
+  });
+
+  test("both settings GETs flag malformed stored Anthropic routes without treating them as valid", async () => {
+    const path = join(testDir, "config.json");
+    const stored = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    const malformed = [{ name: "broken", match: "[", accounts: ["removed-id"] }];
+    stored.anthropicAccountPool = { enabled: true, routes: malformed };
+    writeFileSync(path, JSON.stringify(stored), { mode: 0o600 });
+    const server = startServer(0);
+    try {
+      const unified = await fetch(new URL("/api/pool/settings?provider=anthropic", server.url));
+      const legacy = await fetch(new URL("/api/oauth/accounts/pool?provider=anthropic", server.url));
+      expect(unified.status).toBe(200);
+      expect(legacy.status).toBe(200);
+      const unifiedBody = await unified.json() as Record<string, unknown>;
+      const legacyBody = await legacy.json() as Record<string, unknown>;
+      expect(unifiedBody.routes).toBeNull();
+      expect(legacyBody.routes).toBeNull();
+      expect(unifiedBody.routesError).toEqual(expect.any(String));
+      expect(legacyBody.routesError).toBe(unifiedBody.routesError);
+      expect(JSON.parse(readFileSync(path, "utf8")).anthropicAccountPool.routes).toEqual(malformed);
+    } finally { await server.stop(true); }
+  });
+
+  test("both Anthropic settings writers preserve, replace and clear model routes", async () => {
+    let server = startServer(0);
+    const routes = [{ name: "sonnet", match: "claude-sonnet-*", accounts: ["removed-id"] }];
+    const send = (path: string, body: Record<string, unknown>) => fetch(new URL(path, server.url), {
+      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    });
+    try {
+      const unified = await send("/api/pool/settings", { provider: "anthropic", routes });
+      expect(unified.status).toBe(200);
+      expect((await unified.json()).routes).toEqual(routes);
+      expect(loadConfig().anthropicAccountPool?.routes).toEqual(routes);
+      await server.stop(true);
+      server = startServer(0);
+      const reloaded = await fetch(new URL("/api/pool/settings?provider=anthropic", server.url));
+      expect((await reloaded.json()).routes).toEqual(routes);
+      const legacy = await send("/api/oauth/accounts/pool", { provider: "anthropic", strategy: "round-robin" });
+      expect(legacy.status).toBe(200);
+      expect((await legacy.json()).routes).toEqual(routes);
+      const bad = await send("/api/pool/settings", { provider: "anthropic", routes: [{ name: "bad", match: "[", accounts: ["id"] }] });
+      expect(bad.status).toBe(400);
+      const other = await send("/api/pool/settings", { provider: "openai", routes });
+      expect(other.status).toBe(400);
+      const clear = await send("/api/oauth/accounts/pool", { provider: "anthropic", routes: null });
+      expect(clear.status).toBe(200);
+      expect((await clear.json()).routes).toBeNull();
+      expect(loadConfig().anthropicAccountPool?.routes).toBeUndefined();
+    } finally { await server.stop(true); }
   });
 
   test("GET /api/oauth/accounts/pool surfaces strategy defaults", async () => {
@@ -439,7 +493,13 @@ describe("Anthropic account pool strategy management API", () => {
     // reading `inert` as covering `enabled` would render a live control as decorative.
     const source = await Bun.file("src/oauth/pool-settings-capability.ts").text();
     const start = source.indexOf("autoSwitchThreshold: number | null;");
-    const marker = source.slice(start, source.indexOf("inert: true;", start));
+    // Anchored on the CURRENT literal. When this type read `inert: true;` and the field became
+    // `inert: boolean;`, indexOf returned -1 and slice(start, -1) handed back almost the whole
+    // file -- which still contains all three words, so every assertion below passed while the
+    // test had stopped checking anything. Fail closed on a missing anchor instead.
+    const end = source.indexOf("inert: boolean;", start);
+    expect(end).toBeGreaterThan(start);
+    const marker = source.slice(start, end);
     expect(marker).toContain("strategy");
     expect(marker).toContain("autoSwitchThreshold");
     expect(marker).toContain("enabled");
@@ -474,7 +534,10 @@ describe("generic OAuth pool-settings contract (#695)", () => {
     try {
       const absent = await fetch(new URL("/api/oauth/accounts/pool?provider=google-antigravity", server.url));
       expect(absent.status).toBe(200);
-      expect(await absent.json()).toEqual({ provider: "google-antigravity", kind: "generic", enabled: null, strategy: null, autoSwitchThreshold: null, inert: true });
+      expect(await absent.json()).toEqual({
+        provider: "google-antigravity", kind: "generic", enabled: null, strategy: null,
+        autoSwitchThreshold: null, stickyLimit: null, inert: true,
+      });
 
       const put = await fetch(new URL("/api/oauth/accounts/pool", server.url), {
         method: "PUT", headers: { "Content-Type": "application/json" },
@@ -488,7 +551,8 @@ describe("generic OAuth pool-settings contract (#695)", () => {
       for (const body of [
         { provider: "google-antigravity", strategy: "weighted" },
         { provider: "google-antigravity", autoSwitchThreshold: 101 },
-        { provider: "google-antigravity", stickyLimit: 3 },
+        { provider: "google-antigravity", stickyLimit: 0 },
+        { provider: "google-antigravity", quotaWindow: "weekly" },
         { provider: "deepseek", strategy: "quota" },
       ]) {
         const bad = await fetch(new URL("/api/oauth/accounts/pool", server.url), {
@@ -508,4 +572,509 @@ describe("generic OAuth pool-settings contract (#695)", () => {
       await server.stop(true);
     }
   });
+});
+
+describe("legacy pool contract goldens (#wp5)", () => {
+  /**
+   * Exact-body pins for the three pool contracts, written BEFORE anything is shared between
+   * them. The existing coverage could not serve as the compatibility net it was assumed to be:
+   * the Codex and Anthropic assertions use toMatchObject, which passes when extra keys appear,
+   * and PUT /api/codex-auth/auto-switch checked only the status code. A refactor guarded by
+   * those would not have noticed the regression it was supposed to catch.
+   *
+   * GET /api/codex-auth/active is deliberately absent: it already carries a full toEqual in
+   * tests/codex-integration/codex-auth-api.test.ts.
+   */
+  test("PUT /api/codex-auth/auto-switch answers exactly { ok: true }", async () => {
+    const req = new Request("http://localhost/api/codex-auth/auto-switch", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ threshold: 70 }),
+    });
+    const resp = await handleCodexAuthAPI(req, new URL(req.url), makeCodexConfig());
+    expect(resp!.status).toBe(200);
+    expect(await resp!.json()).toEqual({ ok: true });
+  });
+
+  test("PUT /api/codex-auth/pool-strategy answers exactly its three keys", async () => {
+    const req = new Request("http://localhost/api/codex-auth/pool-strategy", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ strategy: "round-robin", stickyLimit: 5 }),
+    });
+    const resp = await handleCodexAuthAPI(req, new URL(req.url), makeCodexConfig());
+    expect(resp!.status).toBe(200);
+    expect(await resp!.json()).toEqual({
+      ok: true,
+      accountPoolStrategy: "round-robin",
+      accountPoolStickyLimit: 5,
+    });
+  });
+
+  test("GET /api/oauth/accounts/pool answers exactly the anthropic shape", async () => {
+    const server = startServer(0);
+    try {
+      const res = await fetch(new URL("/api/oauth/accounts/pool?provider=anthropic", server.url));
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        provider: "anthropic",
+        enabled: false,
+        autoSwitchThreshold: 80,
+        strategy: "quota",
+        stickyLimit: 1,
+        quotaWindow: "five-hour",
+        routes: null,
+        nativeMessages: true,
+        experimental: true,
+      });
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("PUT /api/oauth/accounts/pool answers exactly the anthropic shape", async () => {
+    const server = startServer(0);
+    try {
+      const res = await fetch(new URL("/api/oauth/accounts/pool", server.url), {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          provider: "anthropic", enabled: true, autoSwitchThreshold: 70,
+          strategy: "round-robin", stickyLimit: 4,
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        ok: true,
+        provider: "anthropic",
+        enabled: true,
+        autoSwitchThreshold: 70,
+        strategy: "round-robin",
+        stickyLimit: 4,
+        quotaWindow: "five-hour",
+        routes: null,
+        nativeMessages: true,
+        experimental: true,
+      });
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("a bad strategy and a bad stickyLimit are rejected identically on every kind, with one null exception", async () => {
+    // One validator, three adapters. The kinds keep their own request and response shapes --
+    // that is what the goldens above pin -- but the VALUE rules are now a single implementation,
+    // so "quota, round-robin, fill-first" and the 1..100 sticky bound cannot drift apart per
+    // kind. Before this, the generic kind carried a private copy of both.
+    // ONE deliberate exception: `strategy: null` is not a bad value on the legacy generic
+    // endpoint -- it clears the saved strategy and answers 200. Codex, Anthropic, and the
+    // unified /api/pool/settings route all reject the same null with 400. A future reader
+    // who sees the 200 must not "fix" it back without deciding that contract first.
+    const codex = async (payload: Record<string, unknown>) => {
+      const req = new Request("http://localhost/api/codex-auth/pool-strategy", {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+      });
+      const resp = await handleCodexAuthAPI(req, new URL(req.url), makeCodexConfig());
+      return resp!.status;
+    };
+    const previousHome = process.env.OPENCODEX_HOME;
+    const testDir = mkdtempSync(join(tmpdir(), "ocx-pool-validator-"));
+    let server: ReturnType<typeof startServer> | undefined;
+    try {
+      process.env.OPENCODEX_HOME = testDir;
+      saveConfig({
+        port: 0,
+        hostname: "127.0.0.1",
+        defaultProvider: "google-antigravity",
+        providers: {
+          "google-antigravity": { adapter: "google", baseUrl: "https://daily-cloudcode-pa.googleapis.com", authMode: "oauth" },
+        },
+      } as OcxConfig);
+      server = startServer(0);
+      const oauth = async (payload: Record<string, unknown>) => {
+        const res = await fetch(new URL("/api/oauth/accounts/pool", server.url), {
+          method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(payload),
+        });
+        return res.status;
+      };
+      const oauthJson = async (payload: Record<string, unknown>) => {
+        const res = await fetch(new URL("/api/oauth/accounts/pool", server.url), {
+          method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(payload),
+        });
+        return { status: res.status, body: await res.json() as { strategy?: unknown } };
+      };
+      for (const strategy of ["weighted", "", 3]) {
+        expect(await codex({ strategy })).toBe(400);
+        expect(await oauth({ provider: "anthropic", strategy })).toBe(400);
+        expect(await oauth({ provider: "google-antigravity", strategy })).toBe(400);
+      }
+      expect(await codex({ strategy: null })).toBe(400);
+      expect(await oauth({ provider: "anthropic", strategy: null })).toBe(400);
+      // The generic legacy contract: null clears the saved strategy. Prove the clear actually
+      // happened -- a 200 that left the old strategy in place would be a silent no-op.
+      expect(await oauth({ provider: "google-antigravity", strategy: "round-robin" })).toBe(200);
+      const cleared = await oauthJson({ provider: "google-antigravity", strategy: null });
+      expect(cleared.status).toBe(200);
+      expect(cleared.body).toHaveProperty("strategy", null);
+      // 0 and 101 sit just outside the shared bound; 1 and 100 are the edges that must pass.
+      for (const stickyLimit of [0, 101, 1.5]) {
+        expect(await codex({ stickyLimit })).toBe(400);
+        expect(await oauth({ provider: "anthropic", stickyLimit })).toBe(400);
+        expect(await oauth({ provider: "google-antigravity", stickyLimit })).toBe(400);
+      }
+      for (const stickyLimit of [1, 100]) {
+        expect(await codex({ stickyLimit })).toBe(200);
+      }
+    } finally {
+      try {
+        await server?.stop(true);
+      } finally {
+        if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+        else process.env.OPENCODEX_HOME = previousHome;
+        removeTreeWithRetry(testDir);
+      }
+    }
+  });
+
+});
+
+describe("unified pool-settings contract (#695 wp5c)", () => {
+  let previousHome2: string | undefined;
+  let dir = "";
+  beforeEach(() => {
+    previousHome2 = process.env.OPENCODEX_HOME;
+    dir = mkdtempSync(join(tmpdir(), "ocx-pool-unified-"));
+    process.env.OPENCODEX_HOME = dir;
+    saveConfig({
+      port: 0,
+      hostname: "127.0.0.1",
+      defaultProvider: "google-antigravity",
+      providers: {
+        "google-antigravity": { adapter: "google", baseUrl: "https://daily-cloudcode-pa.googleapis.com", authMode: "oauth" },
+        deepseek: { adapter: "openai-chat", baseUrl: "https://api.deepseek.com/v1", apiKey: "deepseek-key-fixture" },
+      },
+    } as OcxConfig);
+  });
+  afterEach(() => {
+    if (previousHome2 === undefined) delete process.env.OPENCODEX_HOME;
+    else process.env.OPENCODEX_HOME = previousHome2;
+    if (dir) removeTreeWithRetry(dir);
+  });
+
+  test("reset-first round-trips through Codex settings and generic pools, never Anthropic", async () => {
+    const server = startServer(0);
+    try {
+      const write = async (provider: string, strategy: string) => fetch(new URL("/api/pool/settings", server.url), {
+        method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider, strategy }),
+      });
+      const result = await write("openai", "reset-first");
+      expect(result.status).toBe(200);
+      expect(await result.json()).toMatchObject({ kind: "codex", strategy: "reset-first" });
+      expect(loadConfig().accountPoolStrategy).toBe("reset-first");
+      const canonical = await fetch(new URL("/api/pool/settings?provider=openai", server.url));
+      expect(await canonical.json()).toMatchObject({ strategy: "reset-first" });
+      const legacy = new Request("http://localhost/api/codex-auth/active");
+      const legacyRead = await handleCodexAuthAPI(legacy, new URL(legacy.url), loadConfig());
+      expect(await legacyRead!.json()).toMatchObject({ accountPoolStrategy: "reset-first" });
+      // The Anthropic runtime implements quota/round-robin/fill-first only, so that kind
+      // refuses reset-first instead of storing a strategy it would ignore.
+      const rejected = await write("anthropic", "reset-first");
+      expect(rejected.status).toBe(400);
+      expect((await rejected.json() as { error: string }).error).toBe("strategy must be one of: quota, round-robin, fill-first");
+      // A generic OAuth pool accepts and round-trips it.
+      const antigravityWrite = await write("google-antigravity", "reset-first");
+      expect(antigravityWrite.status).toBe(200);
+      expect(await antigravityWrite.json()).toMatchObject({ kind: "generic", strategy: "reset-first" });
+      const antigravityRead = await fetch(new URL("/api/pool/settings?provider=google-antigravity", server.url));
+      expect(await antigravityRead.json()).toMatchObject({ kind: "generic", strategy: "reset-first" });
+      expect(loadConfig().providers["google-antigravity"]?.oauthAccountFailover?.strategy).toBe("reset-first");
+      const compatibility = new Request("http://localhost/api/codex-auth/pool-strategy", {
+        method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ strategy: "reset-first" }),
+      });
+      const compatibilityWrite = await handleCodexAuthAPI(compatibility, new URL(compatibility.url), loadConfig());
+      expect(compatibilityWrite!.status).toBe(200);
+      expect(await compatibilityWrite!.json()).toMatchObject({ accountPoolStrategy: "reset-first" });
+      expect(loadConfig().accountPoolStrategy).toBe("reset-first");
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("quota history is a protected bounded cached read for stored pool accounts", async () => {
+    const config = loadConfig();
+    config.codexAccounts = [{ id: "history-row", email: "history@example.test", isMain: false }];
+    saveConfig(config);
+    const server = startServer(0);
+    try {
+      const endpoint = "/api/codex-auth/quota/history";
+      const denied = await globalThis.fetch(new URL(`${endpoint}?accountId=history-row`, server.url));
+      expect(denied.status).toBe(401);
+      await denied.text();
+      for (const query of ["", "?accountId=__main__", "?accountId=history-row&accountId=history-row", "?accountId=history-row&limit=201", "?accountId=history-row&refresh=1"]) {
+        const response = await fetch(new URL(endpoint + query, server.url));
+        expect(response.status).toBe(400);
+        await response.text();
+      }
+      const unknown = await fetch(new URL(`${endpoint}?accountId=missing`, server.url));
+      expect(unknown.status).toBe(404);
+      await unknown.text();
+      const response = await fetch(new URL(`${endpoint}?accountId=history-row&limit=1`, server.url));
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ accountId: "history-row", observations: [], retention: { maxObservations: 200, maxAgeDays: 30 }, truncated: false, capacity: { status: "insufficient-evidence", reason: "identity_unavailable", estimates: [], assumptions: expect.any(Array) } });
+      const { saveCodexAccountCredential, capturePoolQuotaWriter } = await import("../../src/codex/account-store");
+      const { setAccountQuotaFromParsed } = await import("../../src/codex/quota");
+      const credential = { accessToken: "history-secret-access", refreshToken: "history-secret-refresh", expiresAt: Date.now() + 3600_000, chatgptAccountId: "private-history-account" };
+      const generation = saveCodexAccountCredential("history-row", credential);
+      const writer = capturePoolQuotaWriter("history-row", { ...credential, generation })!;
+      const raw = { weeklyPercent: 21 };
+      setAccountQuotaFromParsed("history-row", raw, undefined, undefined, raw, { writer, observedAt: Date.now(), source: "wham", raw });
+      const populated = await fetch(new URL(`${endpoint}?accountId=history-row`, server.url));
+      const body = await populated.json() as { observations: Array<{ source: string; windows: Array<{ usedPercent: number }> }> };
+      expect(body.observations).toHaveLength(1);
+      expect(body.observations[0]).toMatchObject({ source: "wham", windows: [{ family: "account", window: "weekly", usedPercent: 21 }] });
+      const serialized = JSON.stringify(body);
+      for (const privateValue of [credential.accessToken, credential.refreshToken, writer.historyIdentity, "credentialGeneration"]) expect(serialized).not.toContain(privateValue);
+
+    } finally { await server.stop(true); }
+  });
+
+  test("every kind answers with the same keys and declares what it supports", async () => {
+    const server = startServer(0);
+    try {
+      for (const [provider, kind, supported] of [
+        ["openai", "codex", ["strategy", "stickyLimit", "autoSwitchThreshold"]],
+        ["anthropic", "anthropic", ["enabled", "strategy", "stickyLimit", "autoSwitchThreshold", "quotaWindow", "routes", "nativeMessages"]],
+        ["google-antigravity", "generic", ["enabled", "strategy", "stickyLimit", "autoSwitchThreshold"]],
+      ] as const) {
+        const res = await fetch(new URL(`/api/pool/settings?provider=${provider}`, server.url));
+        expect(res.status).toBe(200);
+        const dto = await res.json() as Record<string, unknown>;
+        // Valid and absent routes keep the fixed key set; routesError appears only for malformed stored rules.
+        // An unsupported field is a declared null, not an absence,
+        // which is the whole difference between a consolidation and a fourth contract.
+        expect(Object.keys(dto).sort()).toEqual([
+          "autoSwitchThreshold", "enabled", "enabledEffective", "kind", "maxConcurrentPerAccount", "nativeMessages",
+          "provider", "quotaWindow", "routes", "stickyLimit", "strategy", "supported",
+        ]);
+        expect(dto.kind).toBe(kind);
+        expect(dto.supported).toEqual([...supported]);
+        // quotaWindow belongs to anthropic alone; the others state null rather than omitting it.
+        if (kind !== "anthropic") expect(dto.quotaWindow).toBeNull();
+      }
+      // An API-key provider has no pool at all and is refused rather than answered with nulls.
+      expect((await fetch(new URL("/api/pool/settings?provider=deepseek", server.url))).status).toBe(400);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("a generic pool with no stored override reports the inherited global", async () => {
+    const config = loadConfig();
+    config.oauthAccountFailover = { enabled: true };
+    saveConfig(config);
+    const server = startServer(0);
+    try {
+      const dto = await (await fetch(new URL("/api/pool/settings?provider=google-antigravity", server.url))).json() as Record<string, unknown>;
+      // The defect this field closes: `enabled: null` means "nothing stored here", which alone
+      // cannot distinguish a disabled pool from one inheriting a global true.
+      expect(dto.enabled).toBeNull();
+      expect(dto.enabledEffective).toBe(true);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("a global false leaves an unset generic pool effectively off", async () => {
+    const config = loadConfig();
+    config.oauthAccountFailover = { enabled: false };
+    saveConfig(config);
+    const server = startServer(0);
+    try {
+      const dto = await (await fetch(new URL("/api/pool/settings?provider=google-antigravity", server.url))).json() as Record<string, unknown>;
+      expect(dto.enabled).toBeNull();
+      expect(dto.enabledEffective).toBe(false);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("a stored provider override beats the global in both directions", async () => {
+    const config = loadConfig();
+    config.oauthAccountFailover = { enabled: true };
+    config.providers["google-antigravity"]!.oauthAccountFailover = { enabled: false };
+    saveConfig(config);
+    const server = startServer(0);
+    try {
+      const dto = await (await fetch(new URL("/api/pool/settings?provider=google-antigravity", server.url))).json() as Record<string, unknown>;
+      expect(dto.enabled).toBe(false);
+      expect(dto.enabledEffective).toBe(false);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("a write reaches each kind's own storage and is refused identically on bad values", async () => {
+    const server = startServer(0);
+    try {
+      const put = async (payload: Record<string, unknown>) => {
+        const res = await fetch(new URL("/api/pool/settings", server.url), {
+          method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(payload),
+        });
+        return { status: res.status, body: await res.json() as Record<string, unknown> };
+      };
+      // Consolidating the contract does not consolidate the persistence: each kind still lands
+      // in its own place, which is what keeps the legacy paths answering byte-identically.
+      expect((await put({ provider: "openai", strategy: "round-robin", stickyLimit: 5 })).body).toMatchObject({ strategy: "round-robin", stickyLimit: 5 });
+      expect((await put({ provider: "anthropic", strategy: "fill-first", quotaWindow: "weekly" })).body).toMatchObject({ strategy: "fill-first", quotaWindow: "weekly" });
+      expect((await put({ provider: "google-antigravity", strategy: "round-robin", enabled: true })).body).toMatchObject({ strategy: "round-robin", enabled: true, enabledEffective: true });
+      const saved = JSON.parse(readFileSync(join(dir, "config.json"), "utf8"));
+      expect(saved.accountPoolStrategy).toBe("round-robin");
+      expect(saved.anthropicAccountPool.strategy).toBe("fill-first");
+      expect(saved.providers["google-antigravity"].oauthAccountFailover.strategy).toBe("round-robin");
+
+      for (const provider of ["openai", "anthropic", "google-antigravity"]) {
+        expect((await put({ provider, strategy: "weighted" })).status).toBe(400);
+        expect((await put({ provider, stickyLimit: 0 })).status).toBe(400);
+      }
+      // quotaWindow and enabled are declared unsupported for the kinds that lack them, and the
+      // route says so instead of silently dropping the field.
+      expect((await put({ provider: "openai", quotaWindow: "weekly" })).status).toBe(400);
+      expect((await put({ provider: "openai", enabled: true })).status).toBe(400);
+      expect((await put({ provider: "google-antigravity", quotaWindow: "weekly" })).status).toBe(400);
+    } finally {
+      await server.stop(true);
+    }
+  });
+  test("Anthropic native preference defaults true, persists false and rejects unsupported or malformed writes", async () => {
+    const server = startServer(0);
+    try {
+      const initial = await (await fetch(new URL("/api/pool/settings?provider=anthropic", server.url))).json();
+      expect(initial.nativeMessages).toBe(true);
+      for (const endpoint of ["/api/pool/settings", "/api/oauth/accounts/pool"]) {
+        const write = await fetch(new URL(endpoint, server.url), { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: "anthropic", enabled: true, nativeMessages: false }) });
+        expect(write.status).toBe(200);
+        expect((await write.json()).nativeMessages).toBe(false);
+        expect(loadConfig().anthropicAccountPool?.nativeMessages).toBe(false);
+        for (const payload of [{ provider: "anthropic", nativeMessages: "false" }, { provider: "google-antigravity", nativeMessages: true }, { provider: "openai", nativeMessages: true }]) {
+          const invalid = await fetch(new URL(endpoint, server.url), { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+          expect(invalid.status).toBe(400);
+          await invalid.text();
+        }
+      }
+    } finally { await server.stop(true); }
+  });
+
+  test("native preference writes rebase competing pool edits and fail closed without changing the live DTO", async () => {
+    const server = startServer(0);
+    try {
+      const configPath = join(dir, "config.json");
+      const write = async (endpoint: string, nativeMessages: boolean) => fetch(new URL(endpoint, server.url), { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: "anthropic", nativeMessages }) });
+      for (const endpoint of ["/api/pool/settings", "/api/oauth/accounts/pool"]) {
+        setPersistedConfigMutationBeforeCommitForTests(() => {
+          const current = JSON.parse(readFileSync(configPath, "utf8"));
+          current.anthropicAccountPool = { ...current.anthropicAccountPool, stickyLimit: 7, quotaWindow: "weekly", strategy: "round-robin" };
+          current.protocols = { rollout: { managedMessagesNative: false } };
+          current.providers.deepseek.note = "concurrent provider edit";
+          current.autoSwitchThreshold = 36;
+          writeFileSync(configPath, JSON.stringify(current));
+        });
+        const saved = await write(endpoint, false);
+        expect(saved.status).toBe(200);
+        await saved.text();
+        expect(loadConfig().anthropicAccountPool).toMatchObject({ nativeMessages: false, stickyLimit: 7, quotaWindow: "weekly", strategy: "round-robin" });
+        expect(loadConfig().protocols?.rollout?.managedMessagesNative).toBe(false);
+        expect(loadConfig().providers.deepseek.note).toBe("concurrent provider edit");
+        expect(loadConfig().autoSwitchThreshold).toBe(36);
+        const validBytes = readFileSync(configPath, "utf8");
+        setPersistedConfigMutationBeforeCommitForTests(() => writeFileSync(configPath, "{fixture-invalid"));
+        const refused = await write(endpoint, true);
+        expect(refused.status).toBe(409);
+        await refused.text();
+        const live = await (await fetch(new URL("/api/pool/settings?provider=anthropic", server.url))).json();
+        expect(live.nativeMessages).toBe(false);
+        writeFileSync(configPath, validBytes);
+      }
+    } finally { setPersistedConfigMutationBeforeCommitForTests(null); await server.stop(true); }
+  });
+
+  for (const endpoint of ["/api/pool/settings", "/api/oauth/accounts/pool"]) {
+    test(`${endpoint} rejects pre-publication failure without changing disk or live state`, async () => {
+      const server = startServer(0);
+      try {
+        const path = join(dir, "config.json");
+        const bytes = readFileSync(path, "utf8");
+        setPersistedConfigMutationBeforeCommitForTests(() => { throw new Error("fixture secret must not reach DTO"); });
+        const response = await fetch(new URL(endpoint, server.url), { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: "anthropic", nativeMessages: false }) });
+        expect(response.status).toBe(500);
+        expect(await response.text()).not.toContain("fixture secret");
+        expect(readFileSync(path, "utf8")).toBe(bytes);
+        const dto = await (await fetch(new URL("/api/pool/settings?provider=anthropic", server.url))).json();
+        expect(dto.nativeMessages).toBe(true);
+      } finally { setPersistedConfigMutationBeforeCommitForTests(null); await server.stop(true); }
+    });
+    test(`${endpoint} adopts saved state after real post-rename bookkeeping failure`, async () => {
+      const server = startServer(0);
+      let fault: ReturnType<typeof spyOn> | undefined;
+      setPersistedConfigMutationBeforeCommitForTests(() => {
+        fault = spyOn(derivedRegistries, "refreshConfigDerivedRegistries").mockImplementationOnce(() => { throw new Error("fixture private bookkeeping details"); });
+      });
+      try {
+        const response = await fetch(new URL(endpoint, server.url), { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: "anthropic", nativeMessages: false, enabled: true }) });
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({ nativeMessages: false, enabled: true, warning: "config_bookkeeping_failed" });
+        const disk = JSON.parse(readFileSync(join(dir, "config.json"), "utf8"));
+        expect(disk.anthropicAccountPool).toMatchObject({ nativeMessages: false, enabled: true });
+        const dto = await (await fetch(new URL("/api/pool/settings?provider=anthropic", server.url))).json();
+        expect(dto).toMatchObject({ nativeMessages: false, enabled: true });
+      } finally { fault?.mockRestore(); setPersistedConfigMutationBeforeCommitForTests(null); await server.stop(true); }
+    });
+    test(`${endpoint} confirms an untyped post-publication mutation failure against disk`, async () => {
+      const server = startServer(0);
+      const fault = spyOn(mutationLock, "bumpGenerationForCooperatingConfigWrite").mockImplementation(() => { throw new Error("fixture generation failure"); });
+      try {
+        const response = await fetch(new URL(endpoint, server.url), { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: "anthropic", nativeMessages: false, routes: null }) });
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({ nativeMessages: false, routes: null, warning: "config_bookkeeping_failed" });
+        expect(JSON.parse(readFileSync(join(dir, "config.json"), "utf8")).anthropicAccountPool.nativeMessages).toBe(false);
+      } finally { fault?.mockRestore(); setPersistedConfigMutationBeforeCommitForTests(null); await server.stop(true); }
+    });
+    test(`${endpoint} returns reload-required unknown state when publication cannot be confirmed`, async () => {
+      const server = startServer(0);
+      const path = join(dir, "config.json");
+      let fault: ReturnType<typeof spyOn> | undefined;
+      setPersistedConfigMutationBeforeCommitForTests(() => {
+        fault = spyOn(derivedRegistries, "refreshConfigDerivedRegistries").mockImplementationOnce(() => {
+          writeFileSync(path, "{fixture-invalid");
+          throw new Error("fixture unknown publication");
+        });
+      });
+      try {
+        const response = await fetch(new URL(endpoint, server.url), { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: "anthropic", nativeMessages: false }) });
+        expect(response.status).toBe(409);
+        expect(await response.json()).toMatchObject({ code: "config_save_state_unknown" });
+        expect(readFileSync(path, "utf8")).toBe("{fixture-invalid");
+      } finally { fault?.mockRestore(); setPersistedConfigMutationBeforeCommitForTests(null); await server.stop(true); }
+    });
+    test(`${endpoint} never calls a conflicting published pool saved`, async () => {
+      const server = startServer(0);
+      const path = join(dir, "config.json");
+      let fault: ReturnType<typeof spyOn> | undefined;
+      setPersistedConfigMutationBeforeCommitForTests(() => {
+        fault = spyOn(derivedRegistries, "refreshConfigDerivedRegistries").mockImplementationOnce(() => {
+          const disk = JSON.parse(readFileSync(path, "utf8"));
+          disk.anthropicAccountPool.nativeMessages = true;
+          writeFileSync(path, JSON.stringify(disk));
+          throw new Error("fixture conflicting published preference");
+        });
+      });
+      try {
+        const response = await fetch(new URL(endpoint, server.url), { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: "anthropic", nativeMessages: false }) });
+        expect(response.status).toBe(409);
+        expect(await response.json()).toMatchObject({ code: "config_save_state_unknown" });
+        expect(JSON.parse(readFileSync(path, "utf8")).anthropicAccountPool.nativeMessages).toBe(true);
+      } finally { fault?.mockRestore(); setPersistedConfigMutationBeforeCommitForTests(null); await server.stop(true); }
+    });
+
+  }
+
 });

@@ -1,6 +1,6 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { managementFetch as fetch } from "../helpers/management-auth";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { saveConfig } from "../../src/config";
@@ -12,8 +12,38 @@ import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/iso
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { withStubbedProviderFetch } from "../helpers/catalog-provider-fetch";
 import { getAccountSet } from "../../src/oauth/store";
+import { getValidAccessSnapshotForAccount } from "../../src/oauth";
 import { ACCOUNT_IMPORT_DEADLINE_MS, ACCOUNT_IMPORT_MAX_BYTES, ACCOUNT_IMPORT_MAX_REQUEST_BYTES } from "../../src/oauth/account-import/types";
 import { handleOauthAccountRoutes } from "../../src/server/management/oauth-account-routes";
+import { createManagementSessionControl, requireManagementAuth, type ManagementAuthState } from "../../src/server/management-auth";
+import { handleSessionRoutes } from "../../src/server/management/session-routes";
+import type { ManagementContext } from "../../src/server/management/context";
+import { publishAccountSelection } from "../../src/lib/account-selection-events";
+
+function selectionSessionFixture() {
+  const origin = "http://127.0.0.1:10100";
+  const token = "ocx_session_selection_liveness_test";
+  const state: Extract<ManagementAuthState, { available: true }> = {
+    available: true, token: "ocx_admin_selection_test", source: "environment",
+    sessions: new Map([[token, {
+      serverOrigin: origin, browserOrigin: origin, csrfToken: "selection-csrf",
+      expiresAt: Date.now() + 60_000, issuance: "loopback",
+    }]]), pairingGrants: new Map(),
+  };
+  const req = new Request(`${origin}/api/accounts/events`, { headers: {
+    Host: "127.0.0.1:10100", Origin: origin, "x-opencodex-gui-origin": origin,
+    "x-opencodex-api-key": token, "x-opencodex-csrf-token": "selection-csrf",
+  } });
+  const ctx: ManagementContext = {
+    req, url: new URL(req.url), config: baseConfig(), deps: {}, version: "test",
+    principal: "gui-session", sessionControl: createManagementSessionControl(state),
+    convergeCodexCatalog: async () => ({ status: "failed", reason: "disk" }),
+    syncClaudeAgentDefsBestEffort: async () => {},
+  };
+  // Cache this Request's original admission: subsequent stream checks must ignore it.
+  expect(requireManagementAuth(req, state, ctx.config)).toBeNull();
+  return { ctx, state, token };
+}
 
 let testDir = "";
 let previousHome: string | undefined;
@@ -39,11 +69,34 @@ function writeAccounts(): void {
     anthropic: {
       activeAccountId: "aaaa1111",
       accounts: [
-        { id: "aaaa1111", credential: { access: "t1", refresh: "r1", expires: 9999999999999, email: "first@example.com", accountId: "acct-1" } },
-        { id: "bbbb2222", credential: { access: "t2", refresh: "r2", expires: 9999999999999, email: "second@example.com", accountId: "acct-2" } },
+        { id: "aaaa1111", credential: { access: "t1", refresh: "r1", expires: 9999999999999, email: "first@example.com", accountId: "acct-1", source: "oauth" } },
+        { id: "bbbb2222", credential: { access: "t2", refresh: "r2", expires: 9999999999999, email: "second@example.com", accountId: "acct-2", source: "oauth" } },
       ],
     },
   }), { mode: 0o600 });
+}
+
+function enableGoogleAntigravityAccounts(configureProvider = true): void {
+  const config = baseConfig();
+  if (configureProvider) {
+    config.providers["google-antigravity"] = {
+      adapter: "openai-chat",
+      baseUrl: "https://cloudcode-pa.googleapis.com",
+      authMode: "oauth",
+    } as OcxConfig["providers"][string];
+  }
+  saveConfig(config);
+
+  const authPath = join(testDir, "auth.json");
+  const auth = JSON.parse(readFileSync(authPath, "utf8")) as Record<string, unknown>;
+  auth["google-antigravity"] = {
+    activeAccountId: "ga111111",
+    accounts: [
+      { id: "ga111111", credential: { access: "antigravity-1", refresh: "refresh-1", expires: 9999999999999, email: "first@example.test", accountId: "ga-account-1", projectId: "project-1" } },
+      { id: "ga222222", credential: { access: "antigravity-2", refresh: "refresh-2", expires: 9999999999999, email: "second@example.test", accountId: "ga-account-2", projectId: "project-2" } },
+    ],
+  };
+  writeFileSync(authPath, JSON.stringify(auth), { mode: 0o600 });
 }
 
 beforeEach(() => {
@@ -66,6 +119,168 @@ afterEach(() => {
 });
 
 describe("multiauth accounts API", () => {
+  test("selection events require management authentication", async () => {
+    const server = startServer(0);
+    try {
+      const response = await originalFetch(new URL("/api/accounts/events", server.url));
+      expect(response.status).toBe(401);
+      await response.body?.cancel();
+    } finally { await server.stop(true); }
+  });
+
+  test("selection event streams bound subscribers and release cancelled connections", async () => {
+    const { accountSelectionStream } = await import("../../src/server/management/account-selection-stream");
+    const streams: Response[] = [];
+    try {
+      for (let i = 0; i < 64; i++) {
+        const response = accountSelectionStream(new Request("http://localhost/api/accounts/events"), () => true);
+        expect(response.status).toBe(200);
+        streams.push(response);
+      }
+      expect(accountSelectionStream(new Request("http://localhost/api/accounts/events"), () => true).status).toBe(429);
+    } finally {
+      await Promise.all(streams.map(response => response.body!.cancel()));
+    }
+    const response = accountSelectionStream(new Request("http://localhost/api/accounts/events"), () => true);
+    expect(response.status).toBe(200);
+    await response.body!.cancel();
+  });
+
+  test("selection event route denies admission without a current session validator", async () => {
+    const { ctx } = selectionSessionFixture();
+    const response = await handleOauthAccountRoutes({ ...ctx, sessionControl: undefined });
+    try { expect(response?.status).toBe(401); }
+    finally { await response?.body?.cancel(); }
+  });
+
+  test.each(["false", "throw"] as const)("selection stream denies an initial validator result of %s", async result => {
+    const { accountSelectionStream } = await import("../../src/server/management/account-selection-stream");
+    const response = accountSelectionStream(new Request("http://localhost/api/accounts/events"), () => {
+      if (result === "throw") throw new Error("validator unavailable");
+      return false;
+    });
+    try { expect(response.status).toBe(401); }
+    finally { await response.body?.cancel(); }
+  });
+
+  test.each(["logout", "expiry"] as const)("selection stream stops publishing after GUI %s despite cached request admission", async change => {
+    const { ctx, state, token } = selectionSessionFixture();
+    const response = await handleOauthAccountRoutes(ctx);
+    expect(response?.status).toBe(200);
+    const reader = response!.body!.getReader();
+    try {
+      expect(new TextDecoder().decode((await reader.read()).value)).toContain("event: ready");
+      if (change === "logout") {
+        const req = new Request(new URL("/api/session/logout", ctx.req.url), { method: "POST", headers: ctx.req.headers });
+        expect(requireManagementAuth(req, state, ctx.config)).toBeNull();
+        expect(handleSessionRoutes({ ...ctx, req, url: new URL(req.url) })?.status).toBe(200);
+      } else {
+        state.sessions.get(token)!.expiresAt = Date.now() - 1;
+      }
+      expect(requireManagementAuth(ctx.req, state, ctx.config)).toBeNull(); // Deliberately memoized.
+      const pending = reader.read();
+      publishAccountSelection("private-provider", "oauth");
+      // Nothing was queued before revocation, so the stream closes quietly instead of
+      // erroring; the pending read resolves done and the post-revocation frame is never sent.
+      await expect(pending).resolves.toMatchObject({ done: true });
+    } finally { await reader.cancel().catch(() => undefined); }
+  });
+
+  test("selection heartbeat revalidates expiry without extending a remote session", async () => {
+    const { ctx, state, token } = selectionSessionFixture();
+    const session = state.sessions.get(token)!;
+    session.issuance = "pairing";
+    const expiresAt = session.expiresAt;
+    const interval = spyOn(globalThis, "setInterval");
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      const response = await handleOauthAccountRoutes(ctx);
+      reader = response!.body!.getReader();
+      await reader.read();
+      const tick = interval.mock.calls.find(call => call[1] === 15_000)?.[0];
+      if (typeof tick !== "function") throw new Error("selection heartbeat not registered");
+      tick();
+      expect(new TextDecoder().decode((await reader.read()).value)).toContain(": heartbeat");
+      expect(session.expiresAt).toBe(expiresAt);
+      session.expiresAt = Date.now() - 1;
+      const pending = reader.read();
+      tick();
+      await expect(pending).resolves.toMatchObject({ done: true });
+    } finally {
+      await reader?.cancel().catch(() => undefined);
+      interval.mockRestore();
+    }
+  });
+
+  test("selection stream discards frames queued before revocation instead of draining them", async () => {
+    const { ctx, state, token } = selectionSessionFixture();
+    const interval = spyOn(globalThis, "setInterval");
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      const response = await handleOauthAccountRoutes(ctx);
+      expect(response?.status).toBe(200);
+      reader = response!.body!.getReader();
+      expect(new TextDecoder().decode((await reader.read()).value)).toContain("event: ready");
+      // No pending read: this event stays queued in the controller when the session expires.
+      publishAccountSelection("queued-provider", "oauth");
+      state.sessions.get(token)!.expiresAt = Date.now() - 1;
+      const tick = interval.mock.calls.find(call => call[1] === 15_000)?.[0];
+      if (typeof tick !== "function") throw new Error("selection heartbeat not registered");
+      tick();
+      // A non-empty queue still takes the error path: the queued frame is discarded and the
+      // revoked consumer rejects instead of ever draining it.
+      await expect(reader.read()).rejects.toMatchObject({ name: "NotAllowedError" });
+    } finally {
+      await reader?.cancel().catch(() => undefined);
+      interval.mockRestore();
+    }
+  });
+
+  test("management session liveness rereads revoked sessions and the current admin token", () => {
+    const { ctx, state, token } = selectionSessionFixture();
+    const control = ctx.sessionControl!;
+    expect(control.isCurrent(ctx.req, ctx.config)).toBe(true);
+    expect(control.revokeCurrent(ctx.req)).toBe(true);
+    expect(control.isCurrent(ctx.req, ctx.config)).toBe(false);
+    expect(state.sessions.has(token)).toBe(false);
+    const adminReq = new Request(ctx.req.url, { headers: { "x-opencodex-api-key": state.token } });
+    expect(requireManagementAuth(adminReq, state, ctx.config)).toBeNull();
+    expect(control.isCurrent(adminReq, ctx.config)).toBe(true);
+    state.token = "ocx_admin_rotated_selection_test";
+    expect(control.isCurrent(adminReq, ctx.config)).toBe(false);
+    expect(createManagementSessionControl({ available: false, reason: "test" }).isCurrent(adminReq, ctx.config)).toBe(false);
+  });
+
+  test("selection events notify only after the new active account is committed", async () => {
+    const server = startServer(0);
+    const abort = new AbortController();
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      const response = await fetch(new URL("/api/accounts/events", server.url), { signal: abort.signal });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toContain("text/event-stream");
+      reader = response.body!.getReader();
+      const ready = new TextDecoder().decode((await reader.read()).value);
+      expect(ready).toContain("event: ready");
+      const eventRead = reader.read();
+      const selected = await fetch(new URL("/api/oauth/accounts/active", server.url), {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: "anthropic", accountId: "bbbb2222" }),
+      });
+      expect(selected.status).toBe(200);
+      const notification = new TextDecoder().decode((await eventRead).value);
+      expect(notification).toContain("event: account-selection");
+      expect(notification).toContain('"provider":"anthropic"');
+      expect(notification).not.toContain("bbbb2222");
+      expect(notification).not.toContain("t2");
+      expect(getAccountSet("anthropic")?.activeAccountId).toBe("bbbb2222");
+    } finally {
+      await reader?.cancel();
+      abort.abort();
+      await server.stop(true);
+    }
+  });
+
   test("GET lists masked accounts with active flag", async () => {
     const server = startServer(0);
     try {
@@ -82,6 +297,51 @@ describe("multiauth accounts API", () => {
     } finally {
       await server.stop(true);
     }
+  });
+
+  test("GET keeps the account label masked by default and keeps maskedLabel masked", async () => {
+    saveConfig({ ...baseConfig(), privacy: { maskEmails: "false" } } as unknown as OcxConfig);
+    const server = startServer(0);
+    try {
+      const res = await fetch(new URL("/api/oauth/accounts?provider=anthropic", server.url));
+      expect(res.status).toBe(200);
+      const body = await res.json() as { accounts: Array<{ id: string; accountLabel?: string; maskedLabel?: string }> };
+      const first = body.accounts.find(account => account.id === "aaaa1111");
+      expect(first?.accountLabel).toBe("f***t@example.com");
+      expect(first?.maskedLabel).toBe("f***t@example.com");
+      expect(JSON.stringify(body).includes("first@example.com")).toBe(false);
+    } finally { await server.stop(true); }
+  });
+
+  test("GET shows the raw account label when email masking is disabled (#8286)", async () => {
+    saveConfig({ ...baseConfig(), privacy: { maskEmails: false } });
+    const server = startServer(0);
+    try {
+      const res = await fetch(new URL("/api/oauth/accounts?provider=anthropic", server.url));
+      expect(res.status).toBe(200);
+      const body = await res.json() as { accounts: Array<{ id: string; email?: string; accountLabel?: string; maskedLabel?: string }> };
+      const first = body.accounts.find(account => account.id === "aaaa1111");
+      expect(first?.email).toBe("first@example.com");
+      expect(first?.accountLabel).toBe("first@example.com");
+      // The tray-facing masked label keeps its contract regardless of the flag.
+      expect(first?.maskedLabel).toBe("f***t@example.com");
+      expect(first?.maskedLabel).not.toBe(first?.email);
+    } finally { await server.stop(true); }
+  });
+
+  test("GET omits identity labels for malformed and absent stored emails", async () => {
+    const authPath = join(testDir, "auth.json");
+    const auth = JSON.parse(readFileSync(authPath, "utf8"));
+    auth.anthropic.accounts[0].credential.email = "not-an-email";
+    delete auth.anthropic.accounts[1].credential.email;
+    writeFileSync(authPath, JSON.stringify(auth), { mode: 0o600 });
+    const server = startServer(0);
+    try {
+      const res = await fetch(new URL("/api/oauth/accounts?provider=anthropic", server.url));
+      const body = await res.json() as { accounts: Array<{ accountLabel?: string; maskedLabel?: string }> };
+      expect(body.accounts.map(account => account.maskedLabel)).toEqual([undefined, undefined]);
+      expect(body.accounts.map(account => account.accountLabel)).toEqual([undefined, undefined]);
+    } finally { await server.stop(true); }
   });
 
   test("GET includes projected health with redacted healthSummary", async () => {
@@ -161,6 +421,94 @@ describe("multiauth accounts API", () => {
     }
   });
 
+  test("GET reports an explicit null plan for an Anthropic account", async () => {
+    writeFileSync(join(testDir, "auth.json"), JSON.stringify({
+      anthropic: {
+        activeAccountId: "aaaa1111",
+        accounts: [
+          {
+            id: "aaaa1111",
+            credential: {
+              access: "t1",
+              refresh: "r1",
+              expires: 9999999999999,
+              email: "first@example.com",
+              accountId: "acct-1",
+            },
+          },
+        ],
+      },
+    }), { mode: 0o600 });
+
+    const server = startServer(0);
+    try {
+      const res = await fetch(new URL("/api/oauth/accounts?provider=anthropic", server.url));
+      expect(res.status).toBe(200);
+      const body = await res.json() as { accounts: Array<{ id: string; plan?: string | null }> };
+      const account = body.accounts[0]!;
+
+      // The key must be PRESENT and null, not omitted. A consumer weighting a pool by seat size
+      // has to tell "this version looked and upstream did not say" apart from "this proxy is too
+      // old to report a tier"; omitting the key collapses those and invites assuming a tier
+      // (#3777). Anthropic's usage endpoint carries no subscription field, so null is the only
+      // truthful answer available today.
+      expect("plan" in account).toBe(true);
+      expect(account.plan).toBeNull();
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  // .27 parity (1f93f9141c, AgentRadar 20720): ?quota=1 fills a plan the credential has not stored yet.
+  test("GET ?quota=1 reads each Anthropic account's plan from its profile, or says why it can't", async () => {
+    const account = (id: string, access: string) => ({ id, credential: { access, refresh: `r-${id}`, expires: 9999999999999, email: `${id}@example.com`, accountId: `acct-${id}` } });
+    writeFileSync(join(testDir, "auth.json"), JSON.stringify({ anthropic: { activeAccountId: "ultra", accounts: [
+      account("ultra", "plan-t-ultra"), account("max", "plan-t-max"), account("pro", "plan-t-pro"), account("down", "plan-t-down"), account("odd", "plan-t-odd"),
+    ] } }), { mode: 0o600 });
+    const profiles: Record<string, unknown> = {
+      "plan-t-ultra": { organization: { organization_type: "claude_max", rate_limit_tier: "default_claude_max_20x" } },
+      "plan-t-max": { organization: { organization_type: "claude_max", rate_limit_tier: "default_claude_max_5x" } },
+      "plan-t-pro": { organization: { organization_type: "claude_pro" } },
+      "plan-t-odd": { organization: { organization_type: "Max!" } },
+    };
+    const asked: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const raw = input instanceof Request ? input.url : String(input);
+      if (!raw.startsWith("https://api.anthropic.com/")) return originalFetch(input, init);
+      if (raw !== "https://api.anthropic.com/api/oauth/profile") return new Response("{}", { status: 500 });
+      const token = new Headers(init?.headers).get("authorization")!.replace("Bearer ", "");
+      asked.push(token);
+      return token in profiles ? Response.json(profiles[token]) : new Response("{}", { status: 503 });
+    }) as typeof fetch;
+
+    const previousAgentRadar = process.env.OPENCODEX_AGENTRADAR;
+    process.env.OPENCODEX_AGENTRADAR = "1";
+    const server = startServer(0);
+    try {
+      const read = async () => {
+        const res = await fetch(new URL("/api/oauth/accounts?provider=anthropic&quota=1", server.url));
+        expect(res.status).toBe(200);
+        const body = await res.json() as { accounts: Array<{ id: string; plan: string | null; planUnknownReason?: string }> };
+        return Object.fromEntries(body.accounts.map(a => [a.id, [a.plan, a.planUnknownReason ?? null]]));
+      };
+      expect(await read()).toEqual({
+        // Ordinary installs answer the canonical max_20x / max_5x; this gateway keeps .27's words.
+        ultra: ["ultra", null], max: ["max", null], pro: ["pro", null],
+        down: [null, "the plan lookup failed (HTTP 503)"], odd: [null, "Anthropic did not report a plan"],
+      });
+      expect(asked.sort()).toEqual(["plan-t-down", "plan-t-max", "plan-t-odd", "plan-t-pro", "plan-t-ultra"]);
+      // Cached per token: a second read asks upstream nothing.
+      await read();
+      expect(asked).toHaveLength(5);
+      // The plain list stays a local read with an explicit null.
+      const plain = await (await fetch(new URL("/api/oauth/accounts?provider=anthropic", server.url))).json() as { accounts: Array<{ plan: unknown }> };
+      expect(plain.accounts.map(a => a.plan)).toEqual([null, null, null, null, null]);
+    } finally {
+      if (previousAgentRadar === undefined) delete process.env.OPENCODEX_AGENTRADAR; else process.env.OPENCODEX_AGENTRADAR = previousAgentRadar;
+      await server.stop(true);
+    }
+  });
+
   test("PUT active switches; unknown account 404; unknown provider 400", async () => {
     const server = startServer(0);
     try {
@@ -188,18 +536,145 @@ describe("multiauth accounts API", () => {
     }
   });
 
+  test("generic OAuth pause persists, moves active selection when possible, and permits pausing every account", async () => {
+    enableGoogleAntigravityAccounts();
+    const server = startServer(0);
+    try {
+      const pause = await fetch(new URL("/api/oauth/accounts/pause", server.url), {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: "google-antigravity", accountId: "ga111111", paused: true }),
+      });
+      expect(pause.status).toBe(200);
+      expect(await pause.json()).toMatchObject({ ok: true, paused: true, activeAccountId: "ga222222" });
+      expect(getAccountSet("google-antigravity")?.accounts.find(account => account.id === "ga111111")?.paused).toBe(true);
+
+      const listed = await fetch(new URL("/api/oauth/accounts?provider=google-antigravity", server.url));
+      const rows = await listed.json() as { accounts: Array<{ id: string; paused?: boolean }> };
+      expect(rows.accounts.find(account => account.id === "ga111111")?.paused).toBe(true);
+      expect(rows.accounts.find(account => account.id === "ga222222")?.paused).toBe(false);
+
+      const selectingPaused = await fetch(new URL("/api/oauth/accounts/active", server.url), {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: "google-antigravity", accountId: "ga111111" }),
+      });
+      expect(selectingPaused.status).toBe(409);
+
+      const pauseLast = await fetch(new URL("/api/oauth/accounts/pause", server.url), {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: "google-antigravity", accountId: "ga222222", paused: true }),
+      });
+      expect(pauseLast.status).toBe(200);
+      expect(getAccountSet("google-antigravity")?.activeAccountId).toBe("ga222222");
+      expect(getAccountSet("google-antigravity")?.accounts.find(account => account.id === "ga222222")?.paused).toBe(true);
+      await expect(getValidAccessSnapshotForAccount("google-antigravity", "ga222222")).rejects.toThrow();
+
+      const resume = await fetch(new URL("/api/oauth/accounts/pause", server.url), {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: "google-antigravity", accountId: "ga111111", paused: false }),
+      });
+      expect(resume.status).toBe(200);
+      expect(getAccountSet("google-antigravity")?.accounts.find(account => account.id === "ga111111")?.paused).toBeUndefined();
+
+      const resumeLast = await fetch(new URL("/api/oauth/accounts/pause", server.url), {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: "google-antigravity", accountId: "ga222222", paused: false }),
+      });
+      expect(resumeLast.status).toBe(200);
+      expect(getAccountSet("google-antigravity")?.accounts.find(account => account.id === "ga222222")?.paused).toBeUndefined();
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("built-in generic OAuth pause works when the provider config row is absent", async () => {
+    enableGoogleAntigravityAccounts(false);
+    const server = startServer(0);
+    try {
+      const listed = await fetch(new URL("/api/oauth/accounts?provider=google-antigravity", server.url));
+      expect(listed.status).toBe(200);
+      const rows = await listed.json() as { accounts: Array<{ id: string; paused?: boolean }> };
+      expect(rows.accounts.find(account => account.id === "ga111111")?.paused).toBe(false);
+
+      const paused = await fetch(new URL("/api/oauth/accounts/pause", server.url), {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: "google-antigravity", accountId: "ga111111", paused: true }),
+      });
+      expect(paused.status).toBe(200);
+      expect(await paused.json()).toMatchObject({ ok: true, paused: true });
+      expect(getAccountSet("google-antigravity")?.accounts.find(account => account.id === "ga111111")?.paused).toBe(true);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("Anthropic pause validates input, persists resume and never alters credentials", async () => {
+    const before = getAccountSet("anthropic")!;
+    const server = startServer(0);
+    const pause = (accountId: string, paused: unknown) => fetch(new URL("/api/oauth/accounts/pause", server.url), {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider: "anthropic", accountId, paused }),
+    });
+    try {
+      expect((await pause("aaaa1111", "true")).status).toBe(400);
+      expect((await pause("missing", true)).status).toBe(404);
+      expect(getAccountSet("anthropic")).toEqual(before);
+      expect((await pause("aaaa1111", true)).status).toBe(200);
+      expect((await pause("bbbb2222", true)).status).toBe(200);
+      const disk = JSON.parse(readFileSync(join(testDir, "auth.json"), "utf8"));
+      expect(disk.anthropic.accounts.every((row: { paused: boolean }) => row.paused)).toBe(true);
+      const resumed = await pause("aaaa1111", false);
+      expect(await resumed.json()).toMatchObject({ paused: false, activeAccountId: "aaaa1111", activeAccountChanged: true });
+      const after = getAccountSet("anthropic")!;
+      expect(after.accounts.map(row => row.credential)).toEqual(before.accounts.map(row => row.credential));
+      expect(after.accounts.find(row => row.id === "aaaa1111")?.paused).toBeUndefined();
+      const serialized = await fetch(new URL("/api/oauth/accounts?provider=anthropic", server.url)).then(response => response.text());
+      expect(serialized).not.toContain('"access"');
+      expect(serialized).not.toContain('"refresh"');
+    } finally { await server.stop(true); }
+  });
+
+  test("pause API supports Anthropic but rejects a generic OAuth account behind an API-key route", async () => {
+    enableGoogleAntigravityAccounts();
+    const keyRouteConfig = baseConfig();
+    keyRouteConfig.providers["google-antigravity"] = {
+      adapter: "openai-chat", baseUrl: "https://cloudcode-pa.googleapis.com", authMode: "key",
+    } as OcxConfig["providers"][string];
+    saveConfig(keyRouteConfig);
+    const server = startServer(0);
+    try {
+      const anthropicPause = await fetch(new URL("/api/oauth/accounts/pause", server.url), {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: "anthropic", accountId: "aaaa1111", paused: true }),
+      });
+      expect(anthropicPause.status).toBe(200);
+      expect(await anthropicPause.json()).toMatchObject({ paused: true, activeAccountId: "bbbb2222" });
+      const listed = await fetch(new URL("/api/oauth/accounts?provider=anthropic", server.url));
+      const rows = await listed.json() as { accounts: Array<{ id: string; paused: boolean }> };
+      expect(rows.accounts.find(row => row.id === "aaaa1111")?.paused).toBe(true);
+      expect(rows.accounts.find(row => row.id === "bbbb2222")?.paused).toBe(false);
+
+      const keyRoutePause = await fetch(new URL("/api/oauth/accounts/pause", server.url), {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: "google-antigravity", accountId: "ga111111", paused: true }),
+      });
+      expect(keyRoutePause.status).toBe(400);
+      expect(getAccountSet("google-antigravity")?.accounts.find(account => account.id === "ga111111")?.paused).toBeUndefined();
+    } finally {
+      await server.stop(true);
+    }
+  });
+
   test("POST Cockpit import admits only the exact provider, format, and array document", async () => {
     const server = startServer(0);
     try {
       for (const [body, code] of [
         [{ provider: "openai", format: "cockpit-tools", document: [] }, "unsupported_provider"],
         [{ provider: "unknown", format: "cockpit-tools", document: [] }, "unsupported_provider"],
-        [{ provider: "google-antigravity", format: "unknown", document: [] }, "unsupported_format"],
-        [{ provider: "google-antigravity", format: "cockpit-tools", document: { accounts: [] } }, "invalid_document"],
-        [{ provider: "google-antigravity", format: "cockpit-tools", document: "not-an-array" }, "invalid_document"],
+        [{ provider: "google-antigravity", acknowledgeAntigravityRisk: true, format: "unknown", document: [] }, "unsupported_format"],
+        [{ provider: "google-antigravity", acknowledgeAntigravityRisk: true, format: "cockpit-tools", document: { accounts: [] } }, "invalid_document"],
+        [{ provider: "google-antigravity", acknowledgeAntigravityRisk: true, format: "cockpit-tools", document: "not-an-array" }, "invalid_document"],
         [{ provider: "Google-Antigravity", format: "cockpit-tools", document: [] }, "unsupported_provider"],
         [{ provider: " google-antigravity ", format: "cockpit-tools", document: [] }, "unsupported_provider"],
-        [{ provider: "google-antigravity", format: "Cockpit-Tools", document: [] }, "unsupported_format"],
+        [{ provider: "google-antigravity", acknowledgeAntigravityRisk: true, format: "Cockpit-Tools", document: [] }, "unsupported_format"],
       ] as const) {
         const response = await fetch(new URL("/api/oauth/accounts/import", server.url), {
           method: "POST",
@@ -229,7 +704,7 @@ describe("multiauth accounts API", () => {
       headers: { "Content-Type": "application/json" },
       body: new ReadableStream<Uint8Array>({
         start(controller) {
-          controller.enqueue(new TextEncoder().encode('{"provider":"google-antigravity",'));
+          controller.enqueue(new TextEncoder().encode('{"provider":"google-antigravity","acknowledgeAntigravityRisk":true,'));
         },
         cancel() { bodyCancelled = true; },
       }),
@@ -300,6 +775,7 @@ describe("multiauth accounts API", () => {
         body: JSON.stringify({
           provider: "google-antigravity",
           format: "cockpit-tools",
+          acknowledgeAntigravityRisk: true,
           document: [
             { email: "first@example.com", refresh_token: "first-refresh" },
             { email: "second@example.com", refresh_token: "second-refresh" },
@@ -344,6 +820,7 @@ describe("multiauth accounts API", () => {
         body: JSON.stringify({
           provider: "google-antigravity",
           format: "cockpit-tools",
+          acknowledgeAntigravityRisk: true,
           document: [{ email: "IMPORTED@example.com", refresh_token: refreshToken, tags: ["tag"], notes: "ignored" }],
         }),
       });
@@ -383,6 +860,7 @@ describe("multiauth accounts API", () => {
       const boundaryBody = JSON.stringify({
         provider: "google-antigravity",
         format: "cockpit-tools",
+        acknowledgeAntigravityRisk: true,
         document: boundaryDocument,
       });
       expect(encoder.encode(JSON.stringify(boundaryDocument)).byteLength).toBe(ACCOUNT_IMPORT_MAX_BYTES);
@@ -439,6 +917,7 @@ describe("multiauth accounts API", () => {
         body: JSON.stringify({
           provider: "google-antigravity",
           format: "cockpit-tools",
+          acknowledgeAntigravityRisk: true,
           document: [
             { email: "claimed@example.com", refresh_token: canary },
             { email: "provider@example.com", refresh_token: "rejected-token" },
@@ -472,6 +951,7 @@ describe("multiauth accounts API", () => {
         body: JSON.stringify({
           provider: "google-antigravity",
           format: "cockpit-tools",
+          acknowledgeAntigravityRisk: true,
           document: [{ email: "provider@example.com", refresh_token: "safe", notes: "x".repeat(ACCOUNT_IMPORT_MAX_BYTES) }],
         }),
       });
@@ -597,6 +1077,48 @@ describe("multiauth accounts API", () => {
       expect(after.activeAccountId).toBe("bbbb2222");
     } finally {
       await server.stop(true);
+    }
+  });
+});
+
+
+describe("Antigravity quota diagnosis projection", () => {
+  let savedProxyEnv: Record<string, string | undefined>;
+  const proxyKeys = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"];
+  beforeEach(() => {
+    savedProxyEnv = Object.fromEntries(proxyKeys.map(key => [key, process.env[key]]));
+    for (const key of proxyKeys) delete process.env[key];
+  });
+  afterEach(() => {
+    for (const key of proxyKeys) {
+      if (savedProxyEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = savedProxyEnv[key];
+    }
+  });
+  test("authenticated account reads expose only the current safe failure category", async () => {
+    const { saveCredential } = await import("../../src/oauth/store");
+    const { clearAccountQuotaCache, setAntigravityAccountQuotaTransportForTests } = await import("../../src/providers/quota");
+    const cfg = baseConfig();
+    cfg.providers["google-antigravity"] = { adapter: "google", baseUrl: "https://daily-cloudcode-pa.googleapis.com", authMode: "oauth" };
+    saveConfig(cfg);
+    await saveCredential("google-antigravity", { access: "private-diagnostic-access", refresh: "private-diagnostic-refresh", expires: Date.now() + 3600_000, projectId: "private-diagnostic-project", accountId: "diag-account" });
+    clearAccountQuotaCache();
+    setAntigravityAccountQuotaTransportForTests({
+      resolveAddresses: async () => ({ hostname: "daily-cloudcode-pa.googleapis.com", addresses: [{ address: "142.250.0.1", family: 4 }], privateNetwork: false }),
+      pinnedPost: async () => new Response(null, { status: 403 }),
+    });
+    const server = startServer(0);
+    try {
+      const response = await fetch(new URL("/api/oauth/accounts?provider=google-antigravity&quota=1&refresh=1", server.url));
+      expect(response.status).toBe(200);
+      const body = await response.json() as { accounts: Array<{ quotaFailure?: string; quotaUnavailable?: boolean }> };
+      expect(body.accounts[0]).toMatchObject({ quotaFailure: "access_denied", quotaUnavailable: true });
+      const text = JSON.stringify(body);
+      for (const secret of ["private-diagnostic-access", "private-diagnostic-refresh", "private-diagnostic-project", "quotaFailureIsCurrent"]) expect(text).not.toContain(secret);
+    } finally {
+      await server.stop(true);
+      clearAccountQuotaCache();
+      setAntigravityAccountQuotaTransportForTests(null);
     }
   });
 });

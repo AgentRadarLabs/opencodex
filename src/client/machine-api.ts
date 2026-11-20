@@ -1,8 +1,10 @@
 import { journalOwner } from "../codex/journal";
-import { diagnoseCodexShim, installCodexShim, uninstallCodexShim } from "../codex/shim";
+import { diagnoseCodexShim, installCodexShimAsync, uninstallCodexShimAsync } from "../codex/shim";
 import { readManagementJsonBody } from "../server/management/body";
 import type { OcxClientConnectionConfig } from "../types";
 import { disconnectClient, syncConnectedClient } from "./connect";
+import { linkHomeName } from "./link-home";
+import { isLinkConnection, readClientConnectionState, sameClientConnectionOwner, type ClientConnectionState } from "./state";
 
 export type HubReachability = "unknown" | "online" | "offline" | "unauthorized";
 
@@ -13,19 +15,27 @@ export interface MachineStatusV1 {
   sharedBase: string;
   sharedServerOrigin: string;
   managementTransport: "direct" | "relay";
+  /** Present when this listener's relay can check an expected target before forwarding. */
+  relayTargetCheck?: "expected-target-v1";
   apiKeyId: string;
   protocolVersion: 1;
   connectedAt: string;
   catalogSyncedAt?: string;
   hubReachability: HubReachability;
+  /** Present only on a Remote Link Child: the dashboard shows "managed by Home <name>". */
+  link?: { linkId: string; home: string | null; readOnly: true };
 }
 
 export interface MachineApiDeps {
   sync: typeof syncConnectedClient;
   disconnect: typeof disconnectClient;
-  scheduleStandaloneRecycle: () => void;
+  scheduleStandaloneRecycle: (disconnectedTokenFingerprint: string) => void;
   hubReachability?: () => HubReachability;
   setHubReachability?: (value: HubReachability) => void;
+  /** Link mode: the Home's name as this listener knows it (sidecar alias or recorded host name). */
+  linkHomeName?: () => string | null;
+  /** The saved connection; a scheduled route-intent sync can change its selection while this runs. */
+  readConnection?: () => ClientConnectionState;
 }
 
 const defaultDeps: MachineApiDeps = {
@@ -50,20 +60,28 @@ async function jsonBody(req: Request): Promise<unknown | Response> {
 
 function statusPayload(req: Request, state: OcxClientConnectionConfig, deps: MachineApiDeps): MachineStatusV1 {
   const machineBase = new URL(req.url).origin;
+  // A link Child's management URL is the tunnel, whose hub-link ingress serves no /api/* and no
+  // session bootstrap. Its dashboard therefore uses this listener's relay base: the browser holds
+  // only this listener's session, and the listener relays allowlisted reads to the Home with the
+  // link key (#6957, src/client/link-management-relay.ts).
+  const linkMode = isLinkConnection(state);
+  const relay = linkMode || state.managementTransport === "relay";
   return {
     mode: "client",
     connected: true,
     machineBase,
-    sharedBase: state.managementTransport === "relay"
-      ? `${machineBase}/api/machine/hub-relay`
-      : state.managementUrl,
-    sharedServerOrigin: state.managementUrl,
-    managementTransport: state.managementTransport,
+    sharedBase: relay ? `${machineBase}/api/machine/hub-relay` : state.managementUrl,
+    sharedServerOrigin: linkMode ? machineBase : state.managementUrl,
+    managementTransport: relay ? "relay" : state.managementTransport,
+    ...(relay && !linkMode ? { relayTargetCheck: "expected-target-v1" as const } : {}),
     apiKeyId: state.apiKeyId,
     protocolVersion: state.protocolVersion,
     connectedAt: state.connectedAt,
     ...(state.catalogSyncedAt ? { catalogSyncedAt: state.catalogSyncedAt } : {}),
     hubReachability: deps.hubReachability?.() ?? "unknown",
+    ...(linkMode && state.link
+      ? { link: { linkId: state.link.linkId, home: deps.linkHomeName ? deps.linkHomeName() : linkHomeName(state), readOnly: true as const } }
+      : {}),
   };
 }
 
@@ -74,12 +92,18 @@ export async function handleMachineApi(
   injected: MachineApiDeps = defaultDeps,
 ): Promise<Response | null> {
   const deps = { ...defaultDeps, ...injected };
-  if (url.pathname === "/api/machine/status" && req.method === "GET") {
+  const readMethod = req.method === "GET" || req.method === "HEAD";
+  if (url.pathname === "/api/machine/status" && readMethod) {
     return Response.json(statusPayload(req, state, deps), { headers: { "Cache-Control": "no-store" } });
   }
-  if (url.pathname === "/api/machine/clients" && req.method === "GET") {
+  if (url.pathname === "/api/machine/clients" && readMethod) {
+    // A Link Child's route-intent tick rewrites the saved selection after this listener started.
+    // Report the saved one while it still belongs to the connection this listener serves.
+    const current = (deps.readConnection ?? readClientConnectionState)();
+    const selected = current.kind === "connected" && sameClientConnectionOwner(current.value, state)
+      ? current.value.selectedClients : state.selectedClients;
     return Response.json({
-      selectedClients: [...state.selectedClients],
+      selectedClients: [...selected],
       journalOwner: journalOwner(),
       shim: diagnoseCodexShim(),
     }, { headers: { "Cache-Control": "no-store" } });
@@ -92,10 +116,16 @@ export async function handleMachineApi(
       return Response.json({ error: "invalid sync request" }, { status: 400 });
     }
     try {
-      const result = await deps.sync(
+      // `connection` is the full saved connection (token fingerprint, prior catalog) for local
+      // callers; it is not part of this response.
+      const { connection: _connection, ...result } = await deps.sync(
         input.restartCodex === undefined ? {} : { restartCodex: input.restartCodex },
       );
       deps.setHubReachability?.("online");
+      // A sync whose journal handover failed is not complete: a supervised restart could undo it.
+      if (result.journalHandoverFailed) {
+        return Response.json({ success: false, ...result, error: "Codex routing was applied, but the Codex journal could not be handed to this connection; sync again, and if it repeats, sync once more after the next OpenCodex restart." }, { status: 409 });
+      }
       return Response.json({ success: true, ...result });
     } catch (error) {
       const message = error instanceof Error ? error.message : "client sync failed";
@@ -103,7 +133,7 @@ export async function handleMachineApi(
       return Response.json({ success: false, error: message }, { status: 502 });
     }
   }
-  if (url.pathname === "/api/machine/shim" && req.method === "GET") {
+  if (url.pathname === "/api/machine/shim" && readMethod) {
     return Response.json(diagnoseCodexShim(), { headers: { "Cache-Control": "no-store" } });
   }
   if (url.pathname === "/api/machine/shim" && req.method === "POST") {
@@ -114,8 +144,9 @@ export async function handleMachineApi(
       return Response.json({ error: "action must be install, repair, or uninstall" }, { status: 400 });
     }
     try {
-      const result = input.action === "uninstall" ? uninstallCodexShim() : installCodexShim();
-      return Response.json({ success: true, action: input.action, result, shim: diagnoseCodexShim() });
+      const result = input.action === "uninstall" ? await uninstallCodexShimAsync() : await installCodexShimAsync();
+      // 200 either way so the dashboard re-reads the shim diagnosis; a refusal is not a success.
+      return Response.json({ success: !result.refused, action: input.action, result, shim: diagnoseCodexShim() });
     } catch (error) {
       return Response.json({ success: false, error: error instanceof Error ? error.message : "shim action failed" }, { status: 409 });
     }
@@ -129,7 +160,7 @@ export async function handleMachineApi(
     }
     try {
       const result = await deps.disconnect(input.keepCatalog === undefined ? {} : { keepCatalog: input.keepCatalog });
-      deps.scheduleStandaloneRecycle();
+      deps.scheduleStandaloneRecycle(state.tokenFingerprint);
       return Response.json({ success: true, ...result }, { status: 202 });
     } catch (error) {
       return Response.json({ success: false, error: error instanceof Error ? error.message : "disconnect failed" }, { status: 409 });

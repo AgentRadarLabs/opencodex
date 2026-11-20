@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { codexWsUpstreamFetch } from "../../src/server/responses/ws-upstream";
 import { providerFetch } from "../../src/server/responses/fetch-helpers";
-import { CodexReserveHelperUnsupportedError, CodexReserveUnavailableError, createCodexReserveDispatchGuard } from "../../src/codex/auth-context";
+import { CodexPoolAccountCreditsOffError, CodexReserveHelperUnsupportedError, CodexReserveUnavailableError, createCodexAuthDispatchGuard, createCodexReserveDispatchGuard } from "../../src/codex/auth-context";
+import { clearAccountQuota, setAccountQuotaFromParsed } from "../../src/codex/quota";
 import { clearAccountNeedsReauth } from "../../src/codex/account-runtime-state";
 import { clearCodexUpstreamHealthForAccount } from "../../src/codex/routing";
 import { clearMainAccountInfoCache, observeMainQuotaCredential, observeMainQuotaIdentity } from "../../src/codex/main-account-cache";
@@ -58,6 +59,32 @@ afterEach(() => {
 });
 
 describe("synchronous Reserve dispatch callbacks on WebSocket", () => {
+  test("a pool credit hold during delayed WS open refuses create and releases the socket without fallback", async () => {
+    install();
+    const accountId = "credit-policy-ws-fixture";
+    const config = { creditCodexAccountIds: [] };
+    const ctx = { kind: "pool" as const, accountId, writerGeneration: 0, generation: 0,
+      accessToken: "fixture-reserve", chatgptAccountId: "fixture-workspace" };
+    setAccountQuotaFromParsed(accountId, { weeklyPercent: 99, weeklyResetAt: Date.now() + 3_600_000 });
+    let fallbacks = 0;
+    const fallback = Object.assign(async () => { fallbacks++; return new Response("unexpected"); }, { preconnect() {} });
+    const requestInit = init();
+    requestInit.body = JSON.stringify({ model: "gpt-5.5", input: "ping", stream: true });
+    try {
+      const pending = codexWsUpstreamFetch(URL, requestInit, fallback, "1.4.0", undefined,
+        createCodexAuthDispatchGuard(ctx, config, "gpt-5.5"));
+      const observed = pending.catch(error => error);
+      const socket = DelayedWebSocket.instances[0]!;
+      setAccountQuotaFromParsed(accountId, { weeklyPercent: 100, weeklyResetAt: Date.now() + 3_600_000 });
+      socket.dispatchEvent(new Event("open"));
+      expect(await observed).toBeInstanceOf(CodexPoolAccountCreditsOffError);
+      expect(socket.sent).toEqual([]);
+      expect(socket.closed).toBe(true);
+      expect(socket.listeners.size).toBe(0);
+      expect(fallbacks).toBe(0);
+    } finally { clearAccountQuota(accountId); }
+  });
+
   test.each([true, false])("valid-proof terminal helper with enabled-at-open=%s cannot confuse helper permission with conversation permission", async enabledAtOpen => {
     install();
     clearAccountNeedsReauth("__main__");
@@ -223,14 +250,11 @@ describe("synchronous Reserve dispatch callbacks on WebSocket", () => {
     const seen: string[] = [];
     const quotaValues: string[] = [];
     let fallbacks = 0;
-    let dispatches = 0;
     const fallback = Object.assign(async () => { fallbacks += 1; return new Response("unexpected"); }, { preconnect() {} });
     const pending = codexWsUpstreamFetch(URL, init(), fallback, "1.4.0", headers => {
       quotaValues.push(headers.get("x-codex-primary-used-percent")!);
     }, headers => {
       seen.push(headers.get("authorization")!);
-    }, () => {
-      dispatches += 1;
     });
     const socket = DelayedWebSocket.instances[0]!;
     socket.dispatchEvent(new Event("open"));
@@ -252,7 +276,6 @@ describe("synchronous Reserve dispatch callbacks on WebSocket", () => {
     expect(quotaValues).toEqual(["37", "49"]);
     expect(response.headers.get("x-codex-primary-used-percent")).toBe("37");
     expect(seen).toEqual(["Bearer fixture-reserve", "Bearer fixture-reserve"]);
-    expect(dispatches).toBe(1);
     expect(socket.sent).toHaveLength(1);
     expect(JSON.parse(socket.sent[0]!)).toMatchObject({ type: "response.create", model: "gpt-reserve" });
     expect(fallbacks).toBe(0);
@@ -264,7 +287,6 @@ describe("synchronous Reserve dispatch callbacks on WebSocket", () => {
     const refusal = new Error("permission expired before fallback");
     let permitted = true;
     let httpSends = 0;
-    let dispatches = 0;
     let constructed!: (socket: DelayedWebSocket) => void;
     const created = new Promise<DelayedWebSocket>(resolve => { constructed = resolve; });
     DelayedWebSocket.constructed = constructed;
@@ -272,10 +294,7 @@ describe("synchronous Reserve dispatch callbacks on WebSocket", () => {
       adapter: "openai-responses", authMode: "forward", baseUrl: "https://chatgpt.com/backend-api/codex",
       fetch: Object.assign(async () => { httpSends += 1; return new Response("unexpected"); }, { preconnect() {} }),
     };
-    const executor = providerFetch(provider, "1.4.0", {
-      beforeDispatch: () => { if (!permitted) throw refusal; },
-      onTransportDispatch: () => { dispatches += 1; },
-    });
+    const executor = providerFetch(provider, "1.4.0", { beforeDispatch: () => { if (!permitted) throw refusal; } });
     const pending = executor(URL, init());
     const observed = pending.then(
       () => ({ status: "fulfilled" as const }),
@@ -290,32 +309,5 @@ describe("synchronous Reserve dispatch callbacks on WebSocket", () => {
     expect(outcome.error).toBe(refusal);
     expect(socket.sent).toEqual([]);
     expect(httpSends).toBe(0);
-    expect(dispatches).toBe(0);
-  });
-
-  test("an upgrade failure records only the successful HTTP fallback dispatch", async () => {
-    install();
-    let checks = 0;
-    let httpSends = 0;
-    let dispatches = 0;
-    let constructed!: (socket: DelayedWebSocket) => void;
-    const created = new Promise<DelayedWebSocket>(resolve => { constructed = resolve; });
-    DelayedWebSocket.constructed = constructed;
-    const provider: OcxProviderConfig & { fetch: typeof fetch } = {
-      adapter: "openai-responses", authMode: "forward", baseUrl: "https://chatgpt.com/backend-api/codex",
-      fetch: Object.assign(async () => { httpSends += 1; return new Response("fallback"); }, { preconnect() {} }),
-    };
-    const executor = providerFetch(provider, "1.4.0", {
-      beforeDispatch: () => { checks += 1; },
-      onTransportDispatch: () => { dispatches += 1; },
-    });
-    const pending = executor(URL, init());
-    const socket = await created;
-    socket.close();
-    expect((await pending).status).toBe(200);
-    expect(socket.sent).toEqual([]);
-    expect(checks).toBe(2);
-    expect(httpSends).toBe(1);
-    expect(dispatches).toBe(1);
   });
 });

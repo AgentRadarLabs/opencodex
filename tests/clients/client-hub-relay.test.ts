@@ -1,7 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import {
   HUB_RELAY_REQUEST_BODY_MAX_BYTES,
   HUB_RELAY_RESPONSE_BODY_MAX_BYTES,
+  HUB_RELAY_DEFAULT_TIMEOUT_MS,
+  HUB_RELAY_EXPECTED_TARGET_HEADER,
   relayHubManagementRequest,
   validateHubRelayRequestHeaders,
 } from "../../src/client/hub-relay";
@@ -28,6 +30,78 @@ function relayRequest(path: string, init: RequestInit = {}): Request {
 }
 
 describe("fixed-target hub management relay", () => {
+  test("a matching expected target reaches the hub and the internal header is stripped", async () => {
+    let captured: { url: string; headers: Headers } | null = null;
+    const response = await relayHubManagementRequest(
+      relayRequest("/api/config", { headers: { [HUB_RELAY_EXPECTED_TARGET_HEADER]: "https://hub.example.test" } }),
+      "/api/config",
+      target,
+      { fetchImpl: (async (input, init) => {
+        captured = { url: String(input), headers: new Headers(init?.headers) };
+        return Response.json({ ok: true });
+      }) as typeof fetch },
+    );
+    expect(response.status).toBe(200);
+    expect(captured!.url).toBe("https://hub.example.test/api/config");
+    expect(captured!.headers.get(HUB_RELAY_EXPECTED_TARGET_HEADER)).toBeNull();
+  });
+
+  test("a mismatched expected target is refused before the body is read or forwarded", async () => {
+    let forwarded = 0;
+    const request = new Request("http://127.0.0.1:10100/api/machine/hub-relay/api/config", {
+      method: "POST",
+      headers: {
+        Origin: target.browserOrigin,
+        "Content-Type": "application/json",
+        [HUB_RELAY_EXPECTED_TARGET_HEADER]: "https://other.example.test",
+      },
+      body: JSON.stringify({ next: true }),
+    });
+    const response = await relayHubManagementRequest(request, "/api/config", target, {
+      fetchImpl: (async () => { forwarded += 1; return Response.json({ ok: true }); }) as typeof fetch,
+    });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: "target_changed" });
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(forwarded).toBe(0);
+    expect(request.bodyUsed).toBe(false);
+  });
+
+  test("duplicate, combined, malformed and oversized expected targets are refused", async () => {
+    for (const value of [
+      "https://hub.example.test, https://other.example.test",
+      "https://hub.example.test/path",
+      "https://user:pass@hub.example.test",
+      `https://${"a".repeat(600)}.example.test`,
+      "not-a-url",
+    ]) {
+      const response = await relayHubManagementRequest(
+        relayRequest("/api/config", { headers: { [HUB_RELAY_EXPECTED_TARGET_HEADER]: value } }),
+        "/api/config",
+        target,
+        { fetchImpl: (async () => Response.json({ ok: true })) as typeof fetch },
+      );
+      expect(response.status).toBe(400);
+    }
+  });
+
+  test("forwarding uses the target snapshot captured at call time", async () => {
+    const mutable = { ...target };
+    let capturedUrl = "";
+    const response = await relayHubManagementRequest(
+      relayRequest("/api/config", { headers: { [HUB_RELAY_EXPECTED_TARGET_HEADER]: "https://hub.example.test" } }),
+      "/api/config",
+      mutable,
+      { fetchImpl: (async (input) => {
+        mutable.managementUrl = "https://other.example.test";
+        capturedUrl = String(input);
+        return Response.json({ ok: true });
+      }) as typeof fetch },
+    );
+    expect(response.status).toBe(200);
+    expect(capturedUrl).toBe("https://hub.example.test/api/config");
+  });
+
   test("raw header validation rejects CL/TE ambiguity, duplicate lengths, upgrade, and CRLF", () => {
     for (const headers of [
       [["Content-Length", "1"], ["Transfer-Encoding", "chunked"]],
@@ -143,5 +217,129 @@ describe("fixed-target hub management relay", () => {
     expect((await reader.read()).done).toBe(false);
     await reader.cancel();
     expect(cancelled).toBe(true);
+  });
+
+  test("established account SSE outlives the handshake deadline and still cancels on client abort", async () => {
+    const deadline = new AbortController();
+    const timeout = spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+    const browser = new AbortController();
+    let upstreamSignal!: AbortSignal;
+    let upstreamController!: ReadableStreamDefaultController<Uint8Array>;
+    let cancelled = false;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      const response = await relayHubManagementRequest(relayRequest("/api/accounts/events", { signal: browser.signal }), "/api/accounts/events", target, {
+        fetchImpl: (async (_input, init) => {
+          upstreamSignal = init!.signal!;
+          return new Response(new ReadableStream<Uint8Array>({
+            start(controller) { upstreamController = controller; controller.enqueue(new TextEncoder().encode("event: ready\n\n")); },
+            cancel() { cancelled = true; },
+          }), { headers: { "Content-Type": "text/event-stream; charset=utf-8" } });
+        }) as typeof fetch,
+      });
+      expect(timeout).toHaveBeenCalledWith(HUB_RELAY_DEFAULT_TIMEOUT_MS);
+      reader = response.body!.getReader();
+      expect(new TextDecoder().decode((await reader.read()).value)).toContain("ready");
+      deadline.abort(new DOMException("Handshake deadline", "TimeoutError"));
+      expect(upstreamSignal.aborted).toBe(false);
+      expect(cancelled).toBe(false);
+      upstreamController.enqueue(new TextEncoder().encode("event: account-selection\n\n"));
+      expect(new TextDecoder().decode((await reader.read()).value)).toContain("account-selection");
+      const pending = reader.read();
+      browser.abort();
+      await pending.catch(() => undefined);
+      expect(upstreamSignal.aborted).toBe(true);
+      expect(cancelled).toBe(true);
+    } finally {
+      await reader?.cancel().catch(() => undefined);
+      browser.abort();
+      timeout.mockRestore();
+    }
+  });
+
+  test.each([
+    ["/api/config", "GET", 200, "application/json"],
+    ["/api/config", "GET", 200, "text/event-stream"],
+    ["/api/accounts/events", "POST", 200, "text/event-stream"],
+    ["/api/accounts/events", "GET", 201, "text/event-stream"],
+    ["/api/accounts/events", "GET", 401, "text/event-stream"],
+    ["/api/accounts/events", "GET", 200, "application/json"],
+    ["/api/accounts/events", "GET", 200, "text/event-streamish"],
+    ["/api/accounts/events?other=1", "GET", 200, "text/event-stream"],
+  ] as const)("relay keeps the total deadline for %s %s %i %s", async (path, method, status, contentType) => {
+    const deadline = new AbortController();
+    const timeout = spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+    let upstreamSignal!: AbortSignal;
+    let cancelled = false;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      const response = await relayHubManagementRequest(relayRequest(path, { method }), path, target, {
+        fetchImpl: (async (_input, init) => {
+          upstreamSignal = init!.signal!;
+          return new Response(new ReadableStream<Uint8Array>({ cancel() { cancelled = true; } }), {
+            status, headers: { "Content-Type": contentType },
+          });
+        }) as typeof fetch,
+      });
+      reader = response.body!.getReader();
+      const pending = reader.read();
+      deadline.abort(new DOMException("Total deadline", "TimeoutError"));
+      await pending.catch(() => undefined);
+      expect(upstreamSignal.aborted).toBe(true);
+      expect(cancelled).toBe(true);
+    } finally {
+      await reader?.cancel().catch(() => undefined);
+      timeout.mockRestore();
+    }
+  });
+
+  test("selection SSE still has a handshake deadline and a response body cap", async () => {
+    const deadline = new AbortController();
+    const timeout = spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+    let handshakeStarted!: () => void;
+    const started = new Promise<void>(resolve => { handshakeStarted = resolve; });
+    try {
+      const pending = relayHubManagementRequest(relayRequest("/api/accounts/events"), "/api/accounts/events", target, {
+        fetchImpl: (async (_input, init) => new Promise<Response>((_resolve, reject) => {
+          init!.signal!.addEventListener("abort", () => reject(init!.signal!.reason), { once: true });
+          handshakeStarted();
+        })) as typeof fetch,
+      });
+      await started;
+      deadline.abort(new DOMException("Handshake deadline", "TimeoutError"));
+      expect((await pending).status).toBe(502);
+    } finally { timeout.mockRestore(); }
+
+    let cancelled = false;
+    const response = await relayHubManagementRequest(relayRequest("/api/accounts/events"), "/api/accounts/events", target, {
+      fetchImpl: (async () => new Response(new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(new Uint8Array(HUB_RELAY_RESPONSE_BODY_MAX_BYTES + 1)); },
+        cancel() { cancelled = true; },
+      }), { headers: { "Content-Type": "text/event-stream" } })) as typeof fetch,
+    });
+    await expect(response.arrayBuffer()).rejects.toThrow("response body too large");
+    expect(cancelled).toBe(true);
+  });
+
+  test.each(["complete", "cancel"] as const)("relay detaches deadline and client listeners after body %s", async disposition => {
+    const deadline = new AbortController();
+    const timeout = spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+    const browser = new AbortController();
+    let upstreamSignal!: AbortSignal;
+    try {
+      const response = await relayHubManagementRequest(relayRequest("/api/config", { signal: browser.signal }), "/api/config", target, {
+        fetchImpl: (async (_input, init) => {
+          upstreamSignal = init!.signal!;
+          return new Response(new ReadableStream<Uint8Array>({
+            start(controller) { if (disposition === "complete") controller.close(); },
+          }), { headers: { "Content-Type": "application/json" } });
+        }) as typeof fetch,
+      });
+      if (disposition === "complete") await response.text();
+      else await response.body!.cancel();
+      deadline.abort();
+      browser.abort();
+      expect(upstreamSignal.aborted).toBe(false);
+    } finally { timeout.mockRestore(); }
   });
 });

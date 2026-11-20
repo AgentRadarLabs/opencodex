@@ -35,6 +35,7 @@ export {
   resolveEffectiveVisionModel,
   shouldResolveOpenAiVisionSidecar,
   planVisionSidecar,
+  requiresVisionPreprocessing,
 } from "./plan";
 export type { AnthropicVisionProvider, VisionPlan } from "./plan";
 export { stripImagesInPlace } from "./image-rewrite";
@@ -216,6 +217,9 @@ function descriptionIdentity(job: ImageJob, plan: VisionPlan): { key: string; pe
     key: JSON.stringify([
       plan.backend,
       plan.settings.model,
+      // Explicit identity: the resolved pool and reasoning. Settings that only gate or bound the call
+      // (enabled, timeoutMs, maxDescriptionsPerTurn) never split the cache.
+      ...(plan.backend === "anthropic" ? [plan.anthropicSidecar?.providerName ?? null, plan.settings.reasoning] : []),
       ...(plan.backend === "openai" ? [plan.settings.reasoning] : []),
       job.detail ?? "high",
       imageHash,
@@ -242,6 +246,8 @@ async function executeDescription(
       plan.routedConfig,
       plan.settings,
       abortSignal,
+      undefined,
+      plan.advisorAdmissionPolicy,
     );
   }
   if (plan.backend === "anthropic") {
@@ -255,6 +261,7 @@ async function executeDescription(
       sidecar.provider,
       plan.settings,
       abortSignal,
+      sidecar.config,
     );
   }
   if (!plan.forwardSidecar) return { text: "", error: "OpenAI vision sidecar is unavailable" };
@@ -267,6 +274,7 @@ async function executeDescription(
     plan.settings,
     abortSignal,
     recordSidecarOutcome,
+    plan.forwardSidecar.beforeDispatch,
   );
 }
 

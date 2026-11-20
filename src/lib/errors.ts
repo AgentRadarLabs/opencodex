@@ -1,13 +1,101 @@
+import { formatRetryAfterAdvice, parseRetryAfterFromMessage } from "./retry-delay";
+import { isMetaMusePlanFailure, META_MUSE_PLAN_REFUSAL_MESSAGE } from "../providers/meta-muse-plan-refusal";
+import { ANTHROPIC_SPEND_LIMIT, EXTRA_USAGE_ROTATION } from "../providers/anthropic-billing-refusal";
+
 export interface OcxErrorPayload {
   message: string;
   type: string;
   code: string | null;
 }
 
-/** Canonical human-readable message paths used by Responses upstream failures. */
+export const ENCRYPTED_FUNCTION_OUTPUT_REJECTION =
+  "Encrypted function output content could not be decrypted or decoded.";
+
+/**
+ * The error identity for a send this proxy declined to make (#4708).
+ *
+ * Declared here rather than only on the error class because the classifier is what decides
+ * whether the identity survives serialization, and every dispatch path has to name the same
+ * string for a client to be able to tell this apart from a provider rate limit.
+ */
+export const SEND_BUDGET_EXHAUSTED_CODE = "request_send_budget_exhausted";
+export const SPEND_LEDGER_STORAGE_UNAVAILABLE_CODE = "spend_ledger_storage_unavailable";
+/**
+ * Wire code for the undeclared-tool guard's deterministic refusal. Endpoint translators
+ * read it to keep the refusal non-retryable instead of folding it into the transient
+ * upstream-error class. Declared here rather than in the guard module because the shared
+ * envelope formatter decides whether the identity survives serialization.
+ */
+export const UNDECLARED_TOOL_CALL_ERROR_CODE = "undeclared_tool_call";
+/** A buffered combo child completed without the call explicitly required by tool_choice. */
+export const REQUIRED_TOOL_CONTRACT_CODE = "required_tool_contract_unsatisfied";
+
+/**
+ * Wire code for a provider's model-scoped plan refusal (#7684): the account's plan does not
+ * include the requested model. It travels as a 400 so Codex ends the turn instead of
+ * reconnecting through its retry budget on the upstream 403, and the shared formatter keeps it so
+ * combo and policy fallback can hop past the one refused target. Neither the body code nor the
+ * marker header is trusted: an upstream can send both. Only object identity is provenance.
+ */
+export const MODEL_NOT_IN_PLAN_CODE = "model_not_in_plan";
+/** Diagnostic `x-opencodex-refusal` value on the adapter's refusal; never read as provenance. */
+export const MODEL_NOT_IN_PLAN_REFUSAL_MARKER = "model-not-in-plan";
+/**
+ * The code a verified plan refusal carries once the response is already a 200 stream. The 400
+ * status can no longer stop Codex there, and it reconnects on any `response.failed` code outside
+ * {@link TERMINAL_REFUSAL_CODES}; `invalid_prompt` is the member that says "this request, as sent,
+ * cannot succeed" without naming a policy family. The message keeps `MODEL_NOT_IN_PLAN`.
+ */
+export const MODEL_NOT_IN_PLAN_STREAM_CODE = "invalid_prompt";
+
+/**
+ * Responses this process built as a verified plan refusal: the Command Code adapter's normalized
+ * refusal, and the client envelope `formatErrorResponse` built from one. Owned wrappers carry
+ * membership the way they carry non-replayability; a wrapper that drops it fails closed (no hop).
+ */
+const verifiedPlanRefusalResponses = new WeakSet<Response>();
+
+export function markVerifiedModelNotInPlanResponse(response: Response): void {
+  verifiedPlanRefusalResponses.add(response);
+}
+
+export function isVerifiedModelNotInPlanResponse(response: Response): boolean {
+  return verifiedPlanRefusalResponses.has(response);
+}
+
+/** True for a verified plan refusal that still carries the canonical code in its 400 body. */
+export function isModelNotInPlanRefusal(response: Response, bodyCode: string | null | undefined): boolean {
+  return response.status === 400 && bodyCode === MODEL_NOT_IN_PLAN_CODE && verifiedPlanRefusalResponses.has(response);
+}
+
+/**
+ * The proxy's own fixed message from a verified plan refusal's body, or `undefined` for any other
+ * response. Sidecar loops rebuild a failed iteration as their own error envelope and use this to
+ * keep the actionable copy; the text is trusted only because the marked object is ours.
+ */
+export function verifiedPlanRefusalMessage(response: Response, bodyText: string): string | undefined {
+  if (response.status !== 400 || !verifiedPlanRefusalResponses.has(response)) return undefined;
+  try {
+    const error = (JSON.parse(bodyText) as { error?: { code?: unknown; message?: unknown } }).error;
+    return error?.code === MODEL_NOT_IN_PLAN_CODE && typeof error.message === "string" ? error.message : undefined;
+  } catch { return undefined; }
+}
+
+/**
+ * Whether a code names the plan refusal in any spelling combo failover folds into it (case,
+ * surrounding space, hyphens). The trust gate has to match the same set, or an unmarked
+ * `MODEL_NOT_IN_PLAN` would pass the gate and still be read as the hop code downstream.
+ */
+export function namesModelNotInPlanCode(code: string | null | undefined): boolean {
+  return typeof code === "string" && code.trim().toLowerCase().replaceAll("-", "_") === MODEL_NOT_IN_PLAN_CODE;
+}
+
+/** First nonblank string across the canonical upstream error paths, in priority order. */
 export function upstreamErrorMessageFromPayload(payload: unknown): string | undefined {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
   const json = payload as {
+    type?: unknown;
+    message?: unknown;
     error?: { message?: unknown };
     last_error?: { message?: unknown };
     response?: {
@@ -15,11 +103,14 @@ export function upstreamErrorMessageFromPayload(payload: unknown): string | unde
       incomplete_details?: { message?: unknown };
     };
   };
-  const message = json.error?.message
-    ?? json.last_error?.message
-    ?? json.response?.error?.message
-    ?? json.response?.incomplete_details?.message;
-  return typeof message === "string" ? message : undefined;
+  const messages = [json.error?.message,
+    json.last_error?.message,
+    json.response?.error?.message,
+    json.response?.incomplete_details?.message,
+    // The Responses stream error event carries a flat message (type/code/message),
+    // unlike the response.failed envelope the branches above already cover.
+    json.type === "error" ? json.message : undefined];
+  return messages.find((message): message is string => typeof message === "string" && message.trim().length > 0);
 }
 
 /** OpenAI / Codex hard block for high-risk cybersecurity activity (HTTP 400 or mid-stream). */
@@ -55,7 +146,76 @@ export function isCyberPolicyMessage(text: string): boolean {
   return false;
 }
 
-function isSubscriptionGateMessage(text: string): boolean {
+/**
+ * Refusal codes Codex ends a turn on.
+ *
+ * Its Responses parser classifies a `response.failed` terminal by `error.code`
+ * alone (codex-rs/codex-api/src/sse/responses.rs:423-462). These four become a
+ * fatal `ApiError` the client reports instead of reconnecting. A code outside
+ * this set is never read as a refusal: `server_is_overloaded` and `slow_down`
+ * take the overload arm, `rate_limit_exceeded` takes the rate-limit arm, and
+ * everything else falls through to `ApiError::Retryable` and is reconnected up
+ * to `stream_max_retries`.
+ *
+ * Deliberately scoped to content refusals. `insufficient_quota` and
+ * `context_length_exceeded` are terminal for Codex too, but they are separate
+ * failure families this proxy already classifies through its own quota and
+ * context paths, and pulling them in here would change their retry behavior
+ * with no evidence asking for it.
+ */
+const TERMINAL_REFUSAL_CODES = new Set<string>([
+  CYBER_POLICY_ERROR_CODE,
+  "misalignment_policy_violation",
+  "invalid_prompt",
+  "bio_policy",
+]);
+
+/** True when an upstream error code is a refusal the client must not retry. */
+export function isTerminalRefusalCode(code: string | null | undefined): boolean {
+  return typeof code === "string" && TERMINAL_REFUSAL_CODES.has(code);
+}
+
+/** Stand-in copy for a refusal the upstream sent without a message of its own. */
+export const TERMINAL_REFUSAL_FALLBACK_MESSAGE = "The upstream refused this request.";
+
+/** Readable copy for a refusal code, used when the upstream carried no message. */
+export function terminalRefusalFallbackMessage(code: string): string {
+  return code === CYBER_POLICY_ERROR_CODE
+    ? CYBER_POLICY_FALLBACK_MESSAGE
+    : TERMINAL_REFUSAL_FALLBACK_MESSAGE;
+}
+
+/**
+ * Name the refusal code behind upstream safety copy when the structured code
+ * was not carried on the wire.
+ *
+ * Same discipline as {@link isCyberPolicyMessage}: whole distinctive phrases
+ * only. A loose match here is the mirror-image defect — it would end a turn
+ * that a genuine transient failure would have retried successfully — so a
+ * message that merely mentions safety or blocking does not qualify. Callers
+ * must consult this only when the upstream carried no structured code at all,
+ * so that a transport failure quoting a refusal in its diagnostic text cannot
+ * be promoted past the verdict the upstream actually gave.
+ *
+ * Copy provenance: "limited access to this content for safety reasons" is the
+ * prefix Codex itself matches (tui/src/chatwidget/turn_runtime.rs:8-15) and
+ * pairs with `invalid_prompt` in its parser fixture (sse/responses.rs:1358-1366),
+ * which also pairs "flagged for possible biological risk" with `bio_policy`.
+ * "blocked by our safety systems" is the copy reported in #5176; pairing it
+ * with `invalid_prompt` is an inference from the two verified pairings above,
+ * not something the upstream source states.
+ */
+export function safetyRefusalCodeFromMessage(text: string): string | undefined {
+  const lower = String(text ?? "").toLowerCase();
+  if (lower.includes("flagged for possible biological risk")) return "bio_policy";
+  if (
+    lower.includes("blocked by our safety systems")
+    || lower.includes("limited access to this content for safety reasons")
+  ) return "invalid_prompt";
+  return undefined;
+}
+
+export function isSubscriptionGateMessage(text: string): boolean {
   return (
     text.includes("requires a subscription") ||
     text.includes("requires subscription") ||
@@ -66,6 +226,93 @@ function isSubscriptionGateMessage(text: string): boolean {
     text.includes("ollama.com/upgrade") ||
     (text.includes("upgrade") && text.includes("subscription"))
   );
+}
+
+/**
+ * xAI (and similar Chat Completions gateways) sometimes refuse a turn with HTTP 403
+ * and a model-refusal sentence instead of 200 + finish_reason=content_filter.
+ * Codex treats that 403 as a transport failure, so the user message is never
+ * recorded as a completed turn and retries loop. Keep this allowlist narrow:
+ * entitlement / plan / model-access 403s must stay errors.
+ */
+const POLICY_REFUSAL_PHRASES = [
+  "i can't help with that request",
+  "i cannot help with that request",
+  "i'm unable to help with that request",
+  "i am unable to help with that request",
+] as const;
+
+function hasModelAccessCue(text: string): boolean {
+  return (
+    text.includes("not allowed to use this model")
+    || text.includes("not allowed to use this operation")
+  );
+}
+
+/**
+ * xAI plan and credit 403 wording. Checked only by the refusal matcher below: adding these to
+ * the global subscription classifier would also change status and error-code inference for
+ * every message-only error that happens to mention credits.
+ */
+function hasEntitlementCue(text: string): boolean {
+  return (
+    isSubscriptionGateMessage(text)
+    || text.includes("need a grok subscription")
+    || text.includes("run out of credits")
+  );
+}
+
+/** Lowercase, collapse whitespace, and strip trailing .!? so an exact phrase match is stable. */
+function normalizePolicyRefusalSentence(text: string): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[.!?]+$/g, "")
+    .trim();
+}
+
+/**
+ * True only when the extracted error sentence is exactly a known model-refusal
+ * phrase. JSON / "Provider error 403:" wrappers are unwrapped first. Extra
+ * plan, credit, entitlement, or model-access wording keeps the error path.
+ */
+export function isUpstreamPolicyRefusalMessage(text: string): boolean {
+  const extracted = extractPolicyRefusalText(text);
+  const originalLower = text.toLowerCase();
+  const extractedLower = extracted.toLowerCase();
+  if (hasEntitlementCue(originalLower) || hasEntitlementCue(extractedLower)) return false;
+  if (hasModelAccessCue(originalLower) || hasModelAccessCue(extractedLower)) return false;
+  const normalized = normalizePolicyRefusalSentence(extracted);
+  return (POLICY_REFUSAL_PHRASES as readonly string[]).includes(normalized);
+}
+
+/** HTTP 403 plus {@link isUpstreamPolicyRefusalMessage}; other statuses never rewrite. */
+export function isUpstreamPolicyRefusal(status: number, text: string): boolean {
+  return status === 403 && isUpstreamPolicyRefusalMessage(text);
+}
+
+/** Pull the human-readable refusal sentence out of a JSON or prefixed error body. */
+export function extractPolicyRefusalText(raw: string): string {
+  const trimmed = raw.trim();
+  try {
+    const parsed = JSON.parse(trimmed) as { error?: unknown; message?: unknown };
+    const nested = parsed.error;
+    if (typeof nested === "string" && nested.trim()) return nested.trim();
+    if (nested && typeof nested === "object") {
+      const msg = (nested as { message?: unknown; error?: unknown }).message
+        ?? (nested as { error?: unknown }).error;
+      if (typeof msg === "string" && msg.trim()) return msg.trim();
+    }
+    if (typeof parsed.message === "string" && parsed.message.trim()) return parsed.message.trim();
+  } catch {
+    /* not JSON */
+  }
+  // The proxy's own error text wraps the upstream JSON (`Provider error 403: {"error": ...}`),
+  // so the remainder after the prefix gets the same unwrapping.
+  const prefixed = trimmed.match(/^Provider error 403:\s*([\s\S]+)$/i);
+  if (prefixed?.[1]?.trim()) return extractPolicyRefusalText(prefixed[1]);
+  return trimmed;
 }
 
 function isLocalAclHardeningMessage(text: string): boolean {
@@ -168,8 +415,73 @@ export function isClientClosedMessage(text: string): boolean {
   );
 }
 
+/**
+ * Ambiguous-reset refusal wording owned by this proxy (src/lib/upstream-retry.ts):
+ * the upstream exchange did not complete reliably, so the request may already have
+ * been processed and automatic replay was stopped. Matched narrowly so a
+ * provider-sent message is never relabeled by it.
+ */
+export function isUpstreamResetReplayRefusedMessage(text: string): boolean {
+  return text.toLowerCase().includes(
+    "the upstream exchange did not complete reliably. the request may already have been processed",
+  );
+}
+
+/** `Provider error <status>` or `Provider error <status>: <body>`, exactly as this proxy writes it. */
+const EXPLICIT_PROVIDER_STATUS = /^Provider error ([1-5]\d\d)(?::|$)/;
+const PROVIDER_ERROR_400_PREFIX = /^Provider error (?:400|422):\s*/i;
+// Anthropic's quota refusals, start-anchored because a validation 400 echoes client values after
+// its own opening: a spent extra-usage balance and a spend limit.
+const isAnthropicQuotaRefusal = (text: string): boolean => {
+  const trimmed = text.trimStart();
+  return EXTRA_USAGE_ROTATION.test(trimmed) || ANTHROPIC_SPEND_LIMIT.test(trimmed);
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Quota evidence in an HTTP 400 or 422, read from fields, never from words anywhere in the text.
+ * A 400/422 is a verdict on the request and echoes client values ("...: toolu_insufficient_quota"),
+ * so matching words let one crafted request read as a spent account and cool a combo provider.
+ * After this proxy's `Provider error 400: ` / `422: ` prefix it is quota only as a JSON envelope
+ * whose `error.code`/`error.type` field is `insufficient_quota`, whose `error.code` is Volcengine
+ * Ark's `InvalidSubscription` (https://www.volcengine.com/docs/82379/1299023), or Anthropic's
+ * envelope whose `error.message` starts with a quota refusal wording (extra usage, spend limit); a nested `Provider error 400`
+ * message is read the same way, at most three deep. An `invalid_request_error: ` text counts only
+ * when it then starts with that wording (an already-extracted `error.message`). Truncated or
+ * malformed JSON is never quota. Other prose is this proxy's own adapter wording, not an echoing
+ * provider body, and keeps the word rules (see providerBadRequestBody).
+ */
+export function isQuotaBadRequestMessage(message: string): boolean {
+  let text = message.trim();
+  for (let depth = 0; depth < 3; depth += 1) {
+    text = text.replace(PROVIDER_ERROR_400_PREFIX, "");
+    if (!text.startsWith("{")) return isAnthropicQuotaRefusal(text.replace(/^invalid_request_error:\s*/i, ""));
+    let payload: unknown;
+    try { payload = JSON.parse(text); } catch { return false; }
+    if (!isRecord(payload) || !isRecord(payload.error)) return false;
+    const { code, type, message: inner } = payload.error;
+    if (code === "insufficient_quota" || type === "insufficient_quota" || code === "InvalidSubscription") return true;
+    if (typeof inner !== "string") return false;
+    if (payload.type === "error" && type === "invalid_request_error" && isAnthropicQuotaRefusal(inner)) return true;
+    if (!PROVIDER_ERROR_400_PREFIX.test(inner.trim())) return false;
+    text = inner.trim();
+  }
+  return false;
+}
+
+/** A 400/422 whose text is the provider's own body: a JSON envelope or an extracted typed message. */
+function providerBadRequestBody(message: string): boolean {
+  return /^(?:\{|invalid_request_error:)/i.test(message.trim().replace(PROVIDER_ERROR_400_PREFIX, ""));
+}
+
 export function classifyError(status: number, type: string, message: string): OcxErrorPayload {
   const text = message.toLowerCase();
+  if (type === SPEND_LEDGER_STORAGE_UNAVAILABLE_CODE) {
+    return { message, type: "server_error", code: SPEND_LEDGER_STORAGE_UNAVAILABLE_CODE };
+  }
   if (type === "previous_response_not_found") {
     return { message, type: "invalid_request_error", code: "previous_response_not_found" };
   }
@@ -201,12 +513,21 @@ export function classifyError(status: number, type: string, message: string): Oc
   if (type === "input_admission_refused") {
     return { message, type: "invalid_request_error", code: "input_admission_refused" };
   }
+  // A LOCAL inbound admission refusal (#3573) keeps its own code for the same reason as the
+  // preflight refusal above. #4112 gave the UPSTREAM 413 on this surface
+  // `context_length_exceeded`; without a distinct code here a client cannot tell a body the
+  // proxy never read from a turn the provider itself rejected, and only one of the two is
+  // fixed by raising `maxInboundBodyBytes`.
+  if (type === "inbound_body_too_large") {
+    return { message, type: "invalid_request_error", code: "inbound_body_too_large" };
+  }
   if (
     text.includes("context_length_exceeded") ||
     text.includes("context window") ||
     text.includes("context length") ||
     text.includes("maximum context") ||
-    text.includes("too many tokens")
+    text.includes("too many tokens") ||
+    (status === 400 && /\binput token count(?:\s*\([\d,]+\))?\s+exceeds\s+the maximum number of tokens allowed\b/.test(text))
   ) {
     return { message, type: "invalid_request_error", code: "context_length_exceeded" };
   }
@@ -224,28 +545,46 @@ export function classifyError(status: number, type: string, message: string): Oc
   // The Cursor adapter's classified rate-limit prefix is authoritative: its DETAIL may echo
   // quota wording ("... quota exhausted") that would otherwise hit the insufficient_quota
   // branch below and break the planned retry-with-backoff contract (WP3 review blocker 1).
-  if (text.includes("cursor rate limit exceeded")) {
+  //
+  // No quota or rate verdict on a 400 or 422 provider body comes from words anywhere in its text:
+  // see isQuotaBadRequestMessage. Those verdicts hop a combo and cool its target or provider.
+  const badRequest = (status === 400 || status === 422) && providerBadRequestBody(message);
+  if (!badRequest && text.includes("cursor rate limit exceeded")) {
     return { message, type: "rate_limit_error", code: "rate_limit_exceeded" };
   }
-  if (
+  // A caller's structured `type` is a field too, not words in the text.
+  if (badRequest ? type === "insufficient_quota" || isQuotaBadRequestMessage(message) : (
     text.includes("insufficient_quota") ||
     text.includes("exceeded your current quota") ||
     text.includes("quota exhausted") ||
+    text.includes("quota has been exhausted") ||
     text.includes("account quota exceeded") ||
     text.includes("monthly quota exceeded") ||
-    text.includes("daily quota exceeded")
-  ) {
+    text.includes("weekly quota exceeded") ||
+    text.includes("daily quota exceeded") ||
+    // Anthropic answers a spent extra-usage balance with HTTP 400 prose; only the opening counts.
+    isAnthropicQuotaRefusal(message)
+  )) {
     return { message, type: "insufficient_quota", code: "insufficient_quota" };
   }
+  // A refusal this proxy made itself, kept apart from the provider rate limits below. The HTTP
+  // semantics are identical -- 429, do not send this again now -- but the code is the only thing
+  // that tells an operator reading a log whether the provider throttled the request or whether
+  // this process declined to send it. Folding it into the generic rate-limit code sent them to
+  // the provider's dashboard to explain a decision that was never made there.
+  if (type === SEND_BUDGET_EXHAUSTED_CODE) {
+    return { message, type: "rate_limit_error", code: SEND_BUDGET_EXHAUSTED_CODE };
+  }
   if (
-    status === 429 ||
-    text.includes("rate limit") ||
-    text.includes("rate limited") ||
-    text.includes("too many requests") ||
-    text.includes("resource_exhausted") ||
-    text.includes("resource exhausted") ||
-    text.includes("throttlingexception") ||
-    text.includes("throttling")
+    status === 429 || (!badRequest && (
+      text.includes("rate limit") ||
+      text.includes("rate limited") ||
+      text.includes("too many requests") ||
+      text.includes("resource_exhausted") ||
+      text.includes("resource exhausted") ||
+      text.includes("throttlingexception") ||
+      text.includes("throttling")
+    ))
   ) {
     return { message, type: "rate_limit_error", code: "rate_limit_exceeded" };
   }
@@ -265,6 +604,16 @@ export function classifyError(status: number, type: string, message: string): Oc
     isAuthenticationMessage(text)
   ) {
     return { message, type: "authentication_error", code: "invalid_api_key" };
+  }
+  // Meta scopes a Muse Code subscription key to its own client and refuses every other caller with
+  // one fixed 403 (#8352). The key is valid and no login lifts the restriction, so the verdict is a
+  // plan/entitlement class rather than a rejected credential. This sits above the generic
+  // `permission_denied` branch because the envelope carries that code as its own detail.
+  if (isMetaMusePlanFailure(status, message)) {
+    // One proxy sentence says what Meta's refusal means and what path does work; the upstream
+    // body names the restriction but not the alternative, and relaying it verbatim reads as a
+    // rejected credential.
+    return { message: META_MUSE_PLAN_REFUSAL_MESSAGE, type: "permission_error", code: "subscription_required" };
   }
   // An explicit permission enum must not acquire a more specific inferred reason.
   if (type === "PERMISSION_DENIED" || text.includes("permission_denied")) {
@@ -327,7 +676,10 @@ export function classifyError(status: number, type: string, message: string): Oc
 export function isRateLimitOrQuotaFailureMessage(message: string): boolean {
   const normalized = String(message ?? "").trim();
   if (!normalized) return false;
-  const numericStatus = Number(normalized);
+  // This proxy's `Provider error <status>` prefix states the status; the body after it echoes
+  // client values, so an explicit 400 is read by classifyError's 400 rules, not by its words.
+  const explicit = EXPLICIT_PROVIDER_STATUS.exec(normalized);
+  const numericStatus = explicit ? Number(explicit[1]) : Number(normalized);
   if (numericStatus === 429 || numericStatus === 402) return true;
   const statusHint = Number.isInteger(numericStatus) && numericStatus > 0 ? numericStatus : 0;
   const classified = classifyError(statusHint, "", normalized);
@@ -339,25 +691,13 @@ export function isRateLimitOrQuotaFailureMessage(message: string): boolean {
   ) {
     return true;
   }
-  // Retained quota cue used by subagent health before classifyError covered it.
+  // Retained quota cue used by subagent health before classifyError covered it. Not for an
+  // explicit other 4xx: that is a verdict on the request, and the words may be the client's.
+  if (explicit && statusHint >= 400 && statusHint < 500) return false;
   return normalized.toLowerCase().includes("usage limit");
 }
 
-/** Best-effort parse of a retry delay embedded in an upstream error message. */
-export function parseRetryAfterFromMessage(message: string): number | undefined {
-  const patterns = [
-    /try again in (\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?/i,
-    /retry after (\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?/i,
-    /retry[- ]after[:\s]+(\d+)/i,
-  ];
-  for (const pattern of patterns) {
-    const match = message.match(pattern);
-    if (!match?.[1]) continue;
-    const seconds = Number.parseFloat(match[1]);
-    if (Number.isFinite(seconds) && seconds > 0) return Math.ceil(seconds);
-  }
-  return undefined;
-}
+export { parseRetryAfterFromMessage };
 
 /** Infer HTTP status from adapter terminal error text (provider-agnostic keyword matching). */
 export function inferHttpStatusFromAdapterMessage(message: string): number {
@@ -366,6 +706,11 @@ export function inferHttpStatusFromAdapterMessage(message: string): number {
   if (isClientClosedMessage(lower)) return 499;
   // Codex Transport maps cyber_policy only on HTTP 400 (SSE is code-based).
   if (isCyberPolicyMessage(lower)) return 400;
+  // This proxy's own `Provider error <status>` prefix states the upstream status outright. The
+  // text after it echoes client values, so a 400 quoting "rate limit" must stay 400 rather than
+  // turn into a 429 that cools a combo target.
+  const explicit = EXPLICIT_PROVIDER_STATUS.exec(message.trimStart());
+  if (explicit) return Number(explicit[1]);
   // See classifyError: this prefix now only means explicit request-size overflow (400);
   // quota-style Cursor resource exhaustion carries the rate-limit prefix and maps to 429.
   if (lower.includes("cursor resource limit exceeded")) return 400;
@@ -441,10 +786,42 @@ export function adapterFailureFromMessage(message: string): { httpStatus: number
             : httpStatus === 400
               ? "invalid_request_error"
               : "upstream_error";
-  return {
-    httpStatus,
-    error: classifyError(httpStatus, errorType, finalMessage),
-  };
+  const error = classifyError(httpStatus, errorType, finalMessage);
+  if (httpStatus === 429 && error.type === "rate_limit_error"
+    && ["rate_limit_exceeded", "slow_down"].includes(error.code ?? "")) {
+    error.message = formatRetryAfterAdvice(message) ?? error.message;
+  }
+  return { httpStatus, error };
+}
+
+/** A declared client refusal: retrying the identical request cannot change the verdict. */
+const CLIENT_ERROR_STATUS: Record<string, 400 | 401 | 403 | 404> = {
+  invalid_request_error: 400,
+  authentication_error: 401,
+  permission_error: 403,
+  not_found_error: 404,
+};
+
+/** Narrow structured classes carried through a synthesized bare-error terminal. */
+export function recognizedUpstreamError(error: { type?: unknown; code?: unknown }):
+  { type: string; code: string; httpStatus: 400 | 401 | 403 | 404 | 429 | 503 } | undefined {
+  const code = typeof error.code === "string" ? error.code : undefined;
+  const clientClass = code ?? (typeof error.type === "string" ? error.type : undefined);
+  if (clientClass !== undefined && Object.hasOwn(CLIENT_ERROR_STATUS, clientClass)) {
+    return { type: clientClass, code: clientClass, httpStatus: CLIENT_ERROR_STATUS[clientClass] };
+  }
+  // An explicit unknown code must not gain a recognized class from its type or copy.
+  if (code !== undefined && !["rate_limit_exceeded", "rate_limit_error", "server_is_overloaded", "overloaded_error"].includes(code)) return undefined;
+  if (code === "rate_limit_exceeded" || code === "rate_limit_error"
+    || (code === undefined && error.type === "rate_limit_error")) {
+    return { type: "rate_limit_error", code: code ?? "rate_limit_exceeded", httpStatus: 429 };
+  }
+  if (code === "server_is_overloaded" || code === "overloaded_error"
+    || (code === undefined && error.type === "overloaded_error")) {
+    return { type: error.type === "overloaded_error" ? "overloaded_error" : "server_error",
+      code: code ?? "server_is_overloaded", httpStatus: 503 };
+  }
+  return undefined;
 }
 
 /** Map a terminal Responses error object to the HTTP status we record in /api/logs. */
@@ -454,12 +831,19 @@ export function httpStatusFromTerminalError(error: {
   message?: string;
 } | undefined): number {
   if (!error) return 502;
+  if (error.code === SPEND_LEDGER_STORAGE_UNAVAILABLE_CODE) return 503;
   if (error.code === "client_closed_request" || error.code === "client_cancelled") return 499;
   if (isCyberPolicyCode(error.code) || (error.message ? isCyberPolicyMessage(error.message) : false)) {
     return 400;
   }
+  const message = error.message ?? "";
+  const recognized = recognizedUpstreamError(error);
+  // Client-closed messages often arrive as invalid_request_error after classifyError, so a
+  // recognized 400 yields to the client-closed check below; every other class keeps its order.
+  if (recognized && !(recognized.httpStatus === 400 && message && isClientClosedMessage(message))) {
+    return recognized.httpStatus;
+  }
   if (error.type === "rate_limit_error" || error.code === "rate_limit_exceeded") return 429;
-  if (error.type === "overloaded_error") return 529;
   if (error.type === "authentication_error" || error.code === "invalid_api_key") return 401;
   if (
     error.type === "permission_error" ||
@@ -470,10 +854,10 @@ export function httpStatusFromTerminalError(error: {
   if (error.type === "server_error" && error.code === "server_is_overloaded") return 503;
   // Client-closed messages often arrive as invalid_request_error after classifyError; check message
   // before treating every invalid_request_error as HTTP 400.
-  const message = error.message ?? "";
   if (message && isClientClosedMessage(message)) return 499;
   if (error.type === "invalid_request_error") return 400;
   if (error.type === "proxy_error") return 500;
+  if (error.code === "upstream_stall_timeout") return 504;
   // A structured server class must not be downgraded to a CLIENT error by message wording.
   // classifyError assigns `server_error` + `upstream_server_error` to every 5xx it sees, so
   // the class is authoritative about blame: the upstream failed, the caller did not send a

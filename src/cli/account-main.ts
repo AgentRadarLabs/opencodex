@@ -1,6 +1,9 @@
 import { isAbsolute } from "node:path";
+import { redactSecretArgs } from "./secret-args";
 import { codexExecInvocation } from "../codex/exec-invocation";
+import { validatedCodexExecInvocationAsync, type CodexExecBoundaryAsyncDeps } from "../codex/exec-boundary";
 import { resolveAndPersistCodexRuntime, type ResolveCodexRuntimeDeps } from "../codex/runtime";
+import { withCodexCliSelectionParentWriteAsync } from "../codex/cli-update-selection-gate";
 import type { ResolveDeps, SpawnInvocation } from "../lib/win-exec";
 import {
   apiError,
@@ -17,6 +20,9 @@ const USAGE = `Usage:
   ocx account main list [--json]
   ocx account main register <label> [--json]
   ocx account main add <label>
+  ocx account main reauth --device [--no-wait] [--json]
+  ocx account main reauth status --flow <id> [--json]
+  ocx account main reauth cancel --flow <id> [--json]
   ocx account main switch <profile-id-or-label> --yes [--json]
   ocx account main recover [--rollback --yes] [--json]
 
@@ -42,6 +48,41 @@ export type NativeMainCodexLoginInvocationDeps =
   & ResolveDeps
   & Pick<ResolveCodexRuntimeDeps, "existsSync" | "execFileSync" | "configDir" | "readFileSync">;
 
+export type NativeMainCodexLoginValidatedDeps =
+  & NativeMainCodexLoginInvocationDeps
+  & CodexExecBoundaryAsyncDeps;
+
+/**
+ * Resolve+persist the runtime selection, then let the exec boundary produce the
+ * invocation that is spawned. Validating the raw command matters: re-wrapping
+ * the already-prepared invocation would launch cmd.exe as if it were Codex and
+ * drop windowsVerbatimArguments.
+ */
+export async function nativeMainCodexLoginValidatedInvocation(
+  platform: NodeJS.Platform = process.platform,
+  deps: NativeMainCodexLoginValidatedDeps = {},
+): Promise<SpawnInvocation> {
+  const env = deps.env ?? process.env;
+  const command = (await withCodexCliSelectionParentWriteAsync(() => resolveAndPersistCodexRuntime({
+    env,
+    platform,
+    existsSync: deps.existsSync,
+    execFileSync: deps.execFileSync,
+    configDir: deps.configDir,
+    readFileSync: deps.readFileSync,
+    discoverAlternatives: false,
+  }), { configDir: deps.configDir, signal: deps.signal })).runtime.command || "codex";
+  return validatedCodexExecInvocationAsync(command, ["login"], {
+    env,
+    platform,
+    exists: deps.exists,
+    executable: deps.executable,
+    realpath: deps.realpath,
+    macBundleTrustReasonAsync: deps.macBundleTrustReasonAsync,
+    signal: deps.signal,
+  });
+}
+
 function flag(args: string[], name: string): boolean {
   const index = args.indexOf(name);
   if (index < 0) return false;
@@ -50,7 +91,7 @@ function flag(args: string[], name: string): boolean {
 }
 
 function reject(args: string[]): number {
-  if (args.length > 0) console.error(`Unexpected argument(s): ${args.join(", ")}`);
+  if (args.length > 0) console.error(`Unexpected argument(s): ${redactSecretArgs(args).join(", ")}`);
   console.error(USAGE);
   return 1;
 }
@@ -61,8 +102,10 @@ function effectiveCodexHome(result: Record<string, unknown>): string {
     : "the effective CODEX_HOME";
 }
 
+const EMPTY_PROFILES_NOTES = ["No native main login profiles registered.", "Next: ocx account main add <label>"];
+
 function printProfiles(profiles: PublicProfile[]): void {
-  if (profiles.length === 0) { console.log("No native main login profiles registered."); return; }
+  if (profiles.length === 0) { for (const note of EMPTY_PROFILES_NOTES) console.log(note); return; }
   const rows = profiles.map(profile => [profile.state === "active" ? "*" : " ", profile.label, profile.id, profile.identityHint]);
   const header = ["", "LABEL", "PROFILE ID", "IDENTITY"];
   const widths = header.map((value, index) => Math.max(value.length, ...rows.map(row => row[index]!.length)));
@@ -86,14 +129,16 @@ export function nativeMainCodexLoginInvocation(
   return codexExecInvocation(command, ["login"], platform, deps);
 }
 
-function spawnOfficialCodexLogin(codexHome: string): NativeMainLoginChild {
-  const invocation = nativeMainCodexLoginInvocation();
-  const child = Bun.spawn([invocation.file, ...invocation.args], {
+async function spawnOfficialCodexLogin(codexHome: string): Promise<NativeMainLoginChild> {
+  // The boundary validates the raw resolved command and returns the invocation
+  // to spawn; the prepared-invocation builder above stays trust-free on purpose.
+  const validated = await nativeMainCodexLoginValidatedInvocation();
+  const child = Bun.spawn([validated.file, ...validated.args], {
     env: { ...process.env, CODEX_HOME: codexHome },
     stdin: "inherit",
     stdout: "inherit",
     stderr: "inherit",
-    ...(invocation.options.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+    ...(validated.options.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
   });
   return child;
 }
@@ -186,14 +231,95 @@ export async function cmdNativeMainAccount(args: string[], deps: AccountDeps): P
   const baseUrl = await resolveBaseUrl(deps);
   if (!baseUrl) return proxyUnreachable();
 
+  if (sub === "reauth") {
+    // #3898: same-identity device reauth of the native __main__ slot via the
+    // dedicated management namespace; /api/codex-auth/login stays pool-only.
+    if (confirmed || rollback) return reject(args);
+    const noWait = flag(args, "--no-wait");
+    const device = flag(args, "--device");
+    const flowIndex = args.indexOf("--flow");
+    const flowId = flowIndex >= 0 ? args.splice(flowIndex, 2)[1] : undefined;
+    const action = args.shift();
+    if (args.length > 0) return reject(args);
+
+    const printStatus = (status: Record<string, unknown>): void => {
+      if (wantsJson) { console.log(JSON.stringify(status, null, 2)); return; }
+      console.log("status: " + String(status.status ?? "unknown"));
+      if (typeof status.verificationUrl === "string" && status.verificationUrl) {
+        console.log("url: " + status.verificationUrl);
+      }
+      if (typeof status.deviceCode === "string" && status.deviceCode) {
+        console.log("deviceCode: " + status.deviceCode);
+      }
+      if (typeof status.code === "string" && status.code) {
+        console.log("failure: " + status.code);
+      }
+    };
+
+    if (action === "status" || action === "cancel") {
+      if (!flowId || device || noWait) return reject(args);
+      const query = "/api/codex-auth/main/reauth-device?flowId=" + encodeURIComponent(flowId);
+      const result = action === "status"
+        ? await apiJson(deps, baseUrl, "GET", query)
+        : await apiJson(deps, baseUrl, "DELETE", query);
+      if (result.status === 0) return proxyUnreachable(result.transportError);
+      if (result.status !== 200) return apiError(result.json, "failed to " + action + " the native main reauth", result.status);
+      printStatus(result.json);
+      return 0;
+    }
+
+    if (action !== undefined || !device) return reject(args);
+    const started = await apiJson(deps, baseUrl, "POST", "/api/codex-auth/main/reauth-device");
+    if (started.status === 0) return proxyUnreachable(started.transportError);
+    if (started.status !== 200) return apiError(started.json, "failed to start the native main device reauth", started.status);
+    const startFlowId = typeof started.json.flowId === "string" ? started.json.flowId : "";
+    if (!startFlowId) {
+      console.error("The proxy returned an invalid reauth flow.");
+      return 1;
+    }
+    // The URL and human code arrive with the usercode response, a beat after start.
+    let pending = started.json;
+    const statusQuery = "/api/codex-auth/main/reauth-device?flowId=" + encodeURIComponent(startFlowId);
+    for (let attempt = 0; attempt < 50 && !pending.deviceCode; attempt += 1) {
+      await Bun.sleep(200);
+      const polled = await apiJson(deps, baseUrl, "GET", statusQuery);
+      if (polled.status === 200) pending = polled.json;
+    }
+    if (noWait) {
+      printStatus({ flowId: startFlowId, ...pending });
+      if (!wantsJson) console.log("follow up: ocx account main reauth status --flow " + startFlowId);
+      return 0;
+    }
+    // Blocking wait bounded by the service flow expiry (15-minute grant + margin).
+    const deadline = Date.now() + 16 * 60_000;
+    for (;;) {
+      if (pending.status !== "pending" && pending.status !== "committing") break;
+      if (Date.now() >= deadline) {
+        console.error("The reauth flow did not finish within the device grant window; check status with --flow " + startFlowId + ".");
+        return 1;
+      }
+      await Bun.sleep(2_000);
+      const polled = await apiJson(deps, baseUrl, "GET", statusQuery);
+      if (polled.status === 0) return proxyUnreachable(polled.transportError);
+      if (polled.status !== 200) return apiError(polled.json, "failed to poll the native main reauth", polled.status);
+      pending = polled.json;
+    }
+    printStatus({ flowId: startFlowId, ...pending });
+    return pending.status === "succeeded" ? 0 : 1;
+  }
+
   if (sub === "doctor" || sub === "list") {
     if (args.length > 0 || confirmed || rollback) return reject(args);
     const path = sub === "doctor" ? "/api/native-main-profiles/doctor" : "/api/native-main-profiles";
     const result = await apiJson(deps, baseUrl, "GET", path);
     if (result.status === 0) return proxyUnreachable(result.transportError);
     if (result.status !== 200) return apiError(result.json, `failed to ${sub} native profiles`, result.status);
-    if (wantsJson || sub === "doctor") console.log(JSON.stringify(result.json, null, 2));
-    else printProfiles(Array.isArray(result.json.profiles) ? result.json.profiles as PublicProfile[] : []);
+    const profiles = Array.isArray(result.json.profiles) ? result.json.profiles as PublicProfile[] : [];
+    if (wantsJson || sub === "doctor") console.log(JSON.stringify({
+      ...result.json,
+      ...(sub === "list" && profiles.length === 0 ? { notes: [...(Array.isArray(result.json.notes) ? result.json.notes : []), ...EMPTY_PROFILES_NOTES] } : {}),
+    }, null, 2));
+    else printProfiles(profiles);
     return 0;
   }
 
@@ -236,7 +362,7 @@ export async function cmdNativeMainAccount(args: string[], deps: AccountDeps): P
         ? deps.spawnCodexLoginImpl(stagingHome)
         : deps.runCodexLoginImpl
           ? { exited: deps.runCodexLoginImpl(stagingHome), kill: () => {} }
-          : spawnOfficialCodexLogin(stagingHome);
+          : await spawnOfficialCodexLogin(stagingHome);
       const heartbeatAbort = new AbortController();
       const heartbeat = maintainStageLease(
         deps,

@@ -1,15 +1,22 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { classifyWindowsServiceStop, installedServiceRespawnRisk, isServiceOwnershipError, ServiceOwnershipError } from "../../../src/service";
+import { installedServiceRespawnRisk, isServiceOwnershipError, ServiceOwnershipError } from "../../../src/service";
+import { serviceStopOutcomeFromWindows } from "../../../src/service/windows-service-stop";
+import type { WindowsCheckedStopResult } from "../../../src/service/windows-checked-stop";
+import { decideStartExitTeardown } from "../../../src/cli/dispatch";
 import { repoPath } from "../../helpers/repo-root";
 
 const CLI_SOURCE = readFileSync(repoPath("src", "cli", "index.ts"), "utf8");
 const ENSURE_SOURCE = readFileSync(repoPath("src", "cli", "ensure-desired-integrations.ts"), "utf8");
 const DISPATCH_SOURCE = readFileSync(repoPath("src", "cli", "dispatch.ts"), "utf8");
-const SERVICE_SOURCE = readFileSync(repoPath("src", "service.ts"), "utf8");
+// handleStop's restore helper lives beside it; its whole file is that one function.
+const STOP_RESTORE_SOURCE = readFileSync(repoPath("src", "cli", "stop-restore.ts"), "utf8");
+const SERVICE_SOURCE = readFileSync(repoPath("src", "service", "cli.ts"), "utf8");
 const MANAGEMENT_SOURCE = readFileSync(repoPath("src", "server", "management-api.ts"), "utf8");
 const PROCESS_CONTROL_SOURCE = readFileSync(repoPath("src", "lib", "process-control.ts"), "utf8");
+// The startup Desktop-3P registry build (and its catch) lives in this shared helper.
+const REGISTRY_STARTUP_SOURCE = readFileSync(repoPath("src", "claude", "desktop-3p-startup.ts"), "utf8");
 
 function sliceFn(source: string, start: string, end: string): string {
   const from = source.indexOf(start);
@@ -25,22 +32,33 @@ function sliceFn(source: string, start: string, end: string): string {
 describe("Grok fence lifecycle wiring", () => {
   test("handleStart syncs the Grok fence outside the Desktop-3P try", () => {
     const startFn = sliceFn(CLI_SOURCE, "async function handleStart(", "async function handleEnsure(");
-    const registryAt = startFn.indexOf("buildDesktop3pRegistry(");
-    const registryCatchAt = startFn.indexOf("/* best-effort — registry rebuilds on first /v1/models call */", registryAt);
+    const startupAt = startFn.indexOf("await reconcileClientStartupBeforeReady(");
+    const registryAt = startFn.indexOf("initDesktop3pRegistry(");
+    const afterStartupAt = startFn.indexOf("if (!startupSync.ran)", registryAt);
     const grokSyncAt = startFn.indexOf('await import("../grok/sync")');
 
-    expect(registryCatchAt).toBeGreaterThan(registryAt);
-    // Nested inside the registry try, a catalog throw skipped the fence entirely.
-    expect(grokSyncAt).toBeGreaterThan(registryCatchAt);
+    expect(startupAt).toBeGreaterThan(-1);
+    expect(registryAt).toBeGreaterThan(startupAt);
+    expect(afterStartupAt).toBeGreaterThan(registryAt);
+    const initialization = startFn.slice(startupAt, afterStartupAt);
+    // The build never throws into the startup callback: its failure is caught inside the helper.
+    expect(REGISTRY_STARTUP_SOURCE).toMatch(/\}\s*catch\s*(?:\([^)]*\)\s*)?\{/);
+    expect(REGISTRY_STARTUP_SOURCE).not.toContain("grok");
+    expect(initialization).not.toContain('import("../grok/sync")');
+    // Grok follows the completed initialization call, outside its callback/try.
+    // A comment wording change must not masquerade as a lifecycle regression.
+    expect(grokSyncAt).toBeGreaterThan(afterStartupAt);
   });
 
-  test("ensure passes only the observed live bind host across the mutation boundary", () => {
+  test("ensure passes only the observed live bind scope and probe address across the mutation boundary", () => {
     const ensureFn = sliceFn(CLI_SOURCE, "async function handleEnsure(", "async function handleTrayProxyStart(");
     const liveBranch = ensureFn.slice(0, ensureFn.indexOf("const pinPort"));
     const spawnBranch = ensureFn.slice(ensureFn.indexOf("const pinPort"));
 
-    // live.hostname is what the proxy ACTUALLY bound; config.hostname may have drifted.
-    expect(liveBranch).toContain('{ kind: "live", hostname: live.hostname }');
+    // live.hostname is the scope the proxy ACTUALLY bound and live.probeHostname the address
+    // that answered; config.hostname may have drifted and must not cross this boundary.
+    expect(liveBranch).toContain('{ kind: "live", hostname: live.hostname, probeHostname: live.probeHostname }');
+    expect(liveBranch).not.toContain("hostname: config.hostname");
     // Spawn passes no config-derived input; the reconciler loads the current hostname.
     expect(spawnBranch).toContain('{ kind: "spawned" }');
     expect(spawnBranch).not.toContain("current.hostname");
@@ -51,7 +69,7 @@ describe("Grok fence lifecycle wiring", () => {
     const helper = sliceFn(
       ENSURE_SOURCE,
       "export async function ensureGrokFenceMatchesDesired(",
-      "export function ensureClaudeDesktopMatchesDesired(",
+      "export async function ensureClaudeDesktopMatchesDesired(",
     );
     const ensureFn = sliceFn(CLI_SOURCE, "async function handleEnsure(", "async function handleTrayProxyStart(");
 
@@ -69,14 +87,14 @@ describe("Grok fence lifecycle wiring", () => {
   test("ensure clears Claude Desktop residue when the durable switch is OFF", () => {
     const helper = sliceFn(
       ENSURE_SOURCE,
-      "export function ensureClaudeDesktopMatchesDesired(",
+      "export async function ensureClaudeDesktopMatchesDesired(",
       "Claude Desktop cleanup failed",
     );
     const ensureFn = sliceFn(CLI_SOURCE, "async function handleEnsure(", "async function handleTrayProxyStart(");
     expect(helper).toContain("claudeDesktopIntegrationEnabled(config)");
     expect(helper).toContain("deps.removeDesktop3pStandardPivot(");
     expect(helper.indexOf("deps.loadConfig()")).toBeLessThan(helper.indexOf("claudeDesktopIntegrationEnabled(config)"));
-    expect(ENSURE_SOURCE).toContain("ensureClaudeDesktopMatchesDesired(deps)");
+    expect(ENSURE_SOURCE).toContain("await ensureClaudeDesktopMatchesDesired(deps)");
   });
 
   test("both ensure branches re-read persisted config after the in-flight await window", () => {
@@ -92,19 +110,22 @@ describe("Grok fence lifecycle wiring", () => {
 
   test("handleStop gates shared teardown on ownership but still reverts system env", () => {
     const stopFn = sliceFn(CLI_SOURCE, "async function handleStop(", "async function handleUninstall(");
-    const restoreFn = sliceFn(CLI_SOURCE, "async function restoreSharedClientStateAfterStop(", "async function handleStop(");
+    const restoreFn = STOP_RESTORE_SOURCE;
 
     expect(stopFn).toContain("isServiceOwnershipError(err)");
     expect(stopFn).toContain("ownershipBlocked = true");
-    // Ownership is now one of two reasons to skip the restore; the other is an inherited
-    // obligation whose proxy could not be confirmed down (#3008).
-    expect(stopFn).toContain("const restoreBlocked = ownershipBlocked || inheritedBlocks || nativeRestoreHandledByProxy;");
-    expect(stopFn).toContain("if (!restoreBlocked) {");
-    expect(stopFn).toContain("await restoreSharedClientStateAfterStop()");
-    expect(restoreFn).toContain("restoreNativeCodexAsync()");
+    // Ownership is one reason to skip the restore; others are an inherited obligation whose
+    // proxy could not be confirmed down (#3008), a sibling runtime, whose shared client
+    // routing belongs to the live proxy it ran beside, and a connected client, whose routing,
+    // catalog and Grok config belong to its connection and are never written back on start (#7563).
+    expect(stopFn).toContain("const restoreBlocked = ownershipBlocked || inheritedBlocks || nativeRestoreHandledByProxy || stoppingSibling || connectedClientSkip !== null;");
+    expect(stopFn).toContain("if (!restoreBlocked && boundary === \"restore\") {");
+    expect(stopFn).toContain("await restoreSharedClientStateAfterStop(reportRetainedCodexProviderTable)");
+    expect(restoreFn).toContain("restoreNativeCodexAsync({ withWriteGuard: guard.run })");
+    expect(restoreFn).toContain("guard.run(() => stripGrokConfig())");
     expect(restoreFn).not.toContain("revertSystemEnv()");
     expect(restoreFn).toContain("stripGrokConfig()");
-    expect(stopFn.indexOf("revertSystemEnv()")).toBeLessThan(stopFn.indexOf("if (!restoreBlocked) {"));
+    expect(stopFn.indexOf("revertSystemEnv()")).toBeLessThan(stopFn.indexOf("if (!restoreBlocked && boundary === \"restore\") {"));
   });
 
   test("graceful stop skips caller restore only when the proxy performed it", () => {
@@ -116,7 +137,7 @@ describe("Grok fence lifecycle wiring", () => {
   });
 
   test("a refused Grok strip makes ocx stop fail instead of reporting success", () => {
-    const restoreFn = sliceFn(CLI_SOURCE, "async function restoreSharedClientStateAfterStop(", "async function handleStop(");
+    const restoreFn = STOP_RESTORE_SOURCE;
     const stopFn = sliceFn(CLI_SOURCE, "async function handleStop(", "async function handleUninstall(");
     // A Grok strip failure is "other", never history-only: it points Grok at a dead proxy,
     // so an update must abort rather than proceed (#3008).
@@ -143,46 +164,61 @@ describe("Grok fence lifecycle wiring", () => {
     // shared teardown must be skipped at both call sites, exactly like the service-manager path.
     const ownershipRefusals = stopFn.match(/err instanceof ProxyOwnershipRefusedError[\s\S]{0,200}?ownershipBlocked = true;/g);
     expect(ownershipRefusals).toHaveLength(2);
-    expect(stopFn.match(/Skipping shared teardown \(native Codex restore, Grok config\): the foreign proxy is still running\./g)).toHaveLength(2);
+    expect(stopFn.match(/Skipping shared teardown \(native Codex restore, Grok config\): the refusing proxy is still running\./g)).toHaveLength(2);
     expect(PROCESS_CONTROL_SOURCE).toContain("throw new ProxyOwnershipRefusedError(");
+
+    // Both sites also print what is actually left to do. The refusal itself is written for
+    // an API client, so it recommends `ocx stop` — the command doing the printing — which
+    // is the loop #4169 reports. Echoing the server's message alone reproduces it.
+    expect(stopFn.match(/console\.error\(`   \$\{refusalNextStep\(err\.code\)\}`\);/g)).toHaveLength(2);
+    expect(PROCESS_CONTROL_SOURCE).toContain("export function refusalNextStep(");
   });
 
   test("handleStop returns its outcome while both restart surfaces share the in-place lifecycle", () => {
     const stopFn = sliceFn(CLI_SOURCE, "async function handleStop(", "async function handleUninstall(");
     // process.exit() inside handleStop would strand runTrayProxyRestart's start() half.
     expect(stopFn).toContain("process.exitCode = 1");
-    expect(stopFn).toContain("return !stopFailed");
+    // The structured outcome (the stop --json summary) keeps the old boolean as ok, so
+    // the dispatcher's downtime-warning gate is byte-for-byte the pre-summary semantics.
+    expect(stopFn).toContain("return { ok: !stopFailed, summary };");
     expect(stopFn).not.toContain("process.exit(1)");
 
     const restartCase = sliceFn(DISPATCH_SOURCE, "restart: async", "health: async");
     expect(restartCase).toContain("await deps.handleProxyRestart(deps.handleRestartStartWhenStopped)");
-    const trayRestart = sliceFn(CLI_SOURCE, "async function handleTrayProxyRestart(", "async function restoreSharedClientStateAfterStop(");
+    const trayRestart = sliceFn(CLI_SOURCE, "async function handleTrayProxyRestart(", "async function handleStop(");
     const restartHelper = sliceFn(CLI_SOURCE, "async function handleProxyRestart(", "async function handleTrayProxyRestart(");
-    expect(trayRestart).toContain("await handleProxyRestart(() => handleTrayProxyStart(false))");
+    expect(trayRestart).toContain("await handleProxyRestart(async () => (await handleTrayProxyStart(false))");
     expect(restartHelper).toContain("requestBoundSystemRestart(previous, deadlineAt)");
+    expect(restartHelper).toContain("recheckAfterFailedStart: () => recheckRestartFailedStart(");
+    expect(CLI_SOURCE).toContain("forceStart: recoveringLiveRestart");
   });
 
   test("a stopped scheduler is verified across the respawn window before stop succeeds", () => {
     const stopFn = sliceFn(CLI_SOURCE, "async function handleStop(", "async function handleUninstall(");
-    // killWindowsSchedulerWrappers is best-effort and the `:loop` wrapper respawns after
-    // ~5s, so "stopped" alone is not a proven-down proxy. An update that trusts it can
-    // start replacing files during the dead interval (#3008).
-    expect(stopFn).toContain("proxyStillLiveAfterStop({ canRespawn: true })");
+    // The `:loop` wrapper respawns after ~5s, so "stopped" alone is not a proven-down
+    // proxy. An update that trusts it can start replacing files during the dead interval
+    // (#3008). On Windows the window is Part B of the checked stop (#7771); its behavior is
+    // covered in tests/windows/windows-stop-callers.test.ts and the parent-stop runner.
+    expect(stopFn).toContain("if (await stopWindowFailed(record)) { stopFailed = true; ownershipBlocked = true; }");
+    const wiring = readFileSync(repoPath("src", "cli", "stop-windows-checked.ts"), "utf8");
+    expect(wiring).toContain("proxyStillLiveAfterStop({ canRespawn: true })");
+    expect(wiring).toContain("confirmWindowsServiceStop(");
     // A survivor is an ordinary failure AND blocks shared teardown: restoring client
     // config while the proxy runs leaves both pointing at each other.
     expect(stopFn).toContain("stopFailed = true;");
     expect(stopFn).toContain("ownershipBlocked = true;");
   });
 
-  test("only Task Scheduler earns the respawn wait", () => {
+  test("only a stop that can be respawned earns the respawn wait", () => {
     const stopFn = sliceFn(CLI_SOURCE, "async function handleStop(", "async function handleUninstall(");
-    const serviceSource = readFileSync(repoPath("src", "service.ts"), "utf8");
+    const serviceSource = readFileSync(repoPath("src", "service", "orchestration.ts"), "utf8");
     // schtasks /end leaves the `cmd :loop` wrapper alive to respawn its child (#764).
     // launchd, systemd and WinSW are down when they report stopped, so charging them a
     // seven-second poll on every ocx stop would be a regression in ordinary use.
     expect(serviceSource).toContain('"absent" | "stopped" | "stopped-respawnable" | "failed"');
-    expect(serviceSource).toContain('schedulerStopped ? "stopped-respawnable" : "stopped"');
     expect(stopFn).toContain("if (schedulerCanRespawn && !ownershipBlocked)");
+    // #7771: a legacy respawnable outcome or a Windows Part A that stopped (Part B follows).
+    expect(stopFn).toContain('schedulerCanRespawn = serviceStop === "stopped-respawnable" || windowsPartBDue();');
     // The wait is gated on the scheduler flag, not on "a service stopped".
     expect(stopFn).not.toContain("if (stoppedService && !ownershipBlocked)");
   });
@@ -197,7 +233,9 @@ describe("Grok fence lifecycle wiring", () => {
     // second redundant teardown (#3008).
     expect(stopFn).toContain("deferSharedTeardownNonce: teardownNonce");
     expect(controlSource).toContain("deferSharedTeardown");
-    expect(apiSource).toContain("performStopTeardown(url, { ownsReceipt: deferralMatchesReceipt })");
+    // The receipt must name this proxy's own port (#8416).
+    expect(apiSource).toContain("const ownsThisReceipt = (nonce: string | null) => deferralMatchesReceipt(nonce, servedPort);");
+    expect(apiSource).toContain("performStopTeardown(url, { ownsReceipt: ownsThisReceipt })");
     // The deferral is an obligation, so it is claimed on disk BEFORE it is requested and
     // released only after THIS process has restored the shared config itself. A bare
     // query flag could not survive the parent dying mid-stop.
@@ -221,16 +259,25 @@ describe("Grok fence lifecycle wiring", () => {
     const guessedBranch = stopFn.slice(stopFn.indexOf('if (read.receipt.endpointSource === "guessed")'), stopFn.indexOf("if (await abandonedTeardownIsSafeToFinish("));
     expect(guessedBranch).toContain("inheritedBlocks = true;");
     expect(guessedBranch).toContain("stopFailed = true;");
-    expect(controlSource).toContain("io.runtimeEndpoint ?? readRuntime(pid)");
+    expect(controlSource).toContain("io.runtimeEndpoint ?? (io.runtimeEndpointOnly ? null : readRuntime(pid))");
     // Inherited obligations are snapshotted BEFORE this run claims anything, so its own
     // receipt is never mistaken for one it inherited.
-    expect(stopFn).toContain("isPendingTeardownAbandoned(read, isProcessAlive)");
+    expect(stopFn).toContain("isPendingTeardownAbandoned(read, teardownOwnerStillRunning)");
+    // Ownership is identity, not bare liveness. A reused PID reported the owner as still
+    // running forever, so the receipt was never recovered while both updater gates kept
+    // refusing on it (#4897). Passing `isProcessAlive` straight in is the regression.
+    expect(stopFn).toContain("isProcessAlive(ownerPid) && isLikelyOcxProcess(ownerPid)");
+    expect(stopFn).not.toContain("isPendingTeardownAbandoned(read, isProcessAlive)");
     expect(stopFn.indexOf("listPendingTeardowns()")).toBeLessThan(claimAt);
-    expect(stopFn).toContain("clearPendingTeardown(nonce)");
-    expect(stopFn.indexOf("await restoreSharedClientStateAfterStop()"))
-      .toBeLessThan(stopFn.indexOf("clearPendingTeardown(nonce)"));
+    expect(stopFn).toContain("clearRestoredStopReceipts(record, teardownNonce ? [teardownNonce, ...recoveredNonces] : recoveredNonces)");
+    expect(stopFn.indexOf("await restoreSharedClientStateAfterStop(reportRetainedCodexProviderTable)"))
+      .toBeLessThan(stopFn.indexOf("clearRestoredStopReceipts(record,"));
     // A receipt that survives its discharge would re-trigger recovery forever.
-    expect(stopFn).toContain("if (!clearPendingTeardown(nonce)) {");
+    const receiptSource = readFileSync(repoPath("src", "cli", "stop-restore-guard.ts"), "utf8");
+    expect(receiptSource).toContain("if (!clearPendingTeardown(nonce)) {");
+    expect(receiptSource).toContain("return withConfigMutationLockSync(() => {");
+    expect(receiptSource.indexOf("const boundary = inspectStopRestoreOwnership();"))
+      .toBeLessThan(receiptSource.indexOf("clearPendingTeardown(nonce)"));
   });
 
   test("an unconfirmed inherited obligation blocks the restore, it does not merely warn", () => {
@@ -240,11 +287,11 @@ describe("Grok fence lifecycle wiring", () => {
     // attempt at this only logged a warning and then restored anyway, which is not a gate.
     expect(stopFn).toContain("await abandonedTeardownIsSafeToFinish(read.receipt.endpoint)");
     expect(stopFn).toContain("const restoreBlocked = ownershipBlocked || inheritedBlocks");
-    expect(stopFn).toContain("if (!restoreBlocked) {");
+    expect(stopFn).toContain("if (!restoreBlocked && boundary === \"restore\") {");
     // The restore is reached only through that gate — no other call site may bypass it.
-    const restoreCalls = stopFn.split("await restoreSharedClientStateAfterStop()").length - 1;
+    const restoreCalls = stopFn.split("await restoreSharedClientStateAfterStop(reportRetainedCodexProviderTable)").length - 1;
     expect(restoreCalls).toBe(1);
-    expect(stopFn.indexOf("const restoreBlocked")).toBeLessThan(stopFn.indexOf("await restoreSharedClientStateAfterStop()"));
+    expect(stopFn.indexOf("const restoreBlocked")).toBeLessThan(stopFn.indexOf("await restoreSharedClientStateAfterStop(reportRetainedCodexProviderTable)"));
     // An obligation that cannot be discharged fails the stop and is preserved.
     const gateBlock = stopFn.slice(stopFn.indexOf("const recoveredNonces"), stopFn.indexOf("const restoreBlocked"));
     expect(gateBlock).toContain("inheritedBlocks = true;");
@@ -261,7 +308,7 @@ describe("Grok fence lifecycle wiring", () => {
     expect(quarantineBlock).toContain("It still blocks 'ocx update'");
     expect(quarantineBlock).toContain("has NOT restored on its behalf");
     expect(quarantineBlock).not.toContain("no longer blocks an update");
-    expect(stopFn.indexOf("await restoreSharedClientStateAfterStop()"))
+    expect(stopFn.indexOf("await restoreSharedClientStateAfterStop(reportRetainedCodexProviderTable)"))
       .toBeLessThan(stopFn.indexOf("quarantinePendingTeardown(read.nonce)"));
     // Inherited receipts are evaluated whether or not this run claimed one of its own, and
     // every discharged nonce is released together — otherwise a stop that finds a live
@@ -278,7 +325,7 @@ describe("Grok fence lifecycle wiring", () => {
     expect(noPidBranch).toContain("stopFailed = true;");
     expect(noPidBranch).toContain("ownershipBlocked = true;");
     const gateFn = sliceFn(CLI_SOURCE, "const abandonedTeardownIsSafeToFinish", "let stopFailed = false;");
-    expect(gateFn).toContain('probeProxyLiveness(endpoint.port, endpoint.hostname) === "dead"');
+    expect(gateFn).toContain('probeEndpointLiveness(endpoint) === "dead"');
     expect(gateFn).toContain("return false;");
   });
 
@@ -301,16 +348,28 @@ describe("Grok fence lifecycle wiring", () => {
     const updateSource2 = readFileSync(repoPath("src", "update", "index.ts"), "utf8");
     expect(updateSource2).toContain("teardownOutstanding: pendingTeardownOutstanding()");
     const decisionSource = readFileSync(repoPath("src", "update", "stop-decision.mjs"), "utf8");
-    expect(decisionSource).toContain('if (teardownOutstanding) return { proceed: false, reason: "teardown-outstanding" };');
+    // The gate has exactly two exemptions, both the child saying it kept its own receipt on
+    // purpose: after the Codex history preflight refused (#4718), and when an update hands
+    // its teardown to the proxy it restarts (#7423). Anything else — including a stop that
+    // merely exited 0 — still aborts the install.
+    expect(decisionSource).toContain('if (teardownOutstanding && !historyDeferred && !handedOver) return { proceed: false, reason: "teardown-outstanding" };');
+    expect(decisionSource).toContain("const historyDeferred = status === STOP_HISTORY_DEFERRED_EXIT_CODE;");
     const receiptSource = readFileSync(repoPath("src", "config", "pending-teardown.ts"), "utf8");
     expect(receiptSource).toContain('from "./pending-teardown-names.mjs"');
     expect(receiptSource).toContain("isPendingTeardownFileName(name)");
   });
 
   test("handleStop treats an incomplete native Codex restore as a stop failure", () => {
-    const restoreFn = sliceFn(CLI_SOURCE, "async function restoreSharedClientStateAfterStop(", "async function handleStop(");
+    const restoreFn = STOP_RESTORE_SOURCE;
     const stopFn = sliceFn(CLI_SOURCE, "async function handleStop(", "async function handleUninstall(");
-    expect(restoreFn).toContain("if (result.success) console.log");
+    // The success branch grew a body when a degraded restore had to report the provider
+    // table it retained, so this pins the branch and its log separately rather than the
+    // one-line shape they used to share.
+    expect(restoreFn).toContain("if (result.success) {");
+    expect(restoreFn).toContain("console.log(`↩️  ${result.message}`)");
+    // A degraded restore is a discharged obligation, not a deferral: the refusal reason is
+    // what keeps a stop receipt owed, and it must stay part of that conjunction.
+    expect(restoreFn).toContain("result.historyPreflightRefusal !== undefined");
     // Config or catalog failure is a real teardown failure - a client reads those. Only a
     // history-only failure is separable, and it still surfaces (#3008).
     expect(restoreFn).toContain('artifacts.config.state === "failed" || artifacts.catalog.state === "failed"');
@@ -321,10 +380,13 @@ describe("Grok fence lifecycle wiring", () => {
 
   test("the daemon's exit cleanup keeps the OCX_SERVICE exclusion and adds the ownership check", () => {
     const startFn = sliceFn(CLI_SOURCE, "const syncCleanup = () => {", "let shuttingDown = false;");
-    // Crash/respawn under a service manager must still keep the fence.
-    expect(startFn).toContain('process.env.OCX_SERVICE === "1"');
+    // Crash/respawn under a service manager must still keep the fence. The exact-"1" sentinel
+    // lives in decideStartExitTeardown (src/cli/dispatch.ts), which the cleanup feeds the raw
+    // environment value and whose whole matrix runs in tests/cli/cli-dispatch.test.ts.
+    expect(startFn).toContain("ocxService: process.env.OCX_SERVICE");
+    expect(decideStartExitTeardown({ sibling: false, recycling: false, ocxService: "1" }).stripGrokConfig).toBe(false);
     expect(startFn).not.toContain("OCX_KEEP_ROUTING");
-    expect(startFn).toContain("!preserveRouting && serviceEnvironmentOwnedHere()");
+    expect(startFn).toContain("teardown.stripGrokConfig && serviceEnvironmentOwnedHere()");
   });
 
   test("signal shutdown reports and exits nonzero when native Codex restore is incomplete", () => {
@@ -332,7 +394,9 @@ describe("Grok fence lifecycle wiring", () => {
     expect(startFn).toContain("if (!restored.success)");
     expect(startFn).toContain("cleanupSucceeded = false");
     expect(startFn).toContain("Native Codex restore failed during shutdown");
-    expect(startFn).toContain("process.exit(restored && shutdownSucceeded ? 0 : 1)");
+    // A clean signal shutdown exits 0, except the launchd-managed job, which exits 128+signal
+    // so its failure-only KeepAlive still relaunches it (src/lib/handled-signal-exit.ts).
+    expect(startFn).toContain("process.exit(restored && shutdownSucceeded ? handledSignalExitCode(signal) : 1)");
   });
 });
 
@@ -378,40 +442,46 @@ describe("POST /api/stop teardown", () => {
     expect(refusalAt).toBeLessThan(shutdownAt);
   });
 
+  test("a sibling's stop never asks the service manager, which belongs to the live owner", () => {
+    const handler = sliceFn(MANAGEMENT_SOURCE, '"/api/stop"', "/api/codex-auth/");
+    expect(handler).toContain("const sibling = siblingOfLivePort() !== null;");
+    expect(handler).toContain('const respawnRisk = holdsReceipt || sibling ? "none" : installedServiceRespawnRisk();');
+    expect(handler).toContain('serviceStop = sibling ? "absent" : await (await import("./stop-service-route")).routeServiceStop(url, holdsReceipt);');
+  });
+
   test("strips the Grok fence on an accepted stop", () => {
     // The teardown moved to src/server/stop-teardown.ts so a test can call it: the route
     // schedules process.exit 200ms after answering, which made the inline version
     // unreachable. tests/service/stop-deferred-teardown.test.ts proves the behaviour; this proves
     // the route still delegates to it rather than growing a second copy.
     const handler = sliceFn(MANAGEMENT_SOURCE, '"/api/stop"', "/api/codex-auth/");
-    expect(handler).toContain("performStopTeardown(url, { ownsReceipt: deferralMatchesReceipt })");
+    expect(handler).toContain("performStopTeardown(url, { ownsReceipt: ownsThisReceipt })");
     const teardownSource = readFileSync(repoPath("src", "server", "stop-teardown.ts"), "utf8");
     expect(teardownSource).toContain('await import("../grok/inject")');
-    expect(teardownSource).toContain("stripGrokConfig()");
+    expect(teardownSource).toContain("grok = guard.run(() => strip())");
+    expect(teardownSource).toContain("restoreNativeCodexAsync(options)");
   });
 
   test("an unreadable scheduler state gets the same diagnosis from the CLI and the API", () => {
-    const serviceSource = readFileSync(repoPath("src", "service.ts"), "utf8");
+    const serviceSource = readFileSync(repoPath("src", "service", "orchestration.ts"), "utf8");
     // A manager that refused to stop and a query that could not answer are different
     // problems: reporting the second as "did not stop" sends the operator looking for the
     // wrong thing, and `ocx stop` was the command the API told them to run (#3008).
     expect(serviceSource).toContain('"absent" | "stopped" | "stopped-respawnable" | "failed" | "state-unknown"');
     // Behavioural, because a source-text assertion cannot tell whether an unreadable probe
-    // is still being folded into the generic failure.
-    expect(classifyWindowsServiceStop({ stopped: false, failed: false, schedulerStopped: false, stateUnknown: true }))
-      .toBe("state-unknown");
-    // A readable failure outranks it — something actually refused to stop.
-    expect(classifyWindowsServiceStop({ stopped: false, failed: true, schedulerStopped: false, stateUnknown: true }))
-      .toBe("failed");
-    // And an unreadable state outranks success: a scheduler we cannot see may respawn.
-    expect(classifyWindowsServiceStop({ stopped: true, failed: false, schedulerStopped: true, stateUnknown: true }))
-      .toBe("state-unknown");
-    expect(classifyWindowsServiceStop({ stopped: true, failed: false, schedulerStopped: true, stateUnknown: false }))
-      .toBe("stopped-respawnable");
-    expect(classifyWindowsServiceStop({ stopped: true, failed: false, schedulerStopped: false, stateUnknown: false }))
-      .toBe("stopped");
-    expect(classifyWindowsServiceStop({ stopped: false, failed: false, schedulerStopped: false, stateUnknown: false }))
-      .toBe("absent");
+    // is still being folded into the generic failure. Since #7771 the Windows outcome is
+    // Part A's: unreadable evidence is state-unknown, a refusal or survivor is failed, and
+    // Task Scheduler no longer reports stopped-respawnable (Part B covers the window).
+    const partA = (outcome: WindowsCheckedStopResult["outcome"]) => serviceStopOutcomeFromWindows({
+      outcome, reason: null, detail: "", registration: { scheduler: "present", winsw: "nonexistent" },
+      bound: [], unbound: [], terminated: [], changed: false,
+    });
+    expect(partA("unknown")).toBe("state-unknown");
+    expect(partA("denied")).toBe("failed");
+    expect(partA("survived")).toBe("failed");
+    expect(partA("unverified-budget")).toBe("failed");
+    expect(partA("stopped")).toBe("stopped");
+    expect(partA("absent")).toBe("absent");
     const stopFn = sliceFn(CLI_SOURCE, "async function handleStop(", "async function handleUninstall(");
     expect(stopFn).toContain('if (serviceStop === "state-unknown")');
     const unknownBranch = stopFn.slice(stopFn.indexOf('if (serviceStop === "state-unknown")'), stopFn.indexOf('if (serviceStop === "state-unknown")') + 700);
@@ -435,7 +505,7 @@ describe("POST /api/stop teardown", () => {
     // stopServiceIfInstalled collapses "failed" into the same false as "not installed", so
     // this route used to tear down shared config while a manager that refused to stop was
     // still there to respawn the proxy (#3008).
-    expect(handler).toContain("stopServiceIfInstalledDetailed()");
+    expect(handler).toContain("routeServiceStop(url, holdsReceipt)");
     expect(handler).not.toContain("stopServiceIfInstalled();");
     expect(handler).toContain('if (serviceStop === "failed")');
     expect(handler.indexOf('if (serviceStop === "failed")')).toBeLessThan(handler.indexOf("await performStopTeardown"));
@@ -446,9 +516,9 @@ describe("POST /api/stop teardown", () => {
     // Stopping the Task Scheduler task and then returning 409 left the proxy running with
     // its manager stopped — worse than either outcome, and the dashboard's Stop button
     // sends a bare request on every backend.
-    expect(handler).toContain('const respawnRisk = holdsReceipt ? "none" : installedServiceRespawnRisk();');
+    expect(handler).toContain('const respawnRisk = holdsReceipt || sibling ? "none" : installedServiceRespawnRisk();');
     expect(handler).toContain('code: "respawnable_service"');
-    expect(handler.indexOf("installedServiceRespawnRisk()")).toBeLessThan(handler.indexOf("stopServiceIfInstalledDetailed()"));
+    expect(handler.indexOf("installedServiceRespawnRisk()")).toBeLessThan(handler.indexOf("routeServiceStop(url, holdsReceipt)"));
     // The refusal must say nothing was changed, because nothing was.
     expect(handler).toContain("Nothing was changed.");
     // An unreadable scheduler state is its own answer: sending that operator to `ocx stop`
@@ -484,7 +554,7 @@ describe("POST /api/stop teardown", () => {
   });
 
   test("direct service stop and uninstall fail when a shared teardown half fails", () => {
-    const serviceSource = readFileSync(repoPath("src", "service.ts"), "utf8");
+    const serviceSource = readFileSync(repoPath("src", "service", "cli.ts"), "utf8");
     // These paths logged the failure and exited 0, so a script could not tell a complete
     // teardown from one that left Grok aimed at a stopped proxy.
     const stopCase = serviceSource.slice(
@@ -500,13 +570,29 @@ describe("POST /api/stop teardown", () => {
   });
 
   test("a 409 does not escalate to a forced kill", () => {
-    // Escalating would run the daemon's cleanup and strip shared config while the foreign
-    // service keeps the proxy alive — the exact hole the ownership gate exists to close.
-    expect(PROCESS_CONTROL_SOURCE).toContain('if (res.status === 409) return "refused"');
+    // Escalating would run the daemon's cleanup and strip shared config while the refusing
+    // service keeps the proxy alive — the exact hole the refusal gate exists to close.
+    // The 409 branch may capture the server's reason first (#4023 added a second refusal
+    // cause, #4169 the code that names it), but it must still yield "refused" without
+    // falling through to !res.ok. Matched loosely so a wrapped return (`done("refused")`)
+    // still satisfies the invariant this guards, which is ordering, not spelling.
+    const stopGracefully = sliceFn(
+      PROCESS_CONTROL_SOURCE,
+      "export async function stopProxyGracefully(",
+      "export async function stopProxy(",
+    );
+    const four09At = stopGracefully.indexOf("res.status === 409");
+    expect(four09At).toBeGreaterThan(-1);
+    const refusedReturn = /return (?:done\()?"refused"/;
+    const okFallthrough = /if \(!res\.ok\) return (?:done\()?false/;
+    const afterFour09 = stopGracefully.slice(four09At);
+    expect(afterFour09).toMatch(refusedReturn);
+    expect(afterFour09.search(refusedReturn))
+      .toBeLessThan(afterFour09.search(okFallthrough));
 
     const stopProxyFn = sliceFn(PROCESS_CONTROL_SOURCE, "export async function stopProxy(", "export function killProxy(");
     const refusedAt = stopProxyFn.indexOf('graceful === "refused"');
-    const killAt = stopProxyFn.indexOf("killProxy(pid)");
+    const killAt = stopProxyFn.indexOf("killProxy(pid");
     expect(refusedAt).toBeGreaterThan(-1);
     expect(refusedAt).toBeLessThan(killAt);
     expect(stopProxyFn).toContain("throw new ProxyOwnershipRefusedError(");

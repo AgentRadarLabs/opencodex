@@ -6,6 +6,7 @@ import {
   type ExportModel,
   type GajaeGeneratedConfig,
   type HermesGeneratedConfig,
+  type OpencodeGeneratedConfig,
   type PiGeneratedConfig,
 } from "../../src/clients/config-export";
 import type { OcxConfig } from "../../src/types";
@@ -52,6 +53,11 @@ function hermesModels(models: ExportModel[]) {
     .providers[OPENCODE_PROVIDER_ID].models;
 }
 
+function opencodeModels(models: ExportModel[]) {
+  return (buildClientConfig("opencode", ctx(models)) as OpencodeGeneratedConfig)
+    .providers[OPENCODE_PROVIDER_ID].models;
+}
+
 /** The live failure, by its real id and real modality list. */
 const MIXED: ExportModel = {
   namespaced: "zenmux/meta-muse-spark-1.1",
@@ -59,6 +65,7 @@ const MIXED: ExportModel = {
   id: "meta-muse-spark-1.1",
   contextWindow: 1_048_576,
   inputModalities: ["text", "image", "audio"],
+  supportsTools: true,
 };
 
 /**
@@ -71,6 +78,7 @@ const AUDIO_ONLY: ExportModel = {
   provider: "p",
   id: "audio-only",
   inputModalities: ["audio"],
+  supportsTools: true,
 };
 
 describe("exported modalities stay inside the enum each client accepts", () => {
@@ -144,6 +152,95 @@ describe("exported modalities stay inside the enum each client accepts", () => {
       }
       // And the incompatible one is gone rather than silently retyped.
       expect(models.map(m => m.id)).not.toContain("p/audio-only");
+    }
+  });
+});
+
+/**
+ * opencode is the third shape of this problem, and the only one where the fix is a
+ * capability field rather than a filter.
+ *
+ * Its model schema accepts a WIDER enum than our internal vocabulary
+ * (`text | audio | image | video | pdf`, opencode.ai/config.json), and its client gates
+ * pasting on `attachment` / `modalities.input` INSTEAD of rejecting the file we hand it. So
+ * an out-of-enum value is dropped, but a row left with nothing acceptable keeps its entry
+ * and carries no capability keys — never a fabricated `text`, which would advertise input
+ * the model cannot read.
+ */
+describe("opencode receives the capability fields its client gates attachments on", () => {
+  test("a declared model advertises attachment plus every modality opencode accepts", () => {
+    // The live catalog shape: meta-muse-spark-1.1 declares text|image|audio, and audio is
+    // INSIDE opencode's enum, so unlike Pi and Gajae nothing is dropped here.
+    expect(opencodeModels([MIXED])["zenmux/meta-muse-spark-1.1"]).toEqual({
+      name: "meta-muse-spark-1.1 (zenmux)",
+      limit: { context: 1_048_576, output: 32_000 },
+      capabilities: { tools: true, input: ["text", "image", "audio"], output: ["text"] },
+      variants: [],
+    });
+  });
+
+  test("an audio-only row stays audio-only instead of being retyped as text", () => {
+    // opencode accepts audio, so the Pi/Gajae answer — omit the row — would lose a model for
+    // no reason. Faithfulness costs nothing here.
+    expect(opencodeModels([AUDIO_ONLY])["p/audio-only"]).toEqual({
+      name: "audio-only (p)",
+      capabilities: { tools: true, input: ["audio"], output: ["text"] },
+      variants: [],
+    });
+  });
+
+  test("a text-only declaration is advertised as text-only rather than omitted", () => {
+    const textOnly: ExportModel = { namespaced: "p/text", provider: "p", id: "text", inputModalities: ["text"], supportsTools: false };
+    expect(opencodeModels([textOnly])["p/text"]).toEqual({
+      name: "text (p)",
+      capabilities: { tools: false, input: ["text"], output: ["text"] },
+      variants: [],
+    });
+  });
+
+  test("a row that declares nothing carries no capability keys at all", () => {
+    // Unknown capabilities are omitted; [] suppresses invented effort choices.
+    const bare: ExportModel = { namespaced: "p/bare", provider: "p", id: "bare" };
+    const empty: ExportModel = { ...bare, namespaced: "p/empty", id: "empty", inputModalities: [] };
+    const models = opencodeModels([bare, empty]);
+    expect(models["p/bare"]).toEqual({ name: "bare (p)", variants: [] });
+    expect(models["p/empty"]).toEqual({ name: "empty (p)", variants: [] });
+  });
+
+  test("an out-of-enum value is dropped and duplicates collapse", () => {
+    const odd: ExportModel = {
+      namespaced: "p/odd", provider: "p", id: "odd", inputModalities: ["file", "image", "image"], supportsTools: true,
+    };
+    expect(opencodeModels([odd])["p/odd"]).toEqual({
+      name: "odd (p)",
+      capabilities: { tools: true, input: ["image"], output: ["text"] },
+      variants: [],
+    });
+  });
+
+  test("a model whose only declaration is out of enum keeps its entry, without capabilities", () => {
+    const foreign: ExportModel = { namespaced: "p/foreign", provider: "p", id: "foreign", inputModalities: ["file"] };
+    expect(opencodeModels([foreign])["p/foreign"]).toEqual({ name: "foreign (p)", variants: [] });
+  });
+
+  test("no emitted entry in a whole catalog carries a value opencode rejects", () => {
+    const catalog: ExportModel[] = [
+      MIXED,
+      AUDIO_ONLY,
+      { namespaced: "p/bare", provider: "p", id: "bare" },
+      { namespaced: "p/foreign", provider: "p", id: "foreign", inputModalities: ["file"] },
+      { namespaced: "p/vision", provider: "p", id: "vision", inputModalities: ["text", "image"] },
+    ];
+    const models = opencodeModels(catalog);
+    // The entry survives where Pi and Gajae would have dropped it; only its bad value goes.
+    expect(Object.keys(models)).toContain("p/foreign");
+    for (const entry of Object.values(models)) {
+      for (const value of entry.capabilities?.input ?? []) {
+        expect(["text", "audio", "image", "video", "pdf"]).toContain(value);
+      }
+      for (const value of entry.capabilities?.output ?? []) {
+        expect(["text", "audio", "image", "video", "pdf"]).toContain(value);
+      }
     }
   });
 });

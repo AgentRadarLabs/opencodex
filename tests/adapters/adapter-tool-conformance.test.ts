@@ -34,6 +34,8 @@ const WIRE_MODELS: Record<AdapterWire, string> = {
   kiro: "claude-sonnet-4.5",
   "openai-responses": "deepseek-v4-flash",
   cursor: "cursor/auto",
+  zed: "auto",
+  codebuddy: "glm-5.3",
 };
 
 function providerFixture(adapterId: string, wire: AdapterWire): OcxProviderConfig {
@@ -46,17 +48,21 @@ function providerFixture(adapterId: string, wire: AdapterWire): OcxProviderConfi
     kiro: "https://runtime.us-east-1.kiro.dev",
     "openai-responses": "https://api.deepseek.com",
     cursor: "https://api2.cursor.sh",
+    zed: "https://cloud.zed.dev",
+    codebuddy: "https://www.codebuddy.ai",
   };
   // Semantic wrappers with provider-specific URL shapes must override the wire-family default here.
-  const baseUrl = adapterId === "mimo-free"
+  const baseUrl = adapterId === "workbuddy-ai" ? "https://www.workbuddy.ai/v2" : adapterId === "mimo-free"
     ? "https://api.xiaomimimo.com/api/free-ai/openai/chat"
     : adapterId === "azure" || adapterId === "azure-openai"
       ? "https://example.openai.azure.com/openai/v1"
-      : baseUrls[wire];
+      : adapterId === "dsh-account"
+        ? "https://api.deepseek.com/anthropic"
+        : baseUrls[wire];
   return {
     adapter: adapterId,
     baseUrl,
-    authMode: wire === "anthropic" || wire === "command-code" ? "oauth" : "key",
+    authMode: wire === "anthropic" || wire === "command-code" || wire === "zed" ? "oauth" : "key",
     apiKey: wire === "kiro" ? "ksk_test" : "test-key",
     defaultMaxOutputTokens: 64_000,
     googleMode: "ai-studio",
@@ -65,6 +71,7 @@ function providerFixture(adapterId: string, wire: AdapterWire): OcxProviderConfi
 }
 
 function prepareForWire(parsed: OcxParsedRequest, wire: AdapterWire): OcxParsedRequest {
+  parsed._workbuddyAuthContext = { uid: "fixture-user", domain: "international" };
   if (wire !== "kiro") return parsed;
   return { ...parsed, _kiroAuthContext: { apiRegion: "us-east-1" } };
 }
@@ -406,6 +413,13 @@ async function restoredStreamInput(adapterId: string, wire: AdapterWire): Promis
 describe("registry-derived routed tool conformance", () => {
   test("provider and model-wire configuration ids are registry members", () => {
     for (const provider of PROVIDER_REGISTRY) {
+      if (provider.credentialOnly) {
+        expect(getAdapterDefinition(provider.adapter), provider.id).toBeUndefined();
+        expect(provider.liveModels, provider.id).toBe(false);
+        expect(provider.models, provider.id).toBeUndefined();
+        expect(provider.defaultModel, provider.id).toBeUndefined();
+        continue;
+      }
       expect(getAdapterDefinition(provider.adapter), provider.id).toBeDefined();
       for (const value of Object.values(provider.modelWireDefaults ?? {})) {
         const adapterId = typeof value === "string" ? value : value.wire;
@@ -417,8 +431,20 @@ describe("registry-derived routed tool conformance", () => {
     }
   });
 
+  // Zed is not tool-less: it forwards client tools through the Anthropic, Google, Responses and
+  // Chat builders, which this suite covers under their own ids. It is skipped because its
+  // envelope needs a live account catalog, so read its entry as "not covered here".
+  const TOOL_LESS_ADAPTERS = new Set(["codebuddy", "qoder", "claude-cli", "zed"]);
+  // The Devin adapter is runTurn-only: it streams Connect-RPC from runTurn, so
+  // buildRequest returns a placeholder and tools never travel the wire path.
+  // Both Devin provider rows share it and differ only in where the credential
+  // came from.
+  const RUN_TURN_ONLY_WIRES = new Set(["devin"]);
+
   test("every registered adapter keeps the nested apply_patch helper in its final request", async () => {
     for (const [adapterId] of adapterDefinitions()) {
+      if (TOOL_LESS_ADAPTERS.has(adapterId)) continue;
+      if (RUN_TURN_ONLY_WIRES.has(effectiveAdapterContract(adapterId).wire)) continue;
       const contract = effectiveAdapterContract(adapterId);
       const body = await outbound(adapterId, codeModeParsed(contract.wire));
       const advertised = advertisedToolNames(contract.wire, body);
@@ -432,6 +458,8 @@ describe("registry-derived routed tool conformance", () => {
 
   test("tool_choice none disables every registered adapter's callable tool surface", async () => {
     for (const [adapterId] of adapterDefinitions()) {
+      if (TOOL_LESS_ADAPTERS.has(adapterId)) continue;
+      if (RUN_TURN_ONLY_WIRES.has(effectiveAdapterContract(adapterId).wire)) continue;
       const contract = effectiveAdapterContract(adapterId);
       const enabledBody = await outbound(adapterId, toolChoiceParsed(contract.wire));
       expect(advertisedToolNames(contract.wire, enabledBody).length, `${adapterId}:enabled`).toBeGreaterThan(0);
@@ -442,9 +470,11 @@ describe("registry-derived routed tool conformance", () => {
 
   test("every parsed streaming wire restores hostile freeform input exactly", async () => {
     for (const [adapterId] of adapterDefinitions()) {
+      if (TOOL_LESS_ADAPTERS.has(adapterId)) continue;
+      if (RUN_TURN_ONLY_WIRES.has(effectiveAdapterContract(adapterId).wire)) continue;
       const contract = effectiveAdapterContract(adapterId);
       const driver = TOOL_WIRE_DRIVERS[contract.wire];
-      if (!driver.streamingToolCall) {
+      if (!driver?.streamingToolCall) {
         // OpenAI Responses is a normal passthrough here and only parses routed compaction;
         // Cursor's proprietary runTurn stream has focused parser coverage elsewhere.
         expect(["openai-responses", "cursor"]).toContain(contract.wire);
@@ -456,6 +486,8 @@ describe("registry-derived routed tool conformance", () => {
 
   test("every buffered adapter preserves same-name tools from different namespaces", async () => {
     for (const [adapterId] of adapterDefinitions()) {
+      if (TOOL_LESS_ADAPTERS.has(adapterId)) continue;
+      if (RUN_TURN_ONLY_WIRES.has(effectiveAdapterContract(adapterId).wire)) continue;
       const contract = effectiveAdapterContract(adapterId);
       if (contract.wire === "openai-responses" || contract.wire === "cursor") {
         // Native Responses passthrough and Cursor's protobuf transport do not use the routed
@@ -470,6 +502,8 @@ describe("registry-derived routed tool conformance", () => {
 
   test("every routed adapter fails closed for an ambiguous bare selector", async () => {
     for (const [adapterId] of adapterDefinitions()) {
+      if (TOOL_LESS_ADAPTERS.has(adapterId)) continue;
+      if (RUN_TURN_ONLY_WIRES.has(effectiveAdapterContract(adapterId).wire)) continue;
       const contract = effectiveAdapterContract(adapterId);
       if (contract.wire === "openai-responses" || contract.wire === "cursor") continue;
       const parsed = namespacedCollisionParsed(contract.wire);
@@ -495,9 +529,11 @@ describe("registry-derived routed tool conformance", () => {
 
   test("every streaming adapter restores namespaced custom/function collisions distinctly", async () => {
     for (const [adapterId] of adapterDefinitions()) {
+      if (TOOL_LESS_ADAPTERS.has(adapterId)) continue;
+      if (RUN_TURN_ONLY_WIRES.has(effectiveAdapterContract(adapterId).wire)) continue;
       const contract = effectiveAdapterContract(adapterId);
       const driver = TOOL_WIRE_DRIVERS[contract.wire];
-      if (!driver.streamingToolCall || !driver.extractWireToolName) {
+      if (!driver?.streamingToolCall || !driver?.extractWireToolName) {
         expect(["openai-responses", "cursor"]).toContain(contract.wire);
         continue;
       }
@@ -537,7 +573,10 @@ describe("registry-derived routed tool conformance", () => {
 
   test("every registered adapter replays the exact apply_patch input on continuation", async () => {
     for (const [adapterId] of adapterDefinitions()) {
+      if (TOOL_LESS_ADAPTERS.has(adapterId)) continue;
+      if (RUN_TURN_ONLY_WIRES.has(effectiveAdapterContract(adapterId).wire)) continue;
       const contract = effectiveAdapterContract(adapterId);
+      // Devin is a runTurn-only adapter; continuation replay is not expressed on buildRequest.
       const body = await outbound(adapterId, continuationParsed(contract.wire));
       expect(continuationInput(contract.wire, body), adapterId).toBe(PATCH);
     }

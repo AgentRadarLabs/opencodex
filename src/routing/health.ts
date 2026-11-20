@@ -17,8 +17,8 @@
  */
 
 import type { OcxConfig } from "../types";
-import { physicalUsageAttempts, type PersistedUsageAttempt } from "../usage/log";
-import { openRequestHistoryIndexSync, requestHistoryDb } from "./history/indexer";
+import { physicalUsageAttempts } from "../usage/log";
+import { openRequestHistoryIndexSync, reportRequestHistoryCorruption, requestHistoryDb } from "./history/indexer";
 import { OPENAI_CODEX_PROVIDER_ID } from "../providers/openai-tiers";
 import {
   getCodexAccountCooldownUntil,
@@ -93,12 +93,12 @@ interface HealthSample {
   streamAborted?: boolean;
   durationMs: number;
   timestamp: number;
+  /** Ledger insertion order, then attempt order: ties between equal timestamps. */
   rowOrder?: number;
   attemptOrder?: number;
 }
 
 interface HealthRow extends HealthSample {
-  attemptCount?: number;
   rowJson?: string | null;
 }
 
@@ -107,6 +107,12 @@ interface HealthRow extends HealthSample {
  * Combo/failover requests store each upstream try in `entry.attempts` while
  * the top-level row records the final outcome; a provider/model that failed
  * as a non-final attempt must still contribute its own health samples.
+ *
+ * Only physical sends are evidence: an attempt answered locally or refused
+ * before it left the proxy says nothing about the target. The row's terminal
+ * facts belong to its last physical send. Returns `undefined` when the row
+ * itself is the sample (no attempts, a single attempt, or none named for this
+ * candidate) and `[]` when the row sent nothing upstream at all.
  */
 function attemptSamplesFor(
   row: Pick<HealthRow, "timestamp" | "rowOrder" | "rowJson">,
@@ -119,27 +125,27 @@ function attemptSamplesFor(
       attempts?: unknown;
       closeReason?: unknown;
       terminalStatus?: unknown;
+      failureCause?: unknown;
     };
-    if (!Array.isArray(parsed.attempts)) return undefined;
-    const persistedAttempts = parsed.attempts.filter(
-      attempt => attempt && typeof attempt === "object" && !Array.isArray(attempt),
-    ) as PersistedUsageAttempt[];
-    const attempts = physicalUsageAttempts(persistedAttempts);
-    const finalAttempt = attempts.at(-1);
+    // A local refusal logged before any attempt began never reached a target.
+    if (!Array.isArray(parsed.attempts)) return parsed.failureCause === "local-refusal" ? [] : undefined;
+    const attempts = parsed.attempts.filter(
+      (attempt): attempt is Record<string, unknown> =>
+        !!attempt && typeof attempt === "object" && !Array.isArray(attempt),
+    );
+    // Physical sends only, one per ordinal; a combo's single send still names its own target.
+    const sent = physicalUsageAttempts(attempts);
+    if (sent.length === 0) return [];
+    const finalSend = sent.at(-1);
     const samples: HealthSample[] = [];
-    for (const [attemptOrder, attempt] of attempts.entries()) {
-      const record = attempt as unknown as Record<string, unknown>;
+    for (const [attemptOrder, record] of sent.entries()) {
       if (record.provider !== provider || record.model !== model) continue;
       if (typeof record.status !== "number" || typeof record.durationMs !== "number") continue;
-      const isFinal = attempt === finalAttempt;
+      const isFinal = record === finalSend;
       samples.push({
         status: record.status,
-        closeReason: isFinal && typeof parsed.closeReason === "string"
-          ? parsed.closeReason
-          : null,
-        terminalStatus: isFinal && typeof parsed.terminalStatus === "string"
-          ? parsed.terminalStatus
-          : null,
+        closeReason: isFinal && typeof parsed.closeReason === "string" ? parsed.closeReason : null,
+        terminalStatus: isFinal && typeof parsed.terminalStatus === "string" ? parsed.terminalStatus : null,
         ...(record.streamAborted === true ? { streamAborted: true } : {}),
         durationMs: record.durationMs,
         timestamp: row.timestamp,
@@ -147,7 +153,7 @@ function attemptSamplesFor(
         attemptOrder,
       });
     }
-    return samples;
+    return samples.length > 0 ? samples : undefined;
   } catch {
     return undefined;
   }
@@ -253,9 +259,10 @@ function computeHistoricalHealthEvidence(
   input: Pick<HealthEvidenceInput, "provider" | "model" | "accountRef">,
   now: number,
 ): HistoricalHealthEvidence {
+  let handle: ReturnType<typeof requestHistoryDb> | undefined;
   try {
     openRequestHistoryIndexSync();
-    const handle = requestHistoryDb();
+    handle = requestHistoryDb();
     const where: string[] = ["provider = ?", "model = ?", "timestamp >= ?"];
     const values: Array<string | number> = [input.provider, input.model, now - HEALTH_WINDOW_MS];
     if (input.accountRef) {
@@ -264,8 +271,7 @@ function computeHistoricalHealthEvidence(
     }
     const rows = handle.query(
       `SELECT status, close_reason AS closeReason, terminal_status AS terminalStatus,
-              duration_ms AS durationMs, timestamp, rowid AS rowOrder,
-              attempt_count AS attemptCount, row_json AS rowJson
+              duration_ms AS durationMs, timestamp, rowid AS rowOrder, row_json AS rowJson
        FROM requests WHERE ${where.join(" AND ")}
        ORDER BY timestamp DESC, rowid DESC LIMIT ?`,
     ).all(...values, HEALTH_MAX_SAMPLES) as HealthRow[];
@@ -275,8 +281,7 @@ function computeHistoricalHealthEvidence(
     // rows that cannot contribute samples for this candidate.
     const escapeLike = (value: string): string => value.replace(/[\\%_]/g, match => `\\${match}`);
     const attemptRows = handle.query(
-      `SELECT timestamp, rowid AS rowOrder,
-              attempt_count AS attemptCount, row_json AS rowJson
+      `SELECT timestamp, rowid AS rowOrder, row_json AS rowJson
        FROM requests WHERE timestamp >= ? AND attempt_count > 0
          AND row_json LIKE ? ESCAPE '\\'
          AND row_json LIKE ? ESCAPE '\\'
@@ -289,9 +294,7 @@ function computeHistoricalHealthEvidence(
       input.provider,
       input.model,
       HEALTH_MAX_SAMPLES,
-    ) as Array<
-      Pick<HealthRow, "timestamp" | "rowOrder" | "rowJson">
-    >;
+    ) as Array<Pick<HealthRow, "timestamp" | "rowOrder" | "rowJson">>;
 
     const samples: HealthSample[] = [];
     for (const row of rows) {
@@ -300,11 +303,9 @@ function computeHistoricalHealthEvidence(
     for (const row of attemptRows) {
       samples.push(...(attemptSamplesFor(row, input.provider, input.model) ?? []));
     }
-    // Newest physical send first for the consecutive-failure walk. SQLite
-    // insertion order breaks equal-timestamp row ties; attempt order breaks
-    // ties between retries stored under one logical request.
-    samples.sort((a, b) =>
-      b.timestamp - a.timestamp
+    // Newest physical send first for the consecutive-failure walk: insertion order breaks
+    // equal-timestamp row ties, attempt order breaks ties between retries in one request.
+    samples.sort((a, b) => b.timestamp - a.timestamp
       || (b.rowOrder ?? 0) - (a.rowOrder ?? 0)
       || (b.attemptOrder ?? 0) - (a.attemptOrder ?? 0));
 
@@ -351,7 +352,8 @@ function computeHistoricalHealthEvidence(
       out.recencyWeight = decayWeight(samples[0]!.timestamp, now);
     }
     return out;
-  } catch {
+  } catch (error) {
+    if (handle) reportRequestHistoryCorruption(error, handle);
     /* index unreadable: evidence stays unknown */
     return {};
   }

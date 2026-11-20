@@ -161,6 +161,7 @@ describe("main account protection setting", () => {
     let reads = 0;
     let reloads = 0;
     const host = await mount((async (_input, init) => {
+      if (String(_input).endsWith("/api/models")) return response([]);
       if (init?.method === "PUT") return response(payload);
       reads++;
       return response(settings(reads === 1));
@@ -262,19 +263,23 @@ describe("main account protection setting", () => {
 
 function mainAccount(state: MainAccountHardLockStatus["state"]): CodexAccountEntry {
   return { id: "__main__", email: "fixture@example.test", isMain: true, paused: false,
-    priority: 0, hasCredential: true, plan: "plus",
+    priority: 0, autoSwitchThresholdOverride: null, hasCredential: true, plan: "plus",
     quota: { weeklyPercent: 100, shortPercent: 0, updatedAt: Date.now() },
     quotaAutoRefresh: { fiveHourAvailable: false, weeklyAvailable: false, fiveHourEnabled: false, weeklyEnabled: false },
     mainAccountHardLock: { enabled: state !== "off", state } };
 }
-function MainCard({ state }: { state: MainAccountHardLockStatus["state"] }) {
-  return <CodexAccountPoolMainCard t={useT()} main={mainAccount(state)} isMainActive={false}
+const externalUsage = { window: "short", fromPercent: 40, toPercent: 55, observedAt: Date.now() } as const;
+function MainCard({ state, warned = false }: { state: MainAccountHardLockStatus["state"]; warned?: boolean }) {
+  const main = mainAccount(state);
+  if (warned) main.mainAccountHardLock = { ...main.mainAccountHardLock!, externalUsage };
+  return <CodexAccountPoolMainCard t={useT()} main={main} isMainActive={false}
     accountModeState="pool" threshold={80} switchActionLabel="Use main" onSwitch={() => {}}
     onTogglePause={() => {}} pauseUpdatingId={null} pauseBusy={false} onPriorityChange={() => {}}
-    priorityUpdatingId={null} switchingId={null} onOpenReset={() => {}} />;
+    priorityUpdatingId={null} onAutoSwitchThresholdChange={async () => true}
+    autoSwitchDisabled={false} switchingId={null} onUnpin={() => {}} onOpenReset={() => {}} />;
 }
 test.each([
-  ["blocked", "Blocked by 99% protection", false],
+  ["blocked", "Blocked by main-account protection (5h 90%, long 98%)", false],
   ["unknown", "Protection on · usage unknown", true],
   ["ready", "Protection on · monitoring", true],
 ] as const)("main card uses server %s state, not rounded weekly usage", async (state, label, canSwitch) => {
@@ -286,6 +291,17 @@ test.each([
   expect(testWindow.location.hash).toBe("#codex-set");
 });
 
+test.each([true, false])("outside-usage warning follows the server report (present: %p)", async present => {
+  const warning = "Possible usage outside opencodex";
+  const setting = await mount((async () => response({ codexMainAccountHardLock: true, mainAccountHardLock: {
+    enabled: true, state: "ready", thresholds: { short: 90, long: 98 }, ...(present ? { externalUsage } : {}) } })) as typeof fetch);
+  expect(setting.textContent?.includes(warning)).toBe(present);
+  await act(async () => { root?.unmount(); });
+  root = null;
+  const card = await mount((async () => response({})) as typeof fetch, <MainCard state="ready" warned={present} />);
+  expect(card.textContent?.includes(warning)).toBe(present);
+});
+
 test("same-page manage opens Advanced; save refreshes the one injected account controller", async () => {
   let enabled = true;
   let accountReads = 0;
@@ -294,7 +310,7 @@ test("same-page manage opens Advanced; save refreshes the one injected account c
     const url = new URL(String(input));
     if (url.pathname === "/api/settings") {
       if (init?.method === "PUT") enabled = JSON.parse(String(init.body)).codexMainAccountHardLock;
-      return response({ ok: true, ...settings(enabled, enabled ? "blocked" : "off"), showCodexSparkQuota: false, codexAccountPickerEnabled: false });
+      return response({ ok: true, ...settings(enabled, enabled ? "blocked" : "off"), codexAccountPickerEnabled: false });
     }
     if (url.pathname === "/api/codex-auth/accounts") {
       accountReads++;
@@ -335,7 +351,7 @@ test("late proxy A PUT cannot reload A or replace proxy B's parent-owned account
         expect(JSON.parse(String(init.body))).toEqual({ codexMainAccountHardLock: false });
         return pendingPut.promise;
       }
-      return response({ ...settings(enabled, state), showCodexSparkQuota: false, codexAccountPickerEnabled: false });
+      return response({ ...settings(enabled, state), codexAccountPickerEnabled: false });
     }
     if (url.pathname === "/api/codex-auth/accounts") return response({
       accounts: [{ ...mainAccount(state), email: isA ? "proxy-a@example.test" : "proxy-b@example.test" }],
@@ -374,7 +390,7 @@ test("collapsing Advanced within the same proxy still refreshes the owner after 
     const url = new URL(String(input));
     if (url.pathname === "/api/settings") {
       if (init?.method === "PUT") return pendingPut.promise;
-      return response({ ...settings(enabled, enabled ? "blocked" : "off"), showCodexSparkQuota: false, codexAccountPickerEnabled: false });
+      return response({ ...settings(enabled, enabled ? "blocked" : "off"), codexAccountPickerEnabled: false });
     }
     if (url.pathname === "/api/codex-auth/accounts") {
       accountReads++;
@@ -395,4 +411,156 @@ test("collapsing Advanced within the same proxy still refreshes the owner after 
   await act(async () => { pendingPut.resolve(response({ ok: true, ...settings(false) })); await flush(); });
   expect(accountReads).toBe(2);
   expect(host.querySelector(".codex-main-hard-lock-status")).toBeNull();
+});
+
+test.each([false, true])("retired Spark setting (legacy response: %s) cannot restore a control; account actions remain usable", async legacy => {
+  const refreshed = deferred<Response>();
+  const writes: { path: string; body: unknown }[] = [];
+  const host = await mount((async (input, init) => {
+    const url = new URL(String(input));
+    if (init?.method && init.method !== "GET") {
+      writes.push({ path: url.pathname, body: init.body ? JSON.parse(String(init.body)) : null });
+    }
+    if (url.pathname === "/api/settings") return response({
+      ...settings(false), codexAccountPickerEnabled: false, codexQuotaAutoRefresh: {},
+      ...(legacy ? { showCodexSparkQuota: true } : {}),
+    });
+    if (url.pathname === "/api/codex-auth/accounts/refresh") return refreshed.promise;
+    if (url.pathname === "/api/codex-auth/accounts/pause-exhausted") {
+      return response({ ok: true, pausedAccountIds: [], pausedCount: 0 });
+    }
+    if (url.pathname === "/api/codex-auth/accounts") return response({ accounts: [mainAccount("off")] });
+    if (url.pathname === "/api/codex-auth/active") return response({ activeCodexAccountId: "__main__", autoSwitchThreshold: 80, accountPoolStrategy: "quota", accountPoolStickyLimit: 1 });
+    if (url.pathname === "/api/config") return response({ providers: {} });
+    return response({});
+  }) as typeof fetch, <CodexSetMultiauth apiBase={`http://spark-retirement-${legacy}`} />);
+
+  expect(host.querySelector('[aria-label="Codex Spark quota"]')).toBeNull();
+  expect(host.querySelector(".codex-auth-spark-toggle")).toBeNull();
+  expect(host.textContent).not.toContain("Spark");
+  expect(host.querySelector("#codex-account-priority-__main__")).not.toBeNull();
+  expect(button(host, '[aria-label="Pause"]').disabled).toBe(false);
+  const actions = host.querySelectorAll<HTMLButtonElement>(".codex-auth-actions-row button");
+  expect(actions).toHaveLength(2);
+  expect(actions[0]!.textContent).toContain("Pause exhausted");
+  expect(actions[1]!.textContent).toContain("Refresh quotas");
+  await click(actions[1]!);
+  expect(actions[0]!.disabled).toBe(true);
+  expect(actions[1]!.disabled).toBe(true);
+  await act(async () => { refreshed.resolve(response({ accounts: [mainAccount("off")] })); await flush(); });
+  expect(actions[0]!.disabled).toBe(false);
+  expect(actions[1]!.disabled).toBe(false);
+  expect(host.querySelector(".codex-auth-page-head__feedback.is-ok")).not.toBeNull();
+  await click(actions[0]!);
+  expect(writes).toEqual([
+    { path: "/api/codex-auth/accounts/refresh", body: null },
+    { path: "/api/codex-auth/accounts/pause-exhausted", body: null },
+  ]);
+  await click(button(host, ".codex-auth-advanced__toggle"));
+  expect(toggle(host).disabled).toBe(false);
+  expect(host.textContent).not.toContain("Spark");
+});
+
+describe("main account hard-lock fallback setting", () => {
+  const settingsWithFallback = (fallback: unknown, state: MainAccountHardLockStatus["state"] = "ready") => ({
+    ...settings(true, state),
+    codexMainAccountHardLockFallback: fallback,
+  });
+  const group = (host: ParentNode) => host.querySelector(".codex-main-hard-lock-fallback")!;
+  const fallbackSwitch = (host: ParentNode) =>
+    group(host).querySelector<HTMLButtonElement>("button.switch")!;
+  const selectTriggers = (host: ParentNode) =>
+    Array.from(group(host).querySelectorAll<HTMLButtonElement>("button[role=\"combobox\"]"));
+  const optionButtons = () =>
+    Array.from(testWindow.document.querySelectorAll<HTMLButtonElement>('[role="option"]'));
+  async function chooseOption(host: ParentNode, index: number, label: string) {
+    await act(async () => { selectTriggers(host)[index]!.click(); await flush(); });
+    const option = optionButtons().find(button => button.textContent === label)!;
+    expect(option).toBeDefined();
+    await act(async () => { option.click(); await flush(); });
+  }
+
+  test("an absent section renders the switch off and the model picker ready", async () => {
+    const host = await mount((async (_input, init) => {
+      if (String(_input).endsWith("/api/models")) return response([]);
+      return response(settings(true));
+    }) as typeof fetch);
+    expect(fallbackSwitch(host).getAttribute("aria-pressed")).toBe("false");
+    // Nothing to route to yet, so the switch waits; the picker is how a fresh setup starts.
+    expect(fallbackSwitch(host).disabled).toBe(true);
+    expect(selectTriggers(host)[0]!.hasAttribute("disabled")).toBe(false);
+    expect(selectTriggers(host)[1]!.hasAttribute("disabled")).toBe(true);
+  });
+
+  test("a saved section renders the switch on with its model and effort", async () => {
+    const host = await mount((async () =>
+      response(settingsWithFallback({ model: "combo/x", reasoningEffort: "low" }))) as typeof fetch);
+    expect(fallbackSwitch(host).getAttribute("aria-pressed")).toBe("true");
+    expect(fallbackSwitch(host).disabled).toBe(false);
+    const triggers = selectTriggers(host);
+    expect(triggers[0]!.textContent).toContain("combo/x");
+    expect(triggers[1]!.textContent).toContain("Low");
+  });
+
+  test("the switch pauses without forgetting the model, then resumes", async () => {
+    const puts: unknown[] = [];
+    const host = await mount((async (_input, init) => {
+      if (init?.method === "PUT") {
+        const body = JSON.parse(String(init!.body)).codexMainAccountHardLockFallback;
+        puts.push(body);
+        return response({ ok: true, ...settingsWithFallback(body) });
+      }
+      return response(settingsWithFallback({ model: "combo/x", reasoningEffort: "low" }));
+    }) as typeof fetch);
+    await click(fallbackSwitch(host));
+    expect(puts).toEqual([{ model: "combo/x", reasoningEffort: "low", enabled: false }]);
+    expect(fallbackSwitch(host).getAttribute("aria-pressed")).toBe("false");
+    // Paused keeps the destination visible in its select, exactly like the shadow row;
+    // only the effort select waits for the reroute to be on again.
+    expect(selectTriggers(host)[0]!.textContent).toContain("combo/x");
+    expect(selectTriggers(host)[1]!.hasAttribute("disabled")).toBe(true);
+    await click(fallbackSwitch(host));
+    expect(puts[1]).toEqual({ model: "combo/x", reasoningEffort: "low", enabled: true });
+    expect(fallbackSwitch(host).getAttribute("aria-pressed")).toBe("true");
+    // Picking a new model while paused re-enables the reroute immediately.
+    await click(fallbackSwitch(host));
+    expect(fallbackSwitch(host).getAttribute("aria-pressed")).toBe("false");
+  });
+
+  test("picking a model PUTs it immediately and enables the effort select", async () => {
+    const puts: unknown[] = [];
+    const host = await mount((async (_input, init) => {
+      if (init?.method === "PUT") {
+        const body = JSON.parse(String(init!.body)).codexMainAccountHardLockFallback;
+        puts.push(body);
+        return response({ ok: true, ...settingsWithFallback(body) });
+      }
+      if (String(_input).endsWith("/api/models")) {
+        return response([
+          { id: "gpt-5.3", provider: "openai", namespaced: "gpt-5.3", native: true },
+          { id: "disabled", provider: "deepseek", namespaced: "deepseek/disabled", disabled: true },
+          { id: "chat", provider: "deepseek", namespaced: "deepseek/deepseek-chat" },
+        ]);
+      }
+      return response(settingsWithFallback({ model: "combo/x", enabled: false }));
+    }) as typeof fetch);
+    await act(async () => { await flush(); await flush(); });
+    await chooseOption(host, 0, "deepseek/deepseek-chat");
+    expect(puts).toEqual([{ model: "deepseek/deepseek-chat", enabled: true }]);
+    expect(fallbackSwitch(host).getAttribute("aria-pressed")).toBe("true");
+    expect(selectTriggers(host)[1]!.hasAttribute("disabled")).toBe(false);
+  });
+
+  test("a failed save shows the alert and keeps the switch state the server last confirmed", async () => {
+    let puts = 0;
+    const host = await mount((async (_input, init) => {
+      if (init?.method === "PUT") { puts++; return response({}, 503); }
+      return response(settingsWithFallback({ model: "combo/x" }));
+    }) as typeof fetch);
+    await click(fallbackSwitch(host));
+    expect(group(host).textContent).toContain("Could not confirm the fallback save");
+    expect(puts).toBe(1);
+    // The draft-free row shows the last acknowledged state until the retry lands.
+    expect(fallbackSwitch(host).getAttribute("aria-pressed")).toBe("true");
+  });
 });

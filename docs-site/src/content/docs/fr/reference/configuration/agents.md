@@ -9,9 +9,9 @@ Les paramètres des agents déterminent la surface de collaboration Codex annonc
 
 | Champ | Type | Valeur par défaut | Signification |
 | --- | --- | --- | --- |
-| `multiAgentMode?` | `"v1" \| "default" \| "v2"` | `"default"` | `v1` marque tous les modèles du catalogue comme compatibles v1 ; `v2` les marque tous comme compatibles v2. `default` rétablit les choix imposés en amont (Sol/Terra en v2, Luna en v1) et suit sinon l’indicateur natif `multi_agent_v2`. S’applique aux nouvelles sessions. |
+| `multiAgentMode?` | `"v1" \| "default" \| "v2" \| "v2-plaintext"` | `"default"` | `v1` marque tous les modèles du catalogue comme compatibles v1 ; `v2` les marque tous comme compatibles v2. `default` rétablit les choix imposés en amont (Sol/Terra en v2, Luna en v1) et suit sinon l’indicateur natif `multi_agent_v2`. `v2-plaintext` active aussi la transmission expérimentale des tâches en clair et désactive la priorité globale. Les choix du catalogue s’appliquent aux nouvelles sessions ; la compilation activée affecte aussi les requêtes ultérieures admissibles des sessions V2 existantes. |
 | `keepNativeChatGptOnV1?` | `boolean` | `false` | Lorsque `multiAgentMode` vaut `"v2"`, marque les lignes natives ChatGPT (Sol/Terra et les autres modèles du backend ChatGPT) comme v1. Les parents routés restent en v2. Utilisez cette option pour qu'un parent ChatGPT puisse encore lancer Grok ou Claude — les tâches enfants v2 natives sont chiffrées par le service en amont ([#92](https://github.com/lidge-jun/opencodex/issues/92)). Ignoré en `v1` et `default`. |
-| `subagentModels?` | `string[]` | `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5` | Jusqu’à cinq identifiants de modèles natifs non qualifiés, qualifiés par un compte sous la forme `<selector>/<native-openai-model>`, ou routés sous la forme `provider/model`, affichés en tête du sélecteur de sous-agents. Le tableau de bord ne propose que les identifiants natifs non qualifiés et les identifiants routés ; lors de l’enregistrement, il omet les choix exacts qualifiés par un compte. Pour les définir, utilisez `ocx agent subagents set` ou modifiez la configuration. Après la [migration unique vers Astra](/reference/configuration/agents/#astra-roster-upgrade), une liste explicitement vide est conservée. |
+| `subagentModels?` | `string[]` | `gpt-6.2-astra`, `gpt-6.2-sol`, `gpt-6-luna` | Jusqu’à cinq identifiants natifs non qualifiés, qualifiés par un compte `<selector>/<native-openai-model>` ou routés `provider/model`, affichés en tête du sélecteur de sous-agents. Le tableau de bord propose les identifiants natifs non qualifiés et routés pour les nouveaux choix. Lors de l’enregistrement, il conserve les identifiants exacts de compte déjà configurés, même absents du catalogue actuel. Pour ajouter un nouvel identifiant exact de compte, utilisez `ocx agent subagents set` ou modifiez la configuration. Après la [migration unique vers Astra](/reference/configuration/agents/#astra-roster-upgrade), une liste explicitement vide est conservée. |
 | `injectionModel?` | `string` | — | Modèle de sous-agent natif ou routé privilégié dans les consignes de délégation v2 produites par le proxy. |
 | `injectionEffort?` | `string` | — | Niveau d’effort privilégié (de `low` à `ultra`), pertinent uniquement avec `injectionModel`. |
 | `injectionPrompt?` | `string` | — | Remplace le corps des consignes v2 intégrées. Accepte `{{model}}`, `{{effort}}`, `{{roster}}` et `{{fallback}}`. La présence d’un `injectionModel` suffit pour produire le prompt personnalisé. |
@@ -22,17 +22,24 @@ Les paramètres des agents déterminent la surface de collaboration Codex annonc
 | `subagentModelFallbackPollMs?` | `number` | `60000` | Durée de mise en cache de la sonde de disponibilité. Les valeurs inférieures à 1000 ms sont remplacées par la valeur par défaut. |
 | `effortCap?` | `string` | — | Plafond strict appliqué aux tours principaux v2 admissibles et aux tours enfants créés qui portent les marqueurs requis. Accepte les valeurs de `low` à `ultra`. |
 | `subagentEffortCap?` | `string` | — | Plafond supplémentaire réservé aux tours enfants créés. Lorsque les deux plafonds s’appliquent, le plus bas l’emporte. |
+| `plaintextV2AgentMessages?` | `boolean` | — (non défini) | Option expérimentale : la valeur explicite `true` ou le mode `multiAgentMode: "v2-plaintext"` active la transmission en clair des arguments de message `spawn_agent`, `send_message` et `followup_task` admissibles. |
 | `agentTaskRecovery?` | `object` | — | Mécanisme expérimental, soumis à activation explicite, pour récupérer les tâches v2 chiffrées par le service en amont lorsqu’elles sont envoyées à des fournisseurs routés. Désactivé sauf si `enabled: true` ; voir [Récupération des tâches v2 chiffrées](#récupération-des-tâches-v2-chiffrées). |
 
-Gérez la surface depuis le tableau de bord ou avec `ocx v2 status|on|off|mode <v1|default|v2>|keep-native-v1 <on|off>|threads <n>|mode-hint <text|--clear>`. Les changements de mode s’appliquent aux nouvelles sessions. `maxConcurrentThreadsPerSession` est un champ de `PUT /api/v2`, et non une clé de `config.json`. Après l’activation de v2, `ocx v2 threads <n>` écrit `max_concurrent_threads_per_session` sous `[features.multi_agent_v2]` dans le fichier `$CODEX_HOME/config.toml` de Codex.
+Gérez la surface depuis le tableau de bord ou avec `ocx v2 status|on|off|mode <v1|default|v2|v2-plaintext>|keep-native-v1 <on|off>|threads <n>|mode-hint <text|--clear>`. L’entrée en `v2-plaintext` exige `--acknowledge-plaintext-agent-messages`. Les changements de choix du catalogue s’appliquent aux nouvelles sessions ; le compilateur en clair suit le réglage actuel pour les requêtes admissibles, y compris les requêtes ultérieures des sessions V2 existantes. `maxConcurrentThreadsPerSession` est un champ de `PUT /api/v2`, et non une clé de `config.json`. Après l’activation de v2, `ocx v2 threads <n>` écrit `max_concurrent_threads_per_session` sous `[features.multi_agent_v2]` dans le fichier `$CODEX_HOME/config.toml` de Codex.
 
 Le **mode Ultra** — accessible depuis l’interrupteur Sous-agents du tableau de bord, le champ `multiAgentModeHintText` de `PUT /api/v2` et `ocx v2 mode-hint` — écrit `features.multi_agent_v2.multi_agent_mode_hint_text` dans le fichier `$CODEX_HOME/config.toml` de Codex. La commande CLI `ocx v2 mode-hint` conserve cette clé même lorsque `multi_agent_v2` est désactivé ; elle n’active ni ne désactive la fonctionnalité. Cette indication remplace la politique multi-agents que codex-rs déduit du niveau d’effort : tous les modèles et tous les niveaux d’effort reçoivent alors le prompt de délégation Proactive. Elle ne modifie **pas** le niveau d’effort de raisonnement.
 
-La valeur `null` supprime la clé et rétablit la politique fondée sur l’effort (proactive avec ultra, explicite dans les autres cas). Les valeurs vides ou composées uniquement d’espaces sont rejetées, car une substitution vide mais présente masquerait même le message Proactive associé au niveau ultra. Pour que l’interrupteur du mode Ultra soit **activé** dans la page Sous-agents du tableau de bord, la fonctionnalité native doit être active et la surface v2 doit être explicitement sélectionnée (`multiAgentMode: "v2"`, équivalent à `ocx v2 mode v2`). La seule commande `ocx v2 on` ne satisfait pas cette condition du tableau de bord.
+La valeur `null` supprime la clé et rétablit la politique fondée sur l’effort (proactive avec ultra, explicite dans les autres cas). Les valeurs vides ou composées uniquement d’espaces sont rejetées, car une substitution vide mais présente masquerait même le message Proactive associé au niveau ultra. Pour activer l’interrupteur du mode Ultra, sélectionnez explicitement `multiAgentMode: "v2"` avec la fonctionnalité native active, ou `multiAgentMode: "v2-plaintext"`, qui utilise les choix du catalogue sans priorité globale. La seule commande `ocx v2 on` ne satisfait pas cette condition du tableau de bord.
+
+Sur la route Responses ChatGPT canonique (`adapter: "openai-responses"`, `authMode: "forward"`, `https://chatgpt.com/backend-api/codex`), la valeur explicite `plaintextV2AgentMessages: true` ou le mode `v2-plaintext` active indépendamment le compilateur des messages de tâche admissibles. Les autres destinations et les clients non Responses sont exclus. Le mode `v2-plaintext` sélectionne V2 pour les nouvelles conversations sans modifier la préférence indépendante `plaintextV2AgentMessages`. Le compilateur suit le réglage actuel pour les requêtes admissibles ultérieures, y compris dans les sessions V2 existantes. Il ne déchiffre pas les tâches existantes et ne réécrit pas l’historique. Sa désactivation ne supprime pas les copies déjà conservées dans l’historique, les requêtes du fournisseur ou l’état local de réponse et de débogage.
+
+Une entrée dans ce mode par `PUT /api/v2` exige `plaintextAgentMessagesAcknowledged: true`. Utilisez sinon la confirmation du tableau de bord ou `ocx v2 mode v2-plaintext --live --acknowledge-plaintext-agent-messages`.
 
 L’API de gestion expose `GET`/`PUT /api/v2`, `/api/injection-model`, `/api/effort-caps`, `/api/subagent-models` et `/api/subagent-model-fallback`. Les mises à jour du modèle d’injection sont partielles ; le prompt personnalisé correspond au champ `prompt` de cette API.
 
 La page Codex Auth permet également de modifier l’indicateur natif `default_mode_request_user_input` de Codex (`GET`/`PUT /api/codex-auth/features/default-mode-request-user-input`). Son activation ajoute `[features] default_mode_request_user_input = true` au fichier `$CODEX_HOME/config.toml` de Codex au moyen de la commande officielle `codex features enable|disable`. Cette modification préserve le format du fichier et est retirée lorsque l’option est désactivée. Codex peut ainsi suspendre une session en mode Default et vous poser des questions avec l’outil `request_user_input`. Cet indicateur est encore en développement en amont et ne s’applique qu’aux nouvelles sessions ; l’activation échoue explicitement si la version installée de Codex ne le reconnaît pas encore.
+
+Pendant qu’une mise à jour de Codex CLI détient l’installation, cette commande renvoie HTTP 503 avec `codex_cli_selection_busy` et `retryable: true` avant toute exécution. Réessayez après la mise à jour ; les erreurs d’écriture de la configuration restent des réponses 502.
 
 ## Liste des modèles et consignes
 
@@ -58,18 +65,18 @@ Pour un tour enfant créé, l’ordre de repli est le suivant :
 
 Les chaînes de repli propres à un rôle doivent résider dans la configuration d’opencodex. L’ajout de `model_fallback` dans `$CODEX_HOME/agents/*.toml` amène Codex 0.146+ à rejeter le fichier de rôle entier à cause de ce champ inconnu, puis à ignorer le rôle (#1190). Une ancienne ligne `model_fallback` dans le fichier TOML reste lue par souci de rétrocompatibilité, mais `ocx doctor` la signale.
 
-opencodex ignore les candidats désactivés, non routables, en mauvais état, en période de temporisation ou ayant atteint le seuil de quota. L’instantané de disponibilité est mis en cache pendant `subagentModelFallbackPollMs`. Les tâches enfants chiffrées limitent la chaîne aux cibles ChatGPT natives canoniques et aux routes Responses directes avec authentification par clé explicitement approuvées via `allowEncryptedV2AgentTasks: true` ; si aucune ne peut consommer la charge chiffrée, la requête échoue au lieu d’envoyer un texte chiffré illisible à une autre destination. Les combos restent limités aux cibles natives canoniques.
+opencodex ignore les candidats désactivés, non routables, en mauvais état, en période de temporisation ou ayant atteint le seuil de quota. L’instantané de disponibilité est mis en cache pendant `subagentModelFallbackPollMs`. Les tâches enfants chiffrées limitent la chaîne aux cibles ChatGPT natives canoniques et aux routes Responses directes avec authentification par clé explicitement approuvées via `allowEncryptedV2AgentTasks: true` ; si aucune ne peut consommer la charge chiffrée et que la récupération facultative ne permet pas un envoi routé, la requête échoue sans transmettre de texte chiffré illisible. Un combo essaie d’abord une cible native canonique disponible ; si aucune n’est sélectionnable ou si les tentatives natives sont épuisées, et que `agentTaskRecovery` est activé, un `NEW_TASK` chiffré est récupéré une fois avant l’envoi routé du combo. La récupération par combo ne s’applique qu’aux tours d’enfant créés par spawn ; la voie routée directe couvre aussi un changement de modèle en cours de conversation.
 
 ```json
 {
   "multiAgentMode": "v2",
-  "subagentModels": ["gpt-5.5", "anthropic/claude-sonnet-5"],
-  "injectionModel": "gpt-5.5",
+  "subagentModels": ["gpt-6.1-sol", "anthropic/claude-sonnet-5"],
+  "injectionModel": "gpt-6.1-sol",
   "injectionEffort": "high",
   "syncCodexSubagentDefaults": true,
-  "subagentModelFallback": ["gpt-5.4-mini"],
+  "subagentModelFallback": ["gpt-6-luna"],
   "subagentModelFallbackByModel": {
-    "gpt-5.5": ["gpt-5.4-mini"]
+    "gpt-6.1-sol": ["gpt-6-luna"]
   },
   "subagentModelFallbackPollMs": 60000,
   "subagentEffortCap": "high"
@@ -78,7 +85,7 @@ opencodex ignore les candidats désactivés, non routables, en mauvais état, en
 
 ## Récupération des tâches v2 chiffrées
 
-`agentTaskRecovery` est un mécanisme expérimental de compatibilité destiné au cas où un parent ChatGPT natif crée un enfant v2 routé. Il est désactivé par défaut. Lorsqu’il est explicitement activé et que la tâche finale destinée à l’enfant routé contient une charge Fernet autrement illisible, opencodex envoie une requête Responses brute en mode relais vers le point de terminaison fixe `https://chatgpt.com/backend-api/codex/responses`, avec une authentification en mode transmission. ChatGPT renvoie l’instruction en clair au moyen d’un appel de fonction imposé ; avant d’envoyer la requête au fournisseur routé, opencodex convertit uniquement cet élément de tâche en message utilisateur standard.
+`agentTaskRecovery` est un mécanisme expérimental de compatibilité destiné aux tâches v2 chiffrées par le service en amont qui parviennent à un fournisseur routé. Deux formes de requête sont concernées : un parent ChatGPT natif qui crée un enfant v2 routé, et une conversation en cours basculée d’un modèle ChatGPT natif vers un modèle routé, dont l’historique rejoue à chaque tour suivant un message d’agent chiffré émis par le service en amont ([#4089](https://github.com/lidge-jun/opencodex/issues/4089)). Il est désactivé par défaut. Lorsqu’il est explicitement activé et que la tâche routée finale contient une charge Fernet autrement illisible, opencodex envoie une requête Responses brute en mode relais vers le point de terminaison fixe `https://chatgpt.com/backend-api/codex/responses`, avec une authentification en mode transmission. ChatGPT renvoie l’instruction en clair au moyen d’un appel de fonction imposé ; avant d’envoyer la requête au fournisseur routé, opencodex convertit uniquement cet élément de tâche en message utilisateur standard.
 
 Il ne s’agit pas d’un déchiffrement local et ce mécanisme ne corrige pas le protocole Codex. Il dépend d’un comportement non documenté du service ChatGPT et peut cesser de fonctionner après une modification de ce service. L’instruction récupérée est une sortie de modèle, et non un texte en clair vérifié cryptographiquement : sa fidélité octet par octet n’est donc pas garantie. En cas d’absence dans le cache propre à cette portée, une requête ChatGPT authentifiée supplémentaire peut être envoyée, consommer le quota du compte et ajouter de la latence avant la requête routée. Les requêtes concurrentes visant la même tâche et la même portée partagent une seule requête de récupération. Un avertissement est affiché au démarrage chaque fois que la fonctionnalité est activée.
 
@@ -111,7 +118,7 @@ Ce mécanisme ne protège pas contre un autre processus exécuté sous le même 
 
 N’activez cette option que si la requête authentifiée supplémentaire, la consommation de quota, la présence de texte en clair dans le processus et la dépendance à un service privé sont acceptables. Dans le cas contraire, privilégiez un enfant ChatGPT natif ou une délégation hétérogène v1.
 
-Ce mécanisme de récupération s’applique aux enfants routés directement. Au maximum 32 requêtes de récupération peuvent être actives simultanément ; toute absence supplémentaire dans le cache échoue de manière sûre. Pour les tâches chiffrées, le routage par combinaison conserve son filtre existant limité aux cibles natives et n’utilise pas la récupération.
+Ce mécanisme de récupération s’applique aux enfants routés directement et aux `NEW_TASK` chiffrés d’un combo. Au maximum 32 requêtes de récupération peuvent être actives simultanément ; toute absence supplémentaire dans le cache échoue de manière sûre. Un combo disposant d’une cible native canonique disponible continue d’envoyer directement le texte chiffré ; la récupération peut s’exécuter si aucune cible native n’est sélectionnable ou si les tentatives natives sont épuisées. Si la récupération est désactivée ou échoue, ou si aucune cible routée n’est disponible, le texte chiffré illisible n’est pas transmis à un fournisseur routé.
 
 ## Plafonds d’effort
 
@@ -119,4 +126,13 @@ Les plafonds s’appliquent uniquement à la fonctionnalité de collaboration v2
 
 Un plafond ne peut que réduire l’effort. Le niveau retenu est le niveau annoncé le plus élevé qui ne dépasse pas le plafond. Si le modèle ne propose aucun contrôle d’effort ou si aucun niveau pris en charge ne convient, opencodex supprime le paramètre d’effort et laisse le fournisseur appliquer sa valeur par défaut. `max` et `ultra` sont acceptés, tandis que le tableau de bord propose les niveaux de `low` à `xhigh`.
 
+Les plafonds configurés s’appliquent aussi aux tours Chat Completions natifs admissibles sans effort épinglé pour le modèle. La conversion vers la valeur du fournisseur intervient lorsqu’un épinglage est appliqué ou qu’un plafond modifie la valeur ; sinon, la valeur de l’appelant natif conserve sa forme d’origine.
+
 Pour une présentation destinée aux débutants des comportements v1, default et v2, consultez [Surfaces de sous-agents](/fr/guides/sub-agent-surface/).
+
+## Mise à jour de la CLI pendant la synchronisation v1
+
+Si la synchronisation avec `multiAgentMode: "v1"` doit désactiver la substitution v2 globale
+de Codex, une mise à jour de la CLI Codex en cours peut refuser temporairement cette
+synchronisation. Réessayez après la mise à jour. Un répertoire Codex utilisant déjà v1
+peut toujours être synchronisé, car aucune commande native de fonctionnalité n'est nécessaire.

@@ -1,8 +1,18 @@
-import { afterEach, describe, expect, jest, test } from "bun:test";
+import {
+  PLAINTEXT_V2_AGENT_MESSAGE_RESTORE_OVERFLOW_MESSAGE,
+  PLAINTEXT_V2_COLLABORATION_NAMESPACE,
+} from "../../src/responses/plaintext-v2-agent-messages";
+import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 import { providerFetch } from "../../src/server/responses/fetch-helpers";
 import { handleResponses } from "../../src/server/responses";
 import { isEagerRelaySseResponse } from "../../src/server/relay";
 import { isWin32EagerRewrite } from "../../src/lib/bun-stream-caps";
+import { fetchWithTransientRetry, isNonReplayableResponse } from "../../src/lib/upstream-retry";
+import { codexWsExchange } from "../../src/server/responses/codex-ws-exchange";
+import { shouldRetryCodexPoolAccountModel400 } from "../../src/server/responses/core-codex-account";
+import { CodexWsSession } from "../../src/server/responses/codex-ws-session";
+import { prepareCodexWsRequest } from "../../src/server/responses/codex-ws-request";
+import { readCodexWsStage } from "../../src/server/responses/codex-ws-wire";
 import { CodexWsMetadata, CODEX_WS_METADATA_MAX_BYTES, CODEX_WS_METADATA_MAX_VALUE_BYTES } from "../../src/server/responses/codex-ws-metadata";
 import {
   bunSupportsBoundedCodexWsRelay,
@@ -11,17 +21,24 @@ import {
   codexWsUpstreamFetch as rawCodexWsUpstreamFetch,
   currentBunRuntimeIdentity,
   isCodexWsUpstreamResponse,
+  isCodexWsQuotaObservedResponse,
   MAX_CODEX_WS_CREATE_FRAME_BYTES,
   MAX_CODEX_WS_FRAME_BYTES,
   MAX_CODEX_WS_QUEUE_BYTES,
   CODEX_WS_RESPONSE_PRELUDE_TIMEOUT_MS,
+  CODEX_WS_LIVENESS_PING_INTERVAL_MS,
   shouldUseCodexWsUpstream as rawShouldUseCodexWsUpstream,
 } from "../../src/server/responses/ws-upstream";
-import type { OcxProviderConfig } from "../../src/types";
-import type { OcxConfig } from "../../src/types";
+import type { OcxConfig, OcxProviderConfig } from "../../src/types";
+import { resolveTurnStateHandle, TURN_STATE_BINDING_INIT } from "../../src/server/turn-state-handles";
+import { BOUNDED_WS_RUNTIME, codexWsUpstreamFetch, shouldUseCodexWsUpstream, streamingInit } from "../helpers/ws-upstream-fixtures";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
+import { installCompactionRoutingAclFixture as installRoutingAclFixture } from "../helpers/compaction-routing-fixtures";
+// Quota headers under families this proxy does not know: ten per family, all of them dropped.
+const quotaFamilyHeaders = (count: number) => Object.fromEntries(Array.from({ length: count }, (_, i) => [`x-codex-family-${Math.floor(i / 10)}-${["primary-used-percent", "primary-window-minutes", "primary-reset-at", "secondary-used-percent", "secondary-window-minutes", "secondary-reset-at", "tertiary-used-percent", "tertiary-window-minutes", "tertiary-reset-at", "limit-name"][i % 10]}`, "1"]));
+installRoutingAclFixture();
 
 const CODEX_URL = "https://chatgpt.com/backend-api/codex/responses";
-const BOUNDED_WS_RUNTIME = "1.4.0";
 
 // #864 keeps win32 rewrite traffic out of the tee()+JS-pull chain, so
 // `isWin32EagerRewrite(platform, needsClientRewrite)` sends it through the eager
@@ -33,26 +50,6 @@ const BOUNDED_WS_RUNTIME = "1.4.0";
 // `FakeWebSocket.instances`; they hold the marker to this rule rather than to a
 // constant that only held before the backfill landed.
 const EAGER_RELAY_FORCED_BY_PLATFORM = isWin32EagerRewrite(process.platform, true);
-
-function shouldUseCodexWsUpstream(url: string, init?: RequestInit, upstreamWebsocket = false): boolean {
-  return rawShouldUseCodexWsUpstream(url, init, BOUNDED_WS_RUNTIME, upstreamWebsocket);
-}
-
-function codexWsUpstreamFetch(
-  url: string,
-  init: RequestInit,
-  fallback: typeof fetch,
-): Promise<Response> {
-  return rawCodexWsUpstreamFetch(url, init, fallback, BOUNDED_WS_RUNTIME);
-}
-
-function streamingInit(body: Record<string, unknown> = {}): RequestInit {
-  return {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: "Bearer test" },
-    body: JSON.stringify({ model: "gpt-5.5", stream: true, ...body }),
-  };
-}
 
 describe("shouldUseCodexWsUpstream", () => {
   test("uses HTTP SSE on runtimes without a bounded response sink", async () => {
@@ -89,7 +86,7 @@ describe("shouldUseCodexWsUpstream", () => {
     const response = await rawCodexWsUpstreamFetch(
       CODEX_URL,
       streamingInit(),
-      (async () => sentinel) as typeof fetch,
+      Object.assign(async () => sentinel, { preconnect: RealFetch.preconnect }),
       "1.3.14",
     );
     expect(response).toBe(sentinel);
@@ -99,7 +96,7 @@ describe("shouldUseCodexWsUpstream", () => {
     const canaryResponse = await rawCodexWsUpstreamFetch(
       CODEX_URL,
       streamingInit(),
-      (async () => canarySentinel) as typeof fetch,
+      Object.assign(async () => canarySentinel, { preconnect: RealFetch.preconnect }),
       { version: "1.4.0", versionWithSha: "v1.4.0-canary.1 (0123abcd)" },
     );
     expect(canaryResponse).toBe(canarySentinel);
@@ -139,11 +136,14 @@ describe("shouldUseCodexWsUpstream", () => {
     expect(shouldUseCodexWsUpstream(CODEX_URL, { method: "POST", body: "{\"stream\":true" })).toBe(false);
   });
 
-  test("opt-in upstream WebSocket only for configured OpenAI-compatible Responses endpoints", () => {
-    // The canonical backend ignores the flag.
-    expect(shouldUseCodexWsUpstream(CODEX_URL, streamingInit(), false)).toBe(true);
-    // Configured providers join the WS lane on their own /v1/responses path.
-    expect(shouldUseCodexWsUpstream("https://sub2api.example.com/v1/responses", streamingInit(), true)).toBe(true);
+  test("keeps configured provider endpoints on bounded HTTP SSE", () => {
+    expect(shouldUseCodexWsUpstream(CODEX_URL, streamingInit(), false)).toBe(false);
+    // Bun cannot reject oversized messages before assembling them, so even an
+    // opted-in provider cannot join the WebSocket lane.
+    expect(shouldUseCodexWsUpstream("https://sub2api.example.com/v1/responses", streamingInit(), true)).toBe(false);
+    // The first-party api.openai.com lane still honors the operator opt-in.
+    expect(shouldUseCodexWsUpstream("https://api.openai.com/v1/responses", streamingInit(), true)).toBe(true);
+    expect(shouldUseCodexWsUpstream("https://api.openai.com/v1/responses", streamingInit(), false)).toBe(false);
     // Plain HTTP stays on SSE; never send credentials or request data through ws://.
     expect(shouldUseCodexWsUpstream("http://10.0.0.5:8080/v1/responses", streamingInit(), true)).toBe(false);
     expect(shouldUseCodexWsUpstream("https://sub2api.example.com/v1/responses", streamingInit(), false)).toBe(false);
@@ -162,18 +162,24 @@ describe("shouldUseCodexWsUpstream", () => {
 });
 
 type Listener = (event: unknown) => void;
+type FakeWebSocketOptions = {
+  headers?: Record<string, string>;
+  proxy?: string;
+};
 
 /** Minimal scriptable stand-in for Bun's WebSocket. */
 class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
   static script: (ws: FakeWebSocket) => void = () => {};
   url: string;
+  options?: FakeWebSocketOptions;
   sent: string[] = [];
   closed = false;
   listeners = new Map<string, Listener[]>();
 
-  constructor(url: string) {
+  constructor(url: string, options?: FakeWebSocketOptions) {
     this.url = url;
+    this.options = options;
     FakeWebSocket.instances.push(this);
     queueMicrotask(() => FakeWebSocket.script(this));
   }
@@ -205,12 +211,30 @@ class FakeWebSocket {
 
 const RealWebSocket = globalThis.WebSocket;
 const RealFetch = globalThis.fetch;
+const PROXY_ENV_KEYS = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"] as const;
+let savedProxyEnv: Record<string, string | undefined>;
+
+beforeEach(() => {
+  savedProxyEnv = Object.fromEntries(PROXY_ENV_KEYS.map(key => [key, process.env[key]]));
+  for (const key of PROXY_ENV_KEYS) delete process.env[key];
+});
+
+// A case that calls handleResponses directly never takes the writer lease startServer takes,
+// so its dispatch is refused. Dropped in teardown so a throwing case cannot leave it behind.
+let releaseSpendHome: (() => void) | undefined;
+const takeSpendHome = (): void => { releaseSpendHome ??= acquireOwnedSpendHome(); };
 
 afterEach(() => {
+  releaseSpendHome?.();
+  releaseSpendHome = undefined;
   globalThis.WebSocket = RealWebSocket;
   globalThis.fetch = RealFetch;
   FakeWebSocket.instances = [];
   FakeWebSocket.script = () => {};
+  for (const key of PROXY_ENV_KEYS) delete process.env[key];
+  for (const key of PROXY_ENV_KEYS) {
+    if (savedProxyEnv[key] !== undefined) process.env[key] = savedProxyEnv[key];
+  }
 });
 
 function installFake(script: (ws: FakeWebSocket) => void) {
@@ -222,11 +246,11 @@ describe("providerFetch routing", () => {
   test("a canary runtime identity cannot open the WS transport", async () => {
     const sentinel = new Response("base");
     let baseCalls = 0;
-    const provider = {
-      fetch: (async () => {
+    const provider = { adapter: "openai-responses", baseUrl: CODEX_URL,
+      fetch: Object.assign(async () => {
         baseCalls += 1;
         return sentinel;
-      }) as typeof fetch,
+      }, { preconnect: RealFetch.preconnect }),
     } as OcxProviderConfig;
     const wrapped = providerFetch(provider, {
       version: "1.4.0",
@@ -253,27 +277,24 @@ describe("providerFetch routing", () => {
     } as unknown as OcxProviderConfig;
     const wrapped = providerFetch(provider, BOUNDED_WS_RUNTIME);
 
-    // Eligible: WS adapter serves it, base fetch untouched.
     const wsResponse = await wrapped(CODEX_URL, streamingInit());
     expect(wsResponse.headers.get("content-type")).toContain("text/event-stream");
     expect(baseCalls).toHaveLength(0);
     expect(FakeWebSocket.instances).toHaveLength(1);
 
-    // Non-streaming body: base fetch.
     await wrapped(CODEX_URL, { method: "POST", body: JSON.stringify({ model: "m" }) });
-    // Different host: base fetch.
     await wrapped("https://api.openai.com/v1/responses", streamingInit());
-    // Request-object input: base fetch (WS path only handles string URLs).
     await wrapped(new Request(CODEX_URL, streamingInit() as RequestInit));
     expect(baseCalls).toHaveLength(3);
     expect(FakeWebSocket.instances).toHaveLength(1);
+    provider.upstreamWebsocket = false;
+    const httpOnly = providerFetch(provider, BOUNDED_WS_RUNTIME);
+    expect(await (await httpOnly(CODEX_URL, streamingInit())).text()).toBe("base");
+    expect(baseCalls).toHaveLength(4);
+    expect(FakeWebSocket.instances).toHaveLength(1);
   });
 
-  test("routes an opt-in provider's Responses streams over its upstream WS", async () => {
-    installFake(ws => {
-      ws.emit("open", {});
-      ws.emit("message", { data: JSON.stringify({ type: "response.completed", response: { id: "r1" } }) });
-    });
+  test("routes an opt-in provider's Responses streams over bounded HTTP SSE", async () => {
     const baseCalls: string[] = [];
     const sentinel = new Response("base");
     const provider = {
@@ -285,16 +306,15 @@ describe("providerFetch routing", () => {
     } as unknown as OcxProviderConfig;
     const wrapped = providerFetch(provider, BOUNDED_WS_RUNTIME);
 
-    const wsResponse = await wrapped("https://sub2api.example.com/v1/responses", streamingInit());
-    expect(wsResponse.headers.get("content-type")).toContain("text/event-stream");
-    expect(baseCalls).toHaveLength(0);
-    expect(FakeWebSocket.instances).toHaveLength(1);
-    expect(FakeWebSocket.instances[0]!.url).toBe("wss://sub2api.example.com/v1/responses");
+    const response = await wrapped("https://sub2api.example.com/v1/responses", streamingInit());
+    expect(await response.text()).toBe("base");
+    expect(baseCalls).toHaveLength(1);
+    expect(FakeWebSocket.instances).toHaveLength(0);
 
     // The same provider's non-Responses paths (images/search/chat) stay on the base fetch.
     await wrapped("https://sub2api.example.com/v1/images", streamingInit());
-    expect(baseCalls).toHaveLength(1);
-    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(baseCalls).toHaveLength(2);
+    expect(FakeWebSocket.instances).toHaveLength(0);
   });
 });
 
@@ -323,6 +343,208 @@ describe("handleResponses Codex WS relay selection", () => {
     });
   }
 
+  function plaintextV2CollaborationRequest(): Request {
+    return new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer test" },
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        stream: true,
+        tools: [{ type: "namespace", name: "collaboration", tools: [{
+          type: "function", name: "spawn_agent", parameters: {
+            type: "object", properties: { message: { type: "string", encrypted: true } },
+          },
+        }, { type: "function", name: "send_message", parameters: { type: "object" } }] }],
+        input: [
+          {
+            type: "additional_tools",
+            tools: [{
+              type: "namespace",
+              name: "collaboration",
+              tools: [
+                {
+                  type: "function",
+                  name: "spawn_agent",
+                  parameters: {
+                    type: "object",
+                    properties: { message: { type: "string", encrypted: true } },
+                  },
+                },
+                { type: "function", name: "send_message", parameters: { type: "object" } },
+              ],
+            }],
+          },
+          { type: "message", role: "user", content: [{ type: "input_text", text: "delegate" }] },
+        ],
+      }),
+    });
+  }
+
+  test.each(["collaboration-optimize", null])("plaintext v2 WS restoration handles namespace=%s", async namespace => {
+    installFake(ws => {
+      ws.emit("open", {});
+      ws.emit("message", {
+        data: JSON.stringify({
+          type: "response.created",
+          response: {
+            id: "r-plaintext-v2-ws",
+            object: "response",
+            status: "in_progress",
+            output: [],
+          },
+        }),
+      });
+      ws.emit("message", {
+        data: JSON.stringify({
+          type: "response.output_item.added",
+          output_index: 0,
+          item: {
+            type: "function_call",
+            id: "fc_spawn",
+            call_id: "call-spawn",
+            namespace,
+            name: "start_delegated_task",
+            arguments: "",
+            encrypted_function_args: [],
+            status: "in_progress",
+          },
+        }),
+      });
+      ws.emit("message", {
+        data: JSON.stringify({
+          type: "response.function_call_arguments.done",
+          item_id: "fc_spawn",
+          output_index: 0,
+          namespace,
+          name: "collaboration-optimize__start_delegated_task",
+          arguments: JSON.stringify({ message: "plain WS assignment" }),
+          encrypted_function_args: [],
+        }),
+      });
+      ws.emit("message", {
+        data: JSON.stringify({
+          type: "response.output_item.done",
+          output_index: 0,
+          item: {
+            type: "function_call",
+            id: "fc_spawn",
+            call_id: "call-spawn",
+            namespace,
+            name: "start_delegated_task",
+            arguments: JSON.stringify({ message: "plain WS assignment" }),
+            encrypted_function_args: [],
+            status: "completed",
+          },
+        }),
+      });
+      ws.emit("message", {
+        data: JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: "r-plaintext-v2-ws",
+            status: "completed",
+            output: [{
+              type: "function_call",
+              id: "fc_spawn",
+              call_id: "call-spawn",
+              namespace,
+              name: "start_delegated_task",
+              arguments: JSON.stringify({ message: "plain WS assignment" }),
+              encrypted_function_args: [],
+              status: "completed",
+            }],
+          },
+        }),
+      });
+    });
+    const config = { ...forwardConfig(), plaintextV2AgentMessages: true } as OcxConfig;
+    const request = plaintextV2CollaborationRequest();
+
+    takeSpendHome();
+    const response = await handleResponses(request, config, { model: "", provider: "" }, {
+      codexWsRuntimeIdentity: BOUNDED_WS_RUNTIME,
+    });
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    const frame = JSON.parse(FakeWebSocket.instances[0]!.sent[0]!) as {
+      type: string;
+      stream?: unknown;
+      input: Array<Record<string, unknown>>;
+    };
+    const additionalTools = frame.input.find(item => item.type === "additional_tools") as {
+      tools: Array<{
+        name: string;
+        tools: Array<{
+          name: string;
+          parameters: { properties: { message: Record<string, unknown> } };
+        }>;
+      }>;
+    };
+    expect(frame.type).toBe("response.create");
+    expect(frame.stream).toBeUndefined();
+    expect(additionalTools.tools[0]!.name).toBe("collaboration-optimize");
+    expect(additionalTools.tools[0]!.tools[0]!.name).toBe("start_delegated_task");
+    expect(additionalTools.tools[0]!.tools[0]!.parameters.properties.message.encrypted).toBeUndefined();
+
+    expect(isEagerRelaySseResponse(response)).toBe(true);
+    const clientText = await response.text();
+    expect(clientText).toContain("response.function_call_arguments.done");
+    const argumentDoneLine = clientText.split("\n")
+      .find(line => line.includes('"response.function_call_arguments.done"'))!;
+    const argumentDone = JSON.parse(argumentDoneLine.replace(/^data: /, "")) as Record<string, unknown>;
+    expect(argumentDone.namespace).toBe("collaboration");
+    expect(argumentDone.name).toBe("spawn_agent");
+    expect(argumentDone.encrypted_function_args).toEqual([]);
+    const completedLine = clientText.split("\n")
+      .find(line => line.includes('"response.completed"'))!;
+    const completed = JSON.parse(completedLine.replace(/^data: /, "")) as {
+      response: { output: Array<Record<string, unknown>> };
+    };
+    expect(completed.response.output[0]!.namespace).toBe("collaboration");
+    expect(completed.response.output[0]!.name).toBe("spawn_agent");
+    expect(completed.response.output[0]!.encrypted_function_args).toEqual([]);
+  });
+
+  test("plaintext v2 restoration overflow fails closed on the WS upstream path", async () => {
+    installFake(ws => {
+      ws.emit("open", {});
+      ws.emit("message", {
+        data: JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: "r-plaintext-v2-ws-overflow",
+            status: "completed",
+            output: Array.from({ length: 10_000 }, (_, index) => ({
+              type: "function_call",
+              call_id: `call-${index}`,
+              namespace: PLAINTEXT_V2_COLLABORATION_NAMESPACE,
+              name: "start_delegated_task",
+              arguments: "{}",
+            })),
+          },
+        }),
+      });
+    });
+    const config = { ...forwardConfig(), plaintextV2AgentMessages: true } as OcxConfig;
+
+    takeSpendHome();
+    const response = await handleResponses(
+      plaintextV2CollaborationRequest(),
+      config,
+      { model: "", provider: "" },
+      { codexWsRuntimeIdentity: BOUNDED_WS_RUNTIME },
+    );
+
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(isEagerRelaySseResponse(response)).toBe(true);
+    const clientText = await response.text();
+    expect(clientText).toContain("event: response.failed");
+    expect(clientText).toContain(PLAINTEXT_V2_AGENT_MESSAGE_RESTORE_OVERFLOW_MESSAGE);
+    expect(clientText).toContain("data: [DONE]");
+    expect(clientText).not.toContain(PLAINTEXT_V2_COLLABORATION_NAMESPACE);
+    expect(clientText).not.toContain("start_delegated_task");
+    expect(FakeWebSocket.instances[0]!.closed).toBe(true);
+  });
+
   test("a successful WS upgrade bypasses the configured legacy tee path", async () => {
     installFake(ws => {
       ws.emit("open", {});
@@ -331,6 +553,7 @@ describe("handleResponses Codex WS relay selection", () => {
       });
     });
 
+    takeSpendHome();
     const response = await handleResponses(request(), forwardConfig(), { model: "", provider: "" }, {
       codexWsRuntimeIdentity: BOUNDED_WS_RUNTIME,
     });
@@ -345,14 +568,15 @@ describe("handleResponses Codex WS relay selection", () => {
 
   test("an HTTP fallback remains on the configured legacy tee path", async () => {
     installFake(ws => ws.close());
-    globalThis.fetch = (async () => new Response(
+    globalThis.fetch = Object.assign(async () => new Response(
       `event: response.completed\ndata: ${JSON.stringify({
         type: "response.completed",
         response: { id: "r-http", status: "completed", output: [] },
       })}\n\n`,
       { status: 200, headers: { "content-type": "text/event-stream" } },
-    )) as typeof fetch;
+    ), { preconnect: RealFetch.preconnect });
 
+    takeSpendHome();
     const response = await handleResponses(request(), forwardConfig(), { model: "", provider: "" }, {
       codexWsRuntimeIdentity: BOUNDED_WS_RUNTIME,
     });
@@ -373,7 +597,8 @@ describe("handleResponses Codex WS relay selection", () => {
       }
     });
 
-    const logCtx = { model: "", provider: "" };
+    const logCtx: Parameters<typeof handleResponses>[2] = { model: "", provider: "" };
+    takeSpendHome();
     const response = await handleResponses(request(), forwardConfig(), logCtx, {
       codexWsRuntimeIdentity: BOUNDED_WS_RUNTIME,
     });
@@ -386,17 +611,39 @@ describe("handleResponses Codex WS relay selection", () => {
     expect(FakeWebSocket.instances[0].closed).toBe(true);
   });
 
+  test("handleResponses adopts the exchange stage onto the logged attempt (#4191)", async () => {
+    installFake(ws => {
+      ws.emit("open", {});
+      ws.emit("close", { code: 1006 });
+    });
+
+    const logCtx: Parameters<typeof handleResponses>[2] = { model: "", provider: "" };
+    takeSpendHome();
+    const response = await handleResponses(request(), forwardConfig(), logCtx, {
+      codexWsRuntimeIdentity: BOUNDED_WS_RUNTIME,
+    });
+
+    expect([502, 504]).toContain(response.status);
+    const stage = (logCtx.activeAttempt as { codexWsStage?: Record<string, unknown> } | undefined)?.codexWsStage;
+    expect(stage).toBeDefined();
+    expect(stage?.closeCode).toBe(1006);
+    expect(stage?.sent).toBe(true);
+    expect(typeof stage?.ocxVersion).toBe("string");
+    expect(stage?.bunVersion).toBe(BOUNDED_WS_RUNTIME);
+  });
+
   test.skipIf(bunSupportsBoundedCodexWsRelay())(
     "an older runtime stays on HTTP SSE without opening a WebSocket",
     async () => {
-      globalThis.fetch = (async () => new Response(
+      globalThis.fetch = Object.assign(async () => new Response(
         `event: response.completed\ndata: ${JSON.stringify({
           type: "response.completed",
           response: { id: "r-old", status: "completed", output: [] },
         })}\n\n`,
         { status: 200, headers: { "content-type": "text/event-stream" } },
-      )) as typeof fetch;
+      ), { preconnect: RealFetch.preconnect });
 
+      takeSpendHome();
       const response = await handleResponses(request(), forwardConfig(), { model: "", provider: "" });
 
       expect(FakeWebSocket.instances).toHaveLength(0);
@@ -429,11 +676,12 @@ describe("handleResponses Codex WS relay selection", () => {
         }],
       },
     };
-    globalThis.fetch = (async () => new Response(
+    globalThis.fetch = Object.assign(async () => new Response(
       `event: response.completed\ndata: ${JSON.stringify(upstreamEvent)}\n\n`,
       { status: 200, headers: { "content-type": "text/event-stream" } },
-    )) as typeof fetch;
+    ), { preconnect: RealFetch.preconnect });
 
+    takeSpendHome();
     const response = await handleResponses(request(), forwardConfig(), { model: "", provider: "" });
     const text = await response.text();
 
@@ -482,12 +730,13 @@ describe("codexWsUpstreamFetch", () => {
       ws.emit("message", { data: JSON.stringify({ type: "response.completed", response: { id: "r1", status: "completed", output: [] } }) });
     };
     globalThis.WebSocket = CapturingSocket as unknown as typeof WebSocket;
+    takeSpendHome();
     const response = await handleResponses(new Request("http://localhost/v1/responses", {
       method: "POST",
       headers: { authorization: "Bearer fixture", "content-type": "application/json", "x-openai-internal-codex-responses-lite": "true" },
       body: JSON.stringify({ model: "gpt-5.5", input: "hello", stream: true, service_tier: "priority" }),
     }), {
-      defaultProvider: "openai", providers: { openai: { adapter: "openai-responses", authMode: "forward", codexAccountMode: "direct", baseUrl: "https://chatgpt.com/backend-api/codex" } },
+      port: 0, defaultProvider: "openai", providers: { openai: { adapter: "openai-responses", authMode: "forward", codexAccountMode: "direct", baseUrl: "https://chatgpt.com/backend-api/codex" } },
     } as OcxConfig, { model: "", provider: "" }, { codexWsRuntimeIdentity: BOUNDED_WS_RUNTIME });
     await response.text();
     expect(frames).toHaveLength(1);
@@ -510,19 +759,56 @@ describe("codexWsUpstreamFetch", () => {
       ws.emit("message", { data: JSON.stringify({ type: "response.created", response: { id: "r1" } }) });
       ws.emit("message", { data: JSON.stringify({ type: "response.completed", response: { id: "r1", status: "completed" } }) });
     });
-    const response = await codexWsUpstreamFetch(CODEX_URL, streamingInit(), (() => {
+    const response = await codexWsUpstreamFetch(CODEX_URL, { ...streamingInit(), [TURN_STATE_BINDING_INIT]: "send-a" } as RequestInit, (() => {
       throw new Error("fallback must not run");
     }) as unknown as typeof fetch);
     expect(response.headers.get("x-codex-primary-used-percent")).toBe("31");
     expect(response.headers.get("x-codex-primary-window-minutes")).toBe("10080");
     expect(response.headers.get("x-codex-credits-balance")).toBe("12.5");
-    expect(response.headers.get("x-models-etag")).toBe("catalog-v2");
-    expect(response.headers.get("x-codex-turn-state")).toBe("turn-state");
+    expect(response.headers.has("x-models-etag")).toBe(false);
+    // The handle is bound to the send that received it, and redeems only under that binding.
+    expect(resolveTurnStateHandle(response.headers.get("x-codex-turn-state")!, "send-a")).toEqual({ value: "turn-state" });
+    expect(resolveTurnStateHandle(response.headers.get("x-codex-turn-state")!, "send-b")).toEqual({ dropped: "mismatch" });
     expect(response.headers.has("authorization")).toBe(false);
     expect(response.headers.has("set-cookie")).toBe(false);
     const text = await response.text();
     expect(text).toContain("response.completed");
     expect(text).not.toContain("must-not-leak");
+  });
+
+  test("passes the selected proxy without changing handshake headers", async () => {
+    process.env.HTTPS_PROXY = "http://proxy.example:8080";
+    installFake(ws => {
+      ws.emit("open", {});
+      ws.emit("message", { data: JSON.stringify({ type: "response.completed", response: {} }) });
+    });
+
+    await codexWsUpstreamFetch(CODEX_URL, streamingInit(), (() => {
+      throw new Error("fallback must not run");
+    }) as unknown as typeof fetch);
+
+    const options = FakeWebSocket.instances[0]!.options;
+    expect(options?.proxy).toBe("http://proxy.example:8080");
+    expect(options?.headers?.authorization).toBe("Bearer test");
+    expect(options?.headers?.["openai-beta"]).toContain("responses_websockets");
+    expect(options?.headers?.["content-type"]).toBeUndefined();
+  });
+
+  test.each([
+    ["unsupported protocol", "socks5://proxy.example:1080"],
+    ["invalid URL", "not a proxy URL"],
+  ])("falls back once without dialing for an %s", async (_label, proxy) => {
+    process.env.HTTPS_PROXY = proxy;
+    const sentinel = new Response("sse-fallback");
+    let fallbackCalls = 0;
+    const response = await codexWsUpstreamFetch(CODEX_URL, streamingInit(), Object.assign(async () => {
+      fallbackCalls += 1;
+      return sentinel;
+    }, { preconnect: RealFetch.preconnect }));
+
+    expect(response).toBe(sentinel);
+    expect(fallbackCalls).toBe(1);
+    expect(FakeWebSocket.instances).toHaveLength(0);
   });
 
   test("relays event frames as an SSE response and sends one response.create frame", async () => {
@@ -585,17 +871,302 @@ describe("codexWsUpstreamFetch", () => {
     expect(FakeWebSocket.instances[0].closed).toBe(true);
   });
 
+  describe("wrapped create refusals", () => {
+    const refusal = { type: "error", status_code: 429, error: {
+      type: "usage_limit_reached", message: "The usage limit has been reached", plan_type: "plus", resets_at: 1_800_000_000,
+    } };
+    const emit = (ws: FakeWebSocket, payload: Record<string, unknown>) =>
+      ws.emit("message", { data: JSON.stringify(payload, null, 2) });
+
+    async function receive(payload: Record<string, unknown>, prelude: Record<string, unknown>[] = [],
+      url = CODEX_URL, onQuota?: (headers: Headers) => void) {
+      installFake(ws => {
+        ws.emit("open", {});
+        for (const event of prelude) emit(ws, event);
+        emit(ws, payload);
+        ws.emit("close", { code: 1000, reason: "normal" });
+      });
+      let attempts = 0;
+      let fallbacks = 0;
+      const response = await fetchWithTransientRetry(() => {
+        attempts++;
+        return rawCodexWsUpstreamFetch(url, streamingInit(), Object.assign(async () => {
+          fallbacks++;
+          throw new Error("a sent create must not be resent over HTTP");
+        }, { preconnect: RealFetch.preconnect }), BOUNDED_WS_RUNTIME, onQuota);
+      }, {});
+      const ws = FakeWebSocket.instances.at(-1)!;
+      expect(attempts).toBe(1);
+      expect(fallbacks).toBe(0);
+      expect(ws.sent).toHaveLength(1);
+      expect(ws.closed).toBe(true);
+      expect([...ws.listeners.values()].every(listeners => listeners.length === 0)).toBe(true);
+      return response;
+    }
+
+    // Independent oracle: openai/codex d2d5b702, responses_websocket.rs:1016-1064
+    test("a wrapped Astra refusal reaches the alternate-account recovery predicate", async () => {
+      const message = "The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account.";
+      const response = await receive({ type: "error", status_code: 400,
+        error: { type: "invalid_request_error", code: "invalid_request_error", message } });
+      expect(await shouldRetryCodexPoolAccountModel400(response, "gpt-6-astra")).toBe(true);
+      expect(await response.json()).toEqual({ error: { type: "invalid_request_error", code: "invalid_request_error", message } });
+    });
+
+    // explicitly accepts numeric window-minutes as the HTTP header string "15".
+    test.each(["status", "status_code"])("returns %s 429 as bounded HTTP JSON with scalar quota headers", async field => {
+      const { status_code, ...frame } = refusal;
+      const response = await receive({ ...frame, [field]: status_code, headers: {
+        "X-Codex-Primary-Used-Percent": "100.0", "X-Codex-Primary-Window-Minutes": 15,
+        "X-Codex-Primary-Reset-At": 1_800_000_000, "X-Codex-Credits-Has-Credits": true,
+        "Retry-After": 60, "X-Request-Id": "fixture-request",
+        "x-codex-extra-secondary-used-percent": "25", "x-ratelimit-remaining-requests": 0,
+      } });
+      expect(response.status).toBe(429);
+      expect(response.headers.get("content-type")).toBe("application/json");
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(response.headers.get("x-codex-primary-used-percent")).toBe("100");
+      expect(response.headers.get("x-codex-primary-window-minutes")).toBe("15");
+      expect(response.headers.get("x-codex-primary-reset-at")).toBe("1800000000");
+      expect(response.headers.get("x-codex-credits-has-credits")).toBe("true");
+      expect(response.headers.get("retry-after")).toBe("60");
+      expect(response.headers.has("x-request-id")).toBe(false);
+      expect(response.headers.has("x-codex-extra-secondary-used-percent")).toBe(false);
+      expect(response.headers.get("x-ratelimit-remaining-requests")).toBe("0");
+      expect(isCodexWsUpstreamResponse(response)).toBe(false);
+      expect(isCodexWsQuotaObservedResponse(response)).toBe(false);
+      expect(await response.json()).toEqual({ error: refusal.error });
+    });
+
+    test.each([400, 401, 402, 403, 404, 408, 499])("preserves a precommit HTTP %i refusal", async status_code => {
+      const response = await receive({ ...refusal, status_code });
+      expect(response.status).toBe(status_code);
+      expect(await response.json()).toEqual({ error: refusal.error });
+    });
+
+    test.each([
+      { status_code: undefined }, { status_code: null }, { status_code: "429" }, { status_code: true },
+      { status_code: 429.5 }, { status_code: 399 }, { status_code: 500 }, { status_code: 502 },
+      { status_code: 503 }, { status_code: 599 }, { status_code: 429, status: 429 },
+      { status_code: 502, status: 429 }, { status_code: null, status: 401 },
+      { status_code: "bad", status: 401 }, { error: [] }, { error: "refused" },
+      { error: { code: 42 } }, { error: { message: false } }, { headers: [] }, { headers: "bad" },
+      { stream_id: "another-stream" },
+    ])("keeps an ineligible wrapper on SSE without outer retry: %j", async fields => {
+      const response = await receive({ ...refusal, ...fields });
+      expect(response.status).toBe(200);
+      expect(isCodexWsUpstreamResponse(response)).toBe(true);
+      expect(await response.text()).toContain("event: error\ndata: ");
+    });
+
+    test.each([undefined, null, {}])("handles an optional error object: %j", async error => {
+      const response = await receive({ ...refusal, error, headers: null });
+      expect(response.status).toBe(429);
+      expect(await response.json()).toEqual({ error: error ?? {
+        type: "upstream_error", message: "Upstream rejected the request",
+      } });
+    });
+
+    test("drops injection, credentials, framing and connection-nominated metadata", async () => {
+      const forbidden = ["Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie", "Content-Length",
+        "Content-Encoding", "Transfer-Encoding", "Keep-Alive", "Proxy-Connection", "TE", "Trailer", "Upgrade",
+        "Content-Range", "Content-Location", "ETag", "Last-Modified", "Digest", "Content-MD5",
+        "Access-Control-Allow-Origin", "Location", "WWW-Authenticate", "x-codex-private-token"];
+      const error = { message: "refusal\r\nX-Injected: body text only" };
+      const response = await receive({ ...refusal, error, headers: {
+        ...Object.fromEntries(forbidden.map(name => [name, "must-not-leak"])),
+        "Content-Type": "text/html", "Cache-Control": "public, max-age=3600",
+        Connection: "Retry-After, X-Codex-Primary-Used-Percent, content-type, cache-control",
+        connection: "X-Request-Id", "Retry-After": "60", "X-Request-Id": "must-not-leak",
+        "x-codex-primary-used-percent": "100", "x-codex-secondary-used-percent": "99",
+        "x-ratelimit-bad name": "invalid", "x-ratelimit-crlf": "ok\r\nSet-Cookie: injected",
+        "x-ratelimit-nul": "bad\0value", "x-ratelimit-nonbyte": "漢字",
+        "x-ratelimit-array": [1], "x-ratelimit-object": { value: 1 }, "x-ratelimit-null": null,
+        "X-RateLimit-Remaining": "2", "x-ratelimit-remaining": "3",
+      } }, [{ type: "codex.response.metadata", headers: {
+        "retry-after": "10", "x-request-id": "prelude-request", "x-codex-primary-used-percent": "30",
+      } }]);
+      expect(response.status).toBe(429);
+      expect(Object.fromEntries(response.headers)).toEqual({
+        "cache-control": "no-store", "content-type": "application/json",
+        "x-codex-secondary-used-percent": "99", "x-ratelimit-remaining": "3",
+      });
+      expect(await response.json()).toEqual({ error });
+    });
+
+    test("merges prelude quota with refusal updates without replaying the observer", async () => {
+      const observations: string[] = [];
+      const response = await receive({ ...refusal, headers: { "x-codex-primary-used-percent": 100 } }, [
+        { type: "codex.rate_limits", rate_limits: {
+          primary: { used_percent: 30, window_minutes: 15, reset_at: 1_800_000_000 },
+          secondary: { used_percent: 40, window_minutes: 10080, reset_at: 1_900_000_000 },
+        } },
+        { type: "codex.response.metadata", headers: { "x-models-etag": "prelude-catalog" } },
+      ], CODEX_URL, headers => observations.push(headers.get("x-codex-primary-used-percent")!));
+      expect(response.status).toBe(429);
+      expect(response.headers.get("x-codex-primary-used-percent")).toBe("100");
+      expect(response.headers.has("x-codex-primary-window-minutes")).toBe(false);
+      expect(response.headers.has("x-codex-primary-reset-at")).toBe(false);
+      expect(response.headers.get("x-codex-secondary-used-percent")).toBe("40");
+      expect(response.headers.get("x-codex-secondary-reset-at")).toBe("1900000000");
+      expect(response.headers.has("x-models-etag")).toBe(false);
+      expect(observations).toEqual(["30"]);
+      expect(isCodexWsQuotaObservedResponse(response)).toBe(false);
+      expect(await response.json()).toEqual({ error: refusal.error });
+    });
+
+    const quotaFamilies = (count: number) => Object.fromEntries(
+      Array.from({ length: count }, (_, i) => [`x-codex-family-${i}-primary-used-percent`, "1"]));
+    test.each([
+      ["value", { "x-codex-turn-state": "x".repeat(4096) }, true],
+      ["value overflow", { "x-codex-turn-state": "x".repeat(4097) }, false],
+      ["UTF-8 overflow", { "x-codex-turn-state": "é".repeat(2049) }, false],
+      ["unknown families are dropped", { ...quotaFamilyHeaders(129), ...quotaFamilies(17) }, true],
+    ] as Array<[string, Record<string, string>, boolean]>)("enforces metadata budget: %s", async (_name, headers, accepted) => {
+      const response = await receive({ ...refusal, headers });
+      if (accepted) {
+        expect(response.status).toBe(429);
+        // Without a send binding the turn-state token is dropped; unknown quota families never pass.
+        for (const name of Object.keys(headers)) expect(response.headers.get(name)).toBeNull();
+        expect(await response.json()).toEqual({ error: refusal.error });
+      } else {
+        // The overflow lands before any response event: an honest 502, never a 200 whose
+        // body then fails, and never the HTTP fallback (the frame was sent).
+        expect(response.status).toBe(502);
+        expect(isCodexWsUpstreamResponse(response)).toBe(false);
+        expect(response.headers.get("content-type")).toBe("application/json");
+        const failure = ((await response.json()) as { error: { code: string; message: string } }).error;
+        expect(failure.code).toBe("upstream_closed_before_response");
+        expect(failure.message).toContain("metadata");
+      }
+    });
+
+    test("bounds the cumulative prelude and rejection metadata even when updates replace values", async () => {
+      // Each frame replaces the same allowlisted value; the prelude still counts every frame's bytes.
+      const response = await receive({ ...refusal, headers: { "x-codex-turn-state": "x".repeat(4096) } },
+        Array.from({ length: 8 }, () => ({ type: "codex.response.metadata", headers: { "x-codex-turn-state": "y".repeat(4096) } })));
+      expect(response.status).toBe(502);
+      expect(((await response.json()) as { error: { message: string } }).error.message).toContain("metadata");
+    });
+
+    test.each([
+      ["response.created", 429], ["response.output_text.delta", 429],
+      ["response.in_progress", 429], ["response.created", 502],
+    ] as Array<[string, number]>)(
+      "does not convert or retry a refusal after %s (status %i)", async (type, status_code) => {
+        const response = await receive({ ...refusal, status_code }, [{ type, response: { id: "r1" }, delta: "output" }]);
+        expect(response.status).toBe(200);
+        const text = await response.text();
+        expect(text).toContain(`event: ${type}`);
+        expect(text).toContain("event: error");
+        expect(response.headers.has("cache-control")).toBe(false);
+      });
+
+    test.each(["websocket_connection_limit_reached", "previous_response_not_found"])(
+      "does not add native special-code reconnect for %s", async code => {
+        const response = await receive({ type: "error", error: { code } });
+        expect(response.status).toBe(200);
+        expect(await response.text()).toContain(code);
+      });
+
+    test("keeps noncanonical providers on the stream path", async () => {
+      const response = await receive(refusal, [], "https://api.openai.com/v1/responses");
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain("event: error");
+    });
+
+    test.each([CODEX_URL, "https://api.openai.com/v1/responses"])(
+      "settles synchronous error/send-throw/close races and detaches deadlines for %s", async url => {
+        jest.useFakeTimers();
+        const abort = new AbortController();
+        let fallbacks = 0;
+        try {
+          installFake(ws => {
+            ws.send = data => {
+              ws.sent.push(data);
+              emit(ws, refusal);
+              throw new Error("send threw after a response was received");
+            };
+            ws.emit("open", {});
+          });
+          const response = await rawCodexWsUpstreamFetch(url, { ...streamingInit(), signal: abort.signal },
+            Object.assign(async () => { fallbacks++; throw new Error("unexpected fallback"); }, { preconnect: RealFetch.preconnect }), BOUNDED_WS_RUNTIME);
+          const ws = FakeWebSocket.instances.at(-1)!;
+          abort.abort(new Error("late abort"));
+          ws.emit("error", {});
+          emit(ws, { type: "codex.rate_limits", rate_limits: { primary: { used_percent: 10 } } });
+          ws.emit("close", {});
+          jest.advanceTimersByTime(CODEX_WS_RESPONSE_PRELUDE_TIMEOUT_MS + 10_000);
+          expect(response.status).toBe(url === CODEX_URL ? 429 : 200);
+          if (url === CODEX_URL) expect(await response.json()).toEqual({ error: refusal.error });
+          else expect(await response.text()).toContain("event: error");
+          expect(ws.sent).toHaveLength(1);
+          expect(ws.closed).toBe(true);
+          expect(fallbacks).toBe(0);
+          expect([...ws.listeners.values()].every(listeners => listeners.length === 0)).toBe(true);
+        } finally { jest.useRealTimers(); }
+      });
+
+    test.each([false, true])("disposes a retained socket; correlation precedes conversion (foreign stream: %s)", async foreign => {
+      installFake(ws => {
+        ws.emit("open", {});
+        emit(ws, { type: "response.created", response: { id: "completed-first" } });
+        emit(ws, { type: "response.completed", response: { id: "completed-first", status: "completed" } });
+      });
+      const init = streamingInit();
+      const prepared = prepareCodexWsRequest(CODEX_URL, init)!;
+      const session = new CodexWsSession("wss://chatgpt.com/backend-api/codex/responses", prepared.headers, true);
+      let fallbacks = 0;
+      const options = { session, url: CODEX_URL, init, prepared, sseFallback: Object.assign(async () => {
+        fallbacks++;
+        throw new Error("retained create must not fall back");
+      }, { preconnect: RealFetch.preconnect }) };
+      try {
+        expect(session.reserve()).toBe(true);
+        await (await codexWsExchange(options)).text();
+        expect(session.reused).toBe(true);
+        expect(session.closed).toBe(false);
+        const ws = FakeWebSocket.instances.at(-1)!;
+        let terminations = 0;
+        Object.assign(ws, { terminate: () => { terminations++; } });
+        ws.send = data => { ws.sent.push(data); emit(ws, { ...refusal, ...(foreign ? { stream_id: "foreign" } : {}) }); };
+        expect(session.reserve()).toBe(true);
+        const response = await codexWsExchange(options);
+        if (foreign) {
+          // A foreign stream before any response event is a transport that misbehaved after
+          // the send: non-replayable 502, and never the 4xx refusal projection.
+          expect(response.status).toBe(502);
+          expect(isCodexWsUpstreamResponse(response)).toBe(false);
+          expect(((await response.json()) as { error: { message: string } }).error.message).toContain("identity mismatch");
+        } else {
+          expect(response.status).toBe(429);
+          expect(isCodexWsUpstreamResponse(response)).toBe(false);
+          expect(await response.json()).toEqual({ error: refusal.error });
+        }
+        expect(ws.sent).toHaveLength(2);
+        expect(ws.closed).toBe(true);
+        expect(terminations).toBe(1);
+        expect(session.closed).toBe(true);
+        expect(session.busy).toBe(false);
+        expect(session.hasCompleted("completed-first")).toBe(false);
+        expect(session.reserve()).toBe(false);
+        expect(fallbacks).toBe(0);
+        expect([...ws.listeners.values()].every(listeners => listeners.length === 0)).toBe(true);
+      } finally { session.dispose(); }
+    });
+  });
+
   test.each(["error", "response.completed"])("multiline upstream %s JSON remains one valid SSE data value", async type => {
     const payload = type === "error"
-      ? { type, status: 400, error: { type: "invalid_request_error", message: "fixture refusal" } }
+      ? { type, error: { type: "invalid_request_error", message: "fixture refusal" } }
       : { type, response: { id: "pretty-response", status: "completed", output: [] } };
     installFake(ws => {
       ws.emit("open", {});
       ws.emit("message", { data: JSON.stringify(payload, null, 2) });
     });
-    const response = await codexWsUpstreamFetch(CODEX_URL, streamingInit(), (async () => {
+    const response = await codexWsUpstreamFetch(CODEX_URL, streamingInit(), Object.assign(async () => {
       throw new Error("a sent multiline response cannot fall back");
-    }) as typeof fetch);
+    }, { preconnect: RealFetch.preconnect }));
     const text = await response.text();
     const data = text.split("\n").filter(line => line.startsWith("data: "));
     expect(data).toHaveLength(1);
@@ -654,6 +1225,7 @@ describe("codexWsUpstreamFetch", () => {
   });
 
   test("falls back to the HTTP fetch when the upgrade is rejected before open", async () => {
+    process.env.HTTPS_PROXY = "http://proxy.example:8080";
     installFake(ws => ws.close());
     const sentinel = new Response("sse-fallback", { status: 429 });
     let fallbackCalls = 0;
@@ -666,6 +1238,7 @@ describe("codexWsUpstreamFetch", () => {
     expect(response).toBe(sentinel);
     expect(isCodexWsUpstreamResponse(response)).toBe(false);
     expect(fallbackCalls).toBe(1);
+    expect(FakeWebSocket.instances[0]!.options?.proxy).toBe("http://proxy.example:8080");
   });
 
   test("falls back to the HTTP fetch when the upgrade deadline elapses without open or close", async () => {
@@ -737,7 +1310,10 @@ describe("codexWsUpstreamFetch", () => {
       throw new Error("fallback must not run after open");
     }) as unknown as typeof fetch);
 
-    await expect(response.text()).rejects.toThrow("frame exceeds the response size limit");
+    // No response event preceded the oversized frame, so the exchange never owed a stream.
+    expect(response.status).toBe(502);
+    expect(((await response.json()) as { error: { message: string } }).error.message)
+      .toContain("frame exceeds the response size limit");
     expect(FakeWebSocket.instances[0].closed).toBe(true);
   });
 
@@ -800,15 +1376,17 @@ describe("codexWsUpstreamFetch", () => {
   });
 
   test("preserves caller headers on the handshake without fabricating an originator", async () => {
-    const seen: Record<string, string>[] = [];
+    process.env.HTTPS_PROXY = "http://proxy.example:8080";
+    process.env.NO_PROXY = "chatgpt.com:443";
+    const seen: FakeWebSocketOptions[] = [];
     FakeWebSocket.script = ws => {
       ws.emit("open", {});
       ws.emit("message", { data: JSON.stringify({ type: "response.completed", response: {} }) });
     };
     class HeaderCapturingWebSocket extends FakeWebSocket {
-      constructor(url: string, options?: { headers?: Record<string, string> }) {
-        super(url);
-        seen.push(options?.headers ?? {});
+      constructor(url: string, options?: FakeWebSocketOptions) {
+        super(url, options);
+        seen.push(options ?? {});
       }
     }
     globalThis.WebSocket = HeaderCapturingWebSocket as unknown as typeof WebSocket;
@@ -817,18 +1395,19 @@ describe("codexWsUpstreamFetch", () => {
     await codexWsUpstreamFetch(CODEX_URL, streamingInit(), fallback);
     // Without a caller originator none is invented: pool/forward traffic must
     // not impersonate Codex CLI (metadata-integrity contract).
-    expect(seen[0].originator).toBeUndefined();
-    expect(seen[0]["openai-beta"]).toContain("responses_websockets");
-    expect(seen[0].authorization).toBe("Bearer test");
+    expect(seen[0].proxy).toBeUndefined();
+    expect(seen[0].headers?.originator).toBeUndefined();
+    expect(seen[0].headers?.["openai-beta"]).toContain("responses_websockets");
+    expect(seen[0].headers?.authorization).toBe("Bearer test");
     // HTTP body-framing headers do not belong on a WS handshake.
-    expect(seen[0]["content-type"]).toBeUndefined();
+    expect(seen[0].headers?.["content-type"]).toBeUndefined();
 
     // A genuine caller originator is forwarded verbatim.
     await codexWsUpstreamFetch(CODEX_URL, {
       ...streamingInit(),
       headers: { ...streamingInit().headers as Record<string, string>, originator: "codex_cli_rs" },
     }, fallback);
-    expect(seen[1].originator).toBe("codex_cli_rs");
+    expect(seen[1].headers?.originator).toBe("codex_cli_rs");
   });
 
   test("aborting before open rejects like an aborted fetch", async () => {
@@ -853,9 +1432,9 @@ describe("codexWsUpstreamFetch", () => {
 
     await opened.promise;
     controller.abort(new Error("turn cancelled"));
-    const response = await pending;
-
-    await expect(response.text()).rejects.toThrow("turn cancelled");
+    // Sent and unacknowledged: the caller's abort is the caller's decision, so the fetch
+    // itself rejects with that reason and closing the socket cancels the upstream turn.
+    await expect(pending).rejects.toThrow("turn cancelled");
     expect(FakeWebSocket.instances[0].closed).toBe(true);
   });
 
@@ -879,24 +1458,52 @@ describe("codexWsUpstreamFetch", () => {
     await response.text();
   });
 
-  test("post-send prelude overflow settles as an errored body without HTTP fallback", async () => {
+  test("post-send prelude overflow settles as a non-replayable 502 without HTTP fallback", async () => {
     installFake(ws => {
       ws.emit("open", {});
       ws.emit("message", { data: JSON.stringify({ type: "codex.response.metadata", headers: { "x-models-etag": "x".repeat(CODEX_WS_METADATA_MAX_BYTES) } }) });
     });
     let resends = 0;
-    const response = await codexWsUpstreamFetch(CODEX_URL, streamingInit(), (async () => {
+    const response = await codexWsUpstreamFetch(CODEX_URL, streamingInit(), Object.assign(async () => {
       resends++;
       return new Response("unexpected resend");
-    }) as typeof fetch);
-    expect(response.status).toBe(200);
-    expect(isCodexWsUpstreamResponse(response)).toBe(true);
-    await expect(response.text()).rejects.toThrow("metadata");
+    }, { preconnect: RealFetch.preconnect }));
+    expect(response.status).toBe(502);
+    expect(isCodexWsUpstreamResponse(response)).toBe(false);
+    expect(isNonReplayableResponse(response)).toBe(true);
+    expect(((await response.json()) as { error: { message: string } }).error.message).toContain("metadata");
     expect(resends).toBe(0);
     expect(FakeWebSocket.instances[0].sent).toHaveLength(1);
   });
 
-  test("the first-response deadline settles a sent request through the outer retry wrapper without resending", async () => {
+  test("a response beginning after 30 seconds completes without resending", async () => {
+    jest.useFakeTimers();
+    const opened = Promise.withResolvers<void>();
+    installFake(ws => { ws.emit("open", {}); opened.resolve(); });
+    let http = 0;
+    try {
+      const pending = codexWsUpstreamFetch(CODEX_URL, streamingInit(), Object.assign(async () => {
+        http++;
+        return new Response("must not resend");
+      }, { preconnect: RealFetch.preconnect }));
+      await opened.promise;
+      const ws = FakeWebSocket.instances[0];
+      jest.advanceTimersByTime(28_000);
+      ws.emit("message", { data: JSON.stringify({ type: "codex.rate_limits" }) });
+      ws.emit("message", { data: JSON.stringify({ type: "codex.response.metadata", headers: {} }) });
+      jest.advanceTimersByTime(3_000);
+      ws.emit("message", { data: JSON.stringify({ type: "response.created", response: { id: "r1" } }) });
+      ws.emit("message", { data: JSON.stringify({ type: "response.completed", response: { id: "r1" } }) });
+      const response = await pending;
+      expect(await response.text()).toContain("event: response.completed");
+      expect(ws.sent).toHaveLength(1);
+      expect(http).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test("the first-response deadline settles a sent request as a 504 the outer retry wrapper does not resend", async () => {
     const { fetchWithTransientRetry } = await import("../../src/lib/upstream-retry");
     jest.useFakeTimers();
     const opened = Promise.withResolvers<void>();
@@ -906,21 +1513,130 @@ describe("codexWsUpstreamFetch", () => {
     try {
       const pending = fetchWithTransientRetry(() => {
         sends++;
-        return codexWsUpstreamFetch(CODEX_URL, streamingInit(), (async () => {
+        return codexWsUpstreamFetch(CODEX_URL, streamingInit(), Object.assign(async () => {
           http++;
           return new Response("must not resend");
-        }) as typeof fetch);
+        }, { preconnect: RealFetch.preconnect }));
       }, {});
       await opened.promise;
       jest.advanceTimersByTime(CODEX_WS_RESPONSE_PRELUDE_TIMEOUT_MS);
       const response = await pending;
-      expect(response.status).toBe(200);
-      await expect(response.text()).rejects.toThrow("prelude timed out");
+      // 504 is a transient status for the wrapper; the non-replayable marker is what stops
+      // the second send, and the status is what lets the client apply its own policy.
+      expect(response.status).toBe(504);
+      expect(isNonReplayableResponse(response)).toBe(true);
+      const failure = ((await response.json()) as { error: { code: string; message: string } }).error;
+      expect(failure.code).toBe("upstream_no_response");
+      expect(failure.message).toContain("prelude timed out");
+      expect(failure.message).toContain("cause=no-upstream-frame");
       expect(sends).toBe(1);
       expect(http).toBe(0);
     } finally {
       jest.useRealTimers();
     }
+  });
+
+  describe("prelude liveness", () => {
+    // The 90 s bound is a silence bound, not a deadline: a peer that answers pings is alive,
+    // and how long an alive origin may take before response.created belongs to the client's
+    // own deadline and the operator's connectTimeoutMs, not to a fixed number in the proxy.
+    const noResend = (counter: { http: number }) => Object.assign(async () => {
+      counter.http++;
+      return new Response("must not resend");
+    }, { preconnect: RealFetch.preconnect });
+
+    test("a peer that answers pings stays alive past the silence bound and still completes with one send", async () => {
+      jest.useFakeTimers();
+      const opened = Promise.withResolvers<void>();
+      let pingsSent = 0;
+      installFake(ws => {
+        Object.assign(ws, { ping: () => { pingsSent++; ws.emit("pong", {}); } });
+        ws.emit("open", {});
+        opened.resolve();
+      });
+      const counter = { http: 0 };
+      try {
+        const pending = codexWsUpstreamFetch(CODEX_URL, streamingInit(), noResend(counter));
+        await opened.promise;
+        const ws = FakeWebSocket.instances[0];
+        // Seven steps plus the send probe: 105 s of no message frames, past the 90 s bound.
+        for (let step = 0; step < 7; step++) jest.advanceTimersByTime(CODEX_WS_LIVENESS_PING_INTERVAL_MS);
+        expect(pingsSent).toBe(8);
+        ws.emit("message", { data: JSON.stringify({ type: "response.created", response: { id: "r1" } }) });
+        ws.emit("message", { data: JSON.stringify({ type: "response.completed", response: { id: "r1" } }) });
+        const response = await pending;
+        expect(response.status).toBe(200);
+        expect(await response.text()).toContain("event: response.completed");
+        expect(ws.sent).toHaveLength(1);
+        expect(counter.http).toBe(0);
+        // The pinger stops once the exchange settles.
+        jest.advanceTimersByTime(CODEX_WS_LIVENESS_PING_INTERVAL_MS * 4);
+        expect(pingsSent).toBe(8);
+        expect([...ws.listeners.values()].every(listeners => listeners.length === 0)).toBe(true);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    test("a peer that never pongs keeps the previous 90 s bound and names the unanswered pings", async () => {
+      jest.useFakeTimers();
+      const opened = Promise.withResolvers<void>();
+      let pingsSent = 0;
+      installFake(ws => {
+        Object.assign(ws, { ping: () => { pingsSent++; } });
+        ws.emit("open", {});
+        opened.resolve();
+      });
+      const counter = { http: 0 };
+      try {
+        const pending = codexWsUpstreamFetch(CODEX_URL, streamingInit(), noResend(counter));
+        await opened.promise;
+        // Step the clock so each chained ping timer is scheduled and fired in turn.
+        for (let elapsed = 0; elapsed < CODEX_WS_RESPONSE_PRELUDE_TIMEOUT_MS; elapsed += CODEX_WS_LIVENESS_PING_INTERVAL_MS) {
+          jest.advanceTimersByTime(CODEX_WS_LIVENESS_PING_INTERVAL_MS);
+        }
+        const response = await pending;
+        expect(response.status).toBe(504);
+        const failure = ((await response.json()) as { error: { code: string; message: string } }).error;
+        expect(failure.code).toBe("upstream_no_response");
+        expect(failure.message).toContain("prelude timed out");
+        expect(failure.message).toMatch(/pings=[56] pongs=0\]/);
+        expect(pingsSent).toBeGreaterThanOrEqual(5);
+        expect(FakeWebSocket.instances[0].sent).toHaveLength(1);
+        expect(counter.http).toBe(0);
+        expect(FakeWebSocket.instances[0].closed).toBe(true);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    test("a control frame is proof of life too: quota keeps the exchange waiting", async () => {
+      jest.useFakeTimers();
+      const opened = Promise.withResolvers<void>();
+      installFake(ws => { ws.emit("open", {}); opened.resolve(); });
+      const counter = { http: 0 };
+      try {
+        const pending = codexWsUpstreamFetch(CODEX_URL, streamingInit(), noResend(counter));
+        await opened.promise;
+        const ws = FakeWebSocket.instances[0];
+        // No ping() on this socket. Quota at 60 s and 120 s resets the silence clock each time.
+        jest.advanceTimersByTime(60_000);
+        ws.emit("message", { data: JSON.stringify({ type: "codex.rate_limits", rate_limits: { primary: { used_percent: 10, window_minutes: 10080 } } }) });
+        jest.advanceTimersByTime(60_000);
+        ws.emit("message", { data: JSON.stringify({ type: "codex.rate_limits", rate_limits: { primary: { used_percent: 11, window_minutes: 10080 } } }) });
+        jest.advanceTimersByTime(60_000);
+        ws.emit("message", { data: JSON.stringify({ type: "response.created", response: { id: "r1" } }) });
+        ws.emit("message", { data: JSON.stringify({ type: "response.completed", response: { id: "r1" } }) });
+        const response = await pending;
+        expect(response.status).toBe(200);
+        expect(response.headers.get("x-codex-primary-used-percent")).toBe("11");
+        expect(await response.text()).toContain("event: response.completed");
+        expect(ws.sent).toHaveLength(1);
+        expect(counter.http).toBe(0);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
   });
 
   test("malformed native WS metadata still normalizes the real HTTP fallback routing hint", async () => {
@@ -940,12 +1656,12 @@ describe("codexWsUpstreamFetch", () => {
 });
 
 describe("native WS metadata boundaries", () => {
-  test("tertiary and label-only metadata families share the native family budget", () => {
+  test("unknown tertiary and label-only metadata families are dropped without spending the budget", () => {
     for (const suffix of ["tertiary-used-percent", "limit-name"]) {
       const owner = new CodexWsMetadata();
       owner.commit();
       const headers = Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`x-codex-family-${i}-${suffix}`, "1"]));
-      expect(() => owner.consume({ type: "codex.response.metadata", headers }, 2000)).toThrow("header budget");
+      expect(owner.consume({ type: "codex.response.metadata", headers }, 2000)).toBe('{"type":"codex.response.metadata","headers":{}}');
       expect([...owner.snapshot()]).toHaveLength(0);
     }
   });
@@ -994,8 +1710,8 @@ describe("native WS metadata boundaries", () => {
 
   test("metadata value and cumulative prelude bounds cannot be bypassed by small frames", () => {
     const owner = new CodexWsMetadata();
-    owner.consume({ type: "codex.response.metadata", headers: { "x-models-etag": "x".repeat(CODEX_WS_METADATA_MAX_VALUE_BYTES) } }, CODEX_WS_METADATA_MAX_VALUE_BYTES);
-    expect(() => owner.consume({ type: "codex.response.metadata", headers: { "x-models-etag": "x".repeat(CODEX_WS_METADATA_MAX_VALUE_BYTES + 1) } }, CODEX_WS_METADATA_MAX_VALUE_BYTES + 1)).toThrow("value");
+    owner.consume({ type: "codex.response.metadata", headers: { "x-codex-turn-state": "x".repeat(CODEX_WS_METADATA_MAX_VALUE_BYTES) } }, CODEX_WS_METADATA_MAX_VALUE_BYTES);
+    expect(() => owner.consume({ type: "codex.response.metadata", headers: { "x-codex-turn-state": "x".repeat(CODEX_WS_METADATA_MAX_VALUE_BYTES + 1) } }, CODEX_WS_METADATA_MAX_VALUE_BYTES + 1)).toThrow("value");
     const prelude = new CodexWsMetadata();
     prelude.consume({ type: "codex.rate_limits" }, CODEX_WS_METADATA_MAX_BYTES);
     expect(() => prelude.consume({ type: "codex.rate_limits" }, 1)).toThrow("prelude");
@@ -1006,7 +1722,7 @@ describe("native WS metadata boundaries", () => {
     const owner = new CodexWsMetadata(() => { calls++; });
     owner.commit();
     const text = owner.consume({ type: "codex.response.metadata", headers: { "x-models-etag": "good", authorization: "secret", "set-cookie": "secret", "x-codex-turn-state": "bad\r\nvalue" } }, 100);
-    expect(text).toBe('{"type":"codex.response.metadata","headers":{"x-models-etag":"good"}}');
+    expect(text).toBe('{"type":"codex.response.metadata","headers":{}}');
     owner.finish();
     const endedCalls = calls;
     owner.consume({ type: "codex.rate_limits", rate_limits: { primary: { used_percent: 40 } } }, 100);
@@ -1014,21 +1730,16 @@ describe("native WS metadata boundaries", () => {
     expect(owner.snapshot().has("x-codex-primary-used-percent")).toBe(false);
   });
 
-  test("metadata family and header-count caps reject only the overflowing addition", () => {
+  test("only known quota families are relayed, so unknown family names never reach the budget", () => {
     const families = new CodexWsMetadata();
     families.commit();
-    for (let i = 0; i < 16; i++) {
+    for (let i = 0; i < 17; i++) {
       families.consume({ type: "codex.rate_limits", metered_limit_name: `codex-family-${i}`, rate_limits: { primary: { used_percent: i } } }, 100);
     }
-    expect(families.snapshot().get("x-codex-family-15-primary-used-percent")).toBe("15");
-    expect(() => families.consume({ type: "codex.rate_limits", metered_limit_name: "codex-family-16", rate_limits: { primary: { used_percent: 16 } } }, 100)).toThrow("header budget");
-    expect(families.snapshot().has("x-codex-family-16-primary-used-percent")).toBe(false);
-    const headers = new CodexWsMetadata();
-    headers.commit();
-    headers.consume({ type: "codex.response.metadata", headers: Object.fromEntries(Array.from({ length: 128 }, (_, i) => [`x-ratelimit-fixture-${i}`, "1"])) }, 4000);
-    expect([...headers.snapshot()]).toHaveLength(128);
-    expect(() => headers.consume({ type: "codex.response.metadata", headers: { "x-ratelimit-extra": "1" } }, 100)).toThrow("header budget");
-    expect([...headers.snapshot()]).toHaveLength(128);
+    families.consume({ type: "codex.response.metadata", headers: quotaFamilyHeaders(129) }, 4000);
+    expect([...families.snapshot()]).toHaveLength(0);
+    families.consume({ type: "codex.rate_limits", metered_limit_name: "codex_bengalfox", rate_limits: { primary: { used_percent: 3 } } }, 100);
+    expect([...families.snapshot()]).toEqual([["x-codex-bengalfox-primary-used-percent", "3"]]);
   });
 });
 
@@ -1176,7 +1887,8 @@ describe("oversized Codex create frames", () => {
       throw new Error("fallback must not run after open");
     }) as unknown as typeof fetch);
 
-    await expect(response.text()).rejects.toThrow(
+    expect(response.status).toBe(502);
+    expect(((await response.json()) as { error: { message: string } }).error.message).toMatch(
       /rejected the request frame as too large \(close 1009 Message Too Big\)/,
     );
   });
@@ -1190,24 +1902,69 @@ describe("oversized Codex create frames", () => {
       throw new Error("fallback must not run after open");
     }) as unknown as typeof fetch);
 
-    await expect(response.text()).rejects.toThrow("closed before a Responses terminal event (close 1006)");
+    expect(response.status).toBe(502);
+    const failure = ((await response.json()) as { error: { code: string; message: string } }).error;
+    expect(failure.code).toBe("upstream_closed_before_response");
+    expect(failure.message).toContain("closed before a Responses terminal event (close 1006)");
   });
 
-  test("dials the configured provider's own wss URL for an opt-in upstream", async () => {
+  test("a pre-terminal 1006 marks the response with a content-free stage record", async () => {
     installFake(ws => {
       ws.emit("open", {});
-      ws.emit("message", { data: JSON.stringify({ type: "response.completed", response: { id: "r-ws" } }) });
+      ws.emit("close", { code: 1006, reason: "abnormal closure detail" });
     });
+    const response = await codexWsUpstreamFetch(CODEX_URL, streamingInit(), (() => {
+      throw new Error("fallback must not run after open");
+    }) as unknown as typeof fetch);
+
+    expect(response.status).toBe(502);
+    const stage = readCodexWsStage(response);
+    expect(stage).toBeDefined();
+    expect(stage?.closeCode).toBe(1006);
+    expect(stage?.sent).toBe(true);
+    expect(stage?.requestBytes).toBeGreaterThan(0);
+    expect(stage?.upstreamFrames).toBe(0);
+    expect(stage?.firstFrameMs).toBeNull();
+    expect(stage?.firstResponseMs).toBeNull();
+    expect(stage?.reused).toBe(false);
+    expect(typeof stage?.ocxVersion).toBe("string");
+    expect(stage?.bunVersion).toBe(BOUNDED_WS_RUNTIME);
+    // Content-free: the close reason is upstream text and never enters the record.
+    expect(JSON.stringify(stage)).not.toContain("abnormal closure detail");
+    expect(JSON.stringify(stage)).not.toContain("reason");
+  });
+
+  test("a committed exchange marks exactly one stage and never byte-counts the frame", async () => {
+    installFake(ws => {
+      ws.emit("open", {});
+      ws.emit("message", { data: JSON.stringify({ type: "response.created", response: { id: "r1" } }) });
+      ws.emit("message", { data: JSON.stringify({ type: "response.completed", response: { id: "r1" } }) });
+    });
+    const response = await codexWsUpstreamFetch(CODEX_URL, streamingInit(), (() => {
+      throw new Error("fallback must not run after open");
+    }) as unknown as typeof fetch);
+
+    expect(response.status).toBe(200);
+    await response.text();
+    const stage = readCodexWsStage(response);
+    expect(stage).toBeDefined();
+    // The happy path skips the UTF-8 walk of the create frame on purpose.
+    expect(stage?.requestBytes).toBeNull();
+    expect(stage?.closeCode).toBeNull();
+    expect(stage?.sent).toBe(true);
+    expect(stage?.relayedEvents).toBeGreaterThan(0);
+    expect(typeof stage?.firstResponseMs).toBe("number");
+  });
+
+  test("falls back before dialing a custom upstream URL", async () => {
     const sentinel = new Response("fallback");
     const response = await codexWsUpstreamFetch(
       "https://sub2api.example.com/v1/responses",
       streamingInit(),
-      (async () => sentinel) as typeof fetch,
+      Object.assign(async () => sentinel, { preconnect: RealFetch.preconnect }),
     );
-    expect(FakeWebSocket.instances).toHaveLength(1);
-    expect(FakeWebSocket.instances[0]!.url).toBe("wss://sub2api.example.com/v1/responses");
-    expect(response.headers.get("content-type")).toContain("text/event-stream");
-    expect(await response.text()).toContain("response.completed");
+    expect(FakeWebSocket.instances).toHaveLength(0);
+    expect(response).toBe(sentinel);
   });
 
   test("response.done normalization keeps unknown usage fields (#41980 parity)", async () => {

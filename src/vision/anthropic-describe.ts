@@ -1,15 +1,23 @@
-import type { OcxProviderConfig } from "../types";
+import { resolveAnthropicHelperSnapshot, fetchAnthropicHelper, anthropicHelperMessagesUrl } from "../sidecar/anthropic-binding";
+import { isAnthropicInstanceId } from "../providers/anthropic-instance-id";
+import type { OAuthAccessSnapshot } from "../oauth";
+import type { OcxConfig, OcxProviderConfig } from "../types";
+import { sidecarThinkingOff } from "../adapters/anthropic-model-contract";
 import { CLAUDE_CODE_HEADERS, claudeCodeSessionId } from "../adapters/client-fingerprint";
 import { signalWithTimeout, cancelBodyOnAbort } from "../lib/abort";
 import { sidecarEnter } from "../lib/sidecar-tracker";
 import { applyUpstreamRecoveryInit, fetchWithResetRetry } from "../lib/upstream-retry";
-import { getValidAccessToken, publicOAuthAuthenticationErrorMessage } from "../oauth";
+import { publicOAuthAuthenticationErrorMessage } from "../oauth";
+import { getAnthropicSidecarAccessToken } from "../oauth/anthropic-routing";
 import { ANTHROPIC_OAUTH_BETA, CLAUDE_CODE_SYSTEM_INSTRUCTION } from "../oauth/anthropic";
+import { CLAUDE_CLI_USER_AGENT } from "../providers/claude-cli-identity";
 import type { DescribeOutcome, VisionSettings } from "./describe";
 
 const ANTHROPIC_VISION_MAX_TOKENS = 1024;
 const ALLOWED_IMAGE_MIME = new Set(["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"]);
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+/** Bound the sidecar SSE stream and its untrusted error body; the description is clamped downstream. */
+const MAX_SIDECAR_RESPONSE_BYTES = 64 * 1024;
 const DESCRIBE_INSTRUCTION =
   "You are a vision describer for a text-only model that cannot see the image. Describe the image " +
   "thoroughly and factually so that model can fully reason about it: transcribe any visible text " +
@@ -43,6 +51,34 @@ function buildImageBlock(imageUrl: string): { block?: AnthropicImageBlock; error
   return { error: "unsupported image URL scheme (expected data: or https:)" };
 }
 
+/** Read at most `MAX_SIDECAR_RESPONSE_BYTES` of an untrusted upstream body, then stop reading. */
+async function readBoundedText(res: Response): Promise<string> {
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let out = "";
+  let seen = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const remaining = MAX_SIDECAR_RESPONSE_BYTES - seen;
+      const accepted = value.byteLength <= remaining ? value : value.subarray(0, remaining);
+      seen += accepted.byteLength;
+      out += decoder.decode(accepted, { stream: true });
+      if (seen >= MAX_SIDECAR_RESPONSE_BYTES) {
+        try { void reader.cancel("vision sidecar error body byte limit reached").catch(() => undefined); }
+        catch { /* best-effort body teardown */ }
+        break;
+      }
+    }
+    out += decoder.decode();
+  } catch {
+    /* a failed error-body read must not mask the HTTP status we are about to report */
+  }
+  return out;
+}
+
 /** Fold Anthropic Messages text deltas into one description. Malformed frames are ignored. */
 export async function parseAnthropicVisionSSE(res: Response): Promise<DescribeOutcome> {
   if (!res.body) return { text: "", error: "anthropic vision sidecar returned no response body" };
@@ -52,6 +88,7 @@ export async function parseAnthropicVisionSSE(res: Response): Promise<DescribeOu
   const decoder = new TextDecoder();
   const reader = res.body.getReader();
   let buffer = "";
+  let responseBytes = 0;
 
   const processFrame = (rawFrame: string): void => {
     let dataLine = "";
@@ -76,11 +113,23 @@ export async function parseAnthropicVisionSSE(res: Response): Promise<DescribeOu
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, "\n");
+      // Frames only fold on a `\n\n` separator, so an upstream that never emits one would grow
+      // `buffer` for the whole response. Accept a bounded prefix instead.
+      const remaining = MAX_SIDECAR_RESPONSE_BYTES - responseBytes;
+      const accepted = value.byteLength <= remaining ? value : value.subarray(0, remaining);
+      responseBytes += accepted.byteLength;
+      buffer = (buffer + decoder.decode(accepted, { stream: true })).replace(/\r\n/g, "\n");
       let separator: number;
       while ((separator = buffer.indexOf("\n\n")) !== -1) {
         processFrame(buffer.slice(0, separator));
         buffer = buffer.slice(separator + 2);
+      }
+      if (responseBytes >= MAX_SIDECAR_RESPONSE_BYTES) {
+        // Keep the frames folded above, drop the unterminated tail, and do not wait on teardown.
+        try { void reader.cancel("vision sidecar response byte limit reached").catch(() => undefined); }
+        catch { /* best-effort body teardown */ }
+        buffer = "";
+        break;
       }
     }
     buffer = (buffer + decoder.decode()).replace(/\r\n/g, "\n");
@@ -108,13 +157,21 @@ export async function describeImageAnthropic(
   provider: OcxProviderConfig,
   settings: VisionSettings,
   abortSignal?: AbortSignal,
+  config?: OcxConfig,
 ): Promise<DescribeOutcome> {
   const image = buildImageBlock(imageUrl);
   if (!image.block) return { text: "", error: image.error ?? "invalid image" };
 
   let token: string;
+  let snapshot: OAuthAccessSnapshot | undefined;
+  const capturedTarget = provider.baseUrl;
   try {
-    token = await getValidAccessToken(providerName);
+    if (config && isAnthropicInstanceId(providerName)) {
+      snapshot = await resolveAnthropicHelperSnapshot(config, providerName, settings.model);
+      token = snapshot.accessToken;
+    } else {
+      token = await getAnthropicSidecarAccessToken(providerName, settings.model, config);
+    }
   } catch (error) {
     return { text: "", error: `anthropic vision sidecar auth failed: ${publicOAuthAuthenticationErrorMessage(error)}` };
   }
@@ -123,7 +180,7 @@ export async function describeImageAnthropic(
     "Content-Type": "application/json",
     "anthropic-version": "2023-06-01",
     "Accept": "text/event-stream",
-    "User-Agent": "@anthropic-ai/sdk/0.74.0",
+    "User-Agent": CLAUDE_CLI_USER_AGENT,
     "Authorization": `Bearer ${token}`,
     "anthropic-beta": ANTHROPIC_OAUTH_BETA,
     ...CLAUDE_CODE_HEADERS,
@@ -138,7 +195,7 @@ export async function describeImageAnthropic(
   const body = {
     model: settings.model,
     max_tokens: ANTHROPIC_VISION_MAX_TOKENS,
-    thinking: { type: "disabled" },
+    ...sidecarThinkingOff(settings.model),
     system: [
       { type: "text", text: CLAUDE_CODE_SYSTEM_INSTRUCTION },
       { type: "text", text: DESCRIBE_INSTRUCTION },
@@ -149,22 +206,27 @@ export async function describeImageAnthropic(
 
   // Anthropic image blocks have no detail field, but detail remains part of the cache identity.
   void detail;
-  const base = provider.baseUrl.replace(/\/v1\/?$/, "");
+  const url = anthropicHelperMessagesUrl(provider.baseUrl);
+  const dispatch = (target: string, init: RequestInit) => snapshot && config
+    ? fetchAnthropicHelper(config, snapshot, settings.model, capturedTarget, target, init)
+    : fetch(target, init);
   const linkedSignal = signalWithTimeout(settings.timeoutMs, abortSignal);
   const sidecarExit = sidecarEnter("vision");
   const startedAt = Date.now();
   try {
     const res = await fetchWithResetRetry(
-      recovery => fetch(`${base}/v1/messages`, applyUpstreamRecoveryInit({
+      recovery => dispatch(url, applyUpstreamRecoveryInit({
         method: "POST",
+        redirect: "manual",
         headers,
         body: JSON.stringify(body),
         signal: linkedSignal.signal,
       }, recovery)),
-      { abortSignal: linkedSignal.signal, label: "vision-sidecar-anthropic" },
+      { replaySafe: true, abortSignal: linkedSignal.signal, label: "vision-sidecar-anthropic" },
     );
     if (!res.ok) {
-      const responseText = await res.text().catch(() => "");
+      // The body is untrusted and only feeds one auth-failure message, so read a bounded prefix.
+      const responseText = await readBoundedText(res);
       console.warn(`[vision] anthropic sidecar HTTP ${res.status} (${Date.now() - startedAt}ms)`);
       if (res.status === 401) {
         return { text: "", error: `anthropic vision sidecar auth failed: ${publicOAuthAuthenticationErrorMessage(new Error(responseText))}` };

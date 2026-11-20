@@ -1,10 +1,11 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   clearAccountQuota,
+  getAccountQuota,
   flushQuotaObservationsForTests,
   setAccountQuotaFromParsed,
 } from "../../src/codex/quota";
@@ -22,36 +23,84 @@ import {
   stopQuotaResetPoller,
 } from "../../src/quota/reset-poller";
 import { resetQuotaResetNotifyCacheForTests } from "../../src/quota/reset-notify-config";
+import { COLD_SPAWN_WARMUP_HOOK_BUDGET_MS, warmModuleGraph } from "../helpers/cold-spawn-warmup";
 
 const ACCOUNT = "acct_reset_observation";
 const HOUR = 60 * 60_000;
 
 let captured: QuotaResetEvent[] = [];
 
-/** Let the seams' lazy import() chains settle. */
+/** Join the writer's ordered observation/forget chain, including cold imports. */
 async function settle(): Promise<void> {
-  for (let index = 0; index < 6; index += 1) await Promise.resolve();
-  await new Promise(resolve => setTimeout(resolve, 5));
+  await flushQuotaObservationsForTests();
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  await settle();
   captured = [];
   resetQuotaResetStoreForTests();
   resetQuotaResetNotifyCacheForTests();
   resetQuotaResetPollerForTests();
   clearAccountQuota();
+  await settle();
   setQuotaResetSink(event => {
     captured.push(event);
   });
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await settle();
   setQuotaResetSink(null);
   resetQuotaResetPollerForTests();
   clearAccountQuota();
+  await settle();
 });
 
 describe("codex quota seam", () => {
+  test("short rollover survives repeated display eviction", async () => {
+    const start = Date.now();
+    let now = start;
+    const clock = spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      setAccountQuotaFromParsed(ACCOUNT, { shortPercent: 96, shortResetAt: start + 60_000,
+        shortWindowSeconds: 18_000, weeklyPercent: 20, weeklyResetAt: start + 7 * 24 * HOUR });
+      await settle();
+      for (const percent of [21, 22]) {
+        now = start + 61_000 + (percent - 21) * 1000;
+        setAccountQuotaFromParsed(ACCOUNT, { weeklyPercent: percent });
+        await settle();
+        const quota = getAccountQuota(ACCOUNT);
+        for (const key of ["shortPercent", "shortResetAt", "shortObservedAt", "shortWindowSeconds"] as const) {
+          expect(quota?.[key]).toBeUndefined();
+        }
+        expect(captured).toEqual([]);
+      }
+      now = start + 63_000;
+      const fresh = { shortPercent: 2, shortResetAt: now + 5 * HOUR, shortWindowSeconds: 18_000 };
+      setAccountQuotaFromParsed(ACCOUNT, fresh);
+      await settle();
+      expect(captured).toHaveLength(1);
+      expect(captured[0]).toMatchObject({ kind: "scheduled", window: "5h", percentBefore: 96, percentAfter: 2 });
+      setAccountQuotaFromParsed(ACCOUNT, fresh);
+      await settle();
+      expect(captured).toHaveLength(1);
+
+      // Leave a new high baseline whose deadline then expires, making a missed clear
+      // observable as a scheduled reset rather than an ignored two-point drop.
+      setAccountQuotaFromParsed(ACCOUNT, { shortPercent: 96, shortResetAt: now + 60_000, shortWindowSeconds: 18_000 });
+      await settle();
+      now += 61_000;
+      setAccountQuotaFromParsed(ACCOUNT, { weeklyPercent: 23 });
+      await settle();
+      clearAccountQuota(ACCOUNT);
+      await settle();
+      captured = [];
+      setAccountQuotaFromParsed(ACCOUNT, { shortPercent: 0, shortResetAt: now + 6 * HOUR });
+      await settle();
+      expect(captured).toEqual([]);
+    } finally { clock.mockRestore(); }
+  });
+
   test("a weekly rollover through the real writer fires exactly one scheduled event", async () => {
     const expired = Date.now() - 60_000;
     setAccountQuotaFromParsed(ACCOUNT, { weeklyPercent: 96, weeklyResetAt: expired });
@@ -277,6 +326,11 @@ describe("idle poller", () => {
 });
 
 describe("observation ordering under a burst", () => {
+  beforeAll(async () => {
+    // Compile in a separate process; the assertion still starts with a fresh module registry.
+    await warmModuleGraph({ graph: "quota-reset/cold-burst", entry:
+      fileURLToPath(new URL("../helpers/quota-reset-burst-child.ts", import.meta.url)) });
+  }, COLD_SPAWN_WARMUP_HOOK_BUDGET_MS);
   test("a rising-usage burst in a COLD process fires nothing", async () => {
     // The regression this pins: the seam awaited two import() calls before swapping the
     // baseline, and Bun does not resolve concurrent dynamic imports in call order. A burst of

@@ -20,7 +20,7 @@ duyduğunda ChatGPT oturumunuzu da kullanabilir.
 ## Kurulum
 
 ```bash
-npm install -g @bitkyc08/opencodex
+npm install -g --allow-scripts=bun @bitkyc08/opencodex
 ```
 
 :::note[npm bun postinstall betiğini engelledi mi?]
@@ -54,7 +54,7 @@ erişim sağlamaz. Önizleme kanalını yalnızca yayınlanmamış opencodex
 derlemelerini test etmek için kullanın:
 
 ```bash
-npm install -g @bitkyc08/opencodex@preview
+npm install -g --allow-scripts=bun @bitkyc08/opencodex@preview
 ocx update --tag preview
 ```
 
@@ -86,7 +86,7 @@ alır.
 | --- | --- |
 | `$OPENCODEX_HOME/config.json` | Sağlayıcılarınız, varsayılan sağlayıcı, port ve seçenekler. |
 | `$OPENCODEX_HOME/ocx.pid` | Çalışan proxy'nin PID'si (tek örnek koruması). |
-| `$OPENCODEX_HOME/runtime-port.json` | Otomatik olarak seçilen bir yedek port dahil olmak üzere canlı PID, ana bilgisayar adı ve port. |
+| `$OPENCODEX_HOME/runtime-port.json` | Canlı PID, ana bilgisayar adı ve port; `config.port` `0` olduğunda işletim sistemi tarafından atanan port da buna dahildir. |
 | `$OPENCODEX_HOME/auth.json` | Saklanan OAuth kimlik bilgileri (`ocx login` yaptığınızda). |
 | `$OPENCODEX_HOME/catalog-backup*.json` | opencodex düzenlemeden önce alınan Codex model kataloğu yedekleri. |
 | `$CODEX_HOME/config.toml` | Geri döngüde opencodex işaretçi sahipliğindeki kök `openai_base_url` ekler; geri döngü olmayan bağlantılar `model_provider = "opencodex"` artı `[model_providers.opencodex]` kullanır, böylece Codex API kimlik doğrulama başlığını gönderebilir. |

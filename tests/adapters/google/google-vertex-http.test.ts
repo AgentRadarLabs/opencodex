@@ -1,7 +1,89 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import * as retry from "../../../src/lib/upstream-retry";
+import { createRequestExecutionBudget } from "../../../src/lib/request-execution-budget";
+import { budgetOwner } from "../../helpers/send-budget-owner";
 import type { AdapterRequest } from "../../../src/adapters/base";
 import { fetchAntigravityWithRetry, fetchDirectGeminiWithRetry, fetchVertexWithRetry } from "../../../src/adapters/google-http";
-import { safeVertexHttpErrorMessage, retryableGoogleStatus } from "../../../src/adapters/google-errors";
+import { ANTIGRAVITY_ACCESS_DENIED_PREFIX, ANTIGRAVITY_AUTH_FAILED_PREFIX, ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX, safeAntigravityHttpErrorMessage, safeVertexHttpErrorMessage, retryableGoogleStatus } from "../../../src/adapters/google-errors";
+import { isAntigravityAccessDeniedRefusal, isAntigravityRawValidationRefusal, isAntigravityValidationRefusal } from "../../../src/server/responses/antigravity-validation-refusal";
+
+describe("Antigravity 403 body boundary", () => {
+  test("a complete structured reason inside 4096 bytes survives normalization", async () => {
+    const payload = JSON.stringify({ error: { status: "PERMISSION_DENIED", message: "validate",
+      details: [{ reason: "VALIDATION_REQUIRED" }] } });
+    const result = await fetchAntigravityWithRetry(request, {
+      executor: (async () => new Response(payload, { status: 403 })) as typeof fetch,
+    });
+    expect((await result.text()).startsWith(`${ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX}:`)).toBe(true);
+  });
+
+  test("only a complete normalized marker admits rotation and inspection preserves the response", async () => {
+    const accepted = new Response(`${ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX}: validation needed`, { status: 403 });
+    expect(await isAntigravityValidationRefusal(accepted)).toBe(true);
+    expect(await accepted.text()).toContain("validation needed");
+    for (const text of [ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX, `${ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX}x: fake`,
+      `Antigravity access denied: ${ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX}: fake`]) {
+      const refused = new Response(text, { status: 403 });
+      expect(await isAntigravityValidationRefusal(refused)).toBe(false);
+      expect(await refused.text()).toBe(text);
+    }
+    const controller = new AbortController();
+    controller.abort();
+    const aborted = new Response(`${ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX}: validation needed`, { status: 403 });
+    expect(await isAntigravityValidationRefusal(aborted, controller.signal)).toBe(false);
+    expect(await aborted.text()).toContain("validation needed");
+  });
+
+  test("a plain access-denied 403 is rotatable but a verify-account or validation demand is not", async () => {
+    const denied = (message: string) => safeAntigravityHttpErrorMessage(403, JSON.stringify({ error: { code: 403, status: "PERMISSION_DENIED", message } }));
+    // The marker prefix must stay what the normalizer actually writes for a 403.
+    expect(denied("The caller does not have permission").startsWith(ANTIGRAVITY_ACCESS_DENIED_PREFIX)).toBe(true);
+    expect(await isAntigravityAccessDeniedRefusal(new Response(denied("The caller does not have permission"), { status: 403 }))).toBe(true);
+    // verify-account has its own durable quarantine path; this one must not pre-empt it.
+    expect(await isAntigravityAccessDeniedRefusal(new Response(denied("Please verify your account to continue."), { status: 403 }))).toBe(false);
+    expect(await isAntigravityAccessDeniedRefusal(new Response(`${ANTIGRAVITY_VALIDATION_REQUIRED_PREFIX}: x`, { status: 403 }))).toBe(false);
+    expect(await isAntigravityAccessDeniedRefusal(new Response(denied("The caller does not have permission"), { status: 401 }))).toBe(false);
+    // A 403 PERMISSION_DENIED worded as invalid credentials normalizes to "authentication failed"; it
+    // refuses this account just the same.
+    expect(await isAntigravityAccessDeniedRefusal(new Response(denied("Request had invalid authentication credentials."), { status: 403 }))).toBe(true);
+    // The same wording without Google's enum (a proxy page, an enum-less envelope) names no account.
+    for (const raw of ["<html>Session expired</html>", JSON.stringify({ error: { code: 403, message: "Token expired" } })]) {
+      const normalized = safeAntigravityHttpErrorMessage(403, raw);
+      expect(normalized.startsWith(ANTIGRAVITY_AUTH_FAILED_PREFIX)).toBe(true);
+      expect(await isAntigravityAccessDeniedRefusal(new Response(normalized, { status: 403 }))).toBe(false);
+      expect(await isAntigravityRawValidationRefusal(new Response(raw, { status: 403 }))).toBe(false);
+    }
+    const aborted = new AbortController();
+    aborted.abort();
+    expect(await isAntigravityAccessDeniedRefusal(new Response(denied("nope"), { status: 403 }), aborted.signal)).toBe(false);
+    // Sidecar dispatch sees the raw Google envelope and normalizes it itself.
+    expect(await isAntigravityRawValidationRefusal(new Response(JSON.stringify({ error: { code: 403, status: "PERMISSION_DENIED", message: "nope" } }), { status: 403 }))).toBe(true);
+    // The sidecar leaves a verify-account demand to the quarantine path too.
+    expect(await isAntigravityRawValidationRefusal(new Response(JSON.stringify({ error: { code: 403, status: "PERMISSION_DENIED", message: "Please verify your account to continue." } }), { status: 403 }))).toBe(false);
+    expect(await isAntigravityRawValidationRefusal(new Response(JSON.stringify({ error: { code: 500, status: "INTERNAL", message: "nope" } }), { status: 500 }))).toBe(false);
+  });
+
+  test("an oversized validation body is discarded before formatting", async () => {
+    const payload = JSON.stringify({ error: { status: "PERMISSION_DENIED", message: "secret-canary",
+      filler: "x".repeat(4200), details: [{ reason: "VALIDATION_REQUIRED" }] } });
+    const result = await fetchAntigravityWithRetry(request, {
+      executor: (async () => new Response(payload, { status: 403 })) as typeof fetch,
+    });
+    const text = await result.text();
+    expect(text).toBe("Antigravity access denied: HTTP 403");
+    expect(text).not.toContain("secret-canary");
+  });
+
+  test("a stalled validation body falls back after the 2 second bound", async () => {
+    const stalled = new ReadableStream<Uint8Array>({ start() {} });
+    const start = performance.now();
+    const result = await fetchAntigravityWithRetry(request, {
+      executor: (async () => new Response(stalled, { status: 403 })) as typeof fetch,
+    });
+    expect(performance.now() - start).toBeLessThan(3500);
+    expect(await result.text()).toBe("Antigravity access denied: HTTP 403");
+  });
+});
 
 const realFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = realFetch; });
@@ -30,6 +112,121 @@ function vertexError(code: number, status: string, message: string): string {
 }
 
 describe("vertex retry fetch", () => {
+  test("Google preserves the executor TypeError after its header deadline", async () => {
+    const original = new TypeError("google executor deadline rejection");
+    let sends = 0;
+    const executor = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      sends += 1;
+      return await new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (signal?.aborted) reject(original);
+        else signal?.addEventListener("abort", () => reject(original), { once: true });
+      });
+    }) as typeof fetch;
+    await expect(fetchVertexWithRetry(request, { executor, timeoutMs: 1 })).rejects.toBe(original);
+    expect(sends).toBe(retry.TRANSIENT_RETRY_MAX_ATTEMPTS);
+  });
+
+  for (const [name, fetchResponse] of [["Vertex", fetchVertexWithRetry], ["Antigravity", fetchAntigravityWithRetry]] as const) {
+    test.each([400, 429, 503, "reset"] as const)(`${name} prepaid final send prevents another inference or backoff (%s)`, async status => {
+      const parent = createRequestExecutionBudget();
+      parent.used = 3;
+      const { owner, dispose } = budgetOwner(parent);
+      const raw = status === 400 ? vertexError(400, "INVALID_ARGUMENT", "tools.0.custom.input_schema: JSON schema is invalid") : `fixture ${status}`;
+      const first = status === "reset" ? Object.assign(new Error("fixture reset"), { code: "ECONNRESET" })
+        : new Response(raw, { status, headers: { "Retry-After": "60" } });
+      const fixture = mockFetch([first, new Response("unexpected replay")]);
+      const waits = spyOn(retry, "sleepWithAbort").mockImplementation(async () => {});
+      const ordinals: number[] = [];
+      try {
+        const hop = owner.reserveCredentialHop("auth-recovery", request.url, true);
+        if (!hop.allowed || !hop.permit) throw new Error("Expected final prepaid send");
+        owner.pendingHopPermit = hop.permit;
+        const scope = owner.adapterDispatchBudget;
+        if (!scope) throw new Error("Expected an adapter dispatch budget");
+        const result = fetchResponse({ ...request, body: JSON.stringify({ request: {
+          contents: [{ role: "user", parts: [{ text: "hi" }] }],
+          tools: [{ functionDeclarations: [{ name: "replace_in_files", parameters: {
+            type: "object", properties: { occurrence_ids: { type: "array", items: { type: "string" } } },
+          } }] }],
+        } }) }, { sendBudget: scope, returnRawErrors: true, onPhysicalSend: send => ordinals.push(send.ordinal) });
+        if (status === "reset") await expect(result).rejects.toBeInstanceOf(retry.SendBudgetExhaustedError);
+        else {
+          const response = await result;
+          expect(response).toBe(first);
+          expect(await response.text()).toBe(raw);
+        }
+        expect(fixture.calls).toHaveLength(1);
+        expect(waits).not.toHaveBeenCalled();
+        expect(parent.used).toBe(4);
+        expect(ordinals).toEqual([1]);
+      } finally { waits.mockRestore(); dispose(); }
+    });
+  }
+
+  // #5044. A refused recovery used to leave nothing behind: one physical send, no recovery
+  // kind, and a real upstream response — byte-identical in the log to a request where no
+  // retry was ever eligible. Those two need opposite follow-ups.
+  test.each([429, 503] as const)("a retry the budget refuses is attributed, not silent (%s)", async status => {
+    const parent = createRequestExecutionBudget();
+    parent.used = 3;
+    const { owner, dispose } = budgetOwner(parent);
+    const first = new Response(`fixture ${status}`, { status, headers: { "Retry-After": "60" } });
+    const fixture = mockFetch([first, new Response("unexpected replay")]);
+    const waits = spyOn(retry, "sleepWithAbort").mockImplementation(async () => {});
+    const ordinals: number[] = [];
+    const withheld: string[] = [];
+    try {
+      const hop = owner.reserveCredentialHop("auth-recovery", request.url, true);
+      if (!hop.allowed || !hop.permit) throw new Error("Expected final prepaid send");
+      owner.pendingHopPermit = hop.permit;
+      const scope = owner.adapterDispatchBudget;
+      if (!scope) throw new Error("Expected an adapter dispatch budget");
+      const response = await fetchVertexWithRetry(request, {
+        sendBudget: scope,
+        returnRawErrors: true,
+        onPhysicalSend: send => ordinals.push(send.ordinal),
+        onRecoveryWithheld: event => withheld.push(event.reason),
+      });
+
+      // The upstream answer is preserved exactly; the attribution is additional evidence, not
+      // a substitute for it.
+      expect(response).toBe(first);
+      expect(withheld).toEqual(["retry-send-budget"]);
+      // And it did not become a send: `sendCount` must keep meaning "requests actually made".
+      expect(ordinals).toEqual([1]);
+      expect(fixture.calls).toHaveLength(1);
+      expect(parent.used).toBe(4);
+      expect(waits).not.toHaveBeenCalled();
+    } finally { waits.mockRestore(); dispose(); }
+  });
+
+  test("a status the ladder would never retry reports nothing withheld", async () => {
+    // The other half of the four-way distinction: no recovery kind AND no withheld reason has
+    // to keep meaning "nothing was eligible", or the new field says everything and so nothing.
+    const parent = createRequestExecutionBudget();
+    parent.used = 3;
+    const { owner, dispose } = budgetOwner(parent);
+    const first = new Response(vertexError(404, "NOT_FOUND", "no such model"), { status: 404 });
+    mockFetch([first, new Response("unexpected replay")]);
+    const withheld: string[] = [];
+    try {
+      const hop = owner.reserveCredentialHop("auth-recovery", request.url, true);
+      if (!hop.allowed || !hop.permit) throw new Error("Expected final prepaid send");
+      owner.pendingHopPermit = hop.permit;
+      const scope = owner.adapterDispatchBudget;
+      if (!scope) throw new Error("Expected an adapter dispatch budget");
+      const response = await fetchVertexWithRetry(request, {
+        sendBudget: scope,
+        returnRawErrors: true,
+        onRecoveryWithheld: event => withheld.push(event.reason),
+      });
+      expect(response).toBe(first);
+      expect(withheld).toEqual([]);
+    } finally { dispose(); }
+  });
+
+
   test("successful response bodies survive beyond the response-header timeout", async () => {
     globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
       async start(controller) {
@@ -87,11 +284,14 @@ describe("vertex retry fetch", () => {
       value: () => neverSettles,
     });
     const mock = mockFetch([first, new Response("ok", { status: 200 })]);
+    // Retry-After is a floor over the jittered backoff (#7802), so stub the backoff sleep: the
+    // race below measures only whether the resend waits on the discarded body's cancellation.
+    const waits = spyOn(retry, "sleepWithAbort").mockImplementation(async () => {});
 
     const res = await Promise.race([
       fetchVertexWithRetry(request, { timeoutMs: 5_000 }),
       Bun.sleep(250).then(() => { throw new Error("retry waited for response body cancellation"); }),
-    ]);
+    ]).finally(() => waits.mockRestore());
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
@@ -100,16 +300,10 @@ describe("vertex retry fetch", () => {
   });
 
   test("retries a thrown network error then succeeds", async () => {
-    const recoveries: string[] = [];
-    const error = Object.assign(new Error("network failure: ECONNRESET"), { code: "ECONNRESET" });
-    const mock = mockFetch([error, new Response("ok", { status: 200 })]);
-    const res = await fetchVertexWithRetry(request, {
-      timeoutMs: 5_000,
-      onRetry: recovery => recoveries.push(recovery),
-    });
+    const mock = mockFetch([new Error("ECONNRESET"), new Response("ok", { status: 200 })]);
+    const res = await fetchVertexWithRetry(request, { timeoutMs: 5_000 });
     expect(res.status).toBe(200);
     expect(mock.calls).toHaveLength(2);
-    expect(recoveries).toEqual(["connection-reset"]);
   });
 
   test("does NOT retry a quota-exhausted 429 (single attempt), but DOES retry a plain rate-limit 429", async () => {
@@ -157,20 +351,40 @@ describe("vertex retry fetch", () => {
       new Response("ok", { status: 200 }),
     ]);
 
-    const recoveries: string[] = [];
-    const res = await fetchAntigravityWithRetry(repairableRequest, {
-      timeoutMs: 5_000,
-      onRetry: recovery => recoveries.push(recovery),
-    });
+    const res = await fetchAntigravityWithRetry(repairableRequest, { timeoutMs: 5_000 });
 
     expect(res.status).toBe(200);
     expect(mock.calls).toHaveLength(2);
-    expect(recoveries).toEqual(["adapter-retry"]);
     const replay = JSON.parse(mock.calls[1].body as string);
     expect(replay.request.tools[0].functionDeclarations[0].parameters).toEqual({
       type: "object",
       properties: {},
     });
+  });
+
+  test("a repaired Vertex replay follows a later credential rebuild on transient retry", async () => {
+    const original: AdapterRequest = { ...request, headers: { authorization: "Bearer old" }, body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: "hi" }] }],
+      tools: [{ functionDeclarations: [{ name: "fixture", parameters: { type: "object", properties: { ids: { type: "array", items: { type: "string" } } } } }] }],
+    }) };
+    const calls: Array<{ url: string; authorization: string | null; body: string }> = [];
+    const sleep = spyOn(retry, "sleepWithAbort").mockImplementation(async () => {});
+    const executor = (async (input, init) => {
+      calls.push({ url: String(input), authorization: new Headers(init?.headers).get("authorization"), body: String(init?.body) });
+      if (calls.length === 1) return new Response(vertexError(400, "INVALID_ARGUMENT", "tools.0.custom.input_schema: JSON schema is invalid"), { status: 400 });
+      if (calls.length === 2) {
+        original.url = "https://aiplatform.googleapis.com/v1/new";
+        original.headers = { authorization: "Bearer new" };
+        return new Response("retry", { status: 503 });
+      }
+      return new Response("ok");
+    }) as typeof fetch;
+    try {
+      expect((await fetchVertexWithRetry(original, { executor, timeoutMs: 5_000 })).status).toBe(200);
+      expect(calls).toHaveLength(3);
+      expect(calls[2]).toMatchObject({ url: "https://aiplatform.googleapis.com/v1/new", authorization: "Bearer new" });
+      expect(calls[2]!.body).toBe(calls[1]!.body);
+    } finally { sleep.mockRestore(); }
   });
 
   test("raw mode preserves final error body and headers without normalization", async () => {
@@ -287,28 +501,17 @@ describe("vertex retry fetch", () => {
     expect(await res.text()).toBe(raw);
   });
 
-  test("routes retries through ctx.executor with labels on the next dispatch", async () => {
-    const executorCalls: Array<string | undefined> = [];
-    let nextRecovery: string | undefined;
-    const responses = [
-      new Response(vertexError(503, "UNAVAILABLE", "overloaded"), { status: 503, headers: { "Retry-After": "0" } }),
-      new Response(vertexError(429, "RESOURCE_EXHAUSTED", "rate limit, try again"), { status: 429, headers: { "Retry-After": "0" } }),
-      new Response("executor-ok", { status: 200 }),
-    ];
-    const customExecutor: typeof fetch = (async () => {
-      executorCalls.push(nextRecovery);
-      nextRecovery = undefined;
-      return responses.shift()!;
+  test("fetchGoogleWithRetry routes physical attempts through ctx.executor when provided", async () => {
+    const executorCalls: RequestInit[] = [];
+    const customExecutor: typeof fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      executorCalls.push(init ?? {});
+      return new Response("executor-ok", { status: 200 });
     }) as typeof fetch;
 
-    const res = await fetchVertexWithRetry(request, {
-      timeoutMs: 5_000,
-      executor: customExecutor,
-      onRetry: recovery => { nextRecovery = recovery; },
-    });
+    const res = await fetchVertexWithRetry(request, { timeoutMs: 5_000, executor: customExecutor });
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("executor-ok");
-    expect(executorCalls).toEqual([undefined, "transient-5xx", "rate-limit-429"]);
+    expect(executorCalls).toHaveLength(1);
   });
 });
 
@@ -374,3 +577,62 @@ describe("adapter fetchResponse wiring", () => {
     }
   });
 });
+
+describe("Google Retry-After is a lower bound (#7802)", () => {
+  const wrappers = [
+    ["Vertex", fetchVertexWithRetry],
+    ["Antigravity", fetchAntigravityWithRetry],
+    ["Gemini direct", fetchDirectGeminiWithRetry],
+  ] as const;
+  const transient = (status: 429 | 503, retryAfter: string) => new Response(
+    vertexError(status, status === 429 ? "RESOURCE_EXHAUSTED" : "UNAVAILABLE", "rate limit, try again"),
+    { status, headers: { "Retry-After": retryAfter } },
+  );
+
+  for (const [name, fetchResponse] of wrappers) {
+    for (const status of [429, 503] as const) test(`${name} waits the full instructed delay before resending (${status})`, async () => {
+      const fixture = mockFetch([transient(status, "30"), new Response("ok", { status: 200 })]);
+      const waits: number[] = [];
+      const sleep = spyOn(retry, "sleepWithAbort").mockImplementation(async ms => { waits.push(ms); });
+      try {
+        const res = await fetchResponse(request, { timeoutMs: 5_000 });
+        expect(res.status).toBe(200);
+        expect(fixture.calls).toHaveLength(2);
+        expect(waits).toHaveLength(1);
+        expect(waits[0]).toBeGreaterThanOrEqual(30_000);
+      } finally { sleep.mockRestore(); }
+    });
+
+    test(`${name} honours an HTTP-date Retry-After as the same floor`, async () => {
+      const at = new Date(Date.now() + 45_000).toUTCString();
+      const fixture = mockFetch([transient(503, at), new Response("ok", { status: 200 })]);
+      const waits: number[] = [];
+      const sleep = spyOn(retry, "sleepWithAbort").mockImplementation(async ms => { waits.push(ms); });
+      try {
+        expect((await fetchResponse(request, { timeoutMs: 5_000 })).status).toBe(200);
+        expect(fixture.calls).toHaveLength(2);
+        expect(waits).toHaveLength(1);
+        expect(waits[0]).toBeGreaterThanOrEqual(43_000);
+        expect(waits[0]).toBeLessThanOrEqual(retry.RETRY_AFTER_CEILING_MS);
+      } finally { sleep.mockRestore(); }
+    });
+
+    for (const status of [429, 503] as const) test(`${name} ends with the upstream answer when the instruction outlives the wait deadline (${status})`, async () => {
+      const first = transient(status, "120");
+      const fixture = mockFetch([first, new Response("unexpected early resend", { status: 200 })]);
+      const sleep = spyOn(retry, "sleepWithAbort").mockImplementation(async () => {});
+      try {
+        const res = await fetchResponse(request, { timeoutMs: 5_000 });
+        expect(res.status).toBe(status);
+        expect(fixture.calls).toHaveLength(1);
+        expect(sleep).not.toHaveBeenCalled();
+        if (name === "Gemini direct") {
+          expect(res).toBe(first);
+          expect(res.headers.get("retry-after")).toBe("120");
+          expect(await res.text()).toContain("rate limit, try again");
+        }
+      } finally { sleep.mockRestore(); }
+    });
+  }
+});
+

@@ -54,6 +54,29 @@ export type PendingTeardownReceipt = {
    * guessed receipt therefore fails closed into manual recovery.
    */
   endpointSource: "exact" | "guessed";
+  /**
+   * Set when the stop handed its teardown to a replacement proxy instead of performing it
+   * (#7423). An update that is about to restart the proxy keeps Codex routing and the
+   * routed catalog in place across the gap, so a Codex process that loads them while the
+   * package is replaced still sees the routed rows. The obligation is the same one: the
+   * replacement discharges it after its first successful publication, and if no
+   * replacement ever comes up, the next `ocx stop` finishes it like any abandoned receipt.
+   */
+  handover?: "update-restart";
+  /**
+   * Windows checked stop (#7771): what the owner's Part A did before it sent the stop.
+   * /api/stop skips its own Part A only for a receipt carrying this record whose manager
+   * is still the registered one; a receipt without it (an older CLI, or one written
+   * before Part A) gets the route's own capped Part A. Readers that predate it ignore it.
+   */
+  partA?: PendingTeardownPartA;
+};
+
+/** The Part A record of a teardown receipt: the outcome, the manager, the ended wrappers. */
+export type PendingTeardownPartA = {
+  partA: "stopped" | "absent";
+  manager: { scheduler: boolean; winsw: boolean };
+  wrappers: { pid: number; startTime: number }[];
 };
 
 /**
@@ -111,6 +134,7 @@ function isReceipt(value: unknown, nonce: string): value is PendingTeardownRecei
     && receipt.nonce === nonce
     && typeof receipt.createdAt === "string"
     && (receipt.endpointSource === "exact" || receipt.endpointSource === "guessed")
+    && (receipt.handover === undefined || receipt.handover === "update-restart")
     && endpointOk;
 }
 
@@ -119,13 +143,51 @@ export function claimPendingTeardown(
   endpoint: { hostname: string; port: number },
   endpointSource: "exact" | "guessed",
   ownerPid: number = process.pid,
+  handover?: "update-restart",
+  partA?: PendingTeardownPartA | null,
 ): PendingTeardownReceipt {
   const dir = getConfigDir();
   assertNotRealHomeUnderTest(dir);
   const nonce = randomBytes(16).toString("hex");
-  const receipt: PendingTeardownReceipt = { ownerPid, nonce, createdAt: new Date().toISOString(), endpoint, endpointSource };
+  const receipt: PendingTeardownReceipt = {
+    ownerPid, nonce, createdAt: new Date().toISOString(), endpoint, endpointSource,
+    ...(handover ? { handover } : {}),
+    ...(partA ? { partA } : {}),
+  };
   atomicWriteFile(pendingTeardownPathFor(nonce), JSON.stringify(receipt, null, 2) + "\n");
   return receipt;
+}
+
+/**
+ * Add the Part A record to a receipt this process claimed before Part A ran (the guarded
+ * stop and an update handover claim first). Only the owner's own valid receipt is
+ * rewritten; anything else is left alone and reported as false.
+ */
+export function recordPendingTeardownPartA(nonce: string, partA: PendingTeardownPartA, ownerPid: number = process.pid): boolean {
+  const read = readPendingTeardown(nonce);
+  if (read.state !== "valid" || read.receipt.ownerPid !== ownerPid) return false;
+  assertNotRealHomeUnderTest(getConfigDir());
+  atomicWriteFile(pendingTeardownPathFor(nonce), JSON.stringify({ ...read.receipt, partA }, null, 2) + "\n");
+  return true;
+}
+
+/** The Part A record of the receipt a request names, when it is present and well formed. */
+export function pendingTeardownPartA(nonce: string | null): PendingTeardownPartA | null {
+  if (!nonce || !NONCE_RE.test(nonce)) return null;
+  const read = readPendingTeardown(nonce);
+  if (read.state !== "valid") return null;
+  const record = read.receipt.partA as unknown;
+  if (!record || typeof record !== "object") return null;
+  const value = record as Record<string, unknown>;
+  const manager = value.manager as Record<string, unknown> | undefined;
+  const ok = (value.partA === "stopped" || value.partA === "absent")
+    && !!manager && typeof manager === "object"
+    && typeof manager.scheduler === "boolean" && typeof manager.winsw === "boolean"
+    && Array.isArray(value.wrappers)
+    && value.wrappers.every(entry => !!entry && typeof entry === "object"
+      && Number.isSafeInteger((entry as { pid?: unknown }).pid)
+      && Number.isFinite((entry as { startTime?: unknown }).startTime));
+  return ok ? read.receipt.partA! : null;
 }
 
 export function readPendingTeardown(nonce: string): PendingTeardownRead {
@@ -175,7 +237,7 @@ export function listPendingTeardowns(): OutstandingTeardown[] {
   }
   const out: OutstandingTeardown[] = [];
   for (const name of names) {
-    // One naming rule, shared with the npm launcher: the two lanes drifting apart is
+    // One naming rule, shared with the package launcher: the two lanes drifting apart is
     // exactly how the Node updater stopped seeing receipts at all.
     if (!isPendingTeardownFileName(name)) continue;
     const nonce = pendingTeardownNonceFromFileName(name)!;
@@ -200,6 +262,37 @@ export function pendingTeardownOutstanding(): boolean {
     // and reporting "none" would unblock an update over a teardown that never ran.
     return (error as NodeJS.ErrnoException).code !== "ENOENT";
   }
+}
+
+/**
+ * Are the outstanding obligations EXACTLY the ones this stop chose to keep?
+ *
+ * `ocx stop` can preserve its own obligations deliberately — the Codex history preflight
+ * refuses before anything is restored, so the receipt has to survive for a later stop
+ * (#4718). That is safe for an update to continue past, because the stop knows those
+ * receipts describe a proxy it just proved down.
+ *
+ * Nothing else is. A quarantined receipt is waiting on a human, and a receipt belonging
+ * to a live owner means another stop is in flight; letting either ride along would turn
+ * "we deliberately kept ours" into "we ignored everyone's". So membership is the test,
+ * not a count of ours: an unrecognized obligation of any kind answers false and the
+ * caller falls back to the ordinary failure code.
+ *
+ * Quarantined names are included in the scan on purpose. They do not correspond to any
+ * nonce this run preserved, so their presence always answers false.
+ */
+export function pendingTeardownsAreExactly(nonces: readonly string[]): boolean {
+  const expected = new Set(nonces.map(nonce => `${PREFIX}${nonce}${SUFFIX}`));
+  let names: string[];
+  try {
+    names = readdirSync(getConfigDir());
+  } catch (error) {
+    // A home that does not exist holds nothing, which matches only an empty expectation.
+    // Any other scan failure may be hiding an obligation and must not answer "exactly".
+    return (error as NodeJS.ErrnoException).code === "ENOENT" && expected.size === 0;
+  }
+  const found = names.filter(isAnyTeardownObligationFileName);
+  return found.length === expected.size && found.every(name => expected.has(name));
 }
 
 /** Paths of quarantined obligations awaiting a human. */
@@ -264,6 +357,14 @@ export function quarantinePendingTeardown(nonce: string): string | null {
  * alone. Only an abandoned obligation is a candidate, and a VALID one still has to prove
  * its endpoint is down before anything is restored — an invalid one never can, which is
  * what {@link quarantinePendingTeardown} exists for.
+ *
+ * `isAlive` must answer "is the OWNER still running", which is not "is this PID alive".
+ * PIDs are reused: after the owner exits its number can be handed to an unrelated process,
+ * and a bare liveness probe then reports the owner as running for as long as that process
+ * lives. The receipt is neither recovered nor quarantined nor reported while both updater
+ * gates keep refusing on it, which is a permanent fail-closed with no way forward (#4897).
+ * `handleStop` therefore passes an identity-aware predicate; do not substitute a bare
+ * `process.kill(pid, 0)` here for cheapness.
  */
 export function isPendingTeardownAbandoned(
   read: PendingTeardownRead | TeardownScanFailure,
@@ -279,8 +380,24 @@ export function isPendingTeardownAbandoned(
   return !isAlive(read.receipt.ownerPid);
 }
 
-/** Does this request name an obligation that exists and is readable? */
-export function deferralMatchesReceipt(nonce: string | null): boolean {
+/**
+ * Does this request name an obligation that exists, is readable, and is about this proxy?
+ *
+ * A receipt records the endpoint its stop was sent to. With `servedPort`, only a receipt naming
+ * that port defers this proxy's teardown, so a nonce claimed for one proxy cannot be spent on
+ * another listening elsewhere: that stop would defer an obligation the receipt does not describe,
+ * and the receipt's owner could release it without knowing (#8416).
+ */
+export function deferralMatchesReceipt(nonce: string | null, servedPort?: number | null): boolean {
   if (!nonce || !NONCE_RE.test(nonce)) return false;
-  return readPendingTeardown(nonce).state === "valid";
+  const read = readPendingTeardown(nonce);
+  if (read.state !== "valid") return false;
+  return servedPort === undefined || (servedPort !== null && read.receipt.endpoint.port === servedPort);
+}
+
+/** Does this request name a valid obligation that an update handed to its replacement (#7423)? */
+export function isUpdateHandoverReceipt(nonce: string | null): boolean {
+  if (!nonce || !NONCE_RE.test(nonce)) return false;
+  const read = readPendingTeardown(nonce);
+  return read.state === "valid" && read.receipt.handover === "update-restart";
 }

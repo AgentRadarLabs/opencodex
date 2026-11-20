@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { repositoryGitEnv } from "../helpers/git-fixture";
 import { repoRoot as resolveRepoRoot } from "../helpers/repo-root";
 
 const repoRoot = resolveRepoRoot();
@@ -16,9 +17,17 @@ const repoRoot = resolveRepoRoot();
  * This test closes that gap by asserting against the real index instead of the
  * ignore file, so a forced add fails CI on the commit that introduces it.
  */
-const FORBIDDEN_TRACKED_DIRS = [".codexclaw", ".omo", ".claude", "node_modules", ".tmp"];
+const FORBIDDEN_TRACKED_DIRS = [".codexclaw", ".omo", ".claude", ".agents", "node_modules", ".tmp"];
 
 const FORBIDDEN_TRACKED_FILENAMES = [".DS_Store", "Thumbs.db"];
+
+/**
+ * Working notes an agent writes for itself or for the next agent. A scoped
+ * `design-debt.md` audit reached the repository root through a bug-train squash,
+ * and the release train 4 lanes committed `_handoff.md` files when they were
+ * stopped and resumed. Durable planning belongs in numbered `devlog/` docs.
+ */
+const AGENT_SCRATCH_FILENAMES = ["design-debt.md", "_handoff.md"];
 
 /**
  * The retired Go native-runtime experiment. Nothing in `src/`, the build, the
@@ -28,10 +37,33 @@ const FORBIDDEN_TRACKED_FILENAMES = [".DS_Store", "Thumbs.db"];
  * #820 campaign, and the third one rode a merge into `dev`. `.gitignore` cannot
  * catch that on its own, because an already-tracked path ignores the rule.
  */
-const RETIRED_TRACKED_DIRS = ["go"];
+/**
+ * The root `docs/` folder and the PR screenshot folders were retired together.
+ * `docs/` had become 4.9 MB, 4.5 MB of it pull-request evidence images that
+ * authors committed on their branch and every squash merge carried into `dev`.
+ * Moving the images did not help: `docs-site/public/pr-screenshots/` grew the
+ * same way and was published to GitHub Pages besides. Evidence images now go in
+ * the PR description or on the orphan `pr-assets` branch.
+ */
+const RETIRED_TRACKED_DIRS = [
+  "go",
+  "docs",
+  ".github/pr-assets",
+  "assets/pr-screenshots",
+  "docs-site/public/pr-screenshots",
+];
+
+/** Loose PR evidence images deleted with the folders above. */
+const RETIRED_TRACKED_FILES = [
+  "assets/pr-gate-screenshot-required.png",
+  "assets/pr2950-capacity-expiry.png",
+  "assets/pr715-selection-order.png",
+  "assets/request-pacing-dashboard.jpg",
+  "assets/zh-tw-providers.png",
+];
 
 function trackedFiles(): string[] {
-  const result = Bun.spawnSync(["git", "ls-files"], { cwd: repoRoot });
+  const result = Bun.spawnSync(["git", "ls-files"], { cwd: repoRoot, env: repositoryGitEnv() });
   if (result.exitCode !== 0) {
     throw new Error(`git ls-files failed: ${new TextDecoder().decode(result.stderr)}`);
   }
@@ -43,7 +75,7 @@ function trackedFiles(): string[] {
 }
 
 function trackedEntries(): { mode: string; path: string }[] {
-  const result = Bun.spawnSync(["git", "ls-files", "-s"], { cwd: repoRoot });
+  const result = Bun.spawnSync(["git", "ls-files", "-s"], { cwd: repoRoot, env: repositoryGitEnv() });
   if (result.exitCode !== 0) {
     throw new Error(`git ls-files -s failed: ${new TextDecoder().decode(result.stderr)}`);
   }
@@ -75,12 +107,25 @@ describe("repository hygiene", () => {
     expect(offenders).toEqual([]);
   });
 
-  test("the retired Go runtime stays untracked", () => {
+  test("no agent scratch notes are tracked", () => {
+    const offenders = trackedFiles().filter((path) =>
+      AGENT_SCRATCH_FILENAMES.includes(path.split("/").pop() ?? ""),
+    );
+
+    expect(offenders).toEqual([]);
+  });
+
+  test("retired directories stay untracked", () => {
     const offenders = trackedFiles().filter((path) =>
       RETIRED_TRACKED_DIRS.some((dir) => path === dir || path.startsWith(`${dir}/`)),
     );
 
     expect(offenders).toEqual([]);
+  });
+
+  test("retired PR evidence images stay untracked", () => {
+    const tracked = new Set(trackedFiles());
+    expect(RETIRED_TRACKED_FILES.filter((path) => tracked.has(path))).toEqual([]);
   });
 
   test("gitignore still declares the agent-state directories", async () => {
@@ -133,6 +178,7 @@ describe("devlog is tracked, with no submodule left behind", () => {
         path.startsWith("devlog/_chase/_litellm/")
         || path.startsWith("devlog/_chase/_cca/")
         || path.startsWith("devlog/_chase/DSCodex/")
+        || path.startsWith("devlog/_chase/CLIProxyAPIPlus/")
         || path.startsWith("devlog/_fin/opencode-cursor/"),
     );
 
@@ -209,7 +255,7 @@ describe("devlog is tracked, with no submodule left behind", () => {
   });
 
   test("no workflow checks out submodules", async () => {
-    const listing = Bun.spawnSync(["git", "ls-files", ".github/workflows"], { cwd: repoRoot });
+    const listing = Bun.spawnSync(["git", "ls-files", ".github/workflows"], { cwd: repoRoot, env: repositoryGitEnv() });
     const workflows = new TextDecoder()
       .decode(listing.stdout)
       .split("\n")

@@ -1,4 +1,18 @@
+import { hasElapsedShortWindow, isTerminalShortWindow } from "../../src/codex/quota-types";
+
+export interface QuotaWindowReading {
+  label: string;
+  /** Presentation-only text; identity stays in label. */
+  displayLabel?: string;
+  percent: number;
+  resetAt?: number;
+  modelId?: string;
+  /** Share of the weekly limit this model family may use ("up to 50% of your weekly limit"). */
+  weeklyAllowancePercent?: number;
+}
+
 export interface AccountQuota {
+  workbuddyCredits?: import("../../src/providers/workbuddy-credit-balance").WorkBuddyCreditBalance;
   weeklyPercent?: number;
   fiveHourPercent?: number;
   /** Codex account API aliases for the same five-hour window. */
@@ -7,9 +21,19 @@ export interface AccountQuota {
   weeklyResetAt?: number;
   fiveHourResetAt?: number;
   shortResetAt?: number;
+  /** Local observation time for the short-window percentage. */
+  shortObservedAt?: number;
   shortWindowSeconds?: number;
   monthlyResetAt?: number;
-  customWindows?: { label: string; percent: number; resetAt?: number }[];
+  customWindows?: QuotaWindowReading[];
+  /**
+   * Display-only readings: an Anthropic model limit upstream reports as not binding right now.
+   * Only the quota bars render them; summary headlines, tray rows and urgency sorting never read
+   * this field, matching the server, where routing reads only `customWindows`.
+   */
+  displayWindows?: QuotaWindowReading[];
+  /** Display-only budgets whose entitlement upstream did not report; never a usage percentage. */
+  unknownBudgetWindows?: { label: string; resetAt?: number }[];
   creditsUsd?: {
     used: number;
     limit: number;
@@ -48,8 +72,58 @@ export function normalizeQuotaForPlan(quota: AccountQuota | null, plan: string |
   return {
     ...(normalized.monthlyPercent !== undefined ? { monthlyPercent: normalized.monthlyPercent } : {}),
     ...(normalized.monthlyResetAt !== undefined ? { monthlyResetAt: normalized.monthlyResetAt } : {}),
+    ...(normalized.workbuddyCredits !== undefined ? { workbuddyCredits: normalized.workbuddyCredits } : {}),
     ...(normalized.creditsUsd !== undefined ? { creditsUsd: normalized.creditsUsd } : {}),
     ...(normalized.resetCredits !== undefined ? { resetCredits: normalized.resetCredits } : {}),
     updatedAt: normalized.updatedAt,
   };
+}
+
+/**
+ * Compute the governing Codex usage score matching the server's auto-switch threshold evaluation.
+ *
+ * Evaluates governing quota windows based on the account's plan:
+ * - For 30-day only plans (e.g. Free/Go), only the monthly window governs.
+ * - For standard plans, weekly and monthly windows govern.
+ * - A known five-hour / short window refines a known governing long-window score until its valid reset elapses.
+ * - If no long window has been observed, an active terminal short burst (at 100%) acts as exhausted (100).
+ * - Unknown or unprimed quota returns `null` so callers do not spuriously trigger threshold actions.
+ */
+export function computeCodexUsageScore(
+  quota: AccountQuota | null | undefined,
+  plan?: string | null,
+  now: number = Date.now(),
+): number | null {
+  if (!quota) return null;
+  const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+  const shortPercent = finite(quota.fiveHourPercent)
+    ? quota.fiveHourPercent
+    : (finite(quota.shortPercent) ? quota.shortPercent : undefined);
+  const longWindows = isThirtyDayOnlyPlan(plan)
+    ? [quota.monthlyPercent]
+    : [quota.weeklyPercent, quota.monthlyPercent];
+  const knownLong = longWindows.filter(finite);
+  if (knownLong.length === 0) {
+    // The same decision the router makes, made by the same function rather than by a second
+    // copy of the rule. The copy that used to live here differed twice: it compared a stored
+    // reset against `now` without normalizing seconds to milliseconds, so a seconds-form
+    // future reset read as expired; and it accepted a fresh observation even when an ELAPSED
+    // reset was present, where routing treats a reset as authoritative once it exists. Either
+    // difference reports an account the router will refuse as usable (#5045).
+    //
+    // The alias collapse happens here because it is a wire concern of this DTO: the account
+    // API spells the same burst window `fiveHour*` and the stored snapshot spells it `short*`.
+    return isTerminalShortWindow({
+      ...(finite(shortPercent) ? { shortPercent } : {}),
+      ...(finite(quota.fiveHourResetAt ?? quota.shortResetAt)
+        ? { shortResetAt: quota.fiveHourResetAt ?? quota.shortResetAt }
+        : {}),
+      ...(finite(quota.shortObservedAt) ? { shortObservedAt: quota.shortObservedAt } : {}),
+    }, now)
+      ? 100
+      : null;
+  }
+  const values = finite(shortPercent) && !hasElapsedShortWindow(quota.fiveHourResetAt ?? quota.shortResetAt, now)
+    ? [...knownLong, shortPercent] : knownLong;
+  return values.length ? Math.max(...values) : null;
 }

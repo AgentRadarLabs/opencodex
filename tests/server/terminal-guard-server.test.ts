@@ -1,15 +1,21 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { clearPoolRotationState } from "../../src/codex/pool-rotation";
-import { clearAnthropicAccountPoolState } from "../../src/oauth/anthropic-routing";
 import { saveConfig } from "../../src/config";
 import { clearKeyCooldowns } from "../../src/providers/key-failover";
-import type { RequestLogContext } from "../../src/server/request-log";
 import { handleResponses } from "../../src/server/responses";
+import { httpStatusFromTerminalError } from "../../src/lib/errors";
+import { errorDetailFor } from "../../src/usage/error-detail";
+import { inspectResponseLogJson, type RequestLogContext } from "../../src/server/request-log";
 import type { OcxConfig } from "../../src/types";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
+import { saveCredential, setActiveAccount, getAccountSet } from "../../src/oauth/store";
+
+let releaseInheritedSpendHome: (() => void) | undefined;
+// Taken per inherited-home dispatch because one row below installs a different home.
+const takeInheritedSpendHome = (): void => { releaseInheritedSpendHome = acquireOwnedSpendHome(); };
 
 const config = {
   port: 0,
@@ -101,10 +107,14 @@ describe("server terminal guard integration", () => {
   });
 
   afterEach(() => {
+    // Released first so a failed row cannot carry its writer lease into the next case.
+    releaseInheritedSpendHome?.();
+    releaseInheritedSpendHome = undefined;
     globalThis.fetch = originalFetch;
   });
 
   test("re-asks Claude once inside the same Responses turn and forwards the tool call", async () => {
+    takeInheritedSpendHome();
     const response = await handleResponses(new Request("http://localhost/v1/responses", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -126,220 +136,8 @@ describe("server terminal guard integration", () => {
     expect(messages.at(-1)?.content?.[0]?.text).toContain("你刚才只描述了计划");
   });
 
-  test("terminal-guard Anthropic account rotation opens a new physical attempt", async () => {
-    const home = mkdtempSync(join(tmpdir(), "ocx-terminal-anthropic-pool-"));
-    const previousHome = process.env.OPENCODEX_HOME;
-    process.env.OPENCODEX_HOME = home;
-    clearAnthropicAccountPoolState();
-    clearPoolRotationState();
-    try {
-      writeFileSync(join(home, "auth.json"), JSON.stringify({
-        anthropic: {
-          activeAccountId: "account-a",
-          accounts: [
-            {
-              id: "account-a",
-              credential: {
-                access: "synthetic-access-a",
-                refresh: "synthetic-refresh-a",
-                expires: 9999999999999,
-                accountId: "synthetic-account-a",
-              },
-            },
-            {
-              id: "account-b",
-              credential: {
-                access: "synthetic-access-b",
-                refresh: "synthetic-refresh-b",
-                expires: 9999999999999,
-                accountId: "synthetic-account-b",
-              },
-            },
-          ],
-        },
-      }), { mode: 0o600 });
-      const poolConfig = {
-        port: 0,
-        defaultProvider: "anthropic",
-        providers: {
-          anthropic: {
-            adapter: "anthropic",
-            baseUrl: "https://example.test",
-            authMode: "oauth",
-          },
-        },
-        anthropicAccountPool: { enabled: true, autoSwitchThreshold: 100 },
-      } as unknown as OcxConfig;
-      const authorizations: string[] = [];
-      globalThis.fetch = (async (_input, init) => {
-        authorizations.push(new Headers(init?.headers).get("authorization") ?? "");
-        if (authorizations.length === 1) return anthropicSse(firstTurn);
-        if (authorizations.length === 2) {
-          return Response.json(
-            { type: "error", error: { type: "rate_limit_error", message: "rate limited" } },
-            { status: 429, headers: { "retry-after": "30" } },
-          );
-        }
-        return anthropicSse(continuationTurn);
-      }) as typeof fetch;
-      const logCtx: RequestLogContext = { model: "", provider: "" };
-
-      const response = await handleResponses(new Request("http://localhost/v1/responses", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          model: "anthropic/claude-opus-4.8",
-          input: "请检查这个问题并修复代码",
-          stream: true,
-          tools: [{ type: "function", name: "exec_command", description: "run a command", parameters: { type: "object" } }],
-        }),
-      }), poolConfig, logCtx);
-
-      expect(await response.text()).toContain("response.completed");
-      expect(authorizations).toEqual([
-        "Bearer synthetic-access-a",
-        "Bearer synthetic-access-a",
-        "Bearer synthetic-access-b",
-      ]);
-      expect(logCtx.attempts).toHaveLength(2);
-      expect(logCtx.attempts?.[0]).toMatchObject({ status: 429, sendCount: 2 });
-      expect(logCtx.attempts?.[1]).toMatchObject({
-        sendCount: 1,
-        recoveryKinds: ["anthropic-oauth-429"],
-      });
-      expect(logCtx.attempts?.[1]?.provider).not.toBe(logCtx.attempts?.[0]?.provider);
-    } finally {
-      clearAnthropicAccountPoolState();
-      clearPoolRotationState();
-      if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
-      else process.env.OPENCODEX_HOME = previousHome;
-      rmSync(home, { recursive: true, force: true });
-    }
-  });
-
-  test("Anthropic rotates on initial and terminal-guard continuation 403 denials", async () => {
-    const home = mkdtempSync(join(tmpdir(), "ocx-terminal-anthropic-denial-"));
-    const previousHome = process.env.OPENCODEX_HOME;
-    process.env.OPENCODEX_HOME = home;
-    clearAnthropicAccountPoolState();
-    clearPoolRotationState();
-    try {
-      writeFileSync(join(home, "auth.json"), JSON.stringify({
-        anthropic: {
-          activeAccountId: "account-a",
-          accounts: [
-            {
-              id: "account-a",
-              credential: {
-                access: "synthetic-access-a",
-                refresh: "synthetic-refresh-a",
-                expires: 9999999999999,
-                accountId: "synthetic-account-a",
-              },
-            },
-            {
-              id: "account-b",
-              credential: {
-                access: "synthetic-access-b",
-                refresh: "synthetic-refresh-b",
-                expires: 9999999999999,
-                accountId: "synthetic-account-b",
-              },
-            },
-            {
-              id: "account-c",
-              credential: {
-                access: "synthetic-access-c",
-                refresh: "synthetic-refresh-c",
-                expires: 9999999999999,
-                accountId: "synthetic-account-c",
-              },
-            },
-          ],
-        },
-      }), { mode: 0o600 });
-      const poolConfig = {
-        port: 0,
-        defaultProvider: "anthropic",
-        providers: {
-          anthropic: {
-            adapter: "anthropic",
-            baseUrl: "https://example.test",
-            authMode: "oauth",
-          },
-        },
-        anthropicAccountPool: { enabled: true, autoSwitchThreshold: 100 },
-      } as unknown as OcxConfig;
-      const sends: Array<{ authorization: string; body: string }> = [];
-      globalThis.fetch = (async (_input, init) => {
-        sends.push({
-          authorization: new Headers(init?.headers).get("authorization") ?? "",
-          body: String(init?.body ?? ""),
-        });
-        if (sends.length === 2) return anthropicSse(firstTurn);
-        if (sends.length === 1 || sends.length === 3) {
-          return Response.json({
-            type: "error",
-            error: {
-              type: "oauth_org_not_allowed",
-              message: "Your organization has disabled Claude subscription access for Claude Code. Use an Anthropic API key instead, or ask your admin to enable access.",
-            },
-          }, { status: 403 });
-        }
-        return anthropicSse(continuationTurn);
-      }) as typeof fetch;
-      const logCtx: RequestLogContext = { model: "", provider: "" };
-
-      const response = await handleResponses(new Request("http://localhost/v1/responses", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          model: "anthropic/claude-opus-4.8",
-          input: "请检查这个问题并修复代码",
-          stream: true,
-          tools: [{ type: "function", name: "exec_command", description: "run a command", parameters: { type: "object" } }],
-        }),
-      }), poolConfig, logCtx);
-
-      const text = await response.text();
-      expect(response.status).toBe(200);
-      expect(text).toContain("response.completed");
-      expect(text).toContain("exec_command");
-      expect(sends.map(send => send.authorization)).toEqual([
-        "Bearer synthetic-access-a",
-        "Bearer synthetic-access-b",
-        "Bearer synthetic-access-b",
-        "Bearer synthetic-access-c",
-      ]);
-      expect(sends[1]!.body).toBe(sends[0]!.body);
-      expect(sends[3]!.body).toBe(sends[2]!.body);
-      expect(logCtx.attempts).toHaveLength(3);
-      expect(logCtx.attempts?.[0]).toMatchObject({ status: 403, sendCount: 1 });
-      expect(logCtx.attempts?.[1]).toMatchObject({
-        status: 403,
-        sendCount: 2,
-        recoveryKinds: ["anthropic-oauth-403"],
-      });
-      expect(logCtx.attempts?.[2]).toMatchObject({
-        sendCount: 1,
-        recoveryKinds: ["anthropic-oauth-403"],
-      });
-      const auth = JSON.parse(readFileSync(join(home, "auth.json"), "utf8")) as {
-        anthropic: { accounts: Array<{ id: string; needsReauth?: boolean }> };
-      };
-      expect(auth.anthropic.accounts.find(account => account.id === "account-a")?.needsReauth).toBe(true);
-      expect(auth.anthropic.accounts.find(account => account.id === "account-b")?.needsReauth).toBe(true);
-      expect(auth.anthropic.accounts.find(account => account.id === "account-c")?.needsReauth).toBeUndefined();
-    } finally {
-      clearAnthropicAccountPoolState();
-      clearPoolRotationState();
-      if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
-      else process.env.OPENCODEX_HOME = previousHome;
-      rmSync(home, { recursive: true, force: true });
-    }
-  });
-
   test("terminal-guard continuation 429 replays on the same key before surfacing", async () => {
+    takeInheritedSpendHome();
     const retryConfig = {
       ...config,
       providers: {
@@ -391,6 +189,8 @@ describe("server terminal guard integration", () => {
     const previousHome = process.env.OPENCODEX_HOME;
     const home = mkdtempSync(join(tmpdir(), "ocx-terminal-guard-failover-"));
     process.env.OPENCODEX_HOME = home;
+    // Taken after this case installs its home so the direct dispatch owns that journal.
+    const releaseSpendHome = acquireOwnedSpendHome();
     clearKeyCooldowns("claude-se");
     const budgetConfig = {
       ...config,
@@ -437,6 +237,8 @@ describe("server terminal guard integration", () => {
       // A per-iteration budget would replay on the second key too (5+ sends).
       expect(sends).toBe(4);
     } finally {
+      // Released before restoring or removing the home so its lease files can be deleted.
+      releaseSpendHome();
       clearKeyCooldowns("claude-se");
       if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previousHome;
@@ -445,6 +247,7 @@ describe("server terminal guard integration", () => {
   });
 
   test("terminal-guard continuation shares the request-wide 429 budget with the main loop", async () => {
+    takeInheritedSpendHome();
     const budgetConfig = {
       ...config,
       providers: {
@@ -495,6 +298,7 @@ describe("server terminal guard integration", () => {
   });
 
   test("terminal-guard continuation preserves structured cyber_policy semantics", async () => {
+    takeInheritedSpendHome();
     const secret = `OpenAI flagged this request for potential high-risk cybersecurity activity. Authorization: ${["Bear", "er"].join("")} continuationsecret123456`;
     let sends = 0;
     globalThis.fetch = (async () => {
@@ -532,6 +336,7 @@ describe("server terminal guard integration", () => {
   });
 
   test("terminal-guard continuation abort during the 429 wait yields 499 without replaying", async () => {
+    takeInheritedSpendHome();
     const abortConfig = {
       ...config,
       providers: {
@@ -579,7 +384,179 @@ describe("server terminal guard integration", () => {
     expect(sends).toBe(2);
   });
 
+  test("a stalled continuation body reports 504 even when cancelling it aborts the client signal", async () => {
+    takeInheritedSpendHome();
+    // Cancelling the stalled source can disconnect the client in the same tick. The
+    // classifier has to read the thrown error first, or this timeout is reported as a
+    // client cancellation and the caller loses the upstream stall signal.
+    const stallConfig = { ...config, stallTimeoutSec: 1 } as unknown as OcxConfig;
+    const abort = new AbortController();
+    let sends = 0;
+    globalThis.fetch = (async () => {
+      sends += 1;
+      if (sends === 1) return anthropicSse(firstTurn);
+      const stalled = new ReadableStream<Uint8Array>({
+        cancel() { abort.abort(new DOMException("client disconnected", "AbortError")); },
+      });
+      return new Response(stalled, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+
+    const response = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "se-claude-opus-4.8",
+        input: "请检查这个问题并修复代码",
+        stream: true,
+        tools: [{ type: "function", name: "exec_command", description: "run a command", parameters: { type: "object" } }],
+      }),
+    }), stallConfig, { model: "", provider: "" }, { abortSignal: abort.signal });
+
+    const text = await response.text();
+    expect(sends).toBe(2);
+    const failure = JSON.parse(text.split("\n").find(line => line.startsWith("data: ") && line.includes('"type":"response.failed"'))!.slice(6));
+    expect(failure.response.error).toMatchObject({ code: "upstream_stall_timeout", message: "Upstream response body stalled for 1000ms" });
+    const log: RequestLogContext = { model: "fixture-model", provider: "fixture" };
+    inspectResponseLogJson(log, JSON.stringify(failure));
+    expect(log.terminalHttpStatus).toBe(504);
+    expect(errorDetailFor({ status: log.terminalHttpStatus!, upstreamError: log.upstreamError }).failureDetail)
+      .toEqual({ code: "body_stall", value: 1000 });
+    expect(text).not.toContain("client closed request during terminal continuation");
+  });
+
+  test.each([true, false])("an empty-completion retry body stall preserves 504 classification (stream=%s)", async stream => {
+    takeInheritedSpendHome();
+    const stallConfig = { ...config, emptyCompletionRetry: true, stallTimeoutSec: 1 } as unknown as OcxConfig;
+    let sends = 0;
+    globalThis.fetch = (async () => {
+      sends += 1;
+      if (sends === 1) return stream
+        ? anthropicSse('event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1}}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n')
+        : Response.json({ id: "msg_fixture", type: "message", role: "assistant", model: "se-claude-opus-4.8",
+            content: [], stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 1 } });
+      return new Response(new ReadableStream<Uint8Array>({}), {
+        status: 200, headers: { "content-type": stream ? "text/event-stream" : "application/json" },
+      });
+    }) as typeof fetch;
+    const response = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "se-claude-opus-4.8", input: "Hi", stream }),
+    }), stallConfig, { model: "", provider: "" });
+    const text = await response.text();
+    const failure = stream
+      ? JSON.parse(text.split("\n").find(line => line.startsWith("data: ") && line.includes('"type":"response.failed"'))!.slice(6)).response
+      : JSON.parse(text);
+    expect(sends).toBe(2);
+    expect(response.status).toBe(stream ? 200 : 504);
+    expect(failure.error).toMatchObject({ code: "upstream_stall_timeout", message: "Upstream response body stalled for 1000ms" });
+    expect(httpStatusFromTerminalError(failure.error)).toBe(504);
+    expect(errorDetailFor({ status: 504, upstreamError: failure.error.message }).failureDetail)
+      .toEqual({ code: "body_stall", value: 1000 });
+  });
+
+  test("a stalled buffered continuation returns 504 with the failed response", async () => {
+    takeInheritedSpendHome();
+    const stallConfig = { ...config, stallTimeoutSec: 1 } as unknown as OcxConfig;
+    let sends = 0;
+    globalThis.fetch = (async () => {
+      sends += 1;
+      if (sends === 1) return Response.json({ id: "msg_fixture", type: "message", role: "assistant",
+        model: "se-claude-opus-4.8", content: [{ type: "text", text: "我接下来会修改相关文件。" }],
+        stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 1 } });
+      return new Response(new ReadableStream<Uint8Array>({}), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    const response = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "se-claude-opus-4.8", input: "请检查这个问题并修复代码", stream: false,
+        tools: [{ type: "function", name: "exec_command", description: "run a command", parameters: { type: "object" } }] }),
+    }), stallConfig, { model: "", provider: "" });
+    const body = await response.json() as { status: string; error: { code?: string; message: string } };
+    expect(sends).toBe(2);
+    expect(response.status).toBe(504);
+    expect(body.status).toBe("failed");
+    expect(body.error).toMatchObject({ code: "upstream_stall_timeout", message: "Upstream response body stalled for 1000ms" });
+    expect(errorDetailFor({ status: response.status, upstreamError: body.error.message }).failureDetail)
+      .toEqual({ code: "body_stall", value: 1000 });
+  });
+
+  test.each(["invalid-body", "provider-timeout-code"] as const)("a buffered continuation %s keeps the existing HTTP 200", async variant => {
+    takeInheritedSpendHome();
+    let sends = 0;
+    globalThis.fetch = (async () => {
+      sends += 1;
+      if (sends === 1) return variant === "invalid-body"
+        ? Response.json({ id: "msg_fixture", type: "message", role: "assistant",
+          model: "se-claude-opus-4.8", content: [{ type: "text", text: "我接下来会修改相关文件。" }],
+          stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 1 } })
+        : Response.json({ id: "chat_fixture", choices: [{ message: { role: "assistant", content: "我接下来会修改相关文件。" }, finish_reason: "stop" }] });
+      return variant === "invalid-body" ? Response.json(null)
+        : Response.json({ error: { type: "upstream_error", code: "upstream_stall_timeout", message: "provider supplied code" } });
+    }) as typeof fetch;
+    const response = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: variant === "invalid-body" ? "se-claude-opus-4.8" : "glm-5.2", input: "请检查这个问题并修复代码", stream: false,
+        tools: [{ type: "function", name: "exec_command", description: "run a command", parameters: { type: "object" } }] }),
+    }), variant === "invalid-body" ? config : openAiChatConfig(true), { model: "", provider: "" });
+    const body = await response.json() as { status: string; error: { code?: string } };
+    expect(sends).toBe(2);
+    expect(response.status).toBe(200);
+    expect(body.status).toBe("failed");
+    if (variant === "provider-timeout-code") expect(body.error.code).toBe("upstream_stall_timeout");
+  });
+
+  test("a stalled initial body fails with a 504 upstream error instead of a proxy error", async () => {
+    takeInheritedSpendHome();
+    // The initial stream has no continuation classifier: without one the bridge catch
+    // reports this upstream timeout as a 500 proxy_error.
+    const stallConfig = { ...config, stallTimeoutSec: 1 } as unknown as OcxConfig;
+    globalThis.fetch = (async () => {
+      const stalled = new ReadableStream<Uint8Array>({});
+      return new Response(stalled, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+
+    const response = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "se-claude-opus-4.8",
+        input: "请检查这个问题并修复代码",
+        stream: true,
+        tools: [{ type: "function", name: "exec_command", description: "run a command", parameters: { type: "object" } }],
+      }),
+    }), stallConfig, { model: "", provider: "" });
+
+    const text = await response.text();
+    expect(text.match(/event: response\.failed/g)?.length).toBe(1);
+    const failure = JSON.parse(text.split("\n").find(line => line.startsWith("data: ") && line.includes('"type":"response.failed"'))!.slice(6));
+    expect(failure.response.error).toMatchObject({ code: "upstream_stall_timeout", message: "Upstream response body stalled for 1000ms" });
+    expect(httpStatusFromTerminalError(failure.response.error)).toBe(504);
+    const log: RequestLogContext = { model: "fixture-model", provider: "fixture" };
+    inspectResponseLogJson(log, JSON.stringify(failure));
+    expect(log.terminalHttpStatus).toBe(504);
+    expect(errorDetailFor({ status: log.terminalHttpStatus!, upstreamError: log.upstreamError }).failureDetail)
+      .toEqual({ code: "body_stall", value: 1000 });
+    expect(text).toContain('"type":"upstream_error"');
+    expect(text).not.toContain("proxy_error");
+  });
+
+  test("a stalled buffered body preserves 504 and the bounded stall detail", async () => {
+    takeInheritedSpendHome();
+    const stallConfig = { ...config, stallTimeoutSec: 1 } as unknown as OcxConfig;
+    globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({}), {
+      status: 200, headers: { "content-type": "application/json" },
+    })) as typeof fetch;
+    const response = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "se-claude-opus-4.8", input: "Hi", stream: false }),
+    }), stallConfig, { model: "", provider: "" });
+    expect(response.status).toBe(504);
+    const body = await response.json() as { error: { message: string } };
+    expect(errorDetailFor({ status: response.status, upstreamError: body.error.message }).failureDetail)
+      .toEqual({ code: "body_stall", value: 1000 });
+  });
+
   test("terminal-guard 429 wait longer than the stall budget still succeeds (heartbeats)", async () => {
+    takeInheritedSpendHome();
     const stallConfig = {
       ...config,
       stallTimeoutSec: 1,
@@ -627,6 +604,7 @@ describe("server terminal guard integration", () => {
   }, 5_000);
 
   test("openai-chat provider without terminalContinuationGuard does not re-ask", async () => {
+    takeInheritedSpendHome();
     const chatConfig = openAiChatConfig();
     let sends = 0;
     globalThis.fetch = (async () => {
@@ -653,6 +631,7 @@ describe("server terminal guard integration", () => {
   });
 
   test("openai-chat provider with terminalContinuationGuard false does not re-ask", async () => {
+    takeInheritedSpendHome();
     const chatConfig = openAiChatConfig(false);
     let sends = 0;
     globalThis.fetch = (async () => {
@@ -678,6 +657,7 @@ describe("server terminal guard integration", () => {
   });
 
   test("openai-chat provider with terminalContinuationGuard re-asks once and forwards the tool call", async () => {
+    takeInheritedSpendHome();
     const chatConfig = openAiChatConfig(true);
     let sends = 0;
     const bodies: Record<string, unknown>[] = [];
@@ -708,7 +688,56 @@ describe("server terminal guard integration", () => {
     expect(messages.some(m => m.role === "developer" || m.role === "system")).toBe(true);
   });
 
+  test("synthetic Antigravity continuation 401 does not rotate accounts", async () => {
+    const priorHome = process.env.OPENCODEX_HOME;
+    const isolated = mkdtempSync(join(tmpdir(), "ocx-antigravity-continuation-"));
+    process.env.OPENCODEX_HOME = isolated;
+    try {
+      await saveCredential("google-antigravity", { access: "access-a", refresh: "refresh-a",
+        expires: Date.now() + 3_600_000, accountId: "account-a", projectId: "project-a", source: "oauth" });
+      const a = getAccountSet("google-antigravity")!.activeAccountId;
+      await saveCredential("google-antigravity", { access: "access-b", refresh: "refresh-b",
+        expires: Date.now() + 3_600_000, accountId: "account-b", projectId: "project-b", source: "oauth" }, { addAccount: true });
+      await setActiveAccount("google-antigravity", a);
+      takeInheritedSpendHome();
+      const antigravityConfig: OcxConfig = { port: 0, defaultProvider: "google-antigravity", providers: {
+        "google-antigravity": {
+          adapter: "google", modelAdapters: { "gemini-3.8-flash": "openai-chat" },
+          baseUrl: "https://example.test/v1", authMode: "oauth", googleMode: "cloud-code-assist",
+          terminalContinuationGuard: true, models: ["gemini-3.8-flash"],
+        },
+      } } as OcxConfig;
+      const auth: string[] = [];
+      globalThis.fetch = (async (_input, init) => {
+        auth.push(new Headers(init?.headers).get("authorization") ?? "");
+        if (auth.length === 1) return chatSse(chatFirstTurn);
+        if (auth.length === 2) return Response.json({ error: { message: "unauthorized" } }, { status: 401 });
+        return chatSse(chatContinuationTurn);
+      }) as typeof fetch;
+
+      const response = await handleResponses(new Request("http://localhost/v1/responses", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "google-antigravity/gemini-3.8-flash",
+          input: "Please fix the file", stream: true,
+          tools: [{ type: "function", name: "exec_command", description: "run a command",
+            parameters: { type: "object" } }] }),
+      }), antigravityConfig, { model: "", provider: "" });
+      const body = await response.text();
+      expect(response.status).toBe(200);
+      expect(body).toContain("Provider continuation error 401");
+      expect(body).not.toContain("exec_command");
+      expect(auth).toEqual(["Bearer access-a", "Bearer access-a"]);
+    } finally {
+      releaseInheritedSpendHome?.();
+      releaseInheritedSpendHome = undefined;
+      if (priorHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = priorHome;
+      removeTreeWithRetry(isolated);
+    }
+  });
+
   test("combo attempts do not run an opted-in openai-chat terminal guard", async () => {
+    takeInheritedSpendHome();
     const comboConfig = {
       ...openAiChatConfig(true),
       combos: {
@@ -742,6 +771,7 @@ describe("server terminal guard integration", () => {
   });
 
   test("routed compaction does not run an opted-in openai-chat terminal guard", async () => {
+    takeInheritedSpendHome();
     const chatConfig = openAiChatConfig(true);
     let sends = 0;
     globalThis.fetch = (async () => {

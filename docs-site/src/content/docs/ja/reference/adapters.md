@@ -111,6 +111,7 @@ HTTP リトライ ループの対象外です。
 - メッセージを Anthropic content block（text、base64 image、`tool_use`、`thinking`）に変換します。
 - **Extended thinking の計算:** Anthropic は `max_tokens > thinking.budget_tokens` を要求します。
   アダプターは reasoning effort を budget にマッピングし（minimal 1024 … max 32000）、出力余裕を取った安全な `max_tokens` を計算します。thinking がオンのときは Anthropic が禁止する **`temperature`/`top_p` を削除**します。
+- **adaptive thinking の表示:** adaptive thinking モデル（Opus 4.7+、Sonnet 5、Fable）には `thinking.display: "summarized"` を送るため、長い思考は数分間の heartbeat ではなく reasoning delta として Chat と Responses のクライアントに届きます。reasoning の要約を隠すリクエスト（`reasoning.summary: "none"`）はプロバイダーの既定値を維持します。ただし、`api.anthropic.com` の Opus 5.5 は `display: "updates"` が既定で、`reasoning.summary` に `"concise"` または `"detailed"` を明示すると updates ベータなしで `"summarized"` を使用します。[Opus 5.5 の進捗更新](/guides/providers/#claude-opus-55-progress-updates)を参照してください。
 - 常に `anthropic-version: 2023-06-01` を送ります。`content_block_delta`（`text_delta`、
   `thinking_delta`、`input_json_delta`）をストリーミングします。
 
@@ -135,6 +136,26 @@ HTTP リトライ ループの対象外です。
   block を送ります。
 - `application/vnd.amazon.eventstream` をデコードして text/thinking/tool イベントを復元し、途切れたツール JSON を検出します。上流がトークン数を返さないため使用量は推定します。
 - `fetchResponse` で限られた回数だけリトライし、エラーを分類/マスクします。非ストリーミングパーサーはウェブ検索ループのために同じイベントストリームを最後まで消費します。
+- リクエストごとにクライアントツールを最大 48 個、変換後のツール JSON を 96 KB まで送り、ツールの説明は
+  1,024 文字（`gpt-5.6-sol` は 9,216 文字）で切り詰めます。tool search で読み込んだツールと Codex
+  code-mode の実行ツールを先に採用し、省略したツールはモデルに伝えます。プロキシの環境に
+  `OCX_KIRO_TOOL_BUDGET=off` を設定するとクライアントのカタログ全体を、
+  `OCX_KIRO_TOOL_DESCRIPTION_LIMIT=off` を設定すると説明の全文を送ります。どちらもリクエスト変換時に
+  読み取られ、すべての Kiro モデルに適用され、他の上限は変わりません。予算を切ると上限自体がなくなり、
+  優先順位も省略も対象がなくなります。宣言したツールがすべて宣言順に送られ、省略の通知も消え、
+  Kiro が受け付ける数より多く宣言したクライアントは、切り詰めたカタログではなく上流の
+  `ValidationException` を受け取ります。リクエストサイズもクライアントのカタログに比例して大きくなります。
+  このスイッチは、より大きなリクエストを受け付けると測定されたアカウント向けのオプトアウトであり、
+  過大なカタログを安全にする手段ではありません。
+- Kiro のバリデータが拒否する JSON Schema キーワード（`pattern`、`minLength`、`maximum`、
+  `additionalProperties` など 29 個）をツールと構造化出力のスキーマから取り除きます。ただし、
+  プローブでそのモデルが受け付けたと確認できたキーワードは残します。`claude-opus-4.5` はすべて残ります。
+  `claude-opus-5.5` は Claude Desktop と Claude Code のカタログが使う 12 個（`$schema`、`additionalProperties`、`pattern`、`format`、`minLength`、`maxLength`、`minimum`、`maximum`、`exclusiveMinimum`、`minItems`、`maxItems`、`propertyNames`）が残ります。本番トラフィックで
+  確認済みです。`claude-sonnet-5.5` は `pattern`、`maximum` だけが残ります。それ以外は取り除かれたままです。
+  この 2 つのモデルに他のキーワードを送ったリクエストがないためです。他の Claude id を含むその他の Kiro モデルは
+  すべて取り除きます。例外をモデル単位・キーワード単位にしているのは、この wire が reasoning effort で
+  すでに Claude モデルを分けているためであり、Kiro が拒否するキーワードはヒントを失うだけで済まず、
+  リクエスト全体を失敗させるからです。
 ### 完了とネイティブ stop reason
 
 Kiro のアシスタントテキストには、それ自体で end-turn を示す信頼できる区別がありません。ただし終端の
@@ -154,10 +175,39 @@ filtered incomplete になります。実際のツール呼び出しを伴わな
 
 ### Reasoning effort
 
-`gpt-5.6-sol` と `claude-opus-5` はネイティブ effort をサポートし、リクエストフィールド名が異なります。
-`low` / `medium` / `high` / `xhigh` / `max` は、前者では
-`additionalModelRequestFields.reasoning.effort`、後者では `output_config.effort` として送信されます。
+GPT-5.6 系と GPT-6 系（`gpt-6-sol`、`gpt-6-luna`、`gpt-6.1-sol`、`gpt-6.1-terra`）は
+`additionalModelRequestFields.reasoning.effort`、以下に挙げる Claude のモデルは
+`additionalModelRequestFields.output_config.effort` を使用します。
+`gpt-5.6-luna` と `gpt-5.6-terra` では、検証済みの `low`、`medium`、`high`、`max` だけをネイティブフィールドで送信します。
+両モデルの `xhigh` は未検証のため、従来の上限付き thinking 指示によるエミュレーションを維持します。
+`gpt-5.6-sol` と GPT-6 系は、同じ `reasoning.effort` フィールドでネイティブの `low`、`medium`、
+`high`、`xhigh`、`max` を維持します。
 
+Kiro は `claude-opus-5`、`claude-opus-5.5`、`claude-opus-4.8`、`claude-opus-4.7`、
+`claude-opus-4.6`、`claude-sonnet-5.5`、`claude-sonnet-5`、`claude-sonnet-4.6`、
+`claude-haiku-5.5` で `low`、`medium`、`high`、`xhigh`、`max` を `output_config.effort` として
+受け付けます。例外が 1 つあります。`claude-opus-4.6` と `claude-sonnet-4.6` はネイティブの `xhigh` を
+拒否するため、その段階だけエミュレーションの thinking ブロックを使います。
+
+Kiro には `minimal` の段階がありません。`claude-opus-5` と `claude-opus-5.5` を除く上記の 9 モデルは、
+ネイティブ effort を有効にする前から動作していたリクエストを失敗させないよう、`minimal` でエミュレーションの
+ブロックを維持します。この 2 つの Opus 5 モデルとネイティブ effort を持つ GPT 系は、何も送信する前に
+`minimal` を 400 `invalid_request_error` で拒否します。
+
+拒否の伝え方はサーフェスごとに異なります。Responses リクエストはモデルと拒否された effort を示す文を
+`error.message` に入れます。Messages と Chat Completions の経路はその位置にプロキシの固定文言
+`The provider rejected the request.` を入れます。どちらもアダプターの詳細文をそのまま中継せず、自前の
+文言に置き換えるためです。モデルと effort を示すのは Responses だけです。ストリーミングと非ストリーミングは
+どのサーフェスでも同じ応答になります。拒否は上流へ送る本文を組み立てる途中で起きるため、ストリームは
+開かれず上流呼び出しも発生しません。
+
+呼び出し元の `ultra` は解析時に `max` へ変換されます。`pinnedReasoningEffort`、
+`modelPinnedReasoningEfforts`、`modelPinnedEfforts` はその後に適用されます。ネイティブ Kiro
+effort を持つモデルでは、アダプターも pin の `ultra` を `max` に変換します。エミュレーション
+モデルでは pin は破棄され、推論シグナルなしでリクエストが送られます。
+
+`claude-haiku-4.5`、`claude-opus-4.5`、`claude-sonnet-4.5` と、上記にない Kiro モデルは
+すべての effort でエミュレーションを使います。effort の選択肢だけではネイティブ対応を意味しません。
 
 ## `cursor`
 
@@ -170,10 +220,21 @@ model discovery の両方に適用されます。
 
 - 通常の fetch/parse 経路の代わりに `runTurn` を使います。リクエスト、サーバーイベント、ツール引数、使用量 checkpoint、クライアントレスポンスは `cursor/gen/agent_pb.ts` の `@bufbuild/protobuf` スキーマでエンコードしたのち Connect メッセージとして framing します。
 - content-addressed blob で対話状態を再生し、サーバーツール呼び出しを Codex に再マッピングします。protobuf の `GetUsableModels` RPC でリアルタイム Cursor モデルを探し、run リクエストが wire に commit される前だけリトライします。
-- ツールなしで正常終了したターンでは、返された ConversationStateStructure をプロセスローカルに保持し、検証済みの線形継続で checkpoint を再利用します。tool-result ターンでは、対象メッセージ境界が判明している場合、最後に正常終了したターンの checkpoint に未収録の suffix だけを追加します。ref のない prefix lookup は、記憶済みの Cursor conversation または安定した client thread（制限付きの Desktop session/thread fallback を含む）があり、同じ provider conversation が所有する checkpoint が一意に一致する場合だけ許可します。それ以外は full replay に戻ります。compaction、helper/shadow の分離、account/model の不一致、ref の欠落、decode の失敗、forced-fresh recovery、invalid_argument retry でも full replay を使います。プロセスを再起動するとメモリ内 store は失われ、full replay になります。Cursor Connect は権威ある cache_read_tokens を公開しないため、OpenCodex usage は cache-hit counter ではありません。制限付き Desktop fallback が保存するのはプロセスローカルで HMAC から導出した owner だけで、raw session/thread header や OAuth/authorization material を checkpoint state に書き込みません。OAuth-backed live transport とアカウントで絞り込む live model discovery は実験的です。ログインと transport の設定は [provider guide](/ja/guides/providers/) と [Cursor provider configuration](/ja/reference/configuration/providers/#cursor-provider-adapter-cursor) を参照してください。checkpoint reuse 自体は自動で、ユーザー設定はありません。
+- ツールなしで正常終了したターンでは、返された ConversationStateStructure をプロセスローカルに保持し、検証済みの線形継続で checkpoint を再利用します。tool-result ターンでは、対象メッセージ境界が判明している場合、最後に正常終了したターンの checkpoint に未収録の suffix だけを追加します。ref のない prefix lookup は、記憶済みの Cursor conversation または安定した client thread（制限付きの Desktop session/thread fallback を含む）があり、同じ provider conversation が所有する checkpoint が一意に一致する場合だけ許可します。それ以外は full replay に戻ります。compaction、helper/shadow の分離、account/model の不一致、ref の欠落、decode の失敗、forced-fresh recovery、invalid_argument retry でも full replay を使います。プロセスを再起動するとメモリ内 store は失われ、full replay になります。Cursor Connect は権威ある cache_read_tokens を公開しないため、OpenCodex usage は cache-hit counter ではありません。制限付き Desktop fallback が保存するのはプロセスローカルで HMAC から導出した owner だけで、raw session/thread header や OAuth/authorization material を checkpoint state に書き込みません。OAuth-backed live transport とアカウントで絞り込む live model discovery は実験的です。ログインと transport の設定は [provider guide](/ja/guides/providers/) と [Cursor provider configuration](/ja/reference/configuration/providers/#cursor-プロバイダー-adapter-cursor) を参照してください。checkpoint reuse 自体は自動で、ユーザー設定はありません。
 - `cursor/grok-4.5-fast` は選択可能なモデルとして維持しつつ、Cursor には正規の `grok-4.5`
   モデルを送信し、個別の `effort` および `fast=true` 値は `requested_model.parameters` に格納します。
 - Cursor ネイティブのローカルファイルシステム/shell/network 実行はデフォルトで拒否します。明示的な `mcpServers` と `desktopExecutor` 統合はそれぞれ別の opt-in です。`nativeLocalExec: "on"` はより広い組み込み executor を有効にし、Codex の承認/サンドボックスルールを迂回します。従来の `unsafeAllowNativeLocalExec: true` は、`nativeLocalExec` が設定されていない場合にのみ同等です。
+
+## `devin`
+
+**対象:** Cognition の `exa.api_server_pb.ApiServerService/GetChatMessage`（`server.codeium.com`、Connect ストリーミング）。
+**認証:** `provider.apiKey` または転送された authorization ヘッダーの Devin/Cognition API キー。ログインはまず、インストール済み Devin CLI が保持する認証情報の取り込みを試みます。`devin auth login` は CLI 自身の PKCE サインインを完了し、`devin-session-token` を CLI の `credentials.toml` に書き込みます。これは `SeatManagementService.RegisterUser` がブラウザサインインに発行するものと同じ資格情報です。利用できる CLI 資格情報がない場合は Auth0 のブラウザサインインにフォールバックし、貼り付けたトークンを `RegisterUser` で長期キーに交換します。`devin-cli` は非推奨エイリアスとして残るだけで、`ocx login devin-cli` も `devin` にルーティングされ、旧 id で保存された設定は起動時に書き換えられます。
+
+- 通常の fetch/parse ではなく `runTurn` を使います。リクエストとサーバーイベントは `devin/cloud-direct/wire.ts` の手動 protobuf フレーミングで扱います。
+- `GetCascadeModelConfigs` でアカウントごとにモデルを取得し、プランに含まれないモデルはリクエスト時ではなく一覧の段階で外れます。
+- Cognition はツール説明の長さ制限と完全一致のブロックリストを課します。アダプターが既知の語句を書き換え、長すぎる説明を切り詰めます。
+- キーは更新されません。失効したら `ocx login devin` をやり直してください。
+- CLI インポート経路でもローカルなのは資格情報だけで、ターン自体はどちらの経路でも Cognition へ送られます。以前のビルドには `devin-cli` id で、ローカルの `devin acp` 子プロセスに対して Agent Client Protocol セッションとしてターンを実行する第2のアダプターがありましたが、削除されました。そのアダプターをまだ指す保存済み設定は起動時に `devin` へ書き換えられ、`"devin-acp"` のようなカスタム名の行も同様です。
 
 ## `azure-openai`（別名: `azure`）
 
@@ -181,6 +242,7 @@ model discovery の両方に適用されます。
 **認証:** `api-key` ヘッダーの `key`（Bearer ではない）。
 
 - リクエスト構成は Responses passthrough に任せます。`baseUrl` に未解釈のテンプレート placeholder がないか検証し、`Authorization` を `api-key` に差し替えます。設定 URL が Azure v1 Responses API を直接指すため、`api-version` は追加しません。
+- 別のプロバイダーが生成した推論状態に対する Responses の復旧を共有します。`400 invalid_encrypted_content` を受けると、その状態（暗号化コンテンツと推論アイテムの `rs_…` ID）を除いて一度だけ再送します。
 
 ## 画像ユーティリティ（`image.ts`）
 

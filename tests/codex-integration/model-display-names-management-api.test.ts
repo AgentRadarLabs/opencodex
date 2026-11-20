@@ -1,9 +1,16 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { buildCatalogEntries, gatherRoutedModels } from "../../src/codex/catalog";
 import { clearModelCache, getFreshCached, setCached } from "../../src/codex/model-cache";
 import type { CatalogDisposition } from "../../src/codex/convergence-types";
 import { listManagementModelRows, toExportModel } from "../../src/server/management/model-rows";
 import { handleModelRoutes } from "../../src/server/management/model-routes";
 import type { OcxConfig } from "../../src/types";
+import { buildOpencodeProviderBlocksFromCatalog, opencodeCatalogFromProxyRows } from "../../src/cli/opencode";
+import { exportModelLabel } from "../../src/clients/config-export/model-metadata";
+import { exportPresentationLabel } from "../../src/clients/model-presentation";
+import { createTempHome } from "../helpers/temp-home";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 const DISPLAY_PROVIDER = "display-test";
 
@@ -32,6 +39,129 @@ afterEach(() => {
 });
 
 describe("model display name management rows", () => {
+  test("GET /api/models returns configured native labels with operator provenance", async () => {
+    const home = createTempHome("native-display-endpoint-");
+    try {
+      const nativeConfig: OcxConfig = {
+        port: 10100, defaultProvider: "openai",
+        providers: { openai: { adapter: "openai-responses", authMode: "forward",
+          baseUrl: "https://chatgpt.com/backend-api/codex", liveModels: false,
+          modelDisplayNames: { "gpt-6.1-sol": "  sol  " } } },
+      };
+      const url = new URL("http://127.0.0.1:10100/api/models");
+      const response = await handleModelRoutes({
+        req: new Request(url), url, config: nativeConfig, deps: {},
+        convergeCodexCatalog: async () => { throw new Error("GET must not converge the catalog"); },
+        syncClaudeAgentDefsBestEffort: async () => {},
+      });
+      expect(response?.status).toBe(200);
+      const rows = await response!.json() as Array<Record<string, unknown>>;
+      expect(rows.find(row => row.native === true && row.id === "gpt-6.1-sol")).toMatchObject({
+        provider: "openai", id: "gpt-6.1-sol", namespaced: "gpt-6.1-sol",
+        displayName: "sol", displayNameOverride: "sol", displayNameSource: "operator",
+      });
+    } finally {
+      home.remove();
+    }
+  });
+
+  test("native labels leave account-qualified rows unchanged", async () => {
+    const home = createTempHome("native-display-name-");
+    try {
+      mkdirSync(home.codexHome, { recursive: true });
+      const slug = "gpt-fixture-native";
+      writeFileSync(join(home.codexHome, "opencodex-catalog.json"), JSON.stringify({ models: [{
+        slug: `main/${slug}`, display_name: "Account native", opencodex_catalog_kind: "account-selector-v1",
+        supported_in_api: true, visibility: "list", base_instructions: "Fixture instructions",
+        comp_hash: null, shell_type: "unified_exec", model_messages: {},
+        supported_reasoning_levels: [{ effort: "low", description: "Low" }],
+      }] }));
+      const nativeConfig: OcxConfig = {
+        port: 10100, defaultProvider: "openai", codexAccountPickerEnabled: true,
+        codexAccountNamespaces: { main: "@main" },
+        providers: { openai: { adapter: "openai-responses", authMode: "forward",
+          baseUrl: "https://chatgpt.com/backend-api/codex",
+          modelDisplayNames: { [slug]: "bare nickname", [`main/${slug}`]: "qualified nickname" } } },
+      };
+      const rows = await listManagementModelRows(nativeConfig, { models: [] });
+      const row = rows.find(row => row.id === `main/${slug}`);
+      expect(row).toBeDefined();
+      expect(row?.displayName).toBeUndefined();
+      expect(row?.displayNameOverride).toBeUndefined();
+      expect(row?.displayNameSource).toBeUndefined();
+      expect(exportModelLabel(toExportModel(row!))).toBe(`main/${slug} (native)`);
+    } finally {
+      home.remove();
+    }
+  });
+
+  test("native labels reach management rows and client exports without changing identity or metadata", async () => {
+    const nativeConfig: OcxConfig = {
+      port: 10100,
+      defaultProvider: "openai",
+      providers: { openai: { adapter: "openai-responses", authMode: "forward",
+        baseUrl: "https://chatgpt.com/backend-api/codex" } },
+    };
+    const labels = { "gpt-6-astra": "astra", "gpt-6-luna": "luna",
+      "gpt-6.1-sol": "sol", "gpt-6.1-terra": "terra" };
+    const baseline = await listManagementModelRows(nativeConfig, { models: [] });
+    nativeConfig.providers.openai.modelDisplayNames = Object.fromEntries(
+      Object.entries(labels).map(([id, name]) => [id, `  ${name}  `]),
+    );
+    const rows = await listManagementModelRows(nativeConfig, { models: [] });
+    const catalog = opencodeCatalogFromProxyRows(rows, nativeConfig);
+    const blocks = buildOpencodeProviderBlocksFromCatalog(10100, catalog, undefined, nativeConfig);
+    for (const [id, name] of Object.entries(labels)) {
+      const row = rows.find(row => row.native && row.id === id)!;
+      expect(row).toMatchObject({ id, namespaced: id, displayName: name,
+        displayNameOverride: name, displayNameSource: "operator" });
+      const { displayName, displayNameOverride, displayNameSource, ...unchanged } = row;
+      expect(unchanged).toEqual(baseline.find(row => row.native && row.id === id)!);
+      const exported = toExportModel(row);
+      expect(exported.namespaced).toBe(id);
+      expect(exportModelLabel(exported)).toBe(`${name} (native)`);
+      expect(exportPresentationLabel(exported)).toBe(name);
+      expect(blocks.v1.models[id]?.name).toBe(`${name} (native)`);
+      expect(blocks.v2.models[id]?.name).toBe(`${name} (native)`);
+    }
+    for (const labels of [undefined, {}, { "gpt-6.1-sol": "   " }, { "GPT-6.1-SOL": "wrong case" }]) {
+      nativeConfig.providers.openai.modelDisplayNames = labels;
+      expect(await listManagementModelRows(nativeConfig, { models: [] })).toEqual(baseline);
+    }
+  });
+
+  test("OpenAI API labels survive trusted reconstruction into the Codex catalog", async () => {
+    const apiConfig: OcxConfig = {
+      port: 10100,
+      defaultProvider: "openai-apikey",
+      providers: {
+        "openai-apikey": {
+          adapter: "openai-responses",
+          baseUrl: "https://api.openai.com/v1",
+          liveModels: false,
+          modelDisplayNames: { "gpt-6-astra": "6 Astra", "gpt-6.1-sol": "6.1 Sol" },
+        },
+      },
+    };
+    const catalog = async () => buildCatalogEntries(null, [], await gatherRoutedModels(apiConfig));
+    const labeled = await catalog();
+    for (const [slug, displayName] of [
+      ["openai-apikey/gpt-6-astra", "6 Astra"],
+      ["openai-apikey/gpt-6.1-sol", "6.1 Sol"],
+    ]) {
+      expect(labeled.filter(entry => entry.slug === slug)).toHaveLength(1);
+      expect(labeled.find(entry => entry.slug === slug)?.display_name).toBe(displayName);
+    }
+
+    delete apiConfig.providers["openai-apikey"]!.modelDisplayNames;
+    const original = await catalog();
+    for (const entry of labeled) {
+      const baseline = original.find(row => row.slug === entry.slug);
+      expect(baseline).toBeDefined();
+      expect({ ...entry, display_name: baseline!.display_name }).toEqual(baseline);
+    }
+  });
+
   test("reports operator, provider, and fallback display name sources without provider secrets", async () => {
     const operatorConfig = config({ "model-a": "Operator Name" });
     operatorConfig.providers[DISPLAY_PROVIDER].apiKey = "sk-secret-not-for-rows";

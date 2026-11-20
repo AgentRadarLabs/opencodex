@@ -1,4 +1,5 @@
 import { stripMachineAuthHeaders } from "./machine-auth";
+import { homeUnreachableBody } from "./home-unreachable";
 
 export interface HubRelayTarget {
   managementUrl: string;
@@ -9,6 +10,8 @@ export const HUB_RELAY_REQUEST_BODY_MAX_BYTES = 4 * 1024 * 1024;
 export const HUB_RELAY_RESPONSE_BODY_MAX_BYTES = 16 * 1024 * 1024;
 export const HUB_RELAY_DEFAULT_TIMEOUT_MS = 15_000;
 export const HUB_RELAY_HEADER_MAX_BYTES = 64 * 1024;
+export const HUB_RELAY_EXPECTED_TARGET_HEADER = "x-opencodex-expected-target";
+export const HUB_RELAY_EXPECTED_TARGET_MAX_BYTES = 512;
 
 const ALLOWED_METHODS = new Set(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]);
 const REQUEST_HEADERS = new Set([
@@ -73,6 +76,11 @@ function relayError(status: number, error: string): Response {
   return Response.json({ error }, { status });
 }
 
+/** The Hub did not answer (OCX-11 `home_unreachable`); the 502 status is kept. */
+function hubUnreachable(): Response {
+  return Response.json(homeUnreachableBody("hub relay unavailable"), { status: 502 });
+}
+
 function canonicalOrigin(value: string): string | null {
   try {
     const url = new URL(value);
@@ -82,6 +90,12 @@ function canonicalOrigin(value: string): string | null {
   } catch {
     return null;
   }
+}
+
+/** A canonical HTTP(S) origin, no userinfo/path/query/fragment/trailing slash. */
+function canonicalExpectedOrigin(value: string): string | null {
+  const origin = canonicalOrigin(value);
+  return origin && value === origin ? origin : null;
 }
 
 function relayDestination(suffix: string, target: HubRelayTarget, method: string): URL | null {
@@ -108,7 +122,7 @@ function relayDestination(suffix: string, target: HubRelayTarget, method: string
   return destination;
 }
 
-async function boundedBody(
+export async function readBoundedRelayRequestBody(
   stream: ReadableStream<Uint8Array> | null,
   declared: string | null,
   limit: number,
@@ -142,16 +156,20 @@ async function boundedBody(
   return body;
 }
 
-function filteredHeaders(source: Headers, allowlist: Set<string>, omitted: ReadonlySet<string> = new Set()): Headers {
+export function filterRelayHeaders(
+  source: Headers,
+  allowlist?: ReadonlySet<string>,
+  omitted: ReadonlySet<string> = new Set(),
+): Headers {
   const headers = new Headers();
   for (const [name, value] of source) {
     const normalized = name.toLowerCase();
-    if (allowlist.has(normalized) && !HOP_BY_HOP_HEADERS.has(normalized) && !omitted.has(normalized)) headers.append(name, value);
+    if ((!allowlist || allowlist.has(normalized)) && !HOP_BY_HOP_HEADERS.has(normalized) && !omitted.has(normalized)) headers.append(name, value);
   }
   return headers;
 }
 
-function headersWithinLimit(headers: Headers): boolean {
+export function headersWithinLimit(headers: Headers): boolean {
   let bytes = 0;
   for (const [name, value] of headers) {
     bytes += name.length + value.length + 4;
@@ -160,10 +178,11 @@ function headersWithinLimit(headers: Headers): boolean {
   return true;
 }
 
-function boundedRelayResponseStream(
+export function boundedRelayResponseStream(
   body: ReadableStream<Uint8Array>,
   limit: number,
   signal: AbortSignal,
+  cleanup: () => void,
 ): ReadableStream<Uint8Array> {
   const reader = body.getReader();
   let bytes = 0;
@@ -172,6 +191,7 @@ function boundedRelayResponseStream(
     if (finished) return;
     finished = true;
     signal.removeEventListener("abort", onAbort);
+    cleanup();
     try { reader.releaseLock(); } catch { /* a pending read may still own it */ }
   };
   const onAbort = () => {
@@ -222,17 +242,35 @@ export async function relayHubManagementRequest(
   const requestHeaderValidation = validateHubRelayRequestHeaders([...req.headers]);
   if (!requestHeaderValidation.ok) return relayError(400, "hub relay request headers refused");
 
+  // The expected-target claim is checked against the same immutable target snapshot used
+  // for forwarding, before the body is read. Absence keeps the legacy caller contract.
+  const expectedTarget = req.headers.get(HUB_RELAY_EXPECTED_TARGET_HEADER);
+  if (expectedTarget !== null) {
+    if (expectedTarget.includes(",") || new TextEncoder().encode(expectedTarget).byteLength > HUB_RELAY_EXPECTED_TARGET_MAX_BYTES) {
+      return relayError(400, "invalid_expected_target");
+    }
+    const claimed = canonicalExpectedOrigin(expectedTarget);
+    const current = canonicalOrigin(target.managementUrl);
+    if (!claimed || !current) return relayError(400, "invalid_expected_target");
+    if (claimed !== current) {
+      return new Response(JSON.stringify({ error: "target_changed" }), {
+        status: 409,
+        headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+      });
+    }
+  }
+
   let body: Uint8Array<ArrayBuffer> | null;
   try {
     body = method === "GET" || method === "HEAD"
       ? null
-      : await boundedBody(req.body, req.headers.get("content-length"), HUB_RELAY_REQUEST_BODY_MAX_BYTES);
+      : await readBoundedRelayRequestBody(req.body, req.headers.get("content-length"), HUB_RELAY_REQUEST_BODY_MAX_BYTES);
   } catch {
     return relayError(413, "hub relay request body too large");
   }
 
   const stripped = stripMachineAuthHeaders(req.headers);
-  const headers = filteredHeaders(stripped, REQUEST_HEADERS, requestHeaderValidation.connectionNamed);
+  const headers = filterRelayHeaders(stripped, REQUEST_HEADERS, requestHeaderValidation.connectionNamed);
   if (!headersWithinLimit(headers)) return relayError(431, "hub relay request headers too large");
   const browserOrigin = canonicalOrigin(target.browserOrigin);
   const mutation = method !== "GET" && method !== "HEAD";
@@ -245,9 +283,19 @@ export async function relayHubManagementRequest(
     ? Math.min(Math.floor(deps.timeoutMs), 120_000)
     : HUB_RELAY_DEFAULT_TIMEOUT_MS;
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
-  const signal = req.signal
-    ? AbortSignal.any([req.signal, timeoutSignal])
-    : timeoutSignal;
+  const relayAbort = new AbortController();
+  const signal = relayAbort.signal;
+  const stopDeadline = () => timeoutSignal.removeEventListener("abort", onTimeout);
+  const cleanup = () => {
+    stopDeadline();
+    req.signal.removeEventListener("abort", onClientAbort);
+  };
+  const onTimeout = () => { relayAbort.abort(timeoutSignal.reason); cleanup(); };
+  const onClientAbort = () => { relayAbort.abort(req.signal.reason); cleanup(); };
+  timeoutSignal.addEventListener("abort", onTimeout, { once: true });
+  req.signal.addEventListener("abort", onClientAbort, { once: true });
+  if (req.signal.aborted) onClientAbort();
+  else if (timeoutSignal.aborted) onTimeout();
   let upstream: Response;
   try {
     upstream = await (deps.fetchImpl ?? fetch)(destination, {
@@ -258,28 +306,48 @@ export async function relayHubManagementRequest(
       signal,
     });
   } catch {
-    return relayError(502, "hub relay unavailable");
+    cleanup();
+    return hubUnreachable();
+  }
+  if (signal.aborted) {
+    cleanup();
+    try { await upstream.body?.cancel(); } catch { /* best effort */ }
+    return hubUnreachable();
   }
   if (upstream.status >= 300 && upstream.status < 400) {
+    cleanup();
     try { await upstream.body?.cancel(); } catch { /* best effort */ }
     return relayError(502, "hub relay redirect refused");
   }
 
   const responseConnectionNamed = new Set((upstream.headers.get("connection") ?? "").split(",").map(value => value.trim().toLowerCase()).filter(Boolean));
-  const responseHeaders = filteredHeaders(upstream.headers, RESPONSE_HEADERS, responseConnectionNamed);
+  const responseHeaders = filterRelayHeaders(upstream.headers, RESPONSE_HEADERS, responseConnectionNamed);
   if (!headersWithinLimit(responseHeaders)) {
+    cleanup();
     try { await upstream.body?.cancel(); } catch { /* best effort */ }
     return relayError(502, "hub relay response headers too large");
   }
   const declaredResponseLength = upstream.headers.get("content-length");
   if (declaredResponseLength !== null && (!/^\d+$/.test(declaredResponseLength)
     || Number(declaredResponseLength) > HUB_RELAY_RESPONSE_BODY_MAX_BYTES)) {
+    cleanup();
     try { await upstream.body?.cancel(); } catch { /* best effort */ }
     return relayError(502, "hub relay response body too large");
   }
-  const responseBody = method === "HEAD" || !upstream.body
-    ? null
-    : boundedRelayResponseStream(upstream.body, HUB_RELAY_RESPONSE_BODY_MAX_BYTES, signal);
+  // Only this known, successfully established SSE endpoint outlives the handshake.
+  // Its body remains byte-bounded and connected to the browser's abort signal.
+  if (method === "GET" && destination.pathname === "/api/accounts/events" && !destination.search
+    && upstream.status === 200
+    && responseHeaders.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() === "text/event-stream") {
+    stopDeadline();
+  }
+  let responseBody: ReadableStream<Uint8Array> | null = null;
+  if (method === "HEAD" || !upstream.body) {
+    cleanup();
+    try { await upstream.body?.cancel(); } catch { /* best effort */ }
+  } else {
+    responseBody = boundedRelayResponseStream(upstream.body, HUB_RELAY_RESPONSE_BODY_MAX_BYTES, signal, cleanup);
+  }
   return new Response(responseBody, {
     status: upstream.status,
     statusText: upstream.statusText,

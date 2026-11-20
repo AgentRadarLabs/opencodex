@@ -1,3 +1,4 @@
+import { samePath } from "../helpers/same-path";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as nodeFs from "node:fs";
 import {
@@ -70,6 +71,25 @@ import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { repoRoot } from "../helpers/repo-root";
 
 const REPO_ROOT = repoRoot();
+
+test("scratch directory rejects an adjacent NTFS-sized identity", () => {
+  const root = nodeFs.mkdtempSync(join(tmpdir(), "ocx-scratch-identity-"));
+  const originalFstat = nodeFs.fstatSync, originalLstat = nodeFs.lstatSync;
+  nodeFs.writeFileSync(join(root, "value"), "test");
+  const fdSpy = spyOn(nodeFs, "fstatSync").mockImplementation(((fd, options) => {
+    const stats = options?.bigint ? originalFstat(fd, { bigint: true }) : originalFstat(fd);
+    return Object.assign(Object.create(Object.getPrototypeOf(stats)), stats,
+      { ino: options?.bigint ? 9_007_199_254_740_992n : Number(9_007_199_254_740_992n) });
+  }) as typeof nodeFs.fstatSync);
+  const pathSpy = spyOn(nodeFs, "lstatSync").mockImplementation(((path, options) => {
+    const stats = options?.bigint ? originalLstat(path, { bigint: true }) : originalLstat(path);
+    return samePath(path, root) && options?.bigint ? Object.assign(Object.create(Object.getPrototypeOf(stats)), stats,
+      { ino: 9_007_199_254_740_993n }) : samePath(path, root) ? Object.assign(Object.create(Object.getPrototypeOf(stats)), stats,
+      { ino: Number(9_007_199_254_740_993n) }) : stats;
+  }) as typeof nodeFs.lstatSync);
+  try { expect(() => readScratchFileUtf8(root, "value", 1024)).toThrow("scratch directory identity changed"); }
+  finally { fdSpy.mockRestore(); pathSpy.mockRestore(); removeTreeWithRetry(root); }
+});
 const CHILD_REAP_GRACE_MS = 2_000;
 
 async function awaitChildExitWithin(child: Bun.Subprocess, timeoutMs: number): Promise<boolean> {
@@ -112,6 +132,7 @@ const FAST_FABRIC_ISOLATION = Object.freeze({
 });
 
 const HOMES: string[] = [];
+const previousHome = process.env.OPENCODEX_HOME;
 
 function tempHome(): string {
   const dir = join(tmpdir(), `ocx-cl07-${process.pid}-${Math.random().toString(16).slice(2)}`);
@@ -181,6 +202,120 @@ export async function execute(_input: FabricPatchExecutorInput): Promise<Synthet
     await Bun.sleep(FAST_FABRIC_ISOLATION.inactivityTimeoutMs + 50);
     return correctSyntheticPatch();
   });
+}
+
+function fabricEarlyResultPatchExecutor(home: string): { executor: TrustedFabricPatchExecutor; marker: string } {
+  const dir = join(home, "fabric-executors");
+  mkdirSync(dir, { recursive: true });
+  const modulePath = join(dir, "early-result-patch.ts");
+  const marker = join(home, "late-child-mutation.txt");
+  writeFileSync(modulePath, `
+import { writeFileSync } from "node:fs";
+import type { FabricPatchExecutorInput, SyntheticPatchV1 } from "${repoImport("src/lab/fabric/types")}";
+import { SYNTHETIC_AFTER_UTF8, SYNTHETIC_VALUE_PATH } from "${repoImport("src/lab/fabric/constants")}";
+
+const patch: SyntheticPatchV1 = {
+  schemaVersion: 1,
+  operations: [{ op: "replace", path: SYNTHETIC_VALUE_PATH, contentUtf8: SYNTHETIC_AFTER_UTF8 }],
+};
+
+export async function execute(input: FabricPatchExecutorInput): Promise<SyntheticPatchV1> {
+  process.stdout.write(JSON.stringify({ type: "result", patch }) + "\\n");
+  const deadline = Date.now() + ${FAST_FABRIC_ISOLATION.totalTimeoutMs + 500};
+  while (Date.now() < deadline) {
+    input.reportActivity();
+    await Bun.sleep(100);
+  }
+  writeFileSync(${JSON.stringify(marker)}, "late\\n");
+  return patch;
+}
+`);
+  return {
+    executor: createHostIssuedFabricPatchExecutor(modulePath, async () => correctSyntheticPatch()),
+    marker,
+  };
+}
+
+function fabricEarlyErrorPatchExecutor(home: string): { executor: TrustedFabricPatchExecutor; marker: string } {
+  const dir = join(home, "fabric-executors");
+  mkdirSync(dir, { recursive: true });
+  const modulePath = join(dir, "early-error-patch.ts");
+  const marker = join(home, "late-child-error-mutation.txt");
+  writeFileSync(modulePath, `
+import { writeFileSync } from "node:fs";
+import type { FabricPatchExecutorInput, SyntheticPatchV1 } from "${repoImport("src/lab/fabric/types")}";
+import { SYNTHETIC_AFTER_UTF8, SYNTHETIC_VALUE_PATH } from "${repoImport("src/lab/fabric/constants")}";
+
+const patch: SyntheticPatchV1 = {
+  schemaVersion: 1,
+  operations: [{ op: "replace", path: SYNTHETIC_VALUE_PATH, contentUtf8: SYNTHETIC_AFTER_UTF8 }],
+};
+
+export async function execute(input: FabricPatchExecutorInput): Promise<SyntheticPatchV1> {
+  process.stdout.write(JSON.stringify({ type: "error", code: "harness_failure", message: "executor reported failure", attribution: "harness" }) + "\\n");
+  const deadline = Date.now() + ${FAST_FABRIC_ISOLATION.totalTimeoutMs + 500};
+  while (Date.now() < deadline) {
+    input.reportActivity();
+    await Bun.sleep(100);
+  }
+  writeFileSync(${JSON.stringify(marker)}, "late\\n");
+  return patch;
+}
+`);
+  return {
+    executor: createHostIssuedFabricPatchExecutor(modulePath, async () => correctSyntheticPatch()),
+    marker,
+  };
+}
+
+function fabricResultThenExitPatchExecutor(home: string): TrustedFabricPatchExecutor {
+  const dir = join(home, "fabric-executors");
+  mkdirSync(dir, { recursive: true });
+  const modulePath = join(dir, "result-then-exit-patch.ts");
+  writeFileSync(modulePath, `
+import type { FabricPatchExecutorInput, SyntheticPatchV1 } from "${repoImport("src/lab/fabric/types")}";
+import { SYNTHETIC_AFTER_UTF8, SYNTHETIC_VALUE_PATH } from "${repoImport("src/lab/fabric/constants")}";
+
+const patch: SyntheticPatchV1 = {
+  schemaVersion: 1,
+  operations: [{ op: "replace", path: SYNTHETIC_VALUE_PATH, contentUtf8: SYNTHETIC_AFTER_UTF8 }],
+};
+
+export function execute(_input: FabricPatchExecutorInput): Promise<SyntheticPatchV1> {
+  process.stdout.write(JSON.stringify({ type: "result", patch }) + "\\n", () => process.exit(1));
+  return new Promise(() => {});
+}
+`);
+  return createHostIssuedFabricPatchExecutor(modulePath, async () => correctSyntheticPatch());
+}
+
+function fabricOrphanedPipePatchExecutor(home: string): TrustedFabricPatchExecutor {
+  const dir = join(home, "fabric-executors");
+  mkdirSync(dir, { recursive: true });
+  const modulePath = join(dir, "orphaned-pipe-patch.ts");
+  writeFileSync(modulePath, `
+import { spawn } from "node:child_process";
+import type { FabricPatchExecutorInput, SyntheticPatchV1 } from "${repoImport("src/lab/fabric/types")}";
+import { SYNTHETIC_AFTER_UTF8, SYNTHETIC_VALUE_PATH } from "${repoImport("src/lab/fabric/constants")}";
+
+const patch: SyntheticPatchV1 = {
+  schemaVersion: 1,
+  operations: [{ op: "replace", path: SYNTHETIC_VALUE_PATH, contentUtf8: SYNTHETIC_AFTER_UTF8 }],
+};
+
+export function execute(_input: FabricPatchExecutorInput): Promise<SyntheticPatchV1> {
+  // A detached descendant holds the inherited stdio open after this process
+  // exits, so the parent's "close" event cannot arrive on its own.
+  const descendant = spawn(process.execPath, ["-e", "setTimeout(() => {}, 4000)"], {
+    stdio: ["ignore", "inherit", "inherit"],
+    detached: true,
+  });
+  descendant.unref();
+  process.stdout.write(JSON.stringify({ type: "result", patch }) + "\\n", () => process.exit(0));
+  return new Promise(() => {});
+}
+`);
+  return createHostIssuedFabricPatchExecutor(modulePath, async () => correctSyntheticPatch());
 }
 
 function fabricTraversalPatchExecutor(home: string): TrustedFabricPatchExecutor {
@@ -314,7 +449,8 @@ afterEach(() => {
       /* ignore */
     }
   }
-  delete process.env.OPENCODEX_HOME;
+  if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+  else process.env.OPENCODEX_HOME = previousHome;
 });
 
 function routeSubject(overrides: Partial<RouteSubjectV1> = {}): RouteSubjectV1 {
@@ -707,6 +843,74 @@ export async function execute() {
     });
     expect(["blocked", "inconclusive"]).toContain(result.outcome.outcome);
     expect(result.outcome.failure?.code).toBe("inactivity_timeout");
+  }, 20_000);
+
+  test("producer result remains supervised until the child exits", async () => {
+    const home = tempHome();
+    process.env.OPENCODEX_HOME = home;
+    const { executor, marker } = fabricEarlyResultPatchExecutor(home);
+    const startedAt = Date.now();
+    const result = await runFabricSyntheticPatchTaskForRoute({
+      routeContext: fabricMockRoute(),
+      destination: await fabricDestination(home),
+      patchExecutor: executor,
+      configDir: home,
+    });
+    expect(result.outcome.outcome).not.toBe("pass");
+    expect(result.outcome.failure?.code).toBe("timeout");
+    // The fixture's late write lands totalTimeoutMs + 500 after the child starts.
+    // The task settles near that deadline, so only the remainder must elapse —
+    // a fixed totalTimeoutMs sleep would overflow the test timeout under CI scaling.
+    await Bun.sleep(Math.max(1_000, FAST_FABRIC_ISOLATION.totalTimeoutMs + 750 - (Date.now() - startedAt)));
+    expect(existsSync(marker)).toBe(false);
+  }, 45_000);
+
+  test("producer error remains supervised until the child exits", async () => {
+    const home = tempHome();
+    process.env.OPENCODEX_HOME = home;
+    const { executor, marker } = fabricEarlyErrorPatchExecutor(home);
+    const startedAt = Date.now();
+    const result = await runFabricSyntheticPatchTaskForRoute({
+      routeContext: fabricMockRoute(),
+      destination: await fabricDestination(home),
+      patchExecutor: executor,
+      configDir: home,
+    });
+    expect(result.outcome.outcome).not.toBe("pass");
+    expect(result.outcome.failure?.code).toBe("harness_failure");
+    // Same bounded wait as above: the child settles fast, so the marker deadline
+    // is still roughly a full budget away under CI-scaled isolation limits.
+    await Bun.sleep(Math.max(1_000, FAST_FABRIC_ISOLATION.totalTimeoutMs + 750 - (Date.now() - startedAt)));
+    expect(existsSync(marker)).toBe(false);
+  }, 45_000);
+
+  test("producer result is rejected when the child exits nonzero", async () => {
+    const home = tempHome();
+    process.env.OPENCODEX_HOME = home;
+    const result = await runFabricSyntheticPatchTaskForRoute({
+      routeContext: fabricMockRoute(),
+      destination: await fabricDestination(home),
+      patchExecutor: fabricResultThenExitPatchExecutor(home),
+      configDir: home,
+    });
+    expect(result.outcome.outcome).not.toBe("pass");
+    expect(result.outcome.failure?.code).toBe("harness_failure");
+  }, 20_000);
+
+  test("producer result is rejected when a descendant holds the pipes", async () => {
+    const home = tempHome();
+    process.env.OPENCODEX_HOME = home;
+    const result = await runFabricSyntheticPatchTaskForRoute({
+      routeContext: fabricMockRoute(),
+      destination: await fabricDestination(home),
+      patchExecutor: fabricOrphanedPipePatchExecutor(home),
+      configDir: home,
+    });
+    // `close` never follows `exit` while a descendant holds the pipes — the
+    // process tree may have escaped supervision, so the result is rejected as
+    // an inconclusive harness failure rather than trusted.
+    expect(result.outcome.outcome).not.toBe("pass");
+    expect(result.outcome.failure?.code).toBe("harness_failure");
   }, 20_000);
 
   test("activity resets inactivity deadline within total budget", async () => {

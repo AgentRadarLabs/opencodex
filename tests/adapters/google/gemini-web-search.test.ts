@@ -2,7 +2,7 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import * as storeModule from "../../../src/oauth/store";
 import { MAX_SIDECAR_RESPONSE_BYTES } from "../../../src/web-search/parse";
 
-let accountSets: Record<string, { accounts: Array<{ id: string; needsReauth?: boolean; credential?: Record<string, unknown> }>; activeAccountId?: string }> = {};
+let accountSets: Record<string, { accounts: Array<{ id: string; needsReauth?: boolean; paused?: boolean; credential?: Record<string, unknown> }>; activeAccountId?: string }> = {};
 mock.module("../../../src/oauth/store", () => ({
   ...storeModule,
   getAccountSet: (provider: string) => accountSets[provider] ?? null,
@@ -95,6 +95,7 @@ describe("planWebSearch gemini arm (L8)", () => {
   test.each([
     ["no account set", {}],
     ["needsReauth", { "google-antigravity": { accounts: [{ id: "a1", needsReauth: true, credential: { projectId: "p" } }], activeAccountId: "a1" } }],
+    ["paused", { "google-antigravity": { accounts: [{ id: "a1", paused: true, credential: { projectId: "p" } }], activeAccountId: "a1" } }],
     ["missing projectId", { "google-antigravity": { accounts: [{ id: "a1", credential: {} }], activeAccountId: "a1" } }],
   ] as const)("%s -> fail closed (no plan)", (_name, sets) => {
     accountSets = sets as typeof accountSets;
@@ -124,6 +125,23 @@ import { createTestTranslatorBudget } from "../../helpers/translator-budget";
 import type { AdapterEvent, ProviderAdapter } from "../../../src/adapters/base";
 
 describe("runGeminiWebSearch request shape (review P1)", () => {
+  test("Argon web search keeps its suffix-only request without requested summaries", async () => {
+    let sent: string | undefined;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input, init) => {
+      sent = String(init?.body);
+      return Response.json({ response: { candidates: [{ content: { parts: [{ text: "ok" }] } }] } });
+    }) as typeof fetch;
+    try {
+      const out = await runGeminiWebSearch("q", "google-antigravity", cca,
+        { model: "gemini-4-argon", reasoning: "high", timeoutMs: 5000, describeImages: false });
+      expect(out.text).toBe("ok");
+      const body = JSON.parse(sent!);
+      expect(body.model).toBe("gemini-4-argon-high");
+      expect(body.request.generationConfig).toBeUndefined();
+    } finally { globalThis.fetch = realFetch; }
+  });
+
   test("malicious baseUrl ignored: registry destination, manual redirect, bearer + IDE UA, full envelope, thinkingConfig", async () => {
     accountSets = { "google-antigravity": { accounts: [{ id: "a1", credential: { projectId: "proj-9" } }], activeAccountId: "a1" } };
     const captured: Array<{ url: string; init: RequestInit }> = [];

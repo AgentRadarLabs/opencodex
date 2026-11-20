@@ -1,3 +1,4 @@
+import { publishCredentialAsync, publishCredentialSync } from "../local-credentials/generation";
 import { randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
 import {
@@ -74,6 +75,7 @@ import {
   type NativeStageProof,
   type NativeStageTerminalOutcome,
 } from "./native-profile-stage-store";
+import { writeNativeMainAuthFileAsync } from "./native-main-auth-file";
 
 const LOCK_WAIT_MS = 5_000;
 const LEGACY_STAGE_MAX_AGE_MS = 30 * 60_000;
@@ -219,7 +221,8 @@ export class NativeProfileManager {
   constructor(options: NativeProfileManagerOptions = {}) {
     this.context = resolveNativeProfileContext(options);
     this.keyProvider = options.keyProvider ?? new OsNativeProfileKeyProvider();
-    this.atomicWrite = options.atomicWrite ?? atomicWriteFileAsync;
+    const write = options.atomicWrite ?? atomicWriteFileAsync;
+    this.atomicWrite = (path, content) => publishCredentialAsync(() => write(path, content));
     this.hardenPath = options.hardenPath ?? hardenNativeProfilePath;
     this.processProbe = options.processProbe ?? probeNativeCodexProcesses;
     this.applyTransition = options.applyTransition ?? ((from, to) => { applyConfirmedMainCodexAccountTransition(from, to); });
@@ -430,12 +433,12 @@ export class NativeProfileManager {
 
   private removeJournal(): void {
     this.assertOperationStorageStable();
-    try { unlinkSync(this.context.journalPath); } catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+    try { publishCredentialSync(() => unlinkSync(this.context.journalPath)); } catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
   }
 
   private removeRecoveryBlock(): void {
     this.assertOperationStorageStable();
-    try { unlinkSync(this.context.recoveryBlockPath); } catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+    try { publishCredentialSync(() => unlinkSync(this.context.recoveryBlockPath)); } catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
   }
 
   private async currentOwnershipConfirmed(): Promise<boolean> {
@@ -488,7 +491,7 @@ export class NativeProfileManager {
     }));
     this.assertOperationStorageStable();
     try {
-      renameSync(this.context.journalPath, quarantinePath);
+      publishCredentialSync(() => renameSync(this.context.journalPath, quarantinePath));
       await this.hardenPath(quarantinePath);
       this.assertOperationStorageStable();
     } catch {
@@ -736,7 +739,7 @@ export class NativeProfileManager {
         true,
         true,
       );
-      unlinkSync(authPath);
+      publishCredentialSync(() => unlinkSync(authPath));
       const unlinked = fstatSync(authFd, { bigint: true });
       if (unlinked.dev !== opened.dev || unlinked.ino !== opened.ino || unlinked.nlink !== 0n) {
         throw new NativeProfileError(
@@ -765,7 +768,7 @@ export class NativeProfileManager {
       try { if (authFd !== undefined) closeSync(authFd); } catch { /* removal below remains required */ }
     }
     if (identity) assertPathIdentity(path, identity, "The native-login staging directory");
-    this.removeStageTree(path);
+    publishCredentialSync(() => this.removeStageTree(path));
   }
 
   private deleteLegacyStageById(stageId: string, requirePresent = false): void {
@@ -1305,7 +1308,7 @@ export class NativeProfileManager {
         journalPrepared = true;
         await this.onSwitchBoundary("journal-prepared");
         this.assertOperationStorageStable();
-        await this.atomicWrite(this.context.authPath, target.text);
+        await writeNativeMainAuthFileAsync(this.context.authPath, target.text, this.atomicWrite);
         const observedTarget = this.verifyWrittenEnvelope(target.digest, targetProfile.identityHash, key);
         observedTarget.raw.fill(0);
         advanceCodexCredentialMutationEpoch();
@@ -1334,7 +1337,7 @@ export class NativeProfileManager {
         }
         try {
           this.assertOperationStorageStable();
-          await this.atomicWrite(this.context.authPath, source!.text);
+          await writeNativeMainAuthFileAsync(this.context.authPath, source!.text, this.atomicWrite);
           const restored = this.verifyWrittenEnvelope(source!.digest, nativeIdentityHash(key!.key, source!.accountId), key!);
           restored.raw.fill(0);
           advanceCodexCredentialMutationEpoch();
@@ -1449,7 +1452,7 @@ export class NativeProfileManager {
           rollbackVaultPublished = true;
         }
         this.assertOperationStorageStable();
-        await this.atomicWrite(this.context.authPath, sourceEnvelope.text);
+        await writeNativeMainAuthFileAsync(this.context.authPath, sourceEnvelope.text, this.atomicWrite);
         const restored = this.verifyWrittenEnvelope(sourceEnvelope.digest, journal.sourceIdentityHash, key);
         restored.raw.fill(0);
         advanceCodexCredentialMutationEpoch();

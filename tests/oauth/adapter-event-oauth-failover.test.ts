@@ -4,21 +4,22 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProviderAdapter } from "../../src/adapters/base";
 import { clearGenericFailoverHealth } from "../../src/oauth/generic-account-failover";
-import {
-  resetProviderRequestPacingForTest,
-  setProviderRequestPacingLimitsForTest,
-} from "../../src/providers/request-pacing";
-import { saveCredential } from "../../src/oauth/store";
+import { getAccountSet, getCredential, saveCredential, setActiveAccount } from "../../src/oauth/store";
 import type { AdapterEvent, OcxConfig, OcxProviderConfig } from "../../src/types";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
-import type { RequestLogContext } from "../../src/server/request-log";
 
 const actualResolver = await import("../../src/server/adapter-resolve");
 const actualResolveAdapter = actualResolver.resolveAdapter;
 let attempts: AdapterEvent[][] = [];
 let attemptKeys: string[] = [];
+let attemptProjects: Array<string | undefined> = [];
+let attemptCredentialIdentities: Array<string | undefined> = [];
 /** Set by the delivery test: an attempt that emits, then blocks before completing the turn. */
 let slowAttempt: ((emit: (event: AdapterEvent) => void) => Promise<void>) | undefined;
+let beforePhysicalSend: (() => Promise<void>) | undefined;
+let physicalSends = 0;
+const originalFetch = globalThis.fetch;
 
 function fixtureAdapter(provider: OcxProviderConfig): ProviderAdapter {
   return {
@@ -30,7 +31,16 @@ function fixtureAdapter(provider: OcxProviderConfig): ProviderAdapter {
     async runTurn(_parsed, incoming, emit) {
       const index = attemptKeys.length;
       attemptKeys.push(provider.apiKey ?? "");
-      await incoming.providerFetch!(provider.baseUrl, { method: "POST" });
+      attemptProjects.push(provider.project);
+      attemptCredentialIdentities.push(_parsed._providerContinuationOwner?.credentialIdentity);
+      const gate = beforePhysicalSend;
+      beforePhysicalSend = undefined;
+      await gate?.();
+      for (let send = 0; send < physicalSends; send++) {
+        await incoming.providerFetch!(provider.baseUrl, {
+          method: "POST", headers: { Authorization: `Bearer ${provider.apiKey}` }, body: "{}",
+        });
+      }
       if (slowAttempt) return await slowAttempt(emit);
       for (const event of attempts[index] ?? []) emit(event);
     },
@@ -40,7 +50,7 @@ function fixtureAdapter(provider: OcxProviderConfig): ProviderAdapter {
 mock.module("../../src/server/adapter-resolve", () => ({
   ...actualResolver,
   resolveAdapter(provider: OcxProviderConfig, cacheRetention?: "none" | "short" | "long") {
-    if (provider.adapter === "cursor") return fixtureAdapter(provider);
+    if (provider.adapter === "cursor" || provider.googleMode === "cloud-code-assist") return fixtureAdapter(provider);
     return actualResolveAdapter(provider, cacheRetention);
   },
 }));
@@ -48,6 +58,7 @@ mock.module("../../src/server/adapter-resolve", () => ({
 const { handleResponses } = await import("../../src/server/responses");
 const originalHome = process.env.OPENCODEX_HOME;
 let home = "";
+let releaseSpendHome: (() => void) | undefined;
 
 /**
  * `enabled: undefined` is the case that matters after #2568d — the key absent entirely, which is
@@ -63,7 +74,6 @@ function config(enabled?: boolean): OcxConfig {
         baseUrl: "https://api2.cursor.sh",
         authMode: "oauth",
         models: ["model"],
-        fetch: async () => new Response(),
       },
     },
     ...(enabled === undefined ? {} : { oauthAccountFailover: { enabled } }),
@@ -92,13 +102,23 @@ async function seedAccounts(count: number): Promise<void> {
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "ocx-adapter-event-failover-"));
   process.env.OPENCODEX_HOME = home;
+  // Take the writer lease after this case installs its home so direct handler dispatch can open the spend journal.
+  releaseSpendHome = acquireOwnedSpendHome();
   clearGenericFailoverHealth();
   attempts = [];
   attemptKeys = [];
+  attemptProjects = [];
+  attemptCredentialIdentities = [];
   slowAttempt = undefined;
+  beforePhysicalSend = undefined;
+  physicalSends = 0;
 });
 
 afterEach(() => {
+  // Release before restoring or removing the home to prevent Windows removal failures and POSIX unlinked databases.
+  releaseSpendHome?.();
+  releaseSpendHome = undefined;
+  globalThis.fetch = originalFetch;
   clearGenericFailoverHealth();
   if (originalHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = originalHome;
@@ -106,6 +126,72 @@ afterEach(() => {
 });
 
 describe("#2568 adapter-event OAuth failover", () => {
+  test.each([false, true])("runTurn first physical send follows a changed selection (image loop=%s)", async imageLoop => {
+    await seedAccounts(2);
+    const accounts = getAccountSet("cursor")!.accounts;
+    beforePhysicalSend = async () => { await setActiveAccount("cursor", accounts[0]!.id); };
+    physicalSends = 1;
+    slowAttempt = async emit => { emit({ type: "text_delta", text: "selected answer" }); emit({ type: "done" }); };
+    const sent: string[] = [];
+    globalThis.fetch = (async (_input, init) => {
+      sent.push(new Headers(init?.headers).get("authorization") ?? "");
+      return new Response("{}");
+    }) as typeof fetch;
+    const cfg = config(false);
+    if (imageLoop) {
+      cfg.images = { bridgeEnabled: true };
+      cfg.providers.xai = { adapter: "openai-chat", baseUrl: "https://api.x.ai/v1", authMode: "key", apiKey: "synthetic-image-key" };
+    }
+    const req = imageLoop ? new Request("http://localhost/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "cursor/model", input: "answer", stream: true, tools: [{ type: "image_generation" }] }),
+    }) : request(true);
+    const response = await handleResponses(req, cfg, { model: "", provider: "" });
+    expect(await response.text()).toContain("selected answer");
+    expect(sent).toEqual(["Bearer cursor-access-0"]);
+  });
+
+  test("an already started multi-message turn keeps its original credential", async () => {
+    await seedAccounts(2);
+    const accounts = getAccountSet("cursor")!.accounts;
+    physicalSends = 2;
+    slowAttempt = async emit => { emit({ type: "text_delta", text: "same turn" }); emit({ type: "done" }); };
+    const sent: string[] = [];
+    globalThis.fetch = (async (_input, init) => {
+      sent.push(new Headers(init?.headers).get("authorization") ?? "");
+      if (sent.length === 1) await setActiveAccount("cursor", accounts[0]!.id);
+      return new Response("{}");
+    }) as typeof fetch;
+    const response = await handleResponses(request(false), config(false), { model: "", provider: "" });
+    expect(await response.text()).toContain("same turn");
+    expect(sent).toEqual(["Bearer cursor-access-1", "Bearer cursor-access-1"]);
+    expect(getCredential("cursor")?.access).toBe("cursor-access-0");
+  });
+
+  test("every CCA request pairs the persisted active account with its own project", async () => {
+    for (const id of ["a", "b"]) await saveCredential("google-antigravity", {
+      access: `ga-access-${id}`, refresh: `ga-refresh-${id}`, expires: Date.now() + 3_600_000,
+      accountId: id, projectId: `project-${id}`,
+    });
+    const cfg = config();
+    cfg.defaultProvider = "google-antigravity";
+    cfg.providers = { "google-antigravity": { ...cfg.providers.cursor!, googleMode: "cloud-code-assist", project: "project-a" } };
+    attempts = [
+      [{ type: "text_delta", text: "first" }, { type: "done" }],
+      [{ type: "text_delta", text: "second" }, { type: "done" }],
+    ];
+    for (let i = 0; i < 2; i++) {
+      const req = new Request("http://localhost/v1/responses", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "google-antigravity/model", input: "answer", stream: false }),
+      });
+      const res = await handleResponses(req, cfg, { model: "", provider: "" });
+      const responseBody = await res.text();
+      expect(res.status, responseBody).toBe(200);
+    }
+    expect(attemptKeys).toEqual(["ga-access-b", "ga-access-b"]);
+    expect(attemptProjects).toEqual(["project-b", "project-b"]);
+  });
   for (const stream of [true, false]) {
     test(`${stream ? "streaming" : "non-streaming"} first-event 429 rotates and replays`, async () => {
       await seedAccounts(2);
@@ -114,46 +200,50 @@ describe("#2568 adapter-event OAuth failover", () => {
         [{ type: "text_delta", text: "alternate answer" }, { type: "done" }],
       ];
 
-      const logCtx: RequestLogContext = { model: "", provider: "" };
-      const response = await handleResponses(request(stream), config(), logCtx);
+      const response = await handleResponses(request(stream), config(), { model: "", provider: "" });
       const body = await response.text();
 
       expect(attemptKeys).toEqual(["cursor-access-1", "cursor-access-0"]);
-      expect(logCtx.attempts).toMatchObject([
-        { status: 429, sendCount: 1 },
-        { sendCount: 1, recoveryKinds: ["oauth-account-429"] },
-      ]);
-      expect(logCtx.attempts?.[1]?.accountLogLabel)
-        .not.toBe(logCtx.attempts?.[0]?.accountLogLabel);
       expect(body).toContain("alternate answer");
       expect(body).not.toContain("Cursor rate limit exceeded");
+      expect(getCredential("cursor")?.access).toBe("cursor-access-0");
+    });
+
+    test(`${stream ? "streaming" : "non-streaming"} local side effect prevents 429 replay`, async () => {
+      await seedAccounts(2);
+      attempts = [[
+        { type: "heartbeat", replayUnsafe: true },
+        { type: "error", message: "Cursor rate limit exceeded: resource_exhausted" },
+      ]];
+
+      const body = await (await handleResponses(request(stream), config(), { model: "", provider: "" })).text();
+
+      expect(attemptKeys).toEqual(["cursor-access-1"]);
+      expect(body).toContain("rate_limit_exceeded");
     });
   }
 
-  test("a rotated credential rejected by pacing creates no phantom attempt", async () => {
-    await seedAccounts(2);
-    attempts = [
-      [{ type: "error", message: "Cursor rate limit exceeded: resource_exhausted" }],
-      [{ type: "text_delta", text: "must not dispatch" }, { type: "done" }],
-    ];
-    const runtimeConfig = config();
-    runtimeConfig.providers.cursor!.requestPacing = { enabled: true, minIntervalMs: 60_000 };
-    runtimeConfig.providers.cursor!.fetch = async () => {
-      setProviderRequestPacingLimitsForTest({ maxQueueDepth: 0 });
-      return new Response();
+  test("a newer manual choice wins a pending request's 429 proposal", async () => {
+    await seedAccounts(3);
+    const accounts = getAccountSet("cursor")!.accounts;
+    slowAttempt = async emit => {
+      if (attemptKeys.length === 1) {
+        await setActiveAccount("cursor", accounts[1]!.id);
+        emit({ type: "error", message: "Cursor rate limit exceeded: resource_exhausted" });
+      } else {
+        emit({ type: "text_delta", text: "manual choice answered" });
+        emit({ type: "done" });
+      }
     };
-    const logCtx: RequestLogContext = { model: "", provider: "" };
-
-    try {
-      const response = await handleResponses(request(true), runtimeConfig, logCtx);
-      await response.text();
-    } finally {
-      resetProviderRequestPacingForTest();
-    }
-
-    expect(attemptKeys).toEqual(["cursor-access-1"]);
-    expect(logCtx.attempts).toHaveLength(1);
-    expect(logCtx.attempts?.[0]).toMatchObject({ sendCount: 1 });
+    const response = await handleResponses(request(false), config(false), { model: "", provider: "" });
+    expect(await response.text()).toContain("manual choice answered");
+    expect(attemptKeys).toEqual(["cursor-access-2", "cursor-access-1"]);
+    expect(getCredential("cursor")?.access).toBe("cursor-access-1");
+    await (await handleResponses(request(false), config(false), { model: "", provider: "" })).text();
+    expect(attemptCredentialIdentities[1]).toBe(attemptCredentialIdentities[2]);
+    await setActiveAccount("cursor", accounts[0]!.id);
+    await (await handleResponses(request(false), config(false), { model: "", provider: "" })).text();
+    expect(attemptCredentialIdentities[1]).not.toBe(attemptCredentialIdentities[3]);
   });
 
   test("a single account is a strict no-op", async () => {

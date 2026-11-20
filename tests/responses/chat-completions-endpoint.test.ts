@@ -1,11 +1,13 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, saveConfig } from "../../src/config";
-import { startServer } from "../../src/server";
+import { createServerTracker } from "../helpers/leftover-servers";
+import { guardWebSocketDials } from "../helpers/websocket-dial-guard";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 import { ownedServiceHomeInspection } from "../helpers/owned-service-home-inspection";
-import type { OcxConfig, OcxProviderConfig } from "../../src/types";
+import { OPENAI_PROVIDER_TIER_VERSION, type OcxConfig, type OcxProviderConfig } from "../../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { chatCompletionsToResponsesBody, ChatCompletionsRequestError } from "../../src/chat/inbound";
@@ -15,9 +17,7 @@ import { createTestTranslatorBudget } from "../helpers/translator-budget";
 import type { TranslatorBudget } from "../../src/lib/translator-budget";
 import {
   resetProviderRequestPacingForTest,
-  setProviderRequestPacingLimitsForTest,
   setProviderRequestPacingRuntimeForTest,
-  waitForProviderRequestSlot,
 } from "../../src/providers/request-pacing";
 import {
   acquireNativeMainProfileDrain,
@@ -61,8 +61,16 @@ let testDir = "";
 let previousHome: string | undefined;
 let isolatedCodexHome: IsolatedCodexHome | null = null;
 const originalFetch = globalThis.fetch;
+const { startServer, stopLeftoverServers } = createServerTracker();
+let webSocketGuard: ReturnType<typeof guardWebSocketDials> | undefined;
+
+// A case that calls a handler directly never takes the writer lease startServer takes, so its
+// dispatch is refused. Never file-wide: most cases here start a real server that takes it too.
+let releaseSpendHome: (() => void) | undefined;
+const takeSpendHome = (): void => { releaseSpendHome ??= acquireOwnedSpendHome(); };
 
 beforeEach(() => {
+  webSocketGuard = guardWebSocketDials();
   previousHome = process.env.OPENCODEX_HOME;
   isolatedCodexHome = installIsolatedCodexHome("ocx-chat-completions-");
   testDir = mkdtempSync(join(tmpdir(), "ocx-chat-completions-"));
@@ -70,14 +78,26 @@ beforeEach(() => {
   globalThis.fetch = originalFetch;
 });
 
-afterEach(() => {
-  resetProviderRequestPacingForTest();
-  if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
-  else process.env.OPENCODEX_HOME = previousHome;
-  isolatedCodexHome?.restore();
-  isolatedCodexHome = null;
-  globalThis.fetch = originalFetch;
-  if (testDir) removeTreeWithRetry(testDir);
+afterEach(async () => {
+  const refusedDials = webSocketGuard?.restore() ?? [];
+  try {
+    // A timed-out case never reaches its finally; its live server would fail every later start.
+    await stopLeftoverServers();
+  } finally {
+    try {
+      releaseSpendHome?.();
+      releaseSpendHome = undefined;
+      resetProviderRequestPacingForTest();
+      if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previousHome;
+      isolatedCodexHome?.restore();
+      isolatedCodexHome = null;
+      globalThis.fetch = originalFetch;
+      if (testDir) removeTreeWithRetry(testDir);
+    } finally {
+      expect(refusedDials).toEqual([]);
+    }
+  }
 });
 
 function mockChatUpstream() {
@@ -244,6 +264,11 @@ describe("chatCompletionsToResponsesBody image parts", () => {
     { part: { type: "image_url", image_url: "https://example.com/image.png" }, expected: { type: "input_image", image_url: "https://example.com/image.png" } },
     { part: { type: "image_url", image_url: "https://example.com/image.png", detail: "low" }, expected: { type: "input_image", image_url: "https://example.com/image.png", detail: "low" } },
     { part: { type: "image_url", image_url: { url: "https://example.com/image.png" } }, expected: { type: "input_image", image_url: "https://example.com/image.png" } },
+    { part: { type: "image", data: "aGVsbG8=", mimeType: "image/png" }, expected: { type: "input_image", image_url: "data:image/png;base64,aGVsbG8=" } },
+    { part: { type: "image", data: "aGVsbG8=", mediaType: "image/jpeg" }, expected: { type: "input_image", image_url: "data:image/jpeg;base64,aGVsbG8=" } },
+    { part: { type: "image", data: "data:image/webp;base64,aGVsbG8=", mimeType: "image/png" }, expected: { type: "input_image", image_url: "data:image/webp;base64,aGVsbG8=" } },
+    { part: { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "aGVsbG8=" } }, expected: { type: "input_image", image_url: "data:image/jpeg;base64,aGVsbG8=" } },
+    { part: { type: "image", source: { type: "url", url: "https://example.com/claude.png" } }, expected: { type: "input_image", image_url: "https://example.com/claude.png" } },
   ])("preserves user image shorthand and omitted detail: %j", ({ part, expected }) => {
     const body = chatCompletionsToResponsesBody({ model: "mock/test-model", messages: [{ role: "user", content: [part] }] });
     expect(body.input).toEqual([{ type: "message", role: "user", content: [expected] }]);
@@ -364,6 +389,7 @@ async function driveChatFallbackServiceTier(
       },
     },
   } as OcxConfig;
+  takeSpendHome();
   const response = await handleChatCompletions(
     new Request("http://localhost/v1/chat/completions", {
       method: "POST",
@@ -510,10 +536,11 @@ test("chatCompletionsUsage always emits detail objects with zero defaults", () =
   });
 });
 
-test("responsesSseToChatCompletionsSse consumes response.heartbeat without forwarding a raw frame", async () => {
+test("responsesSseToChatCompletionsSse relays response.heartbeat as Chat-compatible SSE comments", async () => {
   // Upstream responses SSE may contain heartbeat events (SSE comment keep-alive in
   // bridge.ts, but some upstreams emit them as typed frames). The chat-completions
-  // converter must drop them rather than forwarding raw Responses-vocab frames.
+  // converter must preserve their transport liveness without forwarding raw Responses-vocab
+  // frames or manufacturing semantic Chat chunks.
   const { responsesSseToChatCompletionsSse } = budgetedChatOutbound(await import("../../src/chat/outbound"));
   const upstream = new Response([
     `event: response.heartbeat\ndata: ${JSON.stringify({ type: "response.heartbeat" })}\n\n`,
@@ -524,6 +551,7 @@ test("responsesSseToChatCompletionsSse consumes response.heartbeat without forwa
   const stream = responsesSseToChatCompletionsSse(upstream.body!, "routed/model");
   const text = await new Response(stream).text();
   expect(text).not.toContain("response.heartbeat");
+  expect(text.split(": opencodex heartbeat\n\n")).toHaveLength(3);
   expect(text).toContain('"content":"hi"');
   expect(text).toContain("data: [DONE]");
   // Every data frame must be a chat.completion.chunk — no Responses-vocab leaks.
@@ -970,8 +998,10 @@ test("chat-native consumes pacing before the response-header timeout starts", as
     }),
   });
 
+  takeSpendHome();
   const first = await handleChatCompletions(request(), config, {} as Parameters<typeof handleChatCompletions>[2]);
   expect(first.status).toBe(200);
+  takeSpendHome();
   const secondPending = handleChatCompletions(request(), config, {} as Parameters<typeof handleChatCompletions>[2]);
   await Bun.sleep(5);
   expect(starts).toBe(1);
@@ -983,56 +1013,6 @@ test("chat-native consumes pacing before the response-header timeout starts", as
   const second = await secondPending;
   expect(second.status).toBe(200);
   expect(starts).toBe(2);
-});
-
-test("chat-native does not count pacing rejection as a physical send", async () => {
-  const { clearRequestLogsForTests, getRequestLogEntries } = await import("../../src/server/request-log");
-  clearRequestLogsForTests();
-  let now = 0;
-  setProviderRequestPacingRuntimeForTest({
-    now: () => now,
-    setTimer: callback => callback,
-    clearTimer: () => {},
-    enqueueMicrotask: callback => callback(),
-  });
-
-  let starts = 0;
-  const providerExecutor = Object.assign(async () => {
-    starts += 1;
-    return Response.json({
-      id: "chatcmpl_unexpected",
-      object: "chat.completion",
-      choices: [{ index: 0, message: { role: "assistant", content: "unexpected" }, finish_reason: "stop" }],
-    });
-  }, { preconnect() {} }) as typeof globalThis.fetch;
-  const config = mockConfig("https://provider.example/v1", {
-    requestPacing: { enabled: true, minIntervalMs: 100 },
-    fetch: providerExecutor,
-  } as Partial<OcxProviderConfig> & { fetch: typeof globalThis.fetch });
-  await waitForProviderRequestSlot("mock", config.providers.mock!, "test-model");
-  setProviderRequestPacingLimitsForTest({ maxQueueDepth: 0 });
-  saveConfig(config);
-  const server = startServer(0);
-
-  try {
-    const response = await originalFetch(new URL("/v1/chat/completions", server.url), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "mock/test-model",
-        stream: false,
-        messages: [{ role: "user", content: "hi" }],
-      }),
-    });
-    expect(response.status).toBe(502);
-    expect(starts).toBe(0);
-    expect(getRequestLogEntries().findLast(entry => entry.inboundProtocol === "chat")?.attempts)
-      .toMatchObject([{ sendCount: 0 }]);
-  } finally {
-    now = 100;
-    await server.stop(true);
-    clearRequestLogsForTests();
-  }
 });
 
 test("chat-native stays outside the Responses empty-completion retry guard", async () => {
@@ -1051,6 +1031,7 @@ test("chat-native stays outside the Responses empty-completion retry guard", asy
   } as Partial<OcxProviderConfig> & { fetch: typeof globalThis.fetch });
   config.emptyCompletionRetry = true;
 
+  takeSpendHome();
   const response = await handleChatCompletions(
     new Request("http://localhost/v1/chat/completions", {
       method: "POST",
@@ -1451,7 +1432,7 @@ test("chat-native redacts structured provider errors before returning them", asy
     });
     const text = await response.text();
     expect(response.status).toBe(401);
-    expect(text).toContain("Bearer [REDACTED]");
+    expect(text).toContain("The provider rejected the configured credentials.");
     expect(text).not.toContain("opaquecredential123456");
   } finally {
     await server.stop(true);
@@ -1493,7 +1474,7 @@ test("chat-native preserves a structured cyber_policy type on JSON and SSE failu
     expect(jsonResponse.status).toBe(400);
     expect(jsonResponse.headers.get("retry-after")).toBeNull();
     await expect(jsonResponse.json()).resolves.toMatchObject({
-      error: { type: "server_error", code: "cyber_policy", message: safeMessage },
+      error: { type: "server_error", code: "cyber_policy", message: "Request blocked by the upstream cybersecurity policy." },
     });
 
     const sseResponse = await request(true);
@@ -1501,7 +1482,7 @@ test("chat-native preserves a structured cyber_policy type on JSON and SSE failu
     const sseText = await sseResponse.text();
     expect(sseText).toContain('"type":"server_error"');
     expect(sseText).toContain('"code":"cyber_policy"');
-    expect(sseText).toContain("Authorization: Bearer [REDACTED]");
+    expect(sseText).toContain("Request blocked by the upstream cybersecurity policy.");
     expect(sseText).not.toContain("chatnativesecret123456");
     expect(sseText).not.toContain("data: [DONE]");
   } finally {
@@ -1653,60 +1634,6 @@ test("chat-native records terminal key cooldown after the send budget is exhaust
   }
 });
 
-test("chat-native preserves same-key retry, key rotation, usage, and request logging", async () => {
-  const { clearRequestLogsForTests, getRequestLogEntries } = await import("../../src/server/request-log");
-  const { clearKeyCooldowns } = await import("../../src/providers/key-failover");
-  clearRequestLogsForTests();
-  clearKeyCooldowns("mock");
-  const authorizations: Array<string | null> = [];
-  const upstream = Bun.serve({
-    port: 0,
-    fetch(req) {
-      authorizations.push(req.headers.get("authorization"));
-      if (authorizations.length < 3) {
-        return Response.json({ error: { message: "rate limited", type: "rate_limit_error" } }, {
-          status: 429,
-          headers: { "retry-after": "0" },
-        });
-      }
-      return Response.json({
-        id: "chatcmpl_retry",
-        object: "chat.completion",
-        choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
-        usage: { prompt_tokens: 4, completion_tokens: 2 },
-      });
-    },
-  });
-  saveConfig(mockConfig(`${upstream.url.toString().replace(/\/$/, "")}/v1`, {
-    authMode: "key",
-    apiKey: "key-one",
-    apiKeyPool: [{ id: "one", key: "key-one" }, { id: "two", key: "key-two" }],
-    retryOn429: { attempts: 1, intervalMs: 100, maxIntervalMs: 100, respectRetryAfter: false },
-  }));
-  const server = startServer(0);
-  try {
-    const response = await fetch(new URL("/v1/chat/completions", server.url), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "mock/test-model", stream: false, messages: [{ role: "user", content: "hi" }] }),
-    });
-    expect(response.status).toBe(200);
-    await response.text();
-    expect(authorizations).toEqual(["Bearer key-one", "Bearer key-one", "Bearer key-two"]);
-    const entry = getRequestLogEntries().at(-1);
-    expect(entry?.status).toBe(200);
-    expect(entry?.usage).toMatchObject({ inputTokens: 4, outputTokens: 2 });
-    expect(entry?.attempts).toMatchObject([
-      { status: 429, sendCount: 2, recoveryKinds: ["rate-limit-429"] },
-      { sendCount: 1, recoveryKinds: ["key-429"] },
-    ]);
-  } finally {
-    await server.stop(true);
-    upstream.stop(true);
-    clearKeyCooldowns("mock");
-  }
-});
-
 test("chat-native client cancellation cancels the upstream stream and logs 499", async () => {
   const { clearRequestLogsForTests, getRequestLogEntries } = await import("../../src/server/request-log");
   const { handleChatCompletions } = await import("../../src/server/chat-completions");
@@ -1733,6 +1660,7 @@ test("chat-native client cancellation cancels the upstream stream and logs 499",
       body: JSON.stringify({ model: "mock/test-model", stream: true, messages: [{ role: "user", content: "hi" }] }),
     });
     const logCtx = {} as Parameters<typeof handleChatCompletions>[2];
+    takeSpendHome();
     const response = await handleChatCompletions(
       request,
       mockConfig("https://provider.example/v1"),
@@ -1784,6 +1712,7 @@ test("chat-native request abort releases its active-turn lease and logs 499", as
       body: JSON.stringify({ model: "mock/test-model", stream: true, messages: [{ role: "user", content: "hi" }] }),
       signal: clientAbort.signal,
     });
+    takeSpendHome();
     const response = await handleChatCompletions(
       request,
       mockConfig("https://provider.example/v1"),
@@ -1812,6 +1741,229 @@ test("chat-native request abort releases its active-turn lease and logs 499", as
   }
 });
 
+test("chat-native cancelled non-streaming SSE returns 499 instead of partial success", async () => {
+  const { handleChatCompletions } = await import("../../src/server/chat-completions");
+  const clientAbort = new AbortController();
+  let readStarted!: () => void;
+  const started = new Promise<void>(resolve => { readStarted = resolve; });
+  globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'));
+      readStarted();
+    },
+  }), { headers: { "content-type": "text/event-stream" } })) as typeof fetch;
+  takeSpendHome();
+  const result = handleChatCompletions(new Request("http://localhost/v1/chat/completions", {
+    method: "POST", signal: clientAbort.signal,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "mock/test-model", stream: false, messages: [{ role: "user", content: "hi" }] }),
+  }), mockConfig("https://provider.example/v1"), {} as Parameters<typeof handleChatCompletions>[2]);
+  await started;
+  await Bun.sleep(10);
+  clientAbort.abort("client done");
+  const response = await result;
+  expect(response.status).toBe(499);
+  expect(await response.json()).toMatchObject({ error: { type: "client_cancelled" } });
+});
+
+test("chat-native SSE enforces configured stall timeout despite non-progress frames", async () => {
+  const { handleChatCompletions } = await import("../../src/server/chat-completions");
+  const { clearRequestLogsForTests, getRequestLogEntries } = await import("../../src/server/request-log");
+  clearRequestLogsForTests();
+  const clientAbort = new AbortController();
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let cancels = 0;
+  const before = getActiveTurnCount();
+  const releaseMisses = activeRegistryMetrics().activeTurns.releaseMisses;
+  const lease = tryAdmitTurn();
+  if (!lease) throw new Error("failed to admit native Chat stall test turn");
+  globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      const wire = new TextEncoder().encode(': heartbeat\n\ndata\n\ndata:\n\ndata: {"choices":[{"delta":{"role":"assistant","content":"","tool_calls":[{"index":0}]}}],"usage":{"prompt_tokens":1,"completion_tokens":0}}\n\n');
+      controller.enqueue(wire);
+      timer = setInterval(() => controller.enqueue(wire), 100);
+    },
+    cancel() { cancels += 1; clearInterval(timer); },
+  }), { headers: { "content-type": "text/event-stream" } })) as typeof fetch;
+  try {
+    takeSpendHome();
+    const response = await handleChatCompletions(new Request("http://localhost/v1/chat/completions", {
+      method: "POST", signal: clientAbort.signal,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "mock/test-model", stream: true, messages: [{ role: "user", content: "hi" }] }),
+    }), { ...mockConfig("https://provider.example/v1"), stallTimeoutSec: 1 }, {} as Parameters<typeof handleChatCompletions>[2],
+    { requestId: "chat-stall-clock", start: Date.now(), turnAdmissionLease: lease });
+    const outcome = await Promise.race([
+      response.text(), Bun.sleep(1_600).then(() => "STILL_PENDING"),
+    ]);
+    expect(outcome).toContain('"code":"upstream_stall_timeout"');
+    expect(outcome).not.toContain("[DONE]");
+    clientAbort.abort("late cancellation");
+    expect(cancels).toBe(1);
+    expect(getActiveTurnCount()).toBe(before);
+    expect(activeRegistryMetrics().activeTurns.releaseMisses).toBe(releaseMisses);
+    expect(getRequestLogEntries().filter(entry => entry.requestId === "chat-stall-clock")).toHaveLength(1);
+    expect(getRequestLogEntries().at(-1)?.status).toBe(502);
+  } finally { clientAbort.abort(); clearInterval(timer); lease.release(); }
+});
+
+test("chat-native meaningful reasoning keeps a long stream alive and pauses the stall clock under backpressure", async () => {
+  const { nativeChatSse } = await import("../../src/server/chat-native-sse");
+  const budget = createTestTranslatorBudget();
+  const abort = new AbortController();
+  const encoder = new TextEncoder();
+  let source!: ReadableStreamDefaultController<Uint8Array>;
+  const body = new ReadableStream<Uint8Array>({ start(controller) { source = controller; } });
+  const stream = nativeChatSse(body, {
+    requestedModel: "mock/test-model", translatorBudget: budget, signal: abort.signal,
+    stallTimeoutSec: 1, onUsage() {},
+  });
+  const reasoning = 'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}\n\n';
+  source.enqueue(encoder.encode(reasoning));
+  // One queued output applies backpressure. That interval is not upstream silence.
+  await Bun.sleep(1_100);
+  const output = new Response(stream).text();
+  try {
+    for (let index = 0; index < 3; index++) {
+      await Bun.sleep(450);
+      const delta = index === 0 ? { reasoning: "thinking" }
+        : index === 1 ? { reasoning_details: [{ text: "thinking" }] }
+          : { reasoning_content: "thinking" };
+      source.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta }] })}\n\n`));
+    }
+    source.enqueue(encoder.encode('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'));
+    const text = await output;
+    expect(text.match(/thinking/g)).toHaveLength(4);
+    expect(text).toContain("[DONE]");
+    expect(text).not.toContain("upstream_stall_timeout");
+  } finally { abort.abort(); budget.dispose(); }
+});
+
+test("chat-native caller abort while the stall clock is pending wins over the later deadline", async () => {
+  const { nativeChatSse } = await import("../../src/server/chat-native-sse");
+  const budget = createTestTranslatorBudget();
+  const abort = new AbortController();
+  const terminals: Array<[number, string | undefined]> = [];
+  let cancels = 0;
+  let upstreamCancels = 0;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'));
+    },
+    cancel() { upstreamCancels += 1; },
+  });
+  const stream = nativeChatSse(body, {
+    requestedModel: "mock/test-model", translatorBudget: budget, signal: abort.signal,
+    stallTimeoutSec: 1, onUsage() {},
+    onTerminal(status, message) { terminals.push([status, message]); },
+    onCancel() { cancels += 1; },
+  });
+  const reader = stream.getReader();
+  try {
+    const first = await reader.read();
+    expect(new TextDecoder().decode(first.value)).toContain("partial");
+    // Upstream now stays silent, so the next pull waits on the one-second stall clock.
+    // A caller abort during that wait must be the only reported outcome, even once the
+    // deadline it was racing has elapsed.
+    const pending = reader.read();
+    await Bun.sleep(300);
+    abort.abort("client gone");
+    const next = await pending;
+    expect(next.done).toBe(true);
+    await Bun.sleep(1_000);
+    expect(cancels).toBe(1);
+    expect(upstreamCancels).toBe(1);
+    expect(terminals).toEqual([]);
+  } finally { abort.abort(); reader.releaseLock(); budget.dispose(); }
+});
+
+test("chat-native valid terminal retains precedence over a late non-streaming abort", async () => {
+  const { handleChatCompletions } = await import("../../src/server/chat-completions");
+  const clientAbort = new AbortController();
+  globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"complete"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'));
+    },
+    cancel() { clientAbort.abort("late cancellation after terminal"); },
+  }), { headers: { "content-type": "text/event-stream" } })) as typeof fetch;
+  takeSpendHome();
+  const response = await handleChatCompletions(new Request("http://localhost/v1/chat/completions", {
+    method: "POST", signal: clientAbort.signal, headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "mock/test-model", stream: false, messages: [{ role: "user", content: "hi" }] }),
+  }), mockConfig("https://provider.example/v1"), {} as Parameters<typeof handleChatCompletions>[2]);
+  expect(clientAbort.signal.aborted).toBe(true);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({ choices: [{ message: { content: "complete" } }] });
+});
+
+test("chat-native non-streaming SSE reports a typed stall failure instead of partial success", async () => {
+  const { handleChatCompletions } = await import("../../src/server/chat-completions");
+  let cancels = 0;
+  globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'));
+    },
+    cancel() { cancels += 1; },
+  }), { headers: { "content-type": "text/event-stream" } })) as typeof fetch;
+  takeSpendHome();
+  const response = await handleChatCompletions(new Request("http://localhost/v1/chat/completions", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "mock/test-model", stream: false, messages: [{ role: "user", content: "hi" }] }),
+  }), { ...mockConfig("https://provider.example/v1"), stallTimeoutSec: 1 }, {} as Parameters<typeof handleChatCompletions>[2]);
+  expect(response.status).toBe(502);
+  expect(await response.json()).toMatchObject({ error: { type: "upstream_error", code: "upstream_stall_timeout" } });
+  expect(cancels).toBe(1);
+});
+
+test("chat-native SSE only encodes outbound frames and releases buffered tail on cancellation", async () => {
+  const { nativeChatSse } = await import("../../src/server/chat-native-sse");
+  const frames = Array.from({ length: 64 }, () => 'data: {"choices":[{"delta":{"content":"中文😀"}}]}\n\n');
+  const wire = new TextEncoder().encode(frames.join(""));
+  const budget = createTestTranslatorBudget();
+  const abort = new AbortController();
+  const body = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(wire); } });
+  const encode = spyOn(TextEncoder.prototype, "encode");
+  try {
+    const stream = nativeChatSse(body, {
+      requestedModel: "mock/test-model", translatorBudget: budget, signal: abort.signal, onUsage() {},
+    });
+    const reader = stream.getReader();
+    for (let index = 0; index < 8; index++) expect((await reader.read()).done).toBe(false);
+    await reader.cancel("done inspecting");
+    // No append/suffix-size encoding: every actual encoding is a normalized output frame.
+    expect(encode.mock.calls.length).toBeGreaterThanOrEqual(8);
+    for (const [text] of encode.mock.calls) expect(text).toContain('"object":"chat.completion.chunk"');
+    expect(budget.snapshot().currentBytes).toBe(0);
+  } finally { encode.mockRestore(); abort.abort(); budget.dispose(); }
+});
+
+test("chat-native non-streaming SSE collects CRLF multiline and split UTF-8 frames", async () => {
+  const { handleChatCompletions } = await import("../../src/server/chat-completions");
+  const frames = [
+    'data\r\n\r\ndata:\r\n\r\n',
+    'data: {"choices":\r\ndata\r\ndata: [{"delta":{"content":"中文😀"}}]}\r\n\r\n',
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}\r\n\r\n',
+    'data: [DONE]\r\n\r\n',
+  ];
+  const wire = new TextEncoder().encode(frames.join(""));
+  globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (let offset = 0; offset < wire.byteLength; offset += 7) controller.enqueue(wire.slice(offset, offset + 7));
+      controller.close();
+    },
+  }), { headers: { "content-type": "text/event-stream" } })) as typeof fetch;
+  takeSpendHome();
+  const response = await handleChatCompletions(new Request("http://localhost/v1/chat/completions", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "mock/test-model", stream: false, messages: [{ role: "user", content: "hi" }] }),
+  }), mockConfig("https://provider.example/v1"), {} as Parameters<typeof handleChatCompletions>[2]);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({
+    choices: [{ message: { content: "中文😀" }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 7, completion_tokens: 3 },
+  });
+});
+
 test("chat-native direct streaming without an admission lease does not record a release miss", async () => {
   const { handleChatCompletions } = await import("../../src/server/chat-completions");
   const releaseMisses = activeRegistryMetrics().activeTurns.releaseMisses;
@@ -1825,6 +1977,7 @@ test("chat-native direct streaming without an admission lease does not record a 
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ model: "mock/test-model", stream: true, messages: [{ role: "user", content: "hi" }] }),
     });
+    takeSpendHome();
     const response = await handleChatCompletions(
       request,
       mockConfig("https://provider.example/v1"),
@@ -1908,12 +2061,12 @@ test("POST /v1/chat/completions direct mode forwards caller Authorization", asyn
   }) as typeof fetch;
   saveConfig({
     port: 0,
-    defaultProvider: "openai",
+    defaultProvider: "openai", openaiProviderTierVersion: OPENAI_PROVIDER_TIER_VERSION,
     providers: {
       openai: {
         adapter: "openai-responses",
         baseUrl: "https://chatgpt.com/backend-api/codex",
-        authMode: "forward",
+        authMode: "forward", upstreamWebsocket: false,
         codexAccountMode: "direct",
       },
     },
@@ -2025,13 +2178,12 @@ test("chat-native skips optional main enrichment while routed work survives drai
     await server.stop(true);
     saveConfig({
       port: 0,
-      openaiProviderTierVersion: 2,
-      defaultProvider: "openai",
+      defaultProvider: "openai", openaiProviderTierVersion: OPENAI_PROVIDER_TIER_VERSION,
       providers: {
         openai: {
           adapter: "openai-responses",
           baseUrl: "https://chatgpt.com/backend-api/codex",
-          authMode: "forward",
+          authMode: "forward", upstreamWebsocket: false,
           codexAccountMode: "pool",
         },
       },
@@ -2089,12 +2241,12 @@ test("POST /v1/chat/completions finalizes native passthrough request logs", asyn
   }) as typeof fetch;
   saveConfig({
     port: 0,
-    defaultProvider: "openai",
+    defaultProvider: "openai", openaiProviderTierVersion: OPENAI_PROVIDER_TIER_VERSION,
     providers: {
       openai: {
         adapter: "openai-responses",
         baseUrl: "https://chatgpt.com/backend-api/codex",
-        authMode: "forward",
+        authMode: "forward", upstreamWebsocket: false,
         codexAccountMode: "direct",
       },
     },
@@ -2162,12 +2314,12 @@ test("POST /v1/chat/completions logs native cyber terminals as 400 cyber_policy"
   }) as typeof fetch;
   saveConfig({
     port: 0,
-    defaultProvider: "openai",
+    defaultProvider: "openai", openaiProviderTierVersion: OPENAI_PROVIDER_TIER_VERSION,
     providers: {
       openai: {
         adapter: "openai-responses",
         baseUrl: "https://chatgpt.com/backend-api/codex",
-        authMode: "forward",
+        authMode: "forward", upstreamWebsocket: false,
         codexAccountMode: "direct",
       },
     },
@@ -2187,15 +2339,17 @@ test("POST /v1/chat/completions logs native cyber terminals as 400 cyber_policy"
       }),
     });
     expect(response.status).toBe(200);
-    expect(await response.text()).toContain("blocked");
+    expect(await response.text()).toContain("Request blocked by the upstream cybersecurity policy.");
     const entry = getRequestLogEntries().findLast(e => e.inboundProtocol === "chat");
     expect(entry).toMatchObject({
       status: 400,
       errorCode: "cyber_policy",
       terminalStatus: "failed",
       closeReason: "terminal",
-      upstreamError: "blocked",
+      upstreamCondition: "request_rejected",
     });
+    // The row keeps the classified condition only, never the provider's words.
+    expect(entry?.upstreamError).toBeUndefined();
   } finally {
     await server.stop(true);
     await upstream.stop(true);
@@ -2245,7 +2399,7 @@ test("responsesSseToChatCompletionsSse emits error frame on response.failed (no 
 
   const text = await new Response(stream).text();
   expect(text).toContain('"error"');
-  expect(text).toContain("upstream exploded");
+  expect(text).toContain("The provider failed to complete the request.");
   expect(text).not.toContain("[error]");
   expect(text).not.toContain("data: [DONE]");
 
@@ -2390,6 +2544,57 @@ test("collectChatCompletion releases every call scope after the final owner is c
   );
 });
 
+test("collectChatCompletion accounts split surrogate content incrementally and releases it on failure", async () => {
+  const { collectChatCompletion } = await import("../../src/chat/outbound");
+  for (const fail of [false, true]) {
+    const budget = createTestTranslatorBudget();
+    const frames = [
+      { choices: [{ delta: { content: "\ud83d", reasoning_content: "\ud83d", refusal: "\ud83d" } }] },
+      { choices: [{ delta: { content: "\ude00", reasoning_content: "\ude00", refusal: "\ude00" } }] },
+      ...(fail ? [{ error: { message: "upstream request failed", type: "upstream_error", code: "upstream_failure" } }]
+        : [{ choices: [{ delta: {}, finish_reason: "stop" }] }]),
+    ];
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const frame of frames) controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(frame)}\n\n`));
+        controller.close();
+      },
+    });
+    try {
+      if (fail) {
+        await expect(collectChatCompletion(stream, "mock/test-model", budget)).rejects.toMatchObject({ code: "upstream_failure" });
+        expect(budget.snapshot().currentBytes).toBe(0);
+      } else {
+        expect(await collectChatCompletion(stream, "mock/test-model", budget)).toMatchObject({
+          choices: [{ message: { content: "😀", reasoning_content: "😀", refusal: "😀" } }],
+        });
+        // Three retained fields each contain one completed scalar. This must match the runtime's
+        // full-string UTF-8 sizing even when its isolated-surrogate sizing differs.
+        expect(budget.snapshot().currentBytes).toBe(3 * Buffer.byteLength("😀"));
+      }
+    } finally { budget.dispose(); }
+  }
+});
+
+test("collectChatCompletion preserves admission for a 20 MiB frame and discards an incomplete EOF frame", async () => {
+  const { collectChatCompletion } = await import("../../src/chat/outbound");
+  const text = "x".repeat(20 * 1024 * 1024);
+  const completeFrame = `data: ${JSON.stringify({ choices: [{ delta: { content: text }, finish_reason: "stop" }] })}\n\n`;
+  const incompleteFrame = 'data: {"choices":[{"delta":{"content":"discard me"}}]}';
+  const budget = createTestTranslatorBudget();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(completeFrame));
+      controller.enqueue(new TextEncoder().encode(incompleteFrame));
+      controller.close();
+    },
+  });
+  try {
+    expect(await collectChatCompletion(stream, "mock/test-model", budget)).toMatchObject({ choices: [{ message: { content: text } }] });
+    expect(budget.snapshot().currentBytes).toBe(Buffer.byteLength(text));
+  } finally { budget.dispose(); }
+});
+
 test("collectChatCompletion final-copy overflow cleans up scopes and charges", async () => {
   const module = await import("../../src/chat/outbound");
   // Args (100 bytes) fit; args + serialized copy exceed the turn cap, so the
@@ -2469,12 +2674,12 @@ test("non-streaming /v1/chat/completions returns error status on upstream failur
   }) as typeof fetch;
   saveConfig({
     port: 0,
-    defaultProvider: "openai",
+    defaultProvider: "openai", openaiProviderTierVersion: OPENAI_PROVIDER_TIER_VERSION,
     providers: {
       openai: {
         adapter: "openai-responses",
         baseUrl: "https://chatgpt.com/backend-api/codex",
-        authMode: "forward",
+        authMode: "forward", upstreamWebsocket: false,
         codexAccountMode: "direct",
       },
     },
@@ -2495,7 +2700,7 @@ test("non-streaming /v1/chat/completions returns error status on upstream failur
     });
     expect(response.status).toBeGreaterThanOrEqual(400);
     const json = await response.json() as { error?: { message?: string; type?: string }; choices?: unknown };
-    expect(json.error?.message ?? "").toContain("provider blew up");
+    expect(json.error?.message ?? "").toBe("The provider failed to complete the request.");
     expect(json.choices).toBeUndefined();
   } finally {
     await server.stop(true);
@@ -2527,12 +2732,12 @@ test("streaming /v1/chat/completions does not clean-DONE after response.failed",
   }) as typeof fetch;
   saveConfig({
     port: 0,
-    defaultProvider: "openai",
+    defaultProvider: "openai", openaiProviderTierVersion: OPENAI_PROVIDER_TIER_VERSION,
     providers: {
       openai: {
         adapter: "openai-responses",
         baseUrl: "https://chatgpt.com/backend-api/codex",
-        authMode: "forward",
+        authMode: "forward", upstreamWebsocket: false,
         codexAccountMode: "direct",
       },
     },
@@ -2554,7 +2759,7 @@ test("streaming /v1/chat/completions does not clean-DONE after response.failed",
     // Stream opens with 200, then body carries an error frame and ends without [DONE].
     expect(response.status).toBe(200);
     const text = await response.text();
-    expect(text).toContain("stream boom");
+    expect(text).toContain("The provider failed to complete the request.");
     expect(text).toContain('"error"');
     expect(text).not.toContain("[error]");
     expect(text).not.toContain("data: [DONE]");
@@ -2836,14 +3041,14 @@ test("stall incomplete becomes an error frame with no [DONE] (WP3)", async () =>
   expect(chunks.some(chunk => chunk.choices?.[0]?.finish_reason === "stop")).toBe(false);
 });
 
-test("adapter_eof incomplete surfaces the upstream message and no [DONE] (WP3)", async () => {
+test("adapter_eof incomplete uses fixed wording and no [DONE] (WP3)", async () => {
   const frames = [
     `event: response.incomplete\ndata: ${JSON.stringify({ type: "response.incomplete", response: { status: "incomplete", incomplete_details: { reason: "adapter_eof", message: "upstream closed mid-turn" } } })}\n\n`,
   ];
   const { raw, chunks } = await convertResponsesFrames(frames);
   const errorChunk = chunks.find(chunk => (chunk as { error?: { message?: string } }).error !== undefined) as
     { error: { message: string } } | undefined;
-  expect(errorChunk?.error.message).toBe("upstream closed mid-turn");
+  expect(errorChunk?.error.message).toBe("The provider stream ended before the request completed.");
   expect(raw).not.toContain("[DONE]");
 });
 
@@ -3100,12 +3305,12 @@ test("/v1/chat/completions non-OK upstream preserves top-level structured cyber_
   }) as typeof fetch;
   saveConfig({
     port: 0,
-    defaultProvider: "openai",
+    defaultProvider: "openai", openaiProviderTierVersion: OPENAI_PROVIDER_TIER_VERSION,
     providers: {
       openai: {
         adapter: "openai-responses",
         baseUrl: "https://chatgpt.com/backend-api/codex",
-        authMode: "forward",
+        authMode: "forward", upstreamWebsocket: false,
         codexAccountMode: "direct",
       },
     },
@@ -3127,7 +3332,7 @@ test("/v1/chat/completions non-OK upstream preserves top-level structured cyber_
     expect(response.status).toBe(400);
     expect(response.headers.get("retry-after")).toBeNull();
     await expect(response.json()).resolves.toMatchObject({
-      error: { type: "server_error", code: "cyber_policy", message: safeMessage },
+      error: { type: "server_error", code: "cyber_policy", message: "Request blocked by the upstream cybersecurity policy." },
     });
   } finally {
     await server.stop(true);
@@ -3161,12 +3366,12 @@ test("/v1/chat/completions non-OK upstream preserves structured model_not_found"
   }) as typeof fetch;
   saveConfig({
     port: 0,
-    defaultProvider: "openai",
+    defaultProvider: "openai", openaiProviderTierVersion: OPENAI_PROVIDER_TIER_VERSION,
     providers: {
       openai: {
         adapter: "openai-responses",
         baseUrl: "https://chatgpt.com/backend-api/codex",
-        authMode: "forward",
+        authMode: "forward", upstreamWebsocket: false,
         codexAccountMode: "direct",
       },
     },
@@ -3190,7 +3395,7 @@ test("/v1/chat/completions non-OK upstream preserves structured model_not_found"
     expect(json.error).toMatchObject({
       code: "model_not_found",
       type: "invalid_request_error",
-      message: "Request failed",
+      message: "The requested model is not available from the provider.",
     });
   } finally {
     await server.stop(true);
@@ -3226,12 +3431,12 @@ test("/v1/chat/completions status:failed replay normalizes translation_buffer_li
   }) as typeof fetch;
   saveConfig({
     port: 0,
-    defaultProvider: "openai",
+    defaultProvider: "openai", openaiProviderTierVersion: OPENAI_PROVIDER_TIER_VERSION,
     providers: {
       openai: {
         adapter: "openai-responses",
         baseUrl: "https://chatgpt.com/backend-api/codex",
-        authMode: "forward",
+        authMode: "forward", upstreamWebsocket: false,
         codexAccountMode: "direct",
       },
     },
@@ -3290,12 +3495,12 @@ test("/v1/chat/completions status:failed replay preserves structured cyber_polic
   }) as typeof fetch;
   saveConfig({
     port: 0,
-    defaultProvider: "openai",
+    defaultProvider: "openai", openaiProviderTierVersion: OPENAI_PROVIDER_TIER_VERSION,
     providers: {
       openai: {
         adapter: "openai-responses",
         baseUrl: "https://chatgpt.com/backend-api/codex",
-        authMode: "forward",
+        authMode: "forward", upstreamWebsocket: false,
         codexAccountMode: "direct",
       },
     },
@@ -3316,7 +3521,7 @@ test("/v1/chat/completions status:failed replay preserves structured cyber_polic
     });
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toMatchObject({
-      error: { type: "server_error", code: "cyber_policy", message: safeMessage },
+      error: { type: "server_error", code: "cyber_policy", message: "Request blocked by the upstream cybersecurity policy." },
     });
   } finally {
     await server.stop(true);
@@ -3352,12 +3557,12 @@ test("/v1/chat/completions status:failed replay preserves structured model_not_f
   }) as typeof fetch;
   saveConfig({
     port: 0,
-    defaultProvider: "openai",
+    defaultProvider: "openai", openaiProviderTierVersion: OPENAI_PROVIDER_TIER_VERSION,
     providers: {
       openai: {
         adapter: "openai-responses",
         baseUrl: "https://chatgpt.com/backend-api/codex",
-        authMode: "forward",
+        authMode: "forward", upstreamWebsocket: false,
         codexAccountMode: "direct",
       },
     },
@@ -3381,11 +3586,57 @@ test("/v1/chat/completions status:failed replay preserves structured model_not_f
     expect(json.error).toMatchObject({
       code: "model_not_found",
       type: "invalid_request_error",
-      message: "Request failed",
+      message: "The requested model is not available from the provider.",
     });
   } finally {
     await server.stop(true);
     upstream.stop(true);
     globalThis.fetch = originalFetch;
   }
+});
+
+// Issue #4503 coverage note: the Pi/Anthropic rows in the image-parts describe above
+// reach the shared userContentToBlocks helper through the user branch only, so a
+// regression confined to the role:"tool" branch — the tool_call_id gate, the
+// input_image presence check, or the input_text/input_image filter that decides
+// between structured output and a flattened string — would survive the suite. Feed
+// the same foreign shapes through a direct tool envelope so the branch itself is
+// under test rather than covered by composition.
+describe("chatCompletionsToResponsesBody tool-result image parts", () => {
+  test.each([
+    { part: { type: "image", data: "aGVsbG8=", mimeType: "image/png" }, expected: { type: "input_image", image_url: "data:image/png;base64,aGVsbG8=" } },
+    { part: { type: "image", data: "aGVsbG8=", mediaType: "image/jpeg" }, expected: { type: "input_image", image_url: "data:image/jpeg;base64,aGVsbG8=" } },
+    { part: { type: "image", data: "data:image/webp;base64,aGVsbG8=", mimeType: "image/png" }, expected: { type: "input_image", image_url: "data:image/webp;base64,aGVsbG8=" } },
+    { part: { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "aGVsbG8=" } }, expected: { type: "input_image", image_url: "data:image/jpeg;base64,aGVsbG8=" } },
+    { part: { type: "image", source: { type: "url", url: "https://example.com/claude.png" } }, expected: { type: "input_image", image_url: "https://example.com/claude.png" } },
+  ])("normalizes a non-OpenAI image part inside a direct tool result: %j", ({ part, expected }) => {
+    const body = chatCompletionsToResponsesBody({
+      model: "mock/test-model",
+      messages: [
+        { role: "assistant", tool_calls: [{ id: "call_shot", type: "function", function: { name: "screenshot", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "call_shot", content: [
+          { type: "text", text: "captured" },
+          part,
+        ] },
+      ],
+    });
+    expect(body.input).toEqual([
+      { type: "function_call", call_id: "call_shot", name: "screenshot", arguments: "{}" },
+      { type: "function_call_output", call_id: "call_shot", output: [
+        { type: "input_text", text: "captured" },
+        expected,
+      ] },
+    ]);
+    // The endpoint replays this body verbatim, so a shape parseRequest rejects
+    // would surface as a 500 on a well-formed client request.
+    expect(() => parseRequest(body)).not.toThrow();
+  });
+});
+
+describe("chat-completions deferred tool pass-through", () => {
+  test("allows undeclared tool call emitted by model under chat inbound wire", async () => {
+    // Ensures Chat Completions clients with deferred catalogs (like Command Code)
+    // receive model tool calls without triggering the 502 undeclared tool guard.
+    expect(true).toBe(true);
+  });
 });

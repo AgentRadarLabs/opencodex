@@ -68,6 +68,24 @@
   white-space: nowrap;
 }
 
+/* A limit upstream reports as not in effect: neutral, so it never reads as a warning. */
+.quota-window-inactive {
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  border: 1px solid color-mix(in srgb, currentColor 35%, transparent);
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.quota-window-share {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
 .quota-stacked-reset {
   min-width: 0;
   overflow-wrap: anywhere;
@@ -100,4 +118,19 @@
   gap: 4px;
   color: var(--amber);
   font-size: 12px;
+}
+
+/* Long subscription labels and reset/value text need separate rows in narrow cards. */
+.quota-compact { container: quota-compact / inline-size; }
+@container quota-compact (max-width: 440px) {
+  .quota-row--credits {
+    grid-template-columns: max-content max-content minmax(0, 1fr) max-content;
+    row-gap: 4px;
+  }
+  .quota-row--credits .quota-label { grid-column: 1 / -1; grid-row: 1; }
+  .quota-row--credits .quota-reset-label { grid-column: 1; grid-row: 2; }
+  .quota-row--credits .quota-reset-day { grid-column: 2; grid-row: 2; }
+  .quota-row--credits .quota-reset-time { grid-column: 3 / -1; grid-row: 2; }
+  .quota-row--credits .bar { grid-column: 1 / 4; grid-row: 3; }
+  .quota-row--credits .quota-val { grid-column: 4; grid-row: 3; white-space: nowrap; }
 }

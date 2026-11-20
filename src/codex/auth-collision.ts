@@ -1,11 +1,12 @@
-import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getCodexAccountCredential } from "./account-store";
 import { loadConfig } from "../config";
 import { resolveCodexHomeDir } from "./home";
 import { extractAccountId } from "../oauth/chatgpt";
-import { isSelectableCodexPoolAccount } from "./account-id";
+import { isSelectableCodexPoolAccount, MAIN_CODEX_ACCOUNT_ID } from "./account-id";
 import { codexPlanKey } from "./plan";
+import { getObservedMainCodexCollisionIdentity, sameCodexCollisionIdentity, type CodexCollisionIdentity } from "./collision-identity";
+import { readNativeMainAuthBytes } from "./native-main-auth-file";
 
 export interface CodexTokens {
   access_token: string;
@@ -23,23 +24,7 @@ export type CodexTokenReadResult =
   | { status: "ok"; tokens: CodexTokens }
   | { status: "missing" | "invalid" | "unreadable" };
 
-function hasErrnoCode(error: unknown, code: string): boolean {
-  return typeof error === "object" && error !== null && "code" in error
-    && (error as { code?: unknown }).code === code;
-}
-
-/**
- * Reads the Codex CLI credential file and classifies the outcome. Reads once instead of doing an
- * `existsSync` pre-check, so a file replaced between check and read cannot be misread as absent.
- * Never returns or logs the raw error or any token material.
- */
-export function readCodexTokensResult(): CodexTokenReadResult {
-  let raw: string;
-  try {
-    raw = readFileSync(join(resolveCodexHomeDir(), "auth.json"), "utf-8");
-  } catch (error) {
-    return { status: hasErrnoCode(error, "ENOENT") ? "missing" : "unreadable" };
-  }
+function parseCodexTokens(raw: string): CodexTokenReadResult {
   try {
     const j = JSON.parse(raw) as {
       tokens?: { access_token?: string; account_id?: string; id_token?: string };
@@ -56,6 +41,33 @@ export function readCodexTokensResult(): CodexTokenReadResult {
   } catch {
     return { status: "invalid" };
   }
+}
+
+function hasErrnoCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error
+    && (error as { code?: unknown }).code === code;
+}
+
+/**
+ * Reads the Codex CLI credential file and classifies the outcome. Reads once instead of doing an
+ * `existsSync` pre-check, so a file replaced between check and read cannot be misread as absent.
+ * An already-owned lifecycle may supply its pinned auth path instead of resolving ambient home.
+ * `bounded` opts into the native-profile bounded reader (regular file, size-capped, no-follow,
+ * non-blocking) for startup observation paths that run inside the owner claim; bounded violations
+ * classify as `unreadable`. Legacy callers keep the unbounded read.
+ * Never returns or logs the raw error or any token material.
+ */
+export function readCodexTokensResult(
+  authPath = join(resolveCodexHomeDir(), "auth.json"),
+  options?: { bounded?: boolean },
+): CodexTokenReadResult {
+  let raw: string;
+  try {
+    raw = readNativeMainAuthBytes(authPath, options?.bounded === true ? "bounded" : "plain").toString("utf-8");
+  } catch (error) {
+    return { status: hasErrnoCode(error, "ENOENT") ? "missing" : "unreadable" };
+  }
+  return parseCodexTokens(raw);
 }
 
 /**
@@ -84,17 +96,23 @@ function isWorkspacePlan(plan: unknown): boolean {
   return !!key && /team|business|enterprise|workspace|edu/.test(key);
 }
 
-// Main login and managed pool accounts are separate duplicate buckets.
-// Inside the pool, personal and workspace subscriptions are also separate buckets.
-// Within each pool bucket, keep the original ChatGPT account id + email collision guard.
+// Main login and pool accounts share the account id + email collision guard.
+// Personal and workspace subscriptions remain separate buckets.
 export function checkAccountIdCollision(
   chatgptAccountId: string,
   email?: string | null,
   plan?: unknown,
   excludeAccountId?: string | null,
+  main: CodexCollisionIdentity | null = getObservedMainCodexCollisionIdentity() ?? null,
 ): { collision: true; reason: string } | { collision: false } {
   const candidateEmail = normalizedEmail(email);
   const candidateWorkspace = isWorkspacePlan(plan);
+
+  if (excludeAccountId !== MAIN_CODEX_ACCOUNT_ID && main
+    && sameCodexCollisionIdentity({ accountId: chatgptAccountId, email, plan }, main)) {
+    return { collision: true, reason: "Account is already configured as the native Codex main account." };
+  }
+
   for (const account of loadConfig().codexAccounts ?? []) {
     if (excludeAccountId && account.id === excludeAccountId) continue;
     if (!isSelectableCodexPoolAccount(account)) continue;
@@ -107,3 +125,23 @@ export function checkAccountIdCollision(
   }
   return { collision: false };
 }
+
+export type MainAuth = CodexTokenReadResult | { status: "api-key-only" };
+
+/** A valid API-key login has no ChatGPT identity; anything else unreadable stays unknown. */
+export function readMainAuth(authPath = join(resolveCodexHomeDir(), "auth.json")): MainAuth {
+  const main = readCodexTokensResult(authPath, { bounded: true });
+  if (main.status !== "invalid") return main;
+  try {
+    const j: unknown = JSON.parse(readNativeMainAuthBytes(authPath, "bounded").toString("utf-8"));
+    if (j === null || typeof j !== "object" || Array.isArray(j)) return main;
+    const envelope = j as { auth_mode?: unknown; OPENAI_API_KEY?: unknown; tokens?: unknown };
+    const apiKeyOnly = envelope.tokens == null
+      && (envelope.auth_mode === undefined || envelope.auth_mode === "api_key")
+      && typeof envelope.OPENAI_API_KEY === "string" && envelope.OPENAI_API_KEY.trim() !== "";
+    return apiKeyOnly ? { status: "api-key-only" } : main;
+  } catch {
+    return main;
+  }
+}
+

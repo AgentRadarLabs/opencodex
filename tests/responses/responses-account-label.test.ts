@@ -11,14 +11,20 @@ import {
   clearThreadAccountMap,
   getCodexUpstreamHealth,
 } from "../../src/codex/routing";
-import type { RequestLogContext } from "../../src/server/request-log";
+import { addFinalRequestLog, type RequestLogContext } from "../../src/server/request-log";
+import { createRequestMetricsOwner } from "../../src/server/request-metrics";
 import { handleResponses } from "../../src/server/responses";
 import type { OcxConfig } from "../../src/types";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 import { CodexWsMetadata } from "../../src/server/responses/codex-ws-metadata";
-import { applyAccountQuotaFromUpstreamHeaders } from "../../src/codex/quota";
+import { applyAccountQuotaFromUpstreamHeaders, getAccountQuotaHistory } from "../../src/codex/quota";
 
 const originalFetch = globalThis.fetch;
+let releaseSpendHome: (() => void) | undefined;
+
+// Taken only by callbacks that physically dispatch, after withPoolHome installs their home.
+const takeSpendHome = (): void => { releaseSpendHome = acquireOwnedSpendHome(); };
 
 function poolConfig(accountIds: string[]): OcxConfig {
   return {
@@ -80,6 +86,9 @@ async function withPoolHome<T>(run: (home: string) => Promise<T>): Promise<T> {
   try {
     return await run(home);
   } finally {
+    // Released before the helper removes or restores the home so its lease cannot outlive it.
+    releaseSpendHome?.();
+    releaseSpendHome = undefined;
     globalThis.fetch = originalFetch;
     clearCodexUpstreamHealth();
     clearThreadAccountMap();
@@ -133,6 +142,7 @@ describe("Responses account usage attribution", () => {
     const originalWebSocket = globalThis.WebSocket;
     try {
       await withPoolHome(async home => {
+        takeSpendHome();
         writeFileSync(join(home, "auth.json"), JSON.stringify({
           tokens: { access_token: "main-access-token", account_id: "main-account" },
         }));
@@ -183,6 +193,8 @@ describe("Responses account usage attribution", () => {
           await response.text();
           expect(getAccountQuota(accountId)?.weeklyPercent).toBe(20);
           expect(getAccountQuota("untouched-account")?.weeklyPercent).toBe(7);
+          expect(getAccountQuotaHistory(accountId).observations.map(row => row.windows[0].usedPercent))
+            .toEqual(accountId === MAIN_CODEX_ACCOUNT_ID ? [] : [10, 20]);
         }
       });
     } finally {
@@ -190,8 +202,75 @@ describe("Responses account usage attribution", () => {
     }
   });
 
+  test("late WS quota from a replaced pool credential cannot repopulate cleared state", async () => {
+    const originalWebSocket = globalThis.WebSocket;
+    let releaseFinalQuota!: () => void;
+    const finalQuotaAllowed = new Promise<void>(resolve => { releaseFinalQuota = resolve; });
+    try {
+      await withPoolHome(async () => {
+        takeSpendHome();
+        savePoolCredential("pool-ws-replaced");
+        class MetadataSocket {
+          listeners = new Map<string, Array<(event: unknown) => void>>();
+          constructor() { queueMicrotask(() => this.emit("open", {})); }
+          addEventListener(type: string, listener: (event: unknown) => void) {
+            this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+          }
+          removeEventListener(type: string, listener: (event: unknown) => void) {
+            this.listeners.set(type, (this.listeners.get(type) ?? []).filter(value => value !== listener));
+          }
+          emit(type: string, event: unknown) {
+            for (const listener of this.listeners.get(type) ?? []) listener(event);
+          }
+          send() {
+            const payload = (value: unknown) => this.emit("message", { data: JSON.stringify(value) });
+            queueMicrotask(() => {
+              payload({ type: "codex.rate_limits", rate_limits: {
+                primary: { used_percent: 10, window_minutes: 10080 },
+              } });
+              payload({ type: "response.created", response: { id: "quota-response" } });
+              // #6969: a Pool exchange holds empty lifecycle frames; the first output event is what
+              // commits the response here, so the handler returns before the final quota frame.
+              payload({ type: "response.output_item.added", response_id: "quota-response", output_index: 0,
+                item: { id: "quota-item", type: "message", role: "assistant", content: [] } });
+              void finalQuotaAllowed.then(() => {
+                payload({ type: "codex.rate_limits", rate_limits: {
+                  primary: { used_percent: 100, window_minutes: 10080 },
+                } });
+                payload({ type: "response.completed", response: { id: "quota-response", status: "completed", output: [] } });
+              });
+            });
+          }
+          close() { this.emit("close", {}); }
+        }
+        globalThis.WebSocket = MetadataSocket as unknown as typeof WebSocket;
+        globalThis.fetch = (async () => { throw new Error("unexpected HTTP request"); }) as typeof fetch;
+        const response = await handleResponses(new Request("http://localhost/v1/responses", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "gpt-5.5", input: "hello", stream: true }),
+        }), poolConfig(["pool-ws-replaced"]), { model: "", provider: "" }, {
+          codexWsRuntimeIdentity: "1.4.0",
+        });
+        expect(getAccountQuota("pool-ws-replaced")?.weeklyPercent).toBe(10);
+        expect(getAccountQuotaHistory("pool-ws-replaced").observations.map(row => row.windows[0].usedPercent)).toEqual([10]);
+
+        savePoolCredential("pool-ws-replaced");
+        clearAccountQuota("pool-ws-replaced");
+        releaseFinalQuota();
+        await response.text();
+
+        expect(getAccountQuota("pool-ws-replaced")).toBeNull();
+        expect(getAccountQuotaHistory("pool-ws-replaced").observations).toEqual([]);
+      });
+    } finally {
+      releaseFinalQuota();
+      globalThis.WebSocket = originalWebSocket;
+    }
+  });
+
   test("main-pool and legacy added accounts carry their effective labels", async () => {
     await withPoolHome(async home => {
+      takeSpendHome();
       writeFileSync(join(home, "auth.json"), JSON.stringify({
         tokens: { access_token: "main-access-token", account_id: "main-account" },
       }));
@@ -217,6 +296,7 @@ describe("Responses account usage attribution", () => {
 
   test("a pre-stream quota retry updates attribution to the serving alternate account", async () => {
     await withPoolHome(async () => {
+      takeSpendHome();
       const config = poolConfig(["pool-a", "pool-b"]);
       for (const id of ["pool-a", "pool-b"]) {
         savePoolCredential(id);
@@ -242,28 +322,55 @@ describe("Responses account usage attribution", () => {
       expect(bearers).toEqual(["Bearer pool-a-access-token", "Bearer pool-b-access-token"]);
       expect(logCtx.accountLogLabel).toBe(fallbackCodexAccountLogLabel("pool-b"));
       expect(logCtx.activeAttempt?.accountLogLabel).toBe(fallbackCodexAccountLogLabel("pool-b"));
-      expect(logCtx.attempts).toEqual([
-        expect.objectContaining({
-          ordinal: 1,
-          provider: expect.stringContaining(fallbackCodexAccountLogLabel("pool-a")),
-          accountLogLabel: fallbackCodexAccountLogLabel("pool-a"),
-          status: 429,
-          sendCount: 1,
-        }),
-        expect.objectContaining({
-          ordinal: 2,
-          provider: expect.stringContaining(fallbackCodexAccountLogLabel("pool-b")),
-          accountLogLabel: fallbackCodexAccountLogLabel("pool-b"),
-          sendCount: 1,
-          recoveryKinds: ["codex-account-retry"],
-          recoveryCount: 1,
-        }),
+      // The move is a named recovery: the first account's row keeps its real 429 rather than an
+      // inferred 502, and the second send says why it exists.
+      expect(logCtx.attempts?.map(attempt => ({
+        label: attempt.accountLogLabel,
+        status: attempt.status,
+        sendCount: attempt.sendCount,
+        recoveryKinds: attempt.recoveryKinds,
+        failureCause: attempt.failureCause,
+      }))).toEqual([
+        { label: fallbackCodexAccountLogLabel("pool-a"), status: 429, sendCount: 1, recoveryKinds: [], failureCause: "rate-limit" },
+        { label: fallbackCodexAccountLogLabel("pool-b"), status: 0, sendCount: 1, recoveryKinds: ["oauth-account-429"], failureCause: undefined },
       ]);
+    });
+  });
+
+  test("a pre-stream 402 move is recorded and counted as a quota recovery, not a rate limit", async () => {
+    await withPoolHome(async () => {
+      takeSpendHome();
+      const config = poolConfig(["pool-a", "pool-b"]);
+      for (const id of ["pool-a", "pool-b"]) {
+        savePoolCredential(id);
+        updateAccountQuota(id, id === "pool-a" ? 10 : 20);
+      }
+      let sends = 0;
+      globalThis.fetch = (async () => ++sends === 1
+        ? Response.json({ error: { message: "payment required" } }, { status: 402 })
+        : completedResponse("pool-b-response")) as typeof fetch;
+
+      const metrics = createRequestMetricsOwner(123);
+      const logCtx: RequestLogContext = { model: "", provider: "", inboundProtocol: "responses", requestMetricsRecorder: metrics };
+      const response = await handleResponses(request(), config, logCtx, {});
+      expect(response.status).toBe(200);
+      expect(logCtx.attempts?.map(attempt => [attempt.status, attempt.recoveryKinds])).toEqual([
+        [402, []],
+        [0, ["oauth-account-402"]],
+      ]);
+
+      addFinalRequestLog("codex-402-move", Date.now() - 1_000, logCtx, 200, {
+        terminalStatus: "completed", closeReason: "terminal",
+      }, () => {});
+      const recoveries = metrics.snapshot().split("\n").filter(line => line.startsWith("opencodex_recoveries_total{"));
+      expect(recoveries.find(line => line.includes('recovery="quota"'))?.endsWith(" 1")).toBe(true);
+      expect(recoveries.find(line => line.includes('recovery="rate_limit"'))?.endsWith(" 0") ?? true).toBe(true);
     });
   });
 
   test("a quota message wrapped in HTTP 502 cools the account and retries an alternate", async () => {
     await withPoolHome(async () => {
+      takeSpendHome();
       const config = poolConfig(["pool-a", "pool-b"]);
       for (const id of ["pool-a", "pool-b"]) {
         savePoolCredential(id);
@@ -298,8 +405,36 @@ describe("Responses account usage attribution", () => {
     });
   });
 
+  // Pool health reads a 429 as the account saying it is out of quota. The replay refusal wears
+  // the same status but no upstream produced it, so recording it would cool a credential that
+  // refused nothing -- and the cooldown outlives the request that invented it.
+  test("a refused reset replay is not quota evidence and invites no client retry", async () => {
+    await withPoolHome(async () => {
+      takeSpendHome();
+      const config = poolConfig(["pool-a"]);
+      savePoolCredential("pool-a");
+      updateAccountQuota("pool-a", 10);
+      let sends = 0;
+      globalThis.fetch = (async () => {
+        sends += 1;
+        throw Object.assign(new Error("The socket connection was closed unexpectedly."), { code: "ECONNRESET" });
+      }) as typeof fetch;
+
+      const response = await handleResponses(request(), config, { model: "", provider: "" }, {});
+
+      expect(response.status).toBe(429);
+      expect(sends).toBe(1);
+      expect((await response.json() as { error?: { code?: string } }).error?.code)
+        .toBe("upstream_reset_replay_refused");
+      expect(response.headers.get("Retry-After")).toBeNull();
+      expect(getCodexUpstreamHealth("pool-a")?.lastFailureStatus).toBeUndefined();
+      expect(getCodexUpstreamHealth("pool-a")?.cooldownUntil).toBeUndefined();
+    });
+  });
+
   test("a wrapped quota failure cools a sole account when no alternate exists", async () => {
     await withPoolHome(async () => {
+      takeSpendHome();
       const config = poolConfig(["pool-a"]);
       savePoolCredential("pool-a");
       updateAccountQuota("pool-a", 10);

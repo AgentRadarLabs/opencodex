@@ -12,6 +12,8 @@
  * (as in `formatAccountTable`), plain text, no ANSI colour.
  */
 
+import type { UsageModelView } from "./usage-model-search";
+
 interface CostRow {
   provider: string;
   model?: string;
@@ -21,9 +23,15 @@ interface CostRow {
 }
 
 interface UsageReportInput {
+  source?: "hub";
+  scope?: "client";
+  usageIncomplete?: true;
+  usageIncompleteReason?: "oversized_rows";
   range?: string;
   surface?: string;
   since?: number | null;
+  until?: number;
+  customWindow?: boolean;
   summary?: {
     requests?: number;
     totalTokens?: number;
@@ -37,7 +45,7 @@ interface UsageReportInput {
   models?: CostRow[];
   providers?: CostRow[];
   days?: { date: string; requests: number; totalTokens: number; estimatedCostUsd?: number }[];
-  filter?: { provider: string | null; model: string | null; matched: boolean; comboOverlap: boolean };
+  filter?: { apiKeyId?: string | null; provider: string | null; model: string | null; matched: boolean; comboOverlap: boolean };
   /**
    * Per-account totals the API already returns and the CLI discarded (#2700).
    *
@@ -57,8 +65,11 @@ interface UsageReportInput {
 
 const MAX_MODEL_ROWS = 10;
 
-function terminalText(value: string): string {
-  return value.replace(/[\x00-\x1f\x7f-\x9f]/g, character => {
+function terminalText(value: unknown): string {
+  const text = typeof value === "string" ? value
+    : value === null || value === undefined ? ""
+    : typeof value === "number" || typeof value === "boolean" ? String(value) : "[invalid]";
+  return text.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, character => {
     const code = character.charCodeAt(0);
     return code <= 0x7f
       ? `\\x${code.toString(16).padStart(2, "0")}`
@@ -67,7 +78,8 @@ function terminalText(value: string): string {
 }
 
 function count(value: number | undefined): string {
-  return (value ?? 0).toLocaleString("en-US");
+  if (value === undefined || value === null) return "0";
+  return typeof value === "number" && Number.isFinite(value) ? value.toLocaleString("en-US") : "—";
 }
 
 /**
@@ -90,23 +102,40 @@ function table(header: string[], rows: string[][]): string[] {
 }
 
 function describeScope(data: UsageReportInput): string {
-  const parts = [`Usage — ${data.range ?? "?"}`];
+  const interval = data.customWindow && typeof data.since === "number" && typeof data.until === "number"
+    ? `custom ${new Date(data.since).toISOString()} to ${new Date(data.until).toISOString()} (inclusive)`
+    : data.range ?? "?";
+  const parts = [`Usage — ${interval}`];
   if (data.surface && data.surface !== "all") parts.push(`surface=${data.surface}`);
   if (data.filter?.provider) parts.push(`provider=${data.filter.provider}`);
+  if (data.filter?.apiKeyId) parts.push(`api-key-id=${data.filter.apiKeyId}`);
   if (data.filter?.model) parts.push(`model=${data.filter.model}`);
   return terminalText(parts.join(", "));
 }
 
-export function formatUsageReport(data: UsageReportInput): string[] {
+export function formatUsageReport(data: UsageReportInput, options?: { modelView?: UsageModelView; modelRowLimit?: number }): string[] {
   const summary = data.summary ?? {};
   const lines: string[] = [describeScope(data), ""];
+  if (data.source === "hub" && data.scope === "client") {
+    lines.push("Source: hub — this client's data key only. Account totals are not shared.", "");
+  }
+  if (data.usageIncomplete === true) {
+    lines.push("WARNING: Usage is incomplete; some records could not be included. Totals and rankings reflect readable records only.", "");
+  }
+  const view = options?.modelView;
+  if (view) {
+    lines.push(`Model search ${JSON.stringify(view.query)}: ${view.returnedModelCount} of ${view.matchedModelCount} matching model rows (limit ${view.limit}). Report totals are unchanged.`, "");
+    if (view.matchedModelCount === 0) lines.push("No model rows match this search. Change --search or use --search= to show the model view.", "");
+  }
 
   if (data.filter && !data.filter.matched) {
-    const what = [data.filter.provider && `provider "${data.filter.provider}"`, data.filter.model && `model "${data.filter.model}"`]
+    const what = [data.filter.apiKeyId && `API key "${data.filter.apiKeyId}"`, data.filter.provider && `provider "${data.filter.provider}"`, data.filter.model && `model "${data.filter.model}"`]
       .filter(Boolean).join(" and ");
-    lines.push(`No usage recorded for ${terminalText(what)} in this range.`);
+    lines.push(data.usageIncomplete === true
+      ? `No matching readable usage records for ${terminalText(what)} in this range; skipped records may contain matches.`
+      : `No usage recorded for ${terminalText(what)} in this range.`);
     lines.push("Check the spelling against `ocx usage --json`, or widen --range.");
-    return lines;
+    return lines.map(terminalText);
   }
 
   const tokenSplit = [
@@ -142,7 +171,7 @@ export function formatUsageReport(data: UsageReportInput): string[] {
   // server cannot answer it honestly.
   const accountFilterActive = Boolean(data.filter?.provider || data.filter?.model);
   const accounts = (data.accounts ?? []).filter(row => row.requests > 0);
-  if (accountFilterActive) {
+  if (accountFilterActive && data.scope !== "client") {
     lines.push("");
     lines.push("ACCOUNT: not reported under a provider or model filter; run without filters for per-account totals.");
   } else if (accounts.length > 0) {
@@ -160,10 +189,10 @@ export function formatUsageReport(data: UsageReportInput): string[] {
     ));
   }
 
-  const models = (data.models ?? []).filter(row => row.requests > 0);
+  const models = view ? (data.models ?? []) : (data.models ?? []).filter(row => row.requests > 0);
   if (models.length > 0) {
     lines.push("");
-    const shown = models.slice(0, MAX_MODEL_ROWS);
+    const shown = models.slice(0, view?.limit ?? options?.modelRowLimit ?? MAX_MODEL_ROWS);
     lines.push(...table(
       ["MODEL", "PROVIDER", "REQUESTS", "TOKENS", "EST. COST"],
       shown.map(row => [row.model ?? "-", row.provider, count(row.requests), count(row.totalTokens), usd(row.estimatedCostUsd)]),
@@ -180,5 +209,5 @@ export function formatUsageReport(data: UsageReportInput): string[] {
 
   lines.push("");
   lines.push("Not a billing receipt. Subscription usage or provider credits may apply instead.");
-  return lines;
+  return lines.map(terminalText);
 }

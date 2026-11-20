@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   EXPORT_CLIENTS,
   EXPORT_CLIENT_IDS,
-  GAJAE_API_KEY_ENV,
   HERMES_API_KEY_ENV_REF,
   LOOPBACK_API_KEY_PLACEHOLDER,
   OPENCLAW_API_KEY_ENV_REF,
@@ -58,12 +58,14 @@ function ctx(config: OcxConfig = LOOPBACK): ExportContext {
 
 describe("no secret reaches a client config", () => {
   test("the generated client support policy identifies every loopback-only integration", () => {
-    // Pi, Kimi, Gajae and Aside cannot emit the dedicated admission header --
-    // Aside's observed provider block has four keys and none is `headers`. OMP
-    // and Prime can carry provider headers, but remote credential wiring is
-    // deliberately deferred from those initial generated integrations.
+    // Pi, Kimi, Gajae, Aside and Raycast cannot emit the dedicated admission
+    // header -- Aside's observed provider block has four keys and none is
+    // `headers`; Raycast's `api_keys` is read literally with no env
+    // interpolation. OMP, Prime and omo can carry provider headers, but remote
+    // credential wiring is deliberately deferred from those initial generated
+    // integrations -- omo and Gentle Shell reuse Pi's builder, which emits no headers at all.
     const loopbackOnly = EXPORT_CLIENT_IDS.filter(id => EXPORT_CLIENTS[id].loopbackOnly);
-    expect(loopbackOnly).toEqual(["pi", "omp", "kimi", "gajae", "dsh", "mcode", "zcode", "prime", "aside"]);
+    expect(loopbackOnly).toEqual(["qoder", "qoder-cn", "workbuddy", "workbuddy-ai", "pi", "omp", "kimi", "gajae", "dsh", "mcode", "zcode", "commandcode", "prime", "aside", "raycast", "omo", "cline", "droid", "gentle-shell", "t3code"]);
   });
 
   test("every client that is not loopback-only carries the header on a remote bind", () => {
@@ -84,6 +86,10 @@ describe("no secret reaches a client config", () => {
 
   test("even a non-loopback bind never serializes the key", () => {
     for (const id of EXPORT_CLIENT_IDS) {
+      if (id === "t3code" || id === "qoder" || id === "qoder-cn" || id === "workbuddy" || id === "workbuddy-ai") {
+        expect(() => buildClientConfigText(id, ctx(REMOTE))).toThrow("loopback");
+        continue;
+      }
       const { text } = buildClientConfigText(id, ctx(REMOTE));
       expect(text).not.toContain(SECRET);
     }
@@ -96,6 +102,7 @@ describe("hermes", () => {
     const block = doc.providers[OPENCODE_PROVIDER_ID]!;
     expect(block.api_key).toBe(HERMES_API_KEY_ENV_REF);
     expect(block.api_mode).toBe("chat_completions");
+    expect(block.session_affinity_header).toBe("session-id");
     expect(block.discover_models).toBe(false);
     expect(block.models).toEqual({
       "anthropic/claude-opus-4-8": { supports_vision: true },
@@ -131,6 +138,33 @@ describe("hermes", () => {
 });
 
 describe("openclaw", () => {
+  const home = join(tmpdir(), "ocx-openclaw-fixture");
+  const custom = join(home, "custom.json");
+  const state = join(home, "state");
+  const relocatedHome = join(home, "relocated");
+  test("declares image input only from catalog capabilities", () => {
+    const doc = buildClientConfig("openclaw", ctx()) as OpenclawGeneratedConfig;
+    const models = doc.models.providers[OPENCODE_PROVIDER_ID]!.models;
+    expect(models.find(model => model.id === "anthropic/claude-opus-4-8")).toHaveProperty("input", ["text", "image"]);
+    expect(models.find(model => model.id === "gpt-5.5")).toHaveProperty("input", ["text"]);
+    expect(models.find(model => model.id === "local/no-window")).not.toHaveProperty("input");
+  });
+
+  test("filters unsupported modalities without inventing image input", () => {
+    const doc = buildClientConfig("openclaw", {
+      ...ctx(),
+      models: [
+        { namespaced: "p/mixed", provider: "p", id: "mixed", inputModalities: ["text", "image", "image", "audio", "video", "pdf"] },
+        { namespaced: "p/unknown", provider: "p", id: "unknown", inputModalities: [] },
+        { namespaced: "p/foreign", provider: "p", id: "foreign", inputModalities: ["pdf"] },
+      ],
+    }) as OpenclawGeneratedConfig;
+    const models = doc.models.providers[OPENCODE_PROVIDER_ID]!.models;
+    expect(models.find(model => model.id === "p/mixed")?.input).toEqual(["text", "image", "audio", "video"]);
+    expect(models.find(model => model.id === "p/unknown")).not.toHaveProperty("input");
+    expect(models.find(model => model.id === "p/foreign")).not.toHaveProperty("input");
+  });
+
   test("merges with the bundled catalog and omits a window it cannot assert", () => {
     const doc = buildClientConfig("openclaw", ctx()) as OpenclawGeneratedConfig;
     expect(doc.models.mode).toBe("merge");
@@ -150,26 +184,26 @@ describe("openclaw", () => {
      * `~/.openclaw/openclaw.json` while the running gateway read a different
      * file — and snapshot the wrong one for rollback.
      */
-    expect(openclawConfigPath({ OPENCLAW_CONFIG_PATH: "/tmp/oc/custom.json" }, "/home/u"))
-      .toBe("/tmp/oc/custom.json");
+    expect(openclawConfigPath({ OPENCLAW_CONFIG_PATH: custom }, home))
+      .toBe(custom);
     // It outranks the state dir, not merely the home default.
     expect(openclawConfigPath(
-      { OPENCLAW_CONFIG_PATH: "/tmp/oc/custom.json", OPENCLAW_STATE_DIR: "/tmp/state" },
-      "/home/u",
-    )).toBe("/tmp/oc/custom.json");
+      { OPENCLAW_CONFIG_PATH: custom, OPENCLAW_STATE_DIR: state },
+      home,
+    )).toBe(custom);
   });
 
   test("OPENCLAW_STATE_DIR relocates both the config file and detection", () => {
-    expect(openclawConfigPath({ OPENCLAW_STATE_DIR: "/tmp/state" }, "/home/u"))
-      .toBe(join("/tmp/state", "openclaw.json"));
+    expect(openclawConfigPath({ OPENCLAW_STATE_DIR: state }, home))
+      .toBe(join(state, "openclaw.json"));
     // Detection has to follow, or a relocated install reads as not installed
     // while the gateway runs perfectly well.
-    expect(openclawHomeDir({ OPENCLAW_STATE_DIR: "/tmp/state" }, "/home/u")).toBe("/tmp/state");
+    expect(openclawHomeDir({ OPENCLAW_STATE_DIR: state }, home)).toBe(state);
   });
 
   test("with no override the documented default still holds", () => {
-    expect(openclawConfigPath({}, "/home/u")).toBe(join("/home/u", ".openclaw", "openclaw.json"));
-    expect(openclawHomeDir({}, "/home/u")).toBe(join("/home/u", ".openclaw"));
+    expect(openclawConfigPath({}, home)).toBe(join(home, ".openclaw", "openclaw.json"));
+    expect(openclawHomeDir({}, home)).toBe(join(home, ".openclaw"));
   });
 
   test("OPENCLAW_PROFILE selects .openclaw-<profile>, and default stays unnamed", () => {
@@ -178,24 +212,24 @@ describe("openclaw", () => {
      * state directory their gateway does not read — and read as not installed
      * besides, because detection looked at the same wrong place.
      */
-    expect(openclawHomeDir({ OPENCLAW_PROFILE: "work" }, "/home/u")).toBe(join("/home/u", ".openclaw-work"));
-    expect(openclawConfigPath({ OPENCLAW_PROFILE: "work" }, "/home/u"))
-      .toBe(join("/home/u", ".openclaw-work", "openclaw.json"));
+    expect(openclawHomeDir({ OPENCLAW_PROFILE: "work" }, home)).toBe(join(home, ".openclaw-work"));
+    expect(openclawConfigPath({ OPENCLAW_PROFILE: "work" }, home))
+      .toBe(join(home, ".openclaw-work", "openclaw.json"));
     // `default` is the unnamed profile, not a directory suffix.
-    expect(openclawHomeDir({ OPENCLAW_PROFILE: "default" }, "/home/u")).toBe(join("/home/u", ".openclaw"));
+    expect(openclawHomeDir({ OPENCLAW_PROFILE: "default" }, home)).toBe(join(home, ".openclaw"));
   });
 
   test("OPENCLAW_HOME outranks the OS home for everything derived from it", () => {
-    expect(openclawHomeDir({ OPENCLAW_HOME: "/srv/claw" }, "/home/u")).toBe(join("/srv/claw", ".openclaw"));
-    expect(openclawHomeDir({ OPENCLAW_HOME: "/srv/claw", OPENCLAW_PROFILE: "work" }, "/home/u"))
-      .toBe(join("/srv/claw", ".openclaw-work"));
-    expect(openclawConfigPath({ OPENCLAW_HOME: "/srv/claw" }, "/home/u"))
-      .toBe(join("/srv/claw", ".openclaw", "openclaw.json"));
+    expect(openclawHomeDir({ OPENCLAW_HOME: relocatedHome }, home)).toBe(join(relocatedHome, ".openclaw"));
+    expect(openclawHomeDir({ OPENCLAW_HOME: relocatedHome, OPENCLAW_PROFILE: "work" }, home))
+      .toBe(join(relocatedHome, ".openclaw-work"));
+    expect(openclawConfigPath({ OPENCLAW_HOME: relocatedHome }, home))
+      .toBe(join(relocatedHome, ".openclaw", "openclaw.json"));
   });
 
   test("an explicit state dir outranks a profile", () => {
-    expect(openclawHomeDir({ OPENCLAW_STATE_DIR: "/tmp/state", OPENCLAW_PROFILE: "work" }, "/home/u"))
-      .toBe("/tmp/state");
+    expect(openclawHomeDir({ OPENCLAW_STATE_DIR: state, OPENCLAW_PROFILE: "work" }, home))
+      .toBe(state);
   });
 
   test("a relative selector is refused, not silently anchored to our cwd", () => {
@@ -209,26 +243,26 @@ describe("openclaw", () => {
      * We cannot know the gateway's cwd, so the honest answer is to refuse at
      * the boundary rather than pick a directory and hope.
      */
-    expect(() => openclawConfigPath({ OPENCLAW_CONFIG_PATH: "custom.json" }, "/home/u"))
+    expect(() => openclawConfigPath({ OPENCLAW_CONFIG_PATH: "custom.json" }, home))
       .toThrow(/OPENCLAW_CONFIG_PATH must be an absolute path/);
-    expect(() => openclawHomeDir({ OPENCLAW_STATE_DIR: "state" }, "/home/u"))
+    expect(() => openclawHomeDir({ OPENCLAW_STATE_DIR: "state" }, home))
       .toThrow(/OPENCLAW_STATE_DIR must be an absolute path/);
-    expect(() => openclawHomeDir({ OPENCLAW_HOME: "srv/claw" }, "/home/u"))
+    expect(() => openclawHomeDir({ OPENCLAW_HOME: "srv/claw" }, home))
       .toThrow(/OPENCLAW_HOME must be an absolute path/);
   });
 
   test("~ is stable, because it anchors to the home rather than the cwd", () => {
-    expect(openclawConfigPath({ OPENCLAW_CONFIG_PATH: "~/claw.json" }, "/home/u"))
-      .toBe(join("/home/u", "claw.json"));
+    expect(openclawConfigPath({ OPENCLAW_CONFIG_PATH: "~/claw.json" }, home))
+      .toBe(join(home, "claw.json"));
     // …and OPENCLAW_HOME moves what `~` means, as it does for OpenClaw itself.
-    expect(openclawConfigPath({ OPENCLAW_CONFIG_PATH: "~/claw.json", OPENCLAW_HOME: "/srv/claw" }, "/home/u"))
-      .toBe(join("/srv/claw", "claw.json"));
-    expect(openclawHomeDir({ OPENCLAW_STATE_DIR: "~/state" }, "/home/u")).toBe(join("/home/u", "state"));
+    expect(openclawConfigPath({ OPENCLAW_CONFIG_PATH: "~/claw.json", OPENCLAW_HOME: relocatedHome }, home))
+      .toBe(join(relocatedHome, "claw.json"));
+    expect(openclawHomeDir({ OPENCLAW_STATE_DIR: "~/state" }, home)).toBe(join(home, "state"));
   });
 
   test("the default profile comparison is case-insensitive, as OpenClaw's is", () => {
     for (const spelling of ["default", "DEFAULT", "Default"]) {
-      expect(openclawHomeDir({ OPENCLAW_PROFILE: spelling }, "/home/u")).toBe(join("/home/u", ".openclaw"));
+      expect(openclawHomeDir({ OPENCLAW_PROFILE: spelling }, home)).toBe(join(home, ".openclaw"));
     }
   });
 });
@@ -250,9 +284,15 @@ describe("kimi", () => {
     expect(doc.providers[OPENCODE_PROVIDER_ID]!.api_key).toBe(LOOPBACK_API_KEY_PLACEHOLDER);
   });
 
-  test("never emits capabilities it cannot assert", () => {
-    const { text } = buildClientConfigText("kimi", ctx());
-    expect(text).not.toContain("capabilities");
+  test("declares image_in only for catalog-backed image models", () => {
+    const doc = buildClientConfig("kimi", ctx()) as KimiGeneratedConfig;
+    expect(doc.models[`${OPENCODE_PROVIDER_ID}/anthropic/claude-opus-4-8`])
+      .toHaveProperty("capabilities", ["image_in"]);
+    expect(doc.models[`${OPENCODE_PROVIDER_ID}/gpt-5.5`]).not.toHaveProperty("capabilities");
+    const unknown = buildClientConfig("kimi", {
+      ...ctx(), models: [{ namespaced: "local/unknown", provider: "local", id: "unknown", contextWindow: 32_000 }],
+    }) as KimiGeneratedConfig;
+    expect(unknown.models[`${OPENCODE_PROVIDER_ID}/local/unknown`]).not.toHaveProperty("capabilities");
   });
 
   test("KIMI_CODE_HOME wins over the default", () => {
@@ -261,13 +301,13 @@ describe("kimi", () => {
 });
 
 describe("gajae", () => {
-  test("uses apiKeyEnv, never apiKey, and emits only schema-known fields", () => {
+  test("uses a non-secret loopback placeholder and emits only schema-known fields", () => {
     const doc = buildClientConfig("gajae", ctx()) as GajaeGeneratedConfig;
     const block = doc.providers[OPENCODE_PROVIDER_ID]!;
-    expect(block.apiKeyEnv).toBe(GAJAE_API_KEY_ENV);
-    expect(block).not.toHaveProperty("apiKey");
-    expect(Object.keys(block).sort()).toEqual(["api", "apiKeyEnv", "baseUrl", "models"]);
-    const allowed = new Set(["id", "name", "input", "contextWindow", "maxTokens"]);
+    expect(block.apiKey).toBe(LOOPBACK_API_KEY_PLACEHOLDER);
+    expect(block).not.toHaveProperty("apiKeyEnv");
+    expect(Object.keys(block).sort()).toEqual(["api", "apiKey", "baseUrl", "models"]);
+    const allowed = new Set(["id", "name", "input", "contextWindow", "maxTokens", "reasoning", "thinking", "compat"]);
     for (const model of block.models) {
       for (const key of Object.keys(model)) expect(allowed.has(key)).toBe(true);
     }
@@ -275,6 +315,52 @@ describe("gajae", () => {
 
   test("the destination is the documented models file", () => {
     expect(gajaeConfigPath({}, "/home/u")).toBe(join("/home/u", ".gjc", "agent", "models.yml"));
+  });
+
+  test("exports a declared effort ladder as GJC reasoning metadata", () => {
+    const doc = buildClientConfig("gajae", {
+      ...ctx(),
+      models: [{
+        namespaced: "deepseek/deepseek-v4.1-flash",
+        provider: "deepseek",
+        id: "deepseek-v4.1-flash",
+        inputModalities: ["text"],
+        reasoningEfforts: ["max", "low", "medium", "high", "xhigh", "none", "turbo"],
+      }],
+    }) as GajaeGeneratedConfig;
+
+    expect(doc.providers[OPENCODE_PROVIDER_ID]!.models).toEqual([{
+      id: "deepseek/deepseek-v4.1-flash",
+      name: "deepseek-v4.1-flash (deepseek)",
+      input: ["text"],
+      reasoning: true,
+      thinking: {
+        mode: "effort",
+        minLevel: "low",
+        maxLevel: "max",
+        levels: ["low", "medium", "high", "xhigh", "max"],
+      },
+      compat: { supportsReasoningEffort: true },
+    }]);
+  });
+
+  test("exports the native Codex effort ladder even when the catalog omits it", () => {
+    const doc = buildClientConfig("gajae", {
+      ...ctx(),
+      models: [{
+        namespaced: "gpt-5.6-sol",
+        provider: "openai",
+        id: "gpt-5.6-sol",
+        native: true,
+        inputModalities: ["text", "image"],
+      }],
+    }) as GajaeGeneratedConfig;
+
+    expect(doc.providers[OPENCODE_PROVIDER_ID]!.models[0]).toMatchObject({
+      reasoning: true,
+      thinking: { mode: "effort", levels: ["low", "medium", "high", "xhigh", "max"] },
+      compat: { supportsReasoningEffort: true },
+    });
   });
 });
 

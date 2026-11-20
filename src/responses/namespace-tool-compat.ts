@@ -1,5 +1,7 @@
-import { namespacedToolName } from "../types";
+import { dottedToolName, namespacedToolName } from "../types";
 import { collectResponsesToolGroups } from "./tool-groups";
+import { collectAmbiguousDottedAliases, dottedAliasIsUnambiguous } from "./tool-name-aliases";
+import { hasItemProvenance, isHistoricalItem } from "./item-provenance";
 
 export interface RoutedNamespaceToolIdentity {
   namespace: string;
@@ -340,13 +342,28 @@ function rewriteInputItem(item: unknown, plan: NamespaceRewritePlan, emitted: Se
  * `<namespace>__<name>` wire identity as the chat adapters. The returned request-local aliases
  * are the only names response restoration is allowed to expand.
  */
-export function rewriteRoutedNamespaceToolsForUpstream(body: unknown): {
+export function rewriteRoutedNamespaceToolsForUpstream(
+  body: unknown,
+  convertedCustomToolNames?: ReadonlySet<string>,
+  replayPrefixLength?: number,
+): {
   body: unknown;
   aliases: Map<string, RoutedNamespaceToolIdentity>;
 } {
   if (!isPlainObject(body)) return { body, aliases: new Map() };
-  const groups = collectResponsesToolGroups(body);
+  const currentTurnStart = Number.isFinite(replayPrefixLength)
+    ? Math.max(0, Math.trunc(replayPrefixLength!))
+    : 0;
+  const hasProvenance = Array.isArray(body.input) && body.input.some(hasItemProvenance);
+  const isHistorical = (item: unknown, index: number) =>
+    hasProvenance ? isHistoricalItem(item) : index < currentTurnStart;
+  const groups = collectResponsesToolGroups(Array.isArray(body.input)
+    ? { ...body, input: body.input.filter((item, index) => !isHistorical(item, index)) }
+    : body);
   const plan = buildRewritePlan(groups);
+  const historicalPlan = buildRewritePlan(collectResponsesToolGroups({
+    input: Array.isArray(body.input) ? body.input.filter(isHistorical) : [],
+  }));
 
   // Deliberately not gated on the plan being non-empty: a turn whose catalog is absent can still
   // replay call items carrying a private `namespace`.
@@ -356,8 +373,13 @@ export function rewriteRoutedNamespaceToolsForUpstream(body: unknown): {
   let input = body.input;
   if (Array.isArray(body.input)) {
     let inputChanged = false;
-    const rewrittenInput = body.input.map(item => {
-      const next = rewriteInputItem(item, plan, emitted);
+    const historicalEmitted = new Set<string>();
+    const rewrittenInput = body.input.map((item, index) => {
+      const historicalCatalog = isHistorical(item, index) && isPlainObject(item) && item.type === "additional_tools";
+      const itemEmitted = historicalCatalog
+        ? historicalEmitted
+        : emitted;
+      const next = rewriteInputItem(item, historicalCatalog ? historicalPlan : plan, itemEmitted);
       if (next !== item) inputChanged = true;
       return next;
     });
@@ -365,6 +387,21 @@ export function rewriteRoutedNamespaceToolsForUpstream(body: unknown): {
   }
 
   const toolChoice = rewriteToolChoice(body.tool_choice, plan);
+  const aliases = authorizedAliases(plan.aliases, toolChoice);
+  const ambiguousDotted = collectAmbiguousDottedAliases(groups);
+  // Authorize canonical identities first, then add only unambiguous spellings.
+  // Selection cannot hide a collision elsewhere in the original declaration set.
+  for (const identity of [...aliases.values()]) {
+    const dotted = dottedToolName(identity.namespace, identity.name);
+    if (dottedAliasIsUnambiguous(identity.namespace, identity.name)
+      && !ambiguousDotted.has(dotted) && !plan.bareWireNames.has(dotted)
+      && !aliases.has(dotted)) aliases.set(dotted, identity);
+  }
+  // The adapter lowers custom tools before namespaces. Preserve their declared
+  // kind only in already-authorized response aliases; wire selectors remain lowered.
+  for (const identity of aliases.values()) {
+    if (convertedCustomToolNames?.has(namespacedToolName(identity.namespace, identity.name))) identity.kind = "custom";
+  }
   return {
     body: {
       ...body,
@@ -372,7 +409,7 @@ export function rewriteRoutedNamespaceToolsForUpstream(body: unknown): {
       ...(input !== body.input ? { input } : {}),
       ...(toolChoice !== body.tool_choice ? { tool_choice: toolChoice } : {}),
     },
-    aliases: authorizedAliases(plan.aliases, toolChoice),
+    aliases,
   };
 }
 
@@ -404,7 +441,11 @@ export function restoreRoutedNamespaceCalls(
     && typeof value.name === "string"
   ) {
     const identity = aliases.get(value.name);
-    if (identity) {
+    if (identity
+      // Custom declarations may be lowered to function calls upstream, but an
+      // ordinary function declaration never authorizes a custom call payload.
+      && (value.type !== "custom_tool_call" || identity.kind === "custom")
+      && (!Object.hasOwn(value, "namespace") || value.namespace === identity.namespace)) {
       restored.name = identity.name;
       restored.namespace = identity.namespace;
       changed = true;

@@ -229,7 +229,7 @@ describe("OAuth provider reconciliation", () => {
     // holds; only the rows the projection actually changed may be replaced.
     expect(config.providers.untouched).toBe(liveUntouched);
   });
-  test("refreshes a saved Antigravity 3.5 preset without touching credentials or user fields", async () => {
+  test("refreshes a saved Antigravity live catalog without touching credentials or user fields", async () => {
     const home = mkdtempSync(join(tmpdir(), "ocx-gemini-36-reconcile-"));
     homes.push(home);
     process.env.OPENCODEX_HOME = home;
@@ -261,15 +261,12 @@ describe("OAuth provider reconciliation", () => {
 
     expect(reconcileOAuthProviders(config)).toBe(true);
     const provider = config.providers["google-antigravity"];
-    expect(provider.defaultModel).toBe("gemini-3.8-flash");
+    expect(provider.defaultModel).toBe("gemini-3.5-flash-low");
     expect(provider.models).toEqual([
       "gemini-3.8-flash",
-      "gemini-3.7-flash",
-      "gemini-3.1-pro",
-      "gemini-3.1-flash-image",
-      "claude-sonnet-4-6",
-      "claude-opus-4-6-thinking",
-      "gpt-oss-120b-medium",
+      "gemini-4-argon",
+      "claude-opus-5-5",
+      "claude-sonnet-5-5",
     ]);
     expect(provider.models).not.toContain("gemini-3.5-flash-low");
     expect(provider.models).not.toContain("gemini-3.6-flash");
@@ -288,7 +285,7 @@ describe("OAuth provider reconciliation", () => {
     });
 
     const persisted = loadConfig();
-    expect(persisted.providers["google-antigravity"]?.defaultModel).toBe("gemini-3.8-flash");
+    expect(persisted.providers["google-antigravity"]?.defaultModel).toBe("gemini-3.5-flash-low");
     expect(persisted.providers["google-antigravity"]?.liveModels).toBe(true);
     expect(reconcileOAuthProviders(config)).toBe(false);
   });
@@ -327,14 +324,13 @@ describe("OAuth provider reconciliation", () => {
 
     upsertOAuthProvider(config, "google-antigravity");
     expect(config.providers["google-antigravity"].liveModels).toBe(true);
-    expect(config.providers["google-antigravity"].models).toHaveLength(7);
+    expect(config.providers["google-antigravity"].models).toHaveLength(4);
   });
 
   test("an explicit 3.7 default survives the 3.8 launch while its capabilities refresh", () => {
-    // The 3.5 case above starts from a RETIRED id, so it only exercises the stale-default
-    // healing branch. This one is the opposite claim, and the one that matters for an
-    // additive rollout: a user who deliberately chose 3.7 must still be on 3.7 afterwards.
-    // Google still serves it, so healing it onto 3.8 would be silently overriding a choice.
+    // The earlier live-discovery case preserves an id outside the static seed. This case
+    // preserves a still-listed choice during an additive catalog rollout, while refreshing
+    // its capability records.
     const home = mkdtempSync(join(tmpdir(), "ocx-antigravity-explicit-default-"));
     homes.push(home);
     process.env.OPENCODEX_HOME = home;
@@ -360,11 +356,59 @@ describe("OAuth provider reconciliation", () => {
     const provider = config.providers["google-antigravity"];
 
     expect(provider.defaultModel).toBe("gemini-3.7-flash");
-    expect(provider.models).toContain("gemini-3.7-flash");
+    // The static lineup no longer lists 3.7, but a live-discovery default stays operator-owned.
+    expect(provider.models).not.toContain("gemini-3.7-flash");
     expect(provider.models).toContain("gemini-3.8-flash");
     // Capability records still refresh from the registry — preservation is about the
     // user's CHOICE, not about freezing the row.
     expect(provider.modelReasoningEfforts?.["gemini-3.8-flash"]).toEqual(["low", "medium", "high"]);
+  });
+
+  test("does not validate a live-models default against the static preset", () => {
+    const config = {
+      port: 10100,
+      defaultProvider: "google-antigravity",
+      providers: {
+        "google-antigravity": {
+          ...structuredClone(OAUTH_PROVIDERS["google-antigravity"].providerConfig),
+          authMode: "oauth",
+          liveModels: true,
+          models: ["account-specific-model"],
+          defaultModel: "account-specific-model",
+        },
+      },
+    } satisfies OcxConfig;
+
+    expect(reconcileOAuthProviders(config, false)).toBe(true);
+    expect(config.providers["google-antigravity"].defaultModel).toBe("account-specific-model");
+
+    upsertOAuthProvider(config, "google-antigravity");
+    expect(config.providers["google-antigravity"].defaultModel).toBe("account-specific-model");
+  });
+
+  test.each(["reconcile", "upsert"] as const)("%s heals an obsolete static default without enabling live discovery", operation => {
+    const preset = OAUTH_PROVIDERS["google-antigravity"].providerConfig;
+    const config: OcxConfig = {
+      port: 10100,
+      defaultProvider: "google-antigravity",
+      providers: {
+        "google-antigravity": {
+          ...structuredClone(preset),
+          liveModels: false,
+          defaultModel: "retired-static-model",
+          models: ["retired-static-model"],
+        },
+      },
+    };
+
+    if (operation === "reconcile") expect(reconcileOAuthProviders(config, false)).toBe(true);
+    else upsertOAuthProvider(config, "google-antigravity");
+
+    const provider = config.providers["google-antigravity"]!;
+    expect(provider.liveModels).toBe(false);
+    expect(provider.defaultModel).toBe(preset.defaultModel);
+    expect(provider.models).toEqual(preset.models);
+    expect(reconcileOAuthProviders(config, false)).toBe(false);
   });
 
   test("preserves an explicit Antigravity static opt-out without the legacy migration marker", () => {
@@ -456,6 +500,41 @@ describe("OAuth provider reconciliation", () => {
 
     reconcileOAuthProviders(config, false);
     expect(config.providers.kimi.requiresReasoningPlaceholderModels).toEqual([]);
+  });
+
+  test("preserves an operator output budget that no OAuth preset declares", () => {
+    // The devin preset declares neither output field, so the delete branch was
+    // the only branch either of them ever took: a hand-edited budget was gone
+    // before the next startup finished, leaving the adapter's own fallback as
+    // the only reachable cap (#5190). Input limits are operator-owned too (#7092).
+    const preset = OAUTH_PROVIDERS.devin.providerConfig;
+    expect(preset.defaultMaxOutputTokens).toBeUndefined();
+    expect(preset.modelMaxOutputTokens).toBeUndefined();
+    const config = {
+      port: 10100,
+      defaultProvider: "devin",
+      googleAntigravityStaticCatalogVersion: 1,
+      providers: {
+        devin: {
+          ...structuredClone(preset),
+          defaultMaxOutputTokens: 64_000,
+          modelMaxOutputTokens: { "swe-2": 32_000 },
+          modelContextWindows: { "swe-2": 1 },
+        },
+      },
+    } satisfies OcxConfig;
+
+    reconcileOAuthProviders(config, false);
+
+    expect(config.providers.devin.defaultMaxOutputTokens).toBe(64_000);
+    expect(config.providers.devin.modelMaxOutputTokens).toEqual({ "swe-2": 32_000 });
+    expect(config.providers.devin.modelContextWindows).toMatchObject({ "swe-2": 1 });
+
+    // Later operator edits remain authoritative through another reconciliation.
+    config.providers.devin.defaultMaxOutputTokens = 1;
+    reconcileOAuthProviders(config, false);
+    expect(config.providers.devin.defaultMaxOutputTokens).toBe(1);
+    expect(OAUTH_PROVIDERS.anthropic.providerConfig.defaultMaxOutputTokens).toBeGreaterThan(0);
   });
 
   test("refreshes Grok 4.6 levels while runtime fills the default without overwriting user intent", () => {

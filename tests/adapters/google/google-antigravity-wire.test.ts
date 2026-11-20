@@ -76,17 +76,14 @@ describe("antigravity CCA envelope", () => {
     expect(req.url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse");
   });
 
-  test("exposes Gemini 3.8 and 3.7 Flash while retired Flash ids resolve to 3.7", async () => {
-    // Collapsed picker: base models only. 3.8 leads because CCA ranks it first in the
-    // Recommended sort; 3.7 stays because Google still serves it.
+  test("exposes the 3.8 / 4 / 5.5 / 5.5 lineup while retired Flash ids still resolve to 3.7", async () => {
+    // Collapsed picker: base models only, the static lineup confirmed 2026-10-14. Older models
+    // reach the picker only through live discovery.
     expect(ANTIGRAVITY_MODELS).toEqual([
       "gemini-3.8-flash",
-      "gemini-3.7-flash",
-      "gemini-3.1-pro",
-      "gemini-3.1-flash-image",
-      "claude-sonnet-4-6",
-      "claude-opus-4-6-thinking",
-      "gpt-oss-120b-medium",
+      "gemini-4-argon",
+      "claude-opus-5-5",
+      "claude-sonnet-5-5",
     ]);
     for (const hidden of [
       "gemini-3.6-flash",
@@ -193,11 +190,7 @@ describe("antigravity CCA envelope", () => {
       "future-flash-low",
       "future-flash-medium",
       "future-flash-high",
-    ]))?.map(model => model.id)).toEqual([
-      "future-flash-low",
-      "future-flash-medium",
-      "future-flash-high",
-    ]);
+    ]))?.map(model => model.id)).toEqual(["future-flash"]);
     expect(parseAntigravityAvailableModels(payload([
       "future-flash-low",
       "future-flash-high",
@@ -452,6 +445,75 @@ describe("antigravity CCA envelope", () => {
     expect(antigravitySessionId(threaded("hi", "thread-a")))
       .not.toBe(antigravitySessionId(threaded("hi", "thread-b")));
   });
+
+  // #5033 / #5058. `_clientThreadId` carries `x-codex-parent-thread-id`, which every parallel
+  // child of one parent presents identically, so anchoring on it alone collapsed concurrent
+  // children onto a single upstream Cloud Code Assist session. #5054 then anchored on the child
+  // alone, which only moved the collision: a thread id is unique WITHIN its parent, so two
+  // parents can each have one of the same id. `codexConversationIdentity` keys on both for this
+  // reason, and so does this anchor now.
+  function child(text: string, ownThreadId?: string, parentThreadId?: string): OcxParsedRequest {
+    const base = parsed(text) as OcxParsedRequest & { _clientThreadId?: string; _codexOwnThreadId?: string };
+    if (parentThreadId) base._clientThreadId = parentThreadId;
+    if (ownThreadId) base._codexOwnThreadId = ownThreadId;
+    return base;
+  }
+
+  test("#5033: parallel children of one parent get distinct session ids", () => {
+    expect(antigravitySessionId(child("hi", "child-1", "parent-a")))
+      .not.toBe(antigravitySessionId(child("hi", "child-2", "parent-a")));
+  });
+
+  test("#5058: the same child id under two different parents does not collide", () => {
+    // The half #5054 missed. A child id is only unique within its parent, so keying on it alone
+    // relocated the shared session rather than removing it.
+    expect(antigravitySessionId(child("hi", "child-1", "parent-a")))
+      .not.toBe(antigravitySessionId(child("hi", "child-1", "parent-b")));
+  });
+
+  test("#5058: the pair encoding cannot be confused with a different pair", () => {
+    // Injectivity, not merely difference: a separator a Codex id could contain would let
+    // (parent "a", child "b:c") and (parent "a:b", child "c") hash to one session.
+    expect(antigravitySessionId(child("hi", "b:c", "a")))
+      .not.toBe(antigravitySessionId(child("hi", "c", "a:b")));
+  });
+
+  test("#5033: a child keeps one session id across its own turns", () => {
+    // The property the anchor exists for is unchanged: stable turn to turn even when the first
+    // user message is compacted away.
+    expect(antigravitySessionId(child("original first message", "child-1", "parent-a")))
+      .toBe(antigravitySessionId(child("summary of earlier turns", "child-1", "parent-a")));
+  });
+
+  test("#5058: a parentless root keeps the anchor it had before #5054", () => {
+    // `src/server/context-history.ts` is explicit that a root uses (session-id=root,
+    // thread-id=root) and does not fabricate a parent key, so a root carries an own thread and no
+    // parent. #5054 gave it an own-thread anchor on that basis and was wrong to.
+    //
+    // Durable Antigravity replay state is keyed by model plus session id, so moving a root's
+    // anchor on upgrade strands every signature stored under the old session. Asserted against
+    // the no-header form rather than a literal: what matters is that the value did not move.
+    expect(antigravitySessionId(child("hi", "root-thread", undefined)))
+      .toBe(antigravitySessionId(threaded("hi", undefined)));
+  });
+
+  test("#5033: a client that sends no own-thread header is unchanged", () => {
+    // Some clients send only the parent header; they keep the previous anchor rather than
+    // falling through to the unstable first-user-text one.
+    expect(antigravitySessionId(child("hi", undefined, "parent-a")))
+      .toBe(antigravitySessionId(threaded("hi", "parent-a")));
+    expect(antigravitySessionId(child("hi", undefined, "parent-a")))
+      .not.toBe(antigravitySessionId(threaded("hi", undefined)));
+  });
+
+  test("#5058: a parent/child pair is stable across restart and compaction", () => {
+    // Both ids are Codex's own values rather than a process-random HMAC, so the pair survives a
+    // proxy restart; the compaction half is the #1297 property, re-asserted for the pair form.
+    expect(antigravitySessionId(child("original first message", "child-1", "parent-a")))
+      .toBe(antigravitySessionId(child("a summary of earlier turns", "child-1", "parent-a")));
+  });
+
+
 
   test("#1297: promptCacheKey does not influence the id", () => {
     // Deliberately not the anchor: it is arbitrary Responses input and is shared
@@ -859,6 +921,48 @@ describe("isLikelyRealThoughtSignature", () => {
     expect(isLikelyRealThoughtSignature("short")).toBe(false);
     expect(isLikelyRealThoughtSignature("has spaces in it here")).toBe(false);
     expect(isLikelyRealThoughtSignature(undefined)).toBe(false);
+    expect(isLikelyRealThoughtSignature("skip_thought_signature_validator")).toBe(false);
+    expect(isLikelyRealThoughtSignature("context_engineering_is_the_way_to_go")).toBe(false);
+  });
+  test("antigravitySessionId isolates session ids per accountScope or _reasoningReplayScope credential identity while preserving single-arg fallback", () => {
+    const p = parsed("hello world");
+    const base = antigravitySessionId(p);
+    const projA = antigravitySessionId(p, "proj-alpha");
+    const projB = antigravitySessionId(p, "proj-beta");
+    expect(projA).toBe(antigravitySessionId(p, "  proj-alpha  "));
+    expect(projA).not.toBe(projB);
+    expect(projA).not.toBe(base);
+    expect(antigravitySessionId(p, "")).toBe(base);
+    const scopedA = {
+      ...p,
+      _reasoningReplayScope: {
+        clientThreadId: "t1",
+        current: {
+          providerName: "google-antigravity",
+          providerDestinationIdentity: "dest",
+          adapterName: "google",
+          modelId: "gemini-3-pro",
+          credentialIdentity: "cred-a",
+          credentialDurableIdentity: "durable-cred-a",
+        },
+      },
+    } as unknown as OcxParsedRequest;
+    const scopedB = {
+      ...p,
+      _reasoningReplayScope: {
+        clientThreadId: "t1",
+        current: {
+          providerName: "google-antigravity",
+          providerDestinationIdentity: "dest",
+          adapterName: "google",
+          modelId: "gemini-3-pro",
+          credentialIdentity: "cred-b",
+          credentialDurableIdentity: "durable-cred-b",
+        },
+      },
+    } as unknown as OcxParsedRequest;
+    expect(antigravitySessionId(scopedA)).not.toBe(antigravitySessionId(scopedB));
+    expect(antigravitySessionId(scopedA)).not.toBe(base);
   });
   test("accepts an opaque base64/base64url signature blob", () => {
     expect(isLikelyRealThoughtSignature("CisBVKhc7+abcDEF0123456789/xyz==")).toBe(true);

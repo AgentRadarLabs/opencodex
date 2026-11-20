@@ -54,20 +54,6 @@
   gap: var(--space-4);
 }
 
-/* Sub-agent delegation + Sync models share one row (same auto-fit rhythm as sidecars). */
-.dash-overview-tools {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 21rem), 1fr));
-  gap: var(--space-4);
-  align-items: stretch;
-}
-
-.dash-overview-tools > .panel {
-  min-width: 0;
-  height: 100%;
-  box-sizing: border-box;
-}
-
 /* Sidecar settings: two panels side by side, gap matches --space-4.
 
    The track floor is the width at which a card can still render its real layout — copy
@@ -527,3 +513,168 @@
   color: var(--text);
   white-space: nowrap;
 }
+
+
+/* Overview settings share a fixed control column, then stack together when the
+   content area is too narrow. Scope this to Overview; provider/model tables keep
+   their own layout. Dropdowns and popovers already portal outside the container. */
+.dash-overview-stack {
+  --dash-controls-width: 26rem;
+
+  container: dashboard-overview / inline-size;
+}
+
+.dash-overview-stack .panel {
+  min-width: 0;
+  padding: 20px;
+}
+
+.dash-overview-stack .dash-delegation-summary,
+.dash-overview-stack .dash-sync-summary,
+.dash-overview-stack .dash-effort-panel .injection-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--dash-controls-width);
+  align-items: center;
+  gap: 24px;
+}
+
+.dash-overview-stack .dash-delegation-controls,
+.dash-effort-controls,
+.dash-shadow-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.dash-overview-stack .dash-delegation-controls .select-trigger,
+.dash-effort-controls .select-trigger,
+.dash-shadow-controls .select-trigger {
+  justify-content: space-between;
+  width: 100%;
+  min-width: 0;
+}
+
+.dash-overview-stack .dash-delegation-controls .select-trigger > span,
+.dash-effort-controls .select-trigger > span,
+.dash-shadow-controls .select-trigger > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dash-overview-stack .dash-sidecar-row-card .dash-sidecar-copy {
+  min-width: 0;
+}
+
+.dash-overview-stack .dash-sidecar-row-card .setting-hint { min-height: 0; }
+
+.dash-overview-stack .dash-sidecar-row-card .dash-delegation-controls {
+  width: 100%;
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.dash-overview-stack .dash-sidecar-select-row .custom-select:first-child {
+  flex: 1;
+  min-width: 0;
+  max-width: none;
+}
+
+.dash-shadow-controls {
+  width: var(--dash-controls-width);
+  flex-shrink: 0;
+}
+
+.dash-shadow-controls > .custom-select { flex: 1; min-width: 0; }
+.dash-shadow-controls > .switch { order: 1; }
+
+/* Memory routing: two fixed column widths, shared by both rows. The pickers must not
+   size themselves from their own label — content-sized pills turned "Low" and "Medium"
+   into two different widths, so the Consolidation row never lined up with the Extract
+   row above it, and the effort picker alone wasted 220px on a five-letter word.
+
+   Each column gets its own width and both rows use the same two, so the columns compare
+   across the rows instead of inside one row: the model column is exactly as wide as the
+   longest common id needs (measured 220px at the trigger's 13px font, trigger padding,
+   chevron gap and chevron included), the effort column fits the longest option label
+   "Codex default" (measured 136px, rounded to 140px). A longer model id ellipsizes
+   inside its column instead of widening one row's pill, so the two rows keep matching
+   columns whatever is selected. */
+.memory-models-row { align-items: center; }
+
+.memory-models-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 8px;
+  flex: 0 0 min(100%, 23rem);
+  min-width: 0;
+}
+
+.memory-models-controls > .custom-select:first-child {
+  flex: 0 1 220px;
+  min-width: 0;
+}
+
+.memory-models-controls > .custom-select:last-child {
+  flex: 0 1 140px;
+  min-width: 0;
+}
+
+.memory-models-controls .select-trigger {
+  justify-content: space-between;
+  width: 100%;
+  min-width: 0;
+}
+
+.memory-models-controls .select-trigger > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dash-overview-stack .setting-hint,
+.dash-overview-stack .dash-sync-hint { max-width: 60ch; }
+
+@container dashboard-overview (max-width: 46rem) {
+  .dash-overview-stack .dash-delegation-summary,
+  .dash-overview-stack .dash-sync-summary,
+  .dash-overview-stack .dash-effort-panel .injection-head {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+  }
+
+  .dash-overview-stack .dash-delegation-controls,
+  .dash-overview-stack .dash-effort-controls,
+  .dash-overview-stack .dash-shadow-controls { width: 100%; }
+
+  .dash-overview-stack .dash-shadow-controls { flex-basis: 100%; }
+  .dash-overview-stack .spread:has(.dash-shadow-controls) { flex-wrap: wrap; }
+  .dash-shadow-label { min-width: 0; max-width: 100%; flex-wrap: wrap; }
+  .dash-shadow-label > .font-semibold { flex-shrink: 0; max-width: 100%; }
+  .dash-shadow-label > code { flex-basis: 100%; min-width: 0; overflow-wrap: anywhere; }
+  .dash-overview-stack .maintenance-actions { justify-content: flex-start; }
+}
+
+@container dashboard-overview (max-width: 30rem) {
+  .dash-overview-stack .panel { padding: 16px; }
+  .dash-overview-stack .select-trigger,
+  .dash-overview-stack .panel .btn:not([aria-haspopup="dialog"]),
+  .dash-overview-stack .dash-vision-advanced-trigger { min-height: 44px; }
+}
+
+.source-scope-groups { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-6); margin-top: var(--space-3); max-height: 220px; overflow: auto; }
+.source-scope-group { border: 0; padding: 0; margin: 0; min-width: 12rem; }
+.source-scope-group legend { padding: 0; }
+.source-scope-group label { display: flex; align-items: center; gap: var(--space-2); color: var(--text); font-size: var(--text-label); padding: var(--space-0-5) 0; }
+/* Captioned controls: a visible label above each select keeps the summarizer model, the
+   trigger scope, the source scope, and the effort from reading as four unnamed pickers. */
+.dash-overview-stack .compaction-routing-controls { align-items: flex-end; }
+.compaction-field { display: flex; flex-direction: column; gap: var(--space-1); min-width: 0; }
+.compaction-sources-block { margin-top: var(--space-3); }
+.compaction-sources-block .compaction-sources-title { margin-bottom: var(--space-1-5); }
+.compaction-sources-block .source-scope-groups { margin-top: 0; }

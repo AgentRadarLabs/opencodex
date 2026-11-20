@@ -1,4 +1,4 @@
-import type { CSSProperties } from "react";
+import { Fragment, type CSSProperties, type ReactNode } from "react";
 import type { Locale, TFn } from "../i18n/shared";
 import { useI18n } from "../i18n/shared";
 import { IconAlert } from "../icons";
@@ -9,24 +9,54 @@ import { type AccountQuota, normalizeQuotaForPlan } from "../codex-quota-utils";
 
 export type QuotaWindowKey = "fiveHour" | "weekly" | "monthly";
 export type QuotaBarRow = {
+  id: string;
   windowKey?: QuotaWindowKey;
   customLabel?: string;
   label: string;
+  /** Presentation-only text; identity stays in customLabel. */
+  displayLabel?: string;
   limitLabel: string;
   percent: number;
   resetAt?: number;
+  /** Share of the weekly limit this model family may use, when upstream reports it. */
+  weeklyAllowancePercent?: number;
+  /** Upstream reports this limit as not the one in effect; it never gates routing. */
+  notInEffect?: boolean;
 };
 
 /**
  * Window ordering is computed from RAW wire identities BEFORE localization
  * (ranking on translated labels breaks the moment a locale changes copy):
- * shorter windows first — 5h, weekly, cursor first-party, cursor API, monthly.
+ * shorter windows first — 5h, weekly, cursor first-party, cursor API, monthly,
+ * then subscription credits before other custom windows.
  */
 function rawCustomWindowRank(rawLabel: string): number {
   if (rawLabel === "5h") return 0;
   if (rawLabel === "First-party models") return 2;
   if (rawLabel === "API usage") return 3;
+  if (rawLabel === "Total subscription credits") return 4.5;
   return 5;
+}
+
+const SUBSCRIPTION_CREDITS_LABEL = "Total subscription credits";
+
+function canonicalCustomWindowLabel(rawLabel: string): string {
+  return rawLabel.trim().toLowerCase() === SUBSCRIPTION_CREDITS_LABEL.toLowerCase()
+    ? SUBSCRIPTION_CREDITS_LABEL
+    : rawLabel;
+}
+
+/** Coverage metadata carries raw labels, while subscription rows use a canonical identity. */
+export function isCustomQuotaWindowIncomplete(
+  customLabel: string | undefined,
+  incompleteLabels?: ReadonlySet<string>,
+): boolean {
+  if (customLabel === undefined || !incompleteLabels) return false;
+  const canonical = canonicalCustomWindowLabel(customLabel);
+  for (const label of incompleteLabels) {
+    if (canonicalCustomWindowLabel(label) === canonical) return true;
+  }
+  return false;
 }
 
 function localizeCustomQuotaLabel(rawLabel: string, t: TFn): string {
@@ -46,7 +76,7 @@ export function buildQuotaRows(quota: AccountQuota | null, plan: string | null |
   const displayQuota = normalizeQuotaForPlan(quota, plan);
   if (!displayQuota) return [];
   // Intrinsic ranks for the standard slots; custom windows rank on their RAW labels.
-  const ranked: Array<{ rank: number; row: QuotaBarRow }> = [];
+  const ranked: Array<{ rank: number; row: Omit<QuotaBarRow, "id"> & { id?: string } }> = [];
   if (typeof displayQuota.fiveHourPercent === "number") {
     ranked.push({
       rank: 0,
@@ -84,19 +114,63 @@ export function buildQuotaRows(quota: AccountQuota | null, plan: string | null |
     });
   }
   for (const w of displayQuota.customWindows ?? []) {
-    const localized = localizeCustomQuotaLabel(w.label, t);
+    const customLabel = canonicalCustomWindowLabel(w.label);
+    const localized = localizeCustomQuotaLabel(customLabel, t);
     ranked.push({
-      rank: rawCustomWindowRank(w.label),
+      rank: rawCustomWindowRank(customLabel),
       row: {
-        customLabel: w.label,
+        id: JSON.stringify([w.modelId ?? null, w.label, w.resetAt ?? null]),
+        customLabel,
         label: localized,
+        ...(typeof w.displayLabel === "string" && w.displayLabel.trim() ? { displayLabel: w.displayLabel } : {}),
         limitLabel: localized,
         percent: w.percent,
         resetAt: w.resetAt,
+        ...(w.weeklyAllowancePercent !== undefined ? { weeklyAllowancePercent: w.weeklyAllowancePercent } : {}),
       },
     });
   }
-  return ranked.sort((a, b) => a.rank - b.rank).map(entry => entry.row);
+  // Display-only limits (not in effect upstream) follow the routed rows they sit beside.
+  for (const w of displayQuota.displayWindows ?? []) {
+    ranked.push({
+      rank: rawCustomWindowRank(w.label),
+      row: {
+        id: JSON.stringify(["display", w.label, w.resetAt ?? null]),
+        customLabel: w.label,
+        label: w.label,
+        limitLabel: w.label,
+        percent: w.percent,
+        resetAt: w.resetAt,
+        ...(w.weeklyAllowancePercent !== undefined ? { weeklyAllowancePercent: w.weeklyAllowancePercent } : {}),
+        notInEffect: true,
+      },
+    });
+  }
+  if (displayQuota.creditsUsd && typeof displayQuota.creditsUsd.percent === "number") {
+    const hasSubscriptionCreditsCustom = displayQuota.customWindows?.some(
+      w => w.modelId === undefined && canonicalCustomWindowLabel(w.label) === SUBSCRIPTION_CREDITS_LABEL,
+    );
+    if (!hasSubscriptionCreditsCustom) {
+      const localized = localizeCustomQuotaLabel(SUBSCRIPTION_CREDITS_LABEL, t);
+      ranked.push({
+        rank: rawCustomWindowRank(SUBSCRIPTION_CREDITS_LABEL),
+        row: {
+          customLabel: SUBSCRIPTION_CREDITS_LABEL,
+          label: localized,
+          limitLabel: localized,
+          percent: displayQuota.creditsUsd.percent,
+          resetAt: displayQuota.creditsUsd.expiresAt,
+        },
+      });
+    }
+  }
+  const identities = new Map<string, number>();
+  return ranked.sort((a, b) => a.rank - b.rank).map(({ row }) => {
+    const identity = row.id ?? row.windowKey ?? row.customLabel!;
+    const ordinal = identities.get(identity) ?? 0;
+    identities.set(identity, ordinal + 1);
+    return { ...row, id: JSON.stringify([identity, ordinal]) };
+  });
 }
 
 /** Max utilisation across known windows (for sorting providers by urgency). */
@@ -105,7 +179,14 @@ export function maxQuotaUtilisation(quota: AccountQuota | null): number {
   const vals = [quota.fiveHourPercent, quota.weeklyPercent, quota.monthlyPercent]
     .filter((n): n is number => typeof n === "number");
   for (const w of quota.customWindows ?? []) {
+    if (w.modelId !== undefined) continue;
     if (typeof w.percent === "number") vals.push(w.percent);
+  }
+  const hasSubscriptionCreditsCustom = quota.customWindows?.some(
+    w => w.modelId === undefined && canonicalCustomWindowLabel(w.label) === SUBSCRIPTION_CREDITS_LABEL,
+  );
+  if (!hasSubscriptionCreditsCustom && typeof quota.creditsUsd?.percent === "number") {
+    vals.push(quota.creditsUsd.percent);
   }
   return vals.length ? Math.max(...vals) : -1;
 }
@@ -130,6 +211,10 @@ function bcp47(locale: Locale): string {
       return "ja-JP";
     case "tr":
       return "tr-TR";
+    case "vi":
+      return "vi-VN";
+    case "pt":
+      return "pt-BR";
     default: {
       const _exhaustive: never = locale;
       return _exhaustive;
@@ -189,6 +274,7 @@ export default function QuotaBars({
   incompleteWindowKeys,
   incompleteCustomWindowLabels,
   observedAt,
+  afterWeekly,
 }: {
   quota: AccountQuota | null;
   plan?: string | null;
@@ -214,9 +300,21 @@ export default function QuotaBars({
    * look live.
    */
   observedAt?: number;
+  /** Compact-only slot after Week, or after the last row when Week is absent. */
+  afterWeekly?: ReactNode;
 }) {
   const { locale } = useI18n();
   const rows = buildQuotaRows(quota, plan, t);
+  const unknownWindows = quota?.unknownBudgetWindows ?? [];
+  const unknownRows = unknownWindows.map((window, index) => (
+    <div className="quota-stacked-row" key={`unknown-${window.label}-${index}`}>
+      <div className="quota-stacked-head">
+        <span className="quota-stacked-limit">{window.label}</span>
+        <span className="quota-stacked-reset muted">{formatResetFuture(window.resetAt, t, locale)}</span>
+      </div>
+      <span className="muted">{t("cws.quota.unknown")}</span>
+    </div>
+  ));
   // Rendered above the bars in both layouts. Null age (under a minute, or no observation)
   // renders nothing rather than "just now", which would be one more thing to read.
   const observedAge = observedAt === undefined ? null : formatObservedAge(observedAt, t);
@@ -225,8 +323,10 @@ export default function QuotaBars({
       {t("quota.observedAgo").replace("{age}", observedAge)}
     </p>
   );
-  if (rows.length === 0) {
-    if (!pending) return null;
+  if (rows.length === 0 && unknownWindows.length === 0) {
+    if (!pending) return layout === "compact" && afterWeekly ? (
+      <div className={`codex-account-quota-slot quota-compact${className ? ` ${className}` : ""}`}>{afterWeekly}</div>
+    ) : null;
     if (layout === "stacked") {
       return (
         <div className={`quota-stacked quota-stacked--pending${className ? ` ${className}` : ""}`} aria-busy="true" role="status">
@@ -272,16 +372,17 @@ export default function QuotaBars({
         {observedLine}
         {rows.map(row => (
           <StackedQuotaRow
-            key={row.limitLabel}
+            key={row.id}
             row={row}
             threshold={threshold}
             t={t}
             locale={locale}
             incomplete={row.windowKey
               ? incompleteWindowKeys?.has(row.windowKey) === true
-              : row.customLabel !== undefined && incompleteCustomWindowLabels?.has(row.customLabel) === true}
+              : isCustomQuotaWindowIncomplete(row.customLabel, incompleteCustomWindowLabels)}
           />
         ))}
+        {unknownRows}
       </div>
     );
   }
@@ -289,21 +390,42 @@ export default function QuotaBars({
     <div className={`codex-account-quota-slot quota-compact${className ? ` ${className}` : ""}`}>
       {observedLine}
       {rows.map(row => (
-        <QuotaRow
-          key={row.label}
-          label={row.label}
-          percent={row.percent}
-          resetAt={row.resetAt}
-          threshold={threshold}
-          t={t}
-          locale={locale}
-        />
+        <Fragment key={row.id}>
+          <QuotaRow
+            credits={row.customLabel === SUBSCRIPTION_CREDITS_LABEL}
+            hint={quotaRowNotes(row, t).join(" · ")}
+            label={row.displayLabel ?? row.label}
+            percent={row.percent}
+            resetAt={row.resetAt}
+            threshold={threshold}
+            t={t}
+            locale={locale}
+          />
+          {row.windowKey === "weekly" && afterWeekly}
+        </Fragment>
       ))}
+      {unknownRows}
+      {!rows.some(row => row.windowKey === "weekly") && afterWeekly}
     </div>
   );
 }
 
-function QuotaRow({ label, percent, resetAt, threshold, t, locale }: {
+/** The weekly share and the not-in-effect state, in display order; empty for an ordinary window. */
+function quotaRowNotes(row: QuotaBarRow, t: TFn): string[] {
+  return [
+    ...(row.weeklyAllowancePercent !== undefined ? [weeklyShareText(row.weeklyAllowancePercent, t)] : []),
+    ...(row.notInEffect ? [t("quota.notInEffect")] : []),
+  ];
+}
+
+function weeklyShareText(allowance: number, t: TFn): string {
+  return t("quota.weeklyShare", { pct: Math.round(allowance) });
+}
+
+function QuotaRow({ credits, hint, label, percent, resetAt, threshold, t, locale }: {
+  credits?: boolean;
+  /** Extra context for the label tooltip, such as a model family's weekly share. */
+  hint?: string;
   label: string;
   percent: number;
   resetAt?: number;
@@ -320,8 +442,8 @@ function QuotaRow({ label, percent, resetAt, threshold, t, locale }: {
     : undefined;
   const hasReset = reset.day !== "" || reset.time !== "";
   return (
-    <div className={`quota-row${warn ? " quota-row--warn" : ""}${exhausted ? " quota-row--exhausted" : ""}`}>
-      <span className="quota-label" title={resetTitle}>{label}</span>
+    <div className={`quota-row${credits ? " quota-row--credits" : ""}${warn ? " quota-row--warn" : ""}${exhausted ? " quota-row--exhausted" : ""}`}>
+      <span className="quota-label" title={[hint, resetTitle].filter(Boolean).join(" · ") || undefined}>{label}</span>
       <span className="quota-reset-label">{hasReset ? t("codexAuth.resets") : ""}</span>
       <span className="quota-reset-day">{reset.day}</span>
       <span className="quota-reset-time">{reset.time}</span>
@@ -354,7 +476,7 @@ function StackedQuotaRow({ row, threshold, t, locale, incomplete }: {
     <div className={`quota-stacked-row${warn ? " quota-stacked-row--warn" : ""}${exhausted ? " quota-stacked-row--exhausted" : ""}`}>
       <div className="quota-stacked-head">
         <span className="quota-stacked-limit-group">
-          <span className="quota-stacked-limit">{row.limitLabel}</span>
+          <span className="quota-stacked-limit">{row.displayLabel ?? row.limitLabel}</span>
           {incomplete && (
             <span
               className="quota-window-partial"
@@ -365,9 +487,17 @@ function StackedQuotaRow({ row, threshold, t, locale, incomplete }: {
               {t("pws.capacity.windowPartial")}
             </span>
           )}
+          {row.notInEffect && (
+            <span className="quota-window-inactive muted" role="note" title={t("quota.notInEffectHint")}>
+              {t("quota.notInEffect")}
+            </span>
+          )}
         </span>
         <span className="quota-stacked-reset muted">{resetText}</span>
       </div>
+      {row.weeklyAllowancePercent !== undefined && (
+        <span className="quota-window-share muted">{weeklyShareText(row.weeklyAllowancePercent, t)}</span>
+      )}
       <div className="quota-stacked-bar-row">
         <div className="bar quota-stacked-bar">
           <div className={`bar-fill ${color}`} style={barFillStyle(row.percent)} />

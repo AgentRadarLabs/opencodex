@@ -61,7 +61,7 @@ describe("buildModelsRequest google routing", () => {
   test("google-vertex without googleMode resolves vertex via registry, not ai-studio", () => {
     const prov = { adapter: "google", authMode: "key", baseUrl: "https://aiplatform.googleapis.com" } as OcxProviderConfig;
     const { url } = buildModelsRequest(prov, "gk-123", "google-vertex");
-    expect(url).toBe("https://aiplatform.googleapis.com/models");
+    expect(url).toBe("https://aiplatform.googleapis.com/v1beta1/publishers/google/models?pageSize=300");
   });
 });
 
@@ -128,9 +128,7 @@ describe("Antigravity live model discovery", () => {
       expect(JSON.parse(String(seen[0]?.init?.body))).toEqual({ project: "configured-project" });
       expect(live.map(model => model.id).sort()).toEqual([
         "future-agent-model",
-        "future-flash-high",
-        "future-flash-low",
-        "future-flash-medium",
+        "future-flash",
         "gemini-3.1-flash-image",
         "gemini-3.1-pro-low",
         "gemini-3.7-flash",
@@ -144,6 +142,12 @@ describe("Antigravity live model discovery", () => {
         contextWindow: 333_333,
         inputModalities: ["text"],
         reasoningEfforts: [],
+      });
+      expect(live.find(model => model.id === "future-flash")).toMatchObject({
+        reasoningEfforts: ["low", "medium", "high"],
+        antigravityEffortWireModelIds: {
+          low: "future-flash-low", medium: "future-flash-medium", high: "future-flash-high",
+        },
       });
       expect(live.map(model => model.id)).not.toContain("tab-only-model");
       expect(live.map(model => model.id)).not.toContain("non-agent-command-model");
@@ -330,7 +334,7 @@ describe("buildModelsRequest anthropic routing", () => {
 });
 
 describe("google models listing via catalog", () => {
-  test("treats a { models } 2xx shape as malformed and degrades to the static seed", async () => {
+  test("publishes generateContent models from the native models envelope", async () => {
     clearModelCache("google");
     const warning = spyOn(console, "warn").mockImplementation(() => {});
     const seen: { url: string; headers: Record<string, string> }[] = [];
@@ -338,8 +342,9 @@ describe("google models listing via catalog", () => {
       seen.push({ url: String(input), headers: (init?.headers ?? {}) as Record<string, string> });
       return new Response(JSON.stringify({
         models: [
-          { name: "models/gemini-3-pro", inputTokenLimit: 1048576, supportedGenerationMethods: ["generateContent", "countTokens"] },
+          { name: "models/gemini-3-pro", inputTokenLimit: 1048576, outputTokenLimit: 65536, supportedGenerationMethods: ["generateContent", "countTokens"] },
           { name: "models/text-embedding-004", supportedGenerationMethods: ["embedContent"] },
+          { name: "models/gemini-missing-methods" },
           { name: "models/gemini-3-flash", inputTokenLimit: 1048576, supportedGenerationMethods: ["generateContent"] },
         ],
       }), { status: 200, headers: { "content-type": "application/json" } });
@@ -356,15 +361,81 @@ describe("google models listing via catalog", () => {
       expect(seen).toHaveLength(1);
       expect(seen[0].url).toBe("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000");
       expect(seen[0].headers["x-goog-api-key"]).toBe("gk-123");
-      const ids = models.filter(m => m.provider === "google").map(m => m.id);
-      expect(ids).toEqual(["gemini-3.1-pro-preview", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash"]);
-      expect(ids).not.toContain("gemini-3-pro");
-      expect(ids).not.toContain("gemini-3-flash");
-      expect(getStaleCached("google")).toBeNull();
-      expect(warning.mock.calls.flat().join(" ")).toContain("google");
+      const live = models.filter(m => m.provider === "google");
+      expect(live.map(m => m.id).sort()).toEqual(["gemini-3-flash", "gemini-3-pro"]);
+      expect(live.find(m => m.id === "gemini-3-pro")).toMatchObject({
+        contextWindow: 1_048_576,
+        maxInputTokens: 1_048_576,
+        maxOutputTokens: 65_536,
+      });
     } finally {
       warning.mockRestore();
     }
+  });
+
+  test("skips toxic or malformed rows and preserves valid models from the native models envelope", async () => {
+    clearModelCache("google");
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    globalThis.fetch = (async () => {
+      return new Response(JSON.stringify({
+        models: [
+          null,
+          "not-an-object",
+          { name: "models/bad\0name", supportedGenerationMethods: ["generateContent"] },
+          { name: "models/ padded ", supportedGenerationMethods: ["generateContent"] },
+          { name: "models/gemini-valid", inputTokenLimit: 524288, outputTokenLimit: 8192, supportedGenerationMethods: ["generateContent"] },
+          // Same normalized id as the row above: must be deduped, not published twice.
+          { name: "models/gemini-valid", inputTokenLimit: 1024, supportedGenerationMethods: ["generateContent"] },
+          // No `models/` prefix: the name is used verbatim.
+          { name: "gemini-unprefixed", supportedGenerationMethods: ["generateContent"] },
+          { name: "models/invalid-methods", supportedGenerationMethods: "not-an-array" },
+          { name: "models/embed-only", supportedGenerationMethods: ["embedContent"] },
+        ],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+
+    try {
+      const models = await gatherRoutedModels(configWith("google", {
+        adapter: "google",
+        authMode: "key",
+        apiKey: "gk-123",
+        baseUrl: "https://generativelanguage.googleapis.com",
+      }));
+
+      const live = models.filter(m => m.provider === "google");
+      expect(live.map(m => m.id).sort()).toEqual(["gemini-unprefixed", "gemini-valid"]);
+      expect(live.filter(m => m.id === "gemini-valid")).toHaveLength(1);
+      expect(live.find(m => m.id === "gemini-valid")).toMatchObject({
+        contextWindow: 524_288,
+        maxInputTokens: 524_288,
+        maxOutputTokens: 8_192,
+      });
+      expect(getStaleCached("google")).not.toBeNull();
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  test("falls back to generic parser when a custom google-adapter provider returns data[] envelope", async () => {
+    clearModelCache("custom-google");
+    globalThis.fetch = (async () => {
+      return new Response(JSON.stringify({
+        data: [
+          { id: "custom-gemini", owned_by: "custom", context_length: 128000 },
+        ],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+
+    const models = await gatherRoutedModels(configWith("custom-google", {
+      adapter: "google",
+      authMode: "key",
+      apiKey: "gk-custom",
+      baseUrl: "https://custom-gateway.example/v1",
+    }));
+
+    const live = models.filter(m => m.provider === "custom-google");
+    expect(live.map(m => m.id)).toEqual(["custom-gemini"]);
+    expect(live[0]?.contextWindow).toBe(128_000);
   });
 });
 

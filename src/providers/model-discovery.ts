@@ -1,4 +1,6 @@
+import { extractWorkBuddyModels } from "./workbuddy-models";
 import type { OcxProviderConfig } from "../types";
+import { providerSkipsInvalidModelRows } from "./model-discovery-config";
 import {
   isValidModelDiscoveryModelId,
   MODEL_DISCOVERY_MAX_MODEL_ID_LENGTH,
@@ -23,11 +25,15 @@ import {
 
 const MODEL_DISCOVERY_MAX_FILTER_VALUES = 256;
 const MODEL_DISCOVERY_MAX_FILTER_STRING_LENGTH = 1_024;
+const TRAILING_SLASHES = /\/+$/;
+const TRAILING_MODELS = /\/models$/;
 
 export interface ResolvedProviderModelDiscovery {
   spec?: ProviderModelDiscoverySpec;
   maxResponseBytes: number;
   maxModels: number;
+  /** Operator opt-in `providers.<name>.modelDiscovery.skipInvalidRows` (#7910); absent means strict. */
+  skipInvalidRows?: true;
 }
 
 export type ProviderModelsApiItem = Record<string, unknown> & { id: string };
@@ -43,12 +49,26 @@ export type BoundedDiscoveryJsonResult =
   | { ok: false; reason: "response_too_large" | "invalid_json" };
 
 export type ProviderModelItemsResult =
-  | { ok: true; items: ProviderModelsApiItem[]; rawCount: number }
-  | { ok: false; reason: "invalid_shape" | "too_many_models" };
+  | { ok: true; items: ProviderModelsApiItem[]; rawCount: number; skippedInvalidRows?: number }
+  | { ok: false; reason: "invalid_shape" | "too_many_models"; diagnostic?: string };
 
 export type ModelEnvelopeRowsResult =
   | { ok: true; rows: unknown[] }
   | { ok: false; reason: "invalid_shape" | "too_many_models" };
+
+/**
+ * Build the default OpenAI-compatible model-discovery URL from a configured baseUrl.
+ *
+ * `baseUrl` is required on both `OcxProviderConfig` and the persisted-config schema, so a row
+ * without one is not a state configuration loading can produce. It is deliberately not tolerated
+ * here: the old template-literal join silently produced `"undefined/models"`, which is not a usable
+ * fallback either — it only ever survived because a static row returns before the URL is parsed.
+ */
+export function providerModelsUrl(baseUrl: string): string {
+  const trimmed = baseUrl.trim().replace(TRAILING_SLASHES, "");
+  const withoutEndpoint = trimmed.replace(TRAILING_MODELS, "");
+  return `${withoutEndpoint}/models`;
+}
 
 function positiveIntegerAtMost(value: number | undefined, hardLimit: number): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return hardLimit;
@@ -62,6 +82,8 @@ function discoveryPredicateError(predicate: ProviderModelDiscoveryPredicate): st
   if (predicate.path.some(segment => typeof segment !== "string" || !segment.trim() || segment.length > 64)) {
     return "predicate path segments must be nonblank strings up to 64 characters";
   }
+  // One projection is sufficient for providers[].id and avoids combinatorial traversal.
+  if (predicate.path.filter(segment => segment === "*").length > 1) return "predicate path may contain at most one array projection";
   const values = "equalsAny" in predicate
     ? predicate.equalsAny
     : "containsAny" in predicate
@@ -113,6 +135,14 @@ export function providerModelDiscoverySpecError(spec: ProviderModelDiscoverySpec
   if (queryEntries.some(([key, value]) => !key.trim() || key.length > 128 || typeof value !== "string" || value.length > 512)) {
     return "discovery query keys/values exceed their bounds";
   }
+  for (const [field, value] of [
+    ["envelopeKey", spec.envelopeKey],
+    ["idField", spec.idField],
+  ] as const) {
+    if (value !== undefined && (
+      typeof value !== "string" || !value || value !== value.trim() || value.length > 128
+    )) return `${field} must be a nonblank field name up to 128 characters`;
+  }
   for (const [field, value, hardLimit] of [
     ["maxResponseBytes", spec.maxResponseBytes, MODEL_DISCOVERY_MAX_RESPONSE_BYTES],
     ["maxModels", spec.maxModels, MODEL_DISCOVERY_MAX_MODELS],
@@ -121,7 +151,7 @@ export function providerModelDiscoverySpecError(spec: ProviderModelDiscoverySpec
       return `${field} must be a positive integer no greater than ${hardLimit}`;
     }
   }
-  for (const [group, predicates] of Object.entries(spec.filter ?? {})) {
+  for (const [group, predicates] of Object.entries({ ...spec.filter, ...(spec.preferFirst === undefined ? {} : { preferFirst: spec.preferFirst }) })) {
     if (!Array.isArray(predicates) || predicates.length === 0 || predicates.length > 32) {
       return `${group} must contain 1-32 predicates`;
     }
@@ -135,7 +165,7 @@ export function providerModelDiscoverySpecError(spec: ProviderModelDiscoverySpec
 
 export function resolveProviderModelDiscovery(
   providerName: string,
-  provider: Pick<OcxProviderConfig, "baseUrl" | "adapter"> & Partial<Pick<OcxProviderConfig, "authMode">>,
+  provider: Pick<OcxProviderConfig, "baseUrl" | "adapter"> & Partial<Pick<OcxProviderConfig, "authMode" | "modelDiscovery">>,
 ): ResolvedProviderModelDiscovery {
   // The dashboard permits a canonical preset to be saved under a different name. Recover its
   // registry-owned discovery policy by transport in that case. The destination helper is limited
@@ -150,6 +180,8 @@ export function resolveProviderModelDiscovery(
     ...(spec ? { spec } : {}),
     maxResponseBytes: positiveIntegerAtMost(spec?.maxResponseBytes, MODEL_DISCOVERY_MAX_RESPONSE_BYTES),
     maxModels: positiveIntegerAtMost(spec?.maxModels, MODEL_DISCOVERY_MAX_MODELS),
+    // Operator configuration, never registry policy: the registry cannot relax row validation.
+    ...(providerSkipsInvalidModelRows(provider) ? { skipInvalidRows: true as const } : {}),
   };
 }
 
@@ -325,12 +357,17 @@ export async function readBoundedDiscoveryJson(
 }
 
 function valueAtPath(item: Record<string, unknown>, path: readonly string[]): unknown {
-  let current: unknown = item;
-  for (const segment of path) {
+  const visit = (current: unknown, index: number): unknown => {
+    if (index === path.length) return current;
+    const segment = path[index];
+    if (segment === "*") {
+      if (!Array.isArray(current)) return undefined;
+      return current.slice(0, MODEL_DISCOVERY_MAX_FILTER_VALUES).map(value => visit(value, index + 1));
+    }
     if (current === null || typeof current !== "object" || Array.isArray(current)) return undefined;
-    current = (current as Record<string, unknown>)[segment];
-  }
-  return current;
+    return visit((current as Record<string, unknown>)[segment!], index + 1);
+  };
+  return visit(item, 0);
 }
 
 function comparableScalar(value: unknown, caseInsensitive: boolean): ProviderModelDiscoveryScalar | undefined {
@@ -406,7 +443,7 @@ export function extractModelEnvelopeRows(
   return { ok: true, rows };
 }
 
-/** Validate, bound, deduplicate, and declaratively filter OpenAI `{data:[...]}` or top-level arrays (Together `#617`). */
+/** Validate, bound, deduplicate, and filter the declared envelope or a top-level array (Together `#617`). */
 /**
  * Metadata a sibling `models[]` array may contribute to an ALREADY-ADMITTED
  * `data[]` row (#1797).
@@ -477,40 +514,69 @@ function plainObject(value: unknown): Record<string, unknown> | null {
     ? value as Record<string, unknown>
     : null;
 }
+
+/** Why one envelope row cannot become a model, phrased without any row content. */
+function invalidRowReason(raw: unknown, idField: string): string | undefined {
+  const row = plainObject(raw);
+  if (!row) return "is not an object";
+  const id = row[idField];
+  if (isValidModelDiscoveryModelId(id)) return undefined;
+  return typeof id !== "string" ? "has a non-string id" : !id.trim() ? "has an empty id" : "has an invalid id";
+}
+
+/**
+ * Strict discovery rejects a listing with any invalid row; `skipInvalidRows` (#7910) drops those rows
+ * instead. Every row is still counted against the raw-row ceiling before this runs, and a listing
+ * where invalid rows were skipped but nothing was admitted stays malformed: skipping must never turn
+ * a broken listing into an authoritative empty roster.
+ */
 export function extractProviderModelItems(
   value: unknown,
   discovery: ResolvedProviderModelDiscovery,
 ): ProviderModelItemsResult {
   const limit = positiveIntegerAtMost(discovery.maxModels, MODEL_DISCOVERY_MAX_MODELS);
+  if (discovery.spec?.format === "workbuddy") return extractWorkBuddyModels(value, limit);
   let data: unknown[];
   let siblings: SiblingIndex | null = null;
   if (Array.isArray(value)) {
-    // Together-style top-level /models arrays. Catalog discovery must not treat a stray
-    // `models` key on openai-chat responses as valid — only `data` envelopes or top-level arrays.
+    // Together-style top-level /models arrays. The default contract must not treat a stray
+    // `models` key on openai-chat responses as valid; only a provider spec may opt into it.
     if (value.length > limit) return { ok: false, reason: "too_many_models" };
     data = value;
   } else {
-    const envelope = extractModelEnvelopeRows(value, discovery.maxModels, ["data"]);
+    const envelopeKey = discovery.spec?.envelopeKey ?? "data";
+    const envelope = extractModelEnvelopeRows(value, discovery.maxModels, [envelopeKey]);
     if (!envelope.ok) return envelope;
     data = envelope.rows;
-    siblings = buildSiblingIndex(value, limit);
+    siblings = envelopeKey === "data" ? buildSiblingIndex(value, limit) : null;
   }
 
   const items: ProviderModelsApiItem[] = [];
+  const preferred: ProviderModelsApiItem[] = [];
   const seen = new Set<string>();
-  for (const raw of data) {
-    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
-      return { ok: false, reason: "invalid_shape" };
+  const idField = discovery.spec?.idField ?? "id";
+  const skipInvalidRows = discovery.skipInvalidRows === true;
+  let invalidRows = 0;
+  let firstInvalid = "";
+  for (const [index, raw] of data.entries()) {
+    const invalid = invalidRowReason(raw, idField);
+    if (invalid !== undefined) {
+      if (invalidRows === 0) firstInvalid = `row ${index} ${invalid}`;
+      invalidRows += 1;
+      continue;
     }
-    const id = (raw as { id?: unknown }).id;
-    if (!isValidModelDiscoveryModelId(id)) return { ok: false, reason: "invalid_shape" };
+    // A strict listing is already rejected; keep scanning only to count the invalid rows.
+    if (invalidRows > 0 && !skipInvalidRows) continue;
+    const id = (raw as Record<string, unknown>)[idField] as string;
     const prefix = discovery.spec?.stripIdPrefix;
     let finalId = id;
     if (prefix && finalId.startsWith(prefix)) {
       finalId = finalId.slice(prefix.length);
       if (!isValidModelDiscoveryModelId(finalId)) continue;
     }
-    const item = finalId === id ? raw as ProviderModelsApiItem : { ...(raw as ProviderModelsApiItem), id: finalId };
+    const item = finalId === id && idField === "id"
+      ? raw as ProviderModelsApiItem
+      : { ...(raw as Record<string, unknown>), id: finalId };
     // Admission is decided on the ORIGINAL `data[]` row, before any sibling
     // enrichment. Merging first let a `models[]` entry supply the very field a
     // provider filter requires — reproduced against the real Chutes policy,
@@ -519,7 +585,18 @@ export function extractProviderModelItems(
     // are published, only what is known about an already-admitted one.
     if (!providerModelMatchesDiscoveryFilter(item, discovery.spec?.filter) || seen.has(finalId)) continue;
     seen.add(finalId);
-    items.push(siblings ? enrichAdmittedModel(item, siblings) : item);
+    // Preference, like admission, must not be supplied by sibling enrichment.
+    const target = discovery.spec?.preferFirst?.some(predicate => predicateMatches(raw as ProviderModelsApiItem, predicate))
+      ? preferred : items;
+    target.push(siblings ? enrichAdmittedModel(item, siblings) : item);
   }
-  return { ok: true, items, rawCount: data.length };
+  if (invalidRows > 0 && (!skipInvalidRows || items.length + preferred.length === 0)) {
+    return { ok: false, reason: "invalid_shape", diagnostic: `${firstInvalid}; ${invalidRows} of ${data.length} rows invalid` };
+  }
+  return {
+    ok: true,
+    items: [...preferred, ...items],
+    rawCount: data.length,
+    ...(invalidRows > 0 ? { skippedInvalidRows: invalidRows } : {}),
+  };
 }

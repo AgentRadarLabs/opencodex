@@ -339,6 +339,68 @@ describe("kiro adapter — buildRequest", () => {
     }
   });
 
+  test("a code-mode exec result carrying a host failure string names the broken rule", async () => {
+    // freeform: the Kiro seam annotates only when the emitted catalog is genuinely code mode.
+    const execTool = { name: "exec", description: "Run JavaScript", freeform: true, parameters: { type: "object" } };
+    const failure = "apply_patch verification failed: invalid patch: The first line of the patch must be '*** Begin Patch'";
+    const messages = [
+      { role: "user", content: "run it" },
+      { role: "assistant", content: [{ type: "toolCall", id: "call-x", name: "exec", arguments: {} }] },
+      { role: "toolResult", toolCallId: "call-x", toolName: "exec", content: failure, isError: false },
+    ];
+    const { body } = await createKiroAdapter(provider).buildRequest(parsedWith(messages, [execTool]));
+    const resultText = JSON.parse(body).conversationState.currentMessage.userInputMessage
+      .userInputMessageContext.toolResults[0].content[0].text;
+    expect(resultText).toBe(`${failure}\n[recovery: The patch text must open with the bare marker line \`*** Begin Patch\`: no code fence, prose, or extra asterisks on that line (blank lines or indentation before it are tolerated).]`);
+  });
+
+  test("a host failure string on a non-code-mode catalog stays raw", async () => {
+    const failure = "tool `apply_patch` expects a string input";
+    const messages = [
+      { role: "user", content: "run it" },
+      { role: "assistant", content: [{ type: "toolCall", id: "call-x", name: "exec", arguments: {} }] },
+      { role: "toolResult", toolCallId: "call-x", toolName: "exec", content: failure, isError: false },
+    ];
+    for (const tools of [
+      // A structured tool that merely shares the name exec.
+      [{ name: "exec", description: "Run a shell string", parameters: { type: "object" } }],
+      // Freeform exec beside a bare shell bridge is the flat-catalog shape, not code mode.
+      [
+        { name: "exec", description: "Run JavaScript", freeform: true, parameters: { type: "object" } },
+        { name: "exec_command", description: "Run", parameters: { type: "object" } },
+      ],
+    ]) {
+      const { body } = await createKiroAdapter(provider).buildRequest(parsedWith(messages, tools));
+      const resultText = JSON.parse(body).conversationState.currentMessage.userInputMessage
+        .userInputMessageContext.toolResults[0].content[0].text;
+      expect(resultText).toBe(failure);
+    }
+  });
+
+  test("a host failure chunk in a coalesced group carries its recovery line beside raw siblings", async () => {
+    // Whitespace and a failed-empty wrapper keep their raw grouping policy; only the chunk that
+    // carries a host failure string is substituted (the exact combination review round 1 named).
+    const execTool = { name: "exec", description: "Run JavaScript", freeform: true, parameters: { type: "object" } };
+    const failedExecWrapper = "Script failed\nWall time 0.1 seconds\nOutput:\n";
+    const hostFailure = "tool `apply_patch` expects a string input";
+    const result = (content: string) => ({ role: "toolResult", toolCallId: "call-g", toolName: "exec", content, isError: false });
+    const messages = [
+      { role: "user", content: "run it" },
+      { role: "assistant", content: [{ type: "toolCall", id: "call-g", name: "exec", arguments: {} }] },
+      result("  "), result(hostFailure), result(failedExecWrapper),
+    ];
+    const { body } = await createKiroAdapter(provider).buildRequest(parsedWith(messages, [execTool]));
+    const toolResults = JSON.parse(body).conversationState.currentMessage.userInputMessage
+      .userInputMessageContext.toolResults as Array<{ content: Array<{ text: string }>; status: string }>;
+    expect(toolResults).toHaveLength(1);
+    expect(toolResults[0].status).toBe("success");
+    expect(toolResults[0].content).toEqual([
+      { text: "  " },
+      { text: `${hostFailure}\n[recovery: tools.apply_patch takes exactly one string argument; pass the patch text itself, not an object such as {input: ...}.]` },
+      { text: failedExecWrapper },
+    ]);
+  });
+
   test("real exec output and empty non-exec results are left alone", async () => {
     // Review finding (Codex P2): a failed cell with no output is empty but NOT a success. The
     // success guidance would erase the only failure signal — reachable via Responses history,
@@ -722,7 +784,7 @@ describe("kiro adapter — buildRequest", () => {
       },
     };
     const { body } = await createKiroAdapter(provider).buildRequest(
-      parsedWith([{ role: "user", content: "hi" }], [{ name: "bash", description: "Run command", parameters }]),
+      parsedWith([{ role: "user", content: "hi" }], [{ name: "bash", description: "Run command", parameters }], "gpt-5.6-sol"),
     );
     const schema = JSON.parse(body).conversationState.currentMessage.userInputMessage.userInputMessageContext.tools[0].toolSpecification.inputSchema.json;
 
@@ -749,7 +811,7 @@ describe("kiro adapter — buildRequest", () => {
       required: ["filename", "note"],
     };
     const { body } = await createKiroAdapter(provider).buildRequest(
-      parsedWith([{ role: "user", content: "hi" }], [{ name: "memories__add_ad_hoc_note", description: "Remember", parameters }]),
+      parsedWith([{ role: "user", content: "hi" }], [{ name: "memories__add_ad_hoc_note", description: "Remember", parameters }], "gpt-5.6-sol"),
     );
     const schema = JSON.parse(body).conversationState.currentMessage.userInputMessage.userInputMessageContext.tools[0].toolSpecification.inputSchema.json;
 
@@ -783,7 +845,7 @@ describe("kiro adapter — buildRequest", () => {
       required: ["target", "message"],
     };
     const { body } = await createKiroAdapter(provider).buildRequest(
-      parsedWith([{ role: "user", content: "hi" }], [{ name: "followup_task", namespace: "collaboration", description: "Send follow-up", parameters }]),
+      parsedWith([{ role: "user", content: "hi" }], [{ name: "followup_task", namespace: "collaboration", description: "Send follow-up", parameters }], "gpt-5.6-sol"),
     );
     const schema = JSON.parse(body).conversationState.currentMessage.userInputMessage.userInputMessageContext.tools[0].toolSpecification.inputSchema.json;
 
@@ -805,7 +867,7 @@ describe("kiro adapter — buildRequest", () => {
       $defs: { Inner: { type: "object", properties: { id: { type: "string" } } } },
     };
     const { body } = await createKiroAdapter(provider).buildRequest(
-      parsedWith([{ role: "user", content: "hi" }], [{ name: "memories__read", description: "Read", parameters }]),
+      parsedWith([{ role: "user", content: "hi" }], [{ name: "memories__read", description: "Read", parameters }], "gpt-5.6-sol"),
     );
     const schema = JSON.parse(body).conversationState.currentMessage.userInputMessage.userInputMessageContext.tools[0].toolSpecification.inputSchema.json;
 
@@ -892,7 +954,7 @@ describe("kiro adapter — buildRequest", () => {
   test("root composition preserves root properties/siblings and merges coexisting keywords", async () => {
     const pick = async (schema: unknown) =>
       JSON.parse((await createKiroAdapter(provider).buildRequest(
-        parsedWith([{ role: "user", content: "hi" }], [{ name: "comp2", description: "d", parameters: schema }]),
+        parsedWith([{ role: "user", content: "hi" }], [{ name: "comp2", description: "d", parameters: schema }], "gpt-5.6-sol"),
       )).body).conversationState.currentMessage.userInputMessage.userInputMessageContext.tools[0].toolSpecification.inputSchema.json;
 
     // Root direct properties/required AND a sibling oneOf: keep the root fields, merge the variant.
@@ -1079,6 +1141,275 @@ describe("kiro adapter — buildRequest", () => {
     );
   });
 
+  describe("adjacent Kiro result coalescing (#3734)", () => {
+    const execTool = { name: "exec", description: "Run JavaScript", parameters: { type: "object" } };
+    const pngBytes = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const pngData = "data:image/png;base64," + pngBytes;
+    const emptyExecWrapper = "Script completed\nWall time 0.1 seconds\nOutput:\n";
+    const failedExecWrapper = "Script failed\nWall time 0.1 seconds\nOutput:\n";
+    const longRawId = "call_" + "x".repeat(64);
+    const truncatedRawId = "call_" + "x".repeat(59);
+
+    function execCall(id: string) {
+      return { role: "assistant", content: [{ type: "toolCall", id, name: "exec", arguments: {} }] };
+    }
+    function execResult(id: string, content: unknown, extra: Record<string, unknown> = {}) {
+      return { role: "toolResult" as const, toolCallId: id, toolName: "exec", content, isError: false, ...extra };
+    }
+    function currentUser(body: string) {
+      return JSON.parse(body).conversationState.currentMessage.userInputMessage as {
+        images?: Array<{ format: string; source: { bytes: string } }>;
+        userInputMessageContext: { toolResults: Array<Record<string, unknown> & { content: Array<{ text: string }>; status: string; toolUseId: string }> };
+      };
+    }
+    function expectWireResults(body: string, expected: Array<{ content: Array<{ text: string }>; status: string; toolUseId: string }>) {
+      const results = currentUser(body).userInputMessageContext.toolResults;
+      expect(results).toEqual(expected);
+      for (const result of results) {
+        expect(result).not.toHaveProperty("rawId");
+        expect(result).not.toHaveProperty("count");
+        expect(result).not.toHaveProperty("texts");
+        expect(result).not.toHaveProperty("hasImages");
+        expect(Object.keys(result).sort()).toEqual(["content", "status", "toolUseId"]);
+      }
+      return results;
+    }
+
+    test("parseRequest keeps a complete external task input then coalesces custom exec notify/notify/final", async () => {
+      const raw = {
+        model: "claude-sonnet-4.5",
+        input: [
+          {
+            type: "function_call_output",
+            id: "task_3735",
+            name: "Launch Task",
+            namespace: "agent.workspace",
+            output: "inspect grouping",
+          },
+          { type: "custom_tool_call", call_id: "call_exec_group", name: "exec", input: "await tools.exec_command({cmd: 'ls'})" },
+          { type: "custom_tool_call_output", call_id: "call_exec_group", output: "notify-one" },
+          { type: "custom_tool_call_output", call_id: "call_exec_group", output: "notify-two" },
+          { type: "custom_tool_call_output", call_id: "call_exec_group", output: "final-text" },
+        ],
+        tools: [{ type: "custom", name: "exec", description: "Run JavaScript", format: { type: "text" } }],
+      };
+      const original = structuredClone(raw);
+      const parsed = parseRequest(raw);
+      expect(raw).toEqual(original);
+      expect(parsed.context.messages).toMatchObject([
+        { role: "user", content: "inspect grouping" },
+        { role: "assistant", content: [{ type: "toolCall", id: "call_exec_group", name: "exec" }] },
+        { role: "toolResult", toolCallId: "call_exec_group", toolName: "exec", content: "notify-one" },
+        { role: "toolResult", toolCallId: "call_exec_group", toolName: "exec", content: "notify-two" },
+        { role: "toolResult", toolCallId: "call_exec_group", toolName: "exec", content: "final-text" },
+      ]);
+
+      const messagesBefore = structuredClone(parsed.context.messages);
+      const { body } = await createKiroAdapter(provider).buildRequest(parsed);
+      expect(raw).toEqual(original);
+      expect(parsed.context.messages).toEqual(messagesBefore);
+      expectWireResults(body, [{
+        content: [{ text: "notify-one" }, { text: "notify-two" }, { text: "final-text" }],
+        status: "success",
+        toolUseId: "call_exec_group",
+      }]);
+    });
+
+    test("direct Ocx three same-id results coalesce in order", async () => {
+      const messages = [
+        { role: "user", content: "run it" },
+        execCall("call-x"),
+        execResult("call-x", "notify-one"),
+        execResult("call-x", "notify-two"),
+        execResult("call-x", "final-text"),
+      ];
+      const { body } = await createKiroAdapter(provider).buildRequest(parsedWith(messages, [execTool]));
+      expectWireResults(body, [{
+        content: [{ text: "notify-one" }, { text: "notify-two" }, { text: "final-text" }],
+        status: "success",
+        toolUseId: "call-x",
+      }]);
+    });
+
+    test.each([
+      {
+        name: "image and error stay sticky after a later success",
+        id: "call-sticky",
+        results: [
+          execResult("call-sticky", [
+            { type: "text", text: "caption" },
+            { type: "image", imageUrl: pngData, detail: "high" },
+          ], { isError: true }),
+          execResult("call-sticky", "later-ok"),
+        ],
+        content: [{ text: "caption" }, { text: "later-ok" }],
+        status: "error",
+        images: [{ format: "png", source: { bytes: pngBytes } }],
+        forbidden: [EMPTY_EXEC_OUTPUT_MESSAGE, KIRO_EMPTY_TOOL_RESULT_MESSAGE],
+      },
+      {
+        name: "image-only later output does not inject empty placeholders into text",
+        id: "call-img",
+        results: [
+          execResult("call-img", "visible"),
+          execResult("call-img", [{ type: "image", imageUrl: pngData, detail: "high" }]),
+        ],
+        content: [{ text: "visible" }],
+        status: "success",
+        images: [{ format: "png", source: { bytes: pngBytes } }],
+        forbidden: [EMPTY_EXEC_OUTPUT_MESSAGE, KIRO_EMPTY_TOOL_RESULT_MESSAGE],
+      },
+      {
+        name: "initial empty placeholder is removed once later text exists",
+        id: "call-empty-then-text",
+        results: [execResult("call-empty-then-text", ""), execResult("call-empty-then-text", "later-text")],
+        content: [{ text: "later-text" }],
+        status: "success",
+        forbidden: [EMPTY_EXEC_OUTPUT_MESSAGE, KIRO_EMPTY_TOOL_RESULT_MESSAGE],
+      },
+      {
+        name: "whitespace before and between meaningful chunks is preserved",
+        id: "call-ws",
+        results: [execResult("call-ws", "  "), execResult("call-ws", "alpha"), execResult("call-ws", "\n\t "), execResult("call-ws", "beta")],
+        content: [{ text: "  " }, { text: "alpha" }, { text: "\n\t " }, { text: "beta" }],
+        status: "success",
+      },
+      {
+        name: "later successful empty exec wrapper is skipped",
+        id: "call-skip-empty",
+        results: [execResult("call-skip-empty", "keep-me"), execResult("call-skip-empty", emptyExecWrapper)],
+        content: [{ text: "keep-me" }],
+        status: "success",
+        forbidden: [EMPTY_EXEC_OUTPUT_MESSAGE, KIRO_EMPTY_TOOL_RESULT_MESSAGE, emptyExecWrapper],
+      },
+      {
+        name: "all-empty success group keeps one empty-exec fallback",
+        id: "call-all-empty",
+        results: [execResult("call-all-empty", ""), execResult("call-all-empty", emptyExecWrapper)],
+        content: [{ text: EMPTY_EXEC_OUTPUT_MESSAGE }],
+        status: "success",
+        forbidden: [KIRO_EMPTY_TOOL_RESULT_MESSAGE],
+      },
+      {
+        name: "all-empty image group uses neutral KIRO_EMPTY without an error",
+        id: "call-empty-img",
+        results: [
+          execResult("call-empty-img", [{ type: "image", imageUrl: pngData, detail: "high" }]),
+          execResult("call-empty-img", ""),
+        ],
+        content: [{ text: KIRO_EMPTY_TOOL_RESULT_MESSAGE }],
+        status: "success",
+        images: [{ format: "png", source: { bytes: pngBytes } }],
+        forbidden: [EMPTY_EXEC_OUTPUT_MESSAGE],
+      },
+      {
+        name: "all-empty error group uses neutral KIRO_EMPTY without images",
+        id: "call-empty-error",
+        results: [execResult("call-empty-error", ""), execResult("call-empty-error", "", { isError: true })],
+        content: [{ text: KIRO_EMPTY_TOOL_RESULT_MESSAGE }],
+        status: "error",
+        forbidden: [EMPTY_EXEC_OUTPUT_MESSAGE],
+      },
+      {
+        name: "failed empty wrapper in a multi group stays raw",
+        id: "call-failed-multi",
+        results: [execResult("call-failed-multi", emptyExecWrapper), execResult("call-failed-multi", failedExecWrapper)],
+        content: [{ text: failedExecWrapper }],
+        status: "success",
+        forbidden: [EMPTY_EXEC_OUTPUT_MESSAGE, FAILED_EXEC_OUTPUT_MESSAGE, KIRO_EMPTY_TOOL_RESULT_MESSAGE],
+      },
+      {
+        name: "single empty exec group keeps option-aware fallback",
+        id: "call-single-empty",
+        results: [execResult("call-single-empty", emptyExecWrapper)],
+        content: [{ text: EMPTY_EXEC_OUTPUT_MESSAGE }],
+        status: "success",
+        forbidden: [KIRO_EMPTY_TOOL_RESULT_MESSAGE],
+      },
+      {
+        name: "exact unusual raw pair still normalizes and coalesces",
+        id: "pipe|raw",
+        results: [execResult("pipe|raw", "left"), execResult("pipe|raw", "right")],
+        content: [{ text: "left" }, { text: "right" }],
+        status: "success",
+        toolUseId: "pipe_raw",
+      },
+    ])("$name", async ({ id, results, content, status, images, forbidden, toolUseId }) => {
+      const messages = [{ role: "user", content: "run it" }, execCall(id), ...results];
+      const original = structuredClone(messages);
+      const { body } = await createKiroAdapter(provider).buildRequest(parsedWith(messages, [execTool]));
+      expect(messages).toEqual(original);
+      const current = currentUser(body);
+      expectWireResults(body, [{ content, status, toolUseId: toolUseId ?? id }]);
+      if (images) expect(current.images).toEqual(images);
+      const joined = current.userInputMessageContext.toolResults.flatMap(result => result.content.map(part => part.text)).join("\n");
+      for (const token of forbidden ?? []) expect(joined).not.toContain(token);
+    });
+
+    test("A/B/A same-id repeat still fails the final validator", async () => {
+      const messages = [
+        { role: "user", content: "run it" },
+        { role: "assistant", content: [
+          { type: "toolCall", id: "call-a", name: "exec", arguments: {} },
+          { type: "toolCall", id: "call-b", name: "exec", arguments: {} },
+        ] },
+        execResult("call-a", "first-a"),
+        execResult("call-b", "first-b"),
+        execResult("call-a", "second-a"),
+      ];
+      await expect(createKiroAdapter(provider).buildRequest(parsedWith(messages, [execTool]))).rejects.toThrow(
+        "Kiro tool result has no matching tool use",
+      );
+    });
+
+    test.each([
+      { name: "user", barrier: { role: "user", content: "steer" } },
+      { name: "developer", barrier: { role: "developer", content: "note" } },
+      { name: "assistant", barrier: { role: "assistant", content: [{ type: "text", text: "mid" }] } },
+      { name: "reasoning-only assistant", barrier: { role: "assistant", content: [{ type: "thinking", thinking: "plan" }] } },
+    ])("$name barrier prevents coalescing the later same-id result", async ({ barrier }) => {
+      const messages = [
+        { role: "user", content: "run it" },
+        execCall("call-x"),
+        execResult("call-x", "before"),
+        barrier,
+        execResult("call-x", "after"),
+      ];
+      await expect(createKiroAdapter(provider).buildRequest(parsedWith(messages, [execTool]))).rejects.toThrow(
+        "Kiro tool result has no matching tool use",
+      );
+    });
+
+    test("later encrypted output throws before grouping even with the same raw id", async () => {
+      const messages = [
+        { role: "user", content: "run it" },
+        execCall("call-x"),
+        execResult("call-x", "before"),
+        execResult("call-x", "opaque", { containsEncryptedContent: true }),
+      ];
+      await expect(createKiroAdapter(provider).buildRequest(parsedWith(messages, [execTool]))).rejects.toThrow(
+        "cannot translate encrypted output",
+      );
+    });
+
+    test.each([
+      { name: "pipe vs underscore", callId: "call|raw", resultId: "call_raw" },
+      { name: "whitespace vs underscore", callId: "call raw", resultId: "call_raw" },
+      { name: "truncation", callId: longRawId, resultId: truncatedRawId },
+      { name: "case", callId: "Call-Raw", resultId: "call-Raw" },
+      { name: "empty result id", callId: "call-x", resultId: "" },
+    ])("raw id mismatch ($name) remains orphaned", async ({ callId, resultId }) => {
+      const messages = [
+        { role: "user", content: "run it" },
+        execCall(callId),
+        execResult(resultId, "nope"),
+      ];
+      await expect(createKiroAdapter(provider).buildRequest(parsedWith(messages, [execTool]))).rejects.toThrow(
+        "orphaned tool result",
+      );
+    });
+  });
+
   test("adjacent user/developer and assistant items normalize without synthetic prose", async () => {
     const messages = [
       { role: "developer", content: "first" },
@@ -1135,11 +1466,6 @@ describe("kiro adapter — buildRequest", () => {
         options,
       } as OcxParsedRequest)).rejects.toThrow(/Kiro (supports only|does not support)/);
     }
-
-    await expect(createKiroAdapter(provider).buildRequest({
-      ...parsedWith([{ role: "user", content: "hi" }], [bashTool]),
-      _structuredOutput: true,
-    } as OcxParsedRequest)).rejects.toThrow("Kiro does not support Responses structured output");
 
     const none = { ...parsedWith([{ role: "user", content: "hi" }], [bashTool]), options: { toolChoice: "none" } } as OcxParsedRequest;
     const current = JSON.parse((await createKiroAdapter(provider).buildRequest(none)).body).conversationState.currentMessage.userInputMessage;
@@ -1199,22 +1525,7 @@ describe("kiro adapter — buildRequest", () => {
     }
   });
 
-  test("still refuses genuine structured output", async () => {
-    for (const text of [
-      { format: { type: "json_schema", name: "answer", schema: { type: "object" } } },
-      { format: { type: "json_object" } },
-    ]) {
-      const parsed = parseRequest({
-        model: "kiro/claude-haiku-4.5",
-        input: "test",
-        stream: true,
-        text,
-      } as never);
-      expect(parsed._structuredOutput).toBe(true);
-      await expect(createKiroAdapter(provider).buildRequest(parsed))
-        .rejects.toThrow("Kiro does not support Responses structured output");
-    }
-  });
+  // Genuine structured output is emulated, not refused: kiro-structured-output.test.ts owns it.
 
   test("accepts Codex's permissive parallel-tool hint while keeping the Kiro wire serialized", async () => {
     const parsed = parseRequest({
@@ -1349,7 +1660,7 @@ describe("kiro adapter — native and emulated reasoning effort", () => {
   test("mid-turn steering reaches Kiro identically for opus-5 and opus-4.8", async () => {
     // The #543 reporter observed opus-4.8 honoring mid-turn steers while opus-5 ignored them on
     // the same proxy build. Pin that our request construction does not differ between the two
-    // beyond model identity and opus-5's native effort field, so a future model-conditional
+    // beyond model identity and the native effort field both now carry, so a future model-conditional
     // regression on this path is caught here rather than in a user's session.
     const steer = "Stop and switch approach now.";
     const messages = [
@@ -1375,10 +1686,9 @@ describe("kiro adapter — native and emulated reasoning effort", () => {
         { content: [{ text: "out" }], status: "success", toolUseId: "call-1" },
       ]);
     }
-    // Only the native-effort field may differ; opus-4.8 also gets no emulated thinking tags
-    // here because tool-result turns skip that injection.
+    // Both carry the same native effort field, and neither gets emulated thinking tags.
     expect(opus5.additionalModelRequestFields).toEqual({ output_config: { effort: "high" } });
-    expect(opus48.additionalModelRequestFields).toBeUndefined();
+    expect(opus48.additionalModelRequestFields).toEqual({ output_config: { effort: "high" } });
     expect(opus48.conversationState.currentMessage.userInputMessage.content).not.toContain("<thinking_mode>");
   });
 
@@ -1410,11 +1720,28 @@ describe("kiro adapter — native and emulated reasoning effort", () => {
   });
 
   test("native-effort models reject efforts Kiro does not accept", async () => {
-    for (const modelId of ["gpt-5.6-sol", "claude-opus-5"]) {
+    for (const modelId of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-sol", "gpt-6-luna", "claude-opus-5", "claude-opus-5.5"]) {
       await expect(createKiroAdapter(provider).buildRequest({
         ...parsedWith([{ role: "user", content: "solve" }], undefined, modelId),
         options: { reasoning: "minimal" },
       })).rejects.toThrow(`Kiro ${modelId} does not support reasoning effort "minimal"`);
+    }
+  });
+
+  test("Claude models newly given native effort keep the emulated block for minimal", async () => {
+    for (const modelId of ["claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-sonnet-5.5", "claude-sonnet-5", "claude-sonnet-4.6", "claude-haiku-5.5"]) {
+      const body = JSON.parse((await createKiroAdapter(provider).buildRequest({
+        ...parsedWith([{ role: "user", content: "solve" }], undefined, modelId),
+        options: { reasoning: "minimal", maxOutputTokens: 1000 },
+      })).body);
+
+      expect(body.additionalModelRequestFields).toBeUndefined();
+      // Both halves of the emulated block, not just the budget: a fallback that only prepended the
+      // length tag would leave `minimal` below the model's own thinking default without saying so.
+      const content = body.conversationState.currentMessage.userInputMessage.content;
+      expect(content).toContain("<thinking_mode>enabled</thinking_mode>");
+      expect(content).toContain("<max_thinking_length>100</max_thinking_length>");
+      expect(content).toContain("<thinking_instruction>");
     }
   });
 });
@@ -1437,16 +1764,13 @@ describe("kiro adapter — per-model context windows (kiro.dev/docs/models)", ()
   });
 
   test("1M-context models map to 1_000_000", () => {
-    for (const id of ["claude-sonnet-5", "claude-opus-5", "claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-sonnet-4.6"]) {
+    for (const id of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "claude-haiku-5.5", "claude-sonnet-5.5", "claude-sonnet-5", "claude-opus-5.5", "claude-opus-5", "claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-sonnet-4.6"]) {
       expect(kiro.models ?? []).toContain(id);
       expect(cw[id]).toBe(1_000_000);
     }
   });
 
   test("smaller-context models match Kiro's published limits", () => {
-    expect(cw["gpt-5.6-sol"]).toBe(272_000);
-    expect(cw["gpt-5.6-terra"]).toBe(272_000);
-    expect(cw["gpt-5.6-luna"]).toBe(272_000);
     expect(cw["claude-opus-4.5"]).toBe(200_000);
     expect(cw["claude-sonnet-4.5"]).toBe(200_000);
     expect(cw["claude-sonnet-4.0"]).toBe(200_000);
@@ -1554,6 +1878,8 @@ describe("kiro code-mode catalog nudge", () => {
     // Reaches the ACTUAL Kiro wire prompt, not just the builder: the live 2026-08-28 session that
     // misread a blank result was a routed Kiro turn.
     expect(content).toContain("Nothing in the isolate is echoed automatically");
+    // Survives Kiro's 16 384-char injected-instruction bound on the real wire prompt.
+    expect(content).toContain("Host contract for the nested helpers");
     // The generic fallback must be gone, not merely accompanied.
     expect(content).not.toContain("If a listed tool exposes nested helpers such as a tools.* API");
   });

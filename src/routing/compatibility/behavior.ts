@@ -4,6 +4,7 @@ import type { OcxConfig, OcxProviderConfig } from "../../types";
 import { PROVIDER_REGISTRY } from "../../providers/registry";
 import { fastPolicyForModel, serviceTierSupportFromPolicy } from "../../providers/service-tier";
 import { resolveProviderAuthTransport } from "../../providers/fastwire";
+import { defaultAnthropicCacheRetention } from "../../adapters/anthropic/cache-retention";
 import { localFingerprint } from "../../lab/digest";
 import type { LabBehaviorSource, LabBehaviorValues } from "../../lab/live/types";
 
@@ -14,6 +15,7 @@ export function upstreamProtocolForAdapter(adapter: string): string {
     case "openai-chat":
     case "command-code":
     case "cursor":
+    case "devin":
     case "azure":
     case "azure-openai":
     case "kiro":
@@ -147,6 +149,7 @@ export function resolveProductionBehaviorValues(
     "wire.adapter": behaviorRow("provider_config", adapter),
     "wire.upstreamProtocol": behaviorRow("provider_config", upstreamProtocol),
     "wire.responsesPath": behaviorRow("provider_config", effective.responsesPath ?? null),
+    "wire.chatCompletionsPath": behaviorRow("provider_config", effective.chatCompletionsPath ?? null),
     "wire.commandCodeVersion": behaviorRow("provider_config", effective.commandCodeVersion ?? null),
     "wire.modelSuffixMode": behaviorRow(
       "provider_config",
@@ -198,6 +201,12 @@ export function resolveProductionBehaviorValues(
         : reasoningEfforts.length > 0 || Boolean(registryEntry?.reasoningEfforts),
     ),
     "reasoning.efforts": behaviorRow("provider_config", reasoningEfforts),
+    // Whether the configured ladder above is what the WIRE uses, or only what the catalog
+    // advertises. An adapter shipping its own per-model table (command-code) otherwise wins for
+    // models it knows, and it also repairs a refused rung by replaying without the effort. Two
+    // routes that disagree about this send different bytes and recover differently, so they are
+    // not the same compatibility subject and must not share evidence.
+    "reasoning.effortsAuthoritative": behaviorRow("provider_config", effective.modelReasoningEffortsAuthoritative === true),
     "reasoning.defaultEffort": behaviorRow("provider_config", defaultReasoningEffort),
     "reasoning.effortMap": behaviorRow("provider_config", reasoningEffortMap),
     "reasoning.wireFormat": behaviorRow("provider_config", effective.reasoningWireFormat ?? null),
@@ -207,6 +216,9 @@ export function resolveProductionBehaviorValues(
     }),
     "reasoning.replayMode": behaviorRow("provider_config", {
       preserveResponses: effective.preserveResponsesReasoningContent === true,
+      // Dropping replayed reasoning items changes the continuation body, so two routes that
+      // disagree about it are not the same compatibility subject and must not share evidence.
+      dropResponses: effective.dropResponsesReasoningItems === true,
       preserveContent: includesModel(effective.preserveReasoningContentModels, modelId),
       placeholder: includesModel(effective.requiresReasoningPlaceholderModels, modelId),
     }),
@@ -226,7 +238,9 @@ export function resolveProductionBehaviorValues(
     }),
     "tools.builtinNameEscaping": behaviorRow("provider_config", effective.escapeBuiltinToolNames === true),
     "cache.forwarding": behaviorRow("provider_config", effective.promptCacheKey === true),
-    "cache.retention": behaviorRow("global_config", config.cacheRetention ?? "short"),
+    // The wire TTL, not just the setting: an omitted value means 1h on first-party Anthropic.
+    "cache.retention": behaviorRow("global_config", config.cacheRetention
+      ?? (adapter === "anthropic" ? defaultAnthropicCacheRetention(effective) : "short")),
     "anthropic.eofPolicy": behaviorRow("provider_config", effective.anthropicEofTolerance === true ? "tolerant" : "strict"),
     "openai-chat.eofPolicy": behaviorRow("provider_config", effective.openaiChatEofTolerance === true ? "tolerant" : "strict"),
     "google.mode": behaviorRow("provider_config", effective.googleMode ?? null),

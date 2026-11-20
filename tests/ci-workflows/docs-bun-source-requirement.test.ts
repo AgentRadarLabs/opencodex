@@ -3,8 +3,8 @@ import { repoPath } from "../helpers/repo-root";
 
 /**
  * Every contributor entry point must say that building from source needs a local `bun`, and
- * must keep that separate from the bundled runtime that ships inside the npm package. Users
- * who install `ocx` never need their own Bun; contributors always do.
+ * explain the bundled runtime and package-script PATH shadowing. Users who install `ocx`
+ * never need their own Bun; contributors need the CLI and the separately pinned test runner.
  *
  * Each file is checked as one whole normalized paragraph rather than as scattered fragments.
  * Matching fragments independently across a whole file passes even after the explanatory
@@ -19,20 +19,20 @@ const CASES = [
     path: "CONTRIBUTING.md",
     paragraph:
       "Source development requires the `bun` CLI on your `PATH`. The published npm package bundles its own"
-      + " Bun runtime for end users, but contributor commands such as `bun install`, `bun run test`, and"
-      + " `bun run prepush` run from your local Bun installation.",
+      + " Bun runtime for end users. Package scripts such as `bun run test` and `bun run prepush` may resolve"
+      + " Bun through that bundled dependency.",
   },
   {
     path: "README.md",
     paragraph:
-      "Source development requires the `bun` CLI on your `PATH`. This is separate from the published npm"
-      + " package's bundled Bun runtime, which is used only by installed `ocx` commands.",
+      "Source development requires the `bun` CLI on your `PATH`. The published npm package bundles its own"
+      + " Bun runtime for installed `ocx` commands; package scripts may also resolve Bun through that bundled dependency.",
   },
   {
     path: "docs-site/src/content/docs/contributing.md",
     paragraph:
       "Source development requires the `bun` CLI on your `PATH`. The published npm package bundles its own"
-      + " Bun runtime for users, but this checkout's scripts run through your local Bun installation.",
+      + " Bun runtime for users; package scripts may resolve Bun through that bundled dependency.",
   },
 ] as const;
 
@@ -50,5 +50,46 @@ test("source development docs require a local Bun CLI while preserving the bundl
   for (const entry of CASES) {
     const text = await Bun.file(repoPath(entry.path)).text();
     expect(normalizedRequirementParagraph(text)).toBe(entry.paragraph);
+  }
+});
+
+test("contributor docs report the test and shipped Bun pins from package.json", async () => {
+  const pkg = await Bun.file(repoPath("package.json")).json();
+  for (const path of ["CONTRIBUTING.md", "docs-site/src/content/docs/contributing.md"]) {
+    const text = await Bun.file(repoPath(path)).text();
+    const versions = /The suite uses Bun (\d+\.\d+\.\d+) \([^)]*testRunnerBun[^)]*\) while the shipped runtime is (\d+\.\d+\.\d+)\./.exec(text);
+    expect(versions?.slice(1)).toEqual([pkg.testRunnerBun, pkg.dependencies.bun]);
+  }
+  const spanish = await Bun.file(repoPath("docs-site/src/content/docs/es/contributing.md")).text();
+  const versions = /La suite usa Bun (\d+\.\d+\.\d+),[^\n]*entorno de ejecución distribuido es (\d+\.\d+\.\d+)\./.exec(spanish);
+  expect(versions?.slice(1)).toEqual([pkg.testRunnerBun, pkg.dependencies.bun]);
+});
+
+test("architecture transport notes identify the current bundle and historical runtime", async () => {
+  const pkg = await Bun.file(repoPath("package.json")).json();
+  for (const [path, statement] of [
+    ["reference/architecture.md", /current package bundles Bun \*\*(\d+\.\d+\.\d+)\*\*/],
+    ["es/reference/architecture.md", /paquete actual incluye Bun \*\*(\d+\.\d+\.\d+)\*\*/],
+    ["fr/reference/architecture.md", /package actuel inclut Bun \*\*(\d+\.\d+\.\d+)\*\*/],
+    ["ko/reference/architecture.md", /현재 패키지에는 Bun \*\*(\d+\.\d+\.\d+)\*\*/],
+  ] as const) {
+    const text = await Bun.file(repoPath(`docs-site/src/content/docs/${path}`)).text();
+    expect(statement.exec(text)?.[1], path).toBe(pkg.dependencies.bun);
+    expect(text, path).not.toMatch(/Bundled Bun 1\.3\.14|El Bun 1\.3\.14 incluido/);
+  }
+});
+
+test("Windows memory guidance reports the shipped runtime in every current-bundle statement", async () => {
+  const pkg = await Bun.file(repoPath("package.json")).json();
+  const cases = [
+    ["troubleshooting/windows-memory.md", /current package bundles Bun\s*\**(\d+\.\d+\.\d+)/g],
+    ["es/troubleshooting/windows-memory.md", /(?:paquete actual incluye Bun|incluye Bun)\s*\**(\d+\.\d+\.\d+)/g],
+  ] as const;
+  for (const [path, statement] of cases) {
+    const text = await Bun.file(repoPath(`docs-site/src/content/docs/${path}`)).text();
+    const versions = [...text.matchAll(statement)].map(match => match[1]);
+    expect(versions.length, `${path} intro and recovery guidance`).toBe(2);
+    expect(versions, path).toEqual([pkg.dependencies.bun, pkg.dependencies.bun]);
+    expect(text, `${path} historical investigation remains historical`).toContain("1.3.14");
   }
 });

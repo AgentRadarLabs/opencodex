@@ -1,4 +1,6 @@
 import type { OcxContentPart, OcxTextContent } from "../types";
+import { audioContentFromRaw } from "./audio";
+import { inlineDocumentFromDataUrl } from "./inline-document";
 
 export function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -8,12 +10,27 @@ type InputBlock =
   | { type: "input_text"; text: string }
   | { type: "text"; text: string }
   | { type: "input_image"; image_url?: string; file_id?: string; detail?: string }
-  | { type: "input_video"; video_url?: string }
+  | { type: "input_video"; video_url?: string; processing?: string }
+  // codex-rs protocol/src/models.rs sends audio as input_audio with an audio_url.
+  | { type: "input_audio"; audio_url?: string; format?: string }
   | { type: "input_file"; file_id?: string; filename?: string; file_data?: string };
 
 /** A usable reference string, or undefined. Empty strings and non-strings are not references. */
 function nonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/**
+ * An audio format label safe to render into model-visible prose.
+ *
+ * `format` is caller-controlled and unbounded in the schema, so interpolating it
+ * verbatim would let a request park newlines, injected instructions, or a signed URL
+ * inside text the model reads as trusted proxy output. Only a short alphanumeric
+ * token is echoed; anything else degrades to the bare marker.
+ */
+function safeAudioFormat(value: unknown): string | undefined {
+  const raw = nonEmptyString(value);
+  return raw !== undefined && /^[a-z0-9]{1,12}$/i.test(raw) ? raw : undefined;
 }
 
 export function inputContentParts(blocks: unknown): string | OcxContentPart[] {
@@ -46,7 +63,20 @@ export function inputContentParts(blocks: unknown): string | OcxContentPart[] {
       // the request never carried, which is worse than dropping malformed input.
     } else if (block.type === "input_video") {
       const videoUrl = nonEmptyString(block.video_url);
-      if (videoUrl) parts.push({ type: "video", videoUrl });
+      const processing = nonEmptyString((block as { processing?: string }).processing);
+      if (videoUrl) parts.push({ type: "video", videoUrl, ...(processing ? { processing } : {}) });
+    } else if (block.type === "input_audio") {
+      const b = block as { audio_url?: string; format?: string };
+      // Keep bytes only when they have a Chat-compatible inline form. Unsupported or
+      // remote references retain a marker for text-only wires; the final adapter guard
+      // refuses them rather than allowing a silent drop.
+      const audio = audioContentFromRaw(b.audio_url, b.format);
+      if (audio) {
+        parts.push(audio);
+      } else if (nonEmptyString(b.audio_url)) {
+        const format = safeAudioFormat(b.format);
+        parts.push({ type: "text", text: format ? `[audio: ${format}]` : "[audio]" });
+      }
     } else if (block.type === "input_file") {
       const b = block as { file_id?: string; filename?: string; file_data?: string };
       const fileId = nonEmptyString(b.file_id);
@@ -55,14 +85,19 @@ export function inputContentParts(blocks: unknown): string | OcxContentPart[] {
       if (fileId) {
         parts.push({ type: "text", text: `[file: ${fileId}]` });
       } else if (fileData) {
-        // Inline file_data is often large base64. Preserve only its presence and name, never bytes.
-        parts.push({ type: "text", text: filename ? `[file: ${filename}]` : "[file: inline data]" });
+        // Inline bytes used to be reduced to a name here, which meant no adapter could forward
+        // the attachment even to a target that has a representation for it, and a title-only
+        // forward came back as a confident answer about a document the model never saw (#5212).
+        // The marker survives on the part for every wire that still cannot carry one. Bytes with
+        // no declared media type are not decodable into a document and keep the marker they had.
+        const document = inlineDocumentFromDataUrl(fileData, filename);
+        parts.push(document ?? { type: "text", text: filename ? `[file: ${filename}]` : "[file: inline data]" });
       }
       // A bare filename is not a file resource in the Responses schema, so omit it rather than
       // fabricating a "[file: ...]" marker for an attachment that was never sent.
     }
   }
-  // Collapse to a plain string only for a single TEXT part; images must stay structured.
+  // Collapse to a plain string only for a single TEXT part; media must stay structured.
   if (parts.length === 1 && parts[0].type === "text") return parts[0].text;
   return parts;
 }
@@ -87,15 +122,15 @@ export function outputTextOf(blocks: unknown): OcxTextContent[] {
 }
 
 /**
- * Tool-call output content. Preserves images (e.g. Codex `view_image` returns
- * `input_image` items): returns content parts when any image is present, else a plain joined string.
- * Never inlines an image_url as text (that would explode the token count).
+ * Tool-call output content. Preserves images (e.g. Codex `view_image` returns)
+ * and inline audio: returns content parts when either is present, else a plain joined string.
+ * Never inlines an image_url or audio payload as text (that would explode the token count).
  */
 export function outputToToolResultContent(output: string | unknown[] | undefined): string | OcxContentPart[] {
   if (typeof output === "string") return output;
   if (!Array.isArray(output)) return "";
   const parts: OcxContentPart[] = [];
-  let hasImage = false;
+  let hasMedia = false;
   for (const raw of output) {
     if (!isObj(raw)) continue;
     if (raw.type === "output_text" || raw.type === "text" || raw.type === "input_text") {
@@ -107,16 +142,25 @@ export function outputToToolResultContent(output: string | unknown[] | undefined
       const fileId = nonEmptyString(raw.file_id);
       if (imageUrl) {
         parts.push({ type: "image", imageUrl, ...(typeof raw.detail === "string" ? { detail: normalizeImageDetail(raw.detail) } : {}) });
-        hasImage = true;
+        hasMedia = true;
       } else if (fileId) {
         parts.push({ type: "text", text: `[image: ${fileId}]` });
+      }
+    } else if (raw.type === "input_audio") {
+      const audio = audioContentFromRaw(raw.audio_url, raw.format);
+      if (audio) {
+        parts.push(audio);
+        hasMedia = true;
+      } else if (nonEmptyString(raw.audio_url)) {
+        const format = safeAudioFormat(raw.format);
+        parts.push({ type: "text", text: format ? `[audio: ${format}]` : "[audio]" });
       }
     } else if (raw.type === "encrypted_content") {
       // codex-rs FunctionCallOutputContentItem::EncryptedContent — opaque to routed models.
       parts.push({ type: "text", text: "[encrypted content omitted]" });
     }
   }
-  if (!hasImage) return parts.map(p => (p.type === "text" ? p.text : "")).join("");
+  if (!hasMedia) return parts.map(p => (p.type === "text" ? p.text : "")).join("");
   return parts;
 }
 

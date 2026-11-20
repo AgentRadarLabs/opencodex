@@ -111,6 +111,7 @@ export function derivePassiveProductionSignals(
 
   scan: for (let rowIndex = scanRows.length - 1; rowIndex >= 0; rowIndex--) {
     const entry = scanRows[rowIndex]!;
+    // Only real upstream sends are production evidence; the first send of an ordinal wins.
     const attempts = physicalUsageAttempts(entry.attempts ?? []);
     for (let attemptIndex = attempts.length - 1; attemptIndex >= 0; attemptIndex--) {
       const signal = signalFor(entry, attempts[attemptIndex]!);

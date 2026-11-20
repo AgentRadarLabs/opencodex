@@ -2,7 +2,7 @@ import { collectResponsesToolGroups } from "../responses/tool-groups";
 import { relaySseWithPayloadRewrite, type SsePayloadRewrite } from "./sse-payload-rewrite";
 import type { TranslatorBudget } from "../lib/translator-budget";
 
-interface NamespacedTool {
+export interface NamespacedTool {
   namespace: string;
   name: string;
 }
@@ -61,7 +61,7 @@ export function imageGenToolCallAliases(
 }
 
 /** Recursively restore only exact image-gen function-call aliases in a parsed Responses payload. */
-function restoreImageGenCalls(
+export function restoreImageGenCalls(
   value: unknown,
   aliases: ReadonlyMap<string, NamespacedTool>,
 ): { value: unknown; changed: boolean } {

@@ -1,3 +1,5 @@
+import { canConfigureResponsesReasoningReplay } from "./responses-reasoning-replay";
+
 export interface ProviderPayloadForm {
   name: string;
   adapter: string;
@@ -8,6 +10,10 @@ export interface ProviderPayloadForm {
   apiKeyTransport?: "x-api-key" | "bearer";
   defaultModel: string;
   allowPrivateNetwork?: boolean;
+  preserveResponsesReasoningContent?: boolean;
+  googleMode?: "vertex";
+  project?: string;
+  location?: string;
 }
 
 export interface ProviderPostPreset {
@@ -78,6 +84,11 @@ export interface ProviderPayload {
   authMode?: "key" | "forward" | "oauth";
   codexAccountMode?: "pool" | "direct";
   allowPrivateNetwork?: boolean;
+  preserveResponsesReasoningContent?: boolean;
+  googleMode?: "vertex";
+  project?: string;
+  location?: string;
+  liveModels?: boolean;
 }
 
 export function buildProviderPayload(form: ProviderPayloadForm): ProviderPayload {
@@ -88,6 +99,12 @@ export function buildProviderPayload(form: ProviderPayloadForm): ProviderPayload
 
   if (form.responsesPath?.trim()) {
     provider.responsesPath = form.responsesPath.trim();
+  }
+  if (form.adapter.trim() === "google" && form.googleMode === "vertex") {
+    provider.googleMode = "vertex";
+    provider.liveModels = false;
+    if (form.project?.trim()) provider.project = form.project.trim();
+    if (form.location?.trim()) provider.location = form.location.trim();
   }
   if (form.authMode === "key" || form.authMode === "forward") {
     provider.authMode = form.authMode;
@@ -103,6 +120,9 @@ export function buildProviderPayload(form: ProviderPayloadForm): ProviderPayload
   }
   if (form.allowPrivateNetwork) {
     provider.allowPrivateNetwork = true;
+  }
+  if (canConfigureResponsesReasoningReplay(form) && form.preserveResponsesReasoningContent === true) {
+    provider.preserveResponsesReasoningContent = true;
   }
 
   return provider;

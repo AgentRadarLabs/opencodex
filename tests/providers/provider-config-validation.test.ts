@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { providerManagementConfigError } from "../../src/server/auth-cors";
+import { providerConfigSchema } from "../../src/config/schema/leaf-validators";
 import {
   apiKeyTransportConfigError,
   booleanRecordConfigError,
+  mergeModelCapabilities,
   modelAdapterRecordConfigError,
+  modelCapabilitiesConfigError,
   modelDisplayNamesConfigError,
   nonBlankStringArrayConfigError,
   normalizeNonBlankStringArray,
@@ -10,11 +14,84 @@ import {
   positiveIntegerRecordConfigError,
   providerBaseUrlConfigError,
   providerHeadersConfigError,
+  projectContextConfigError,
   reasoningSummaryDeliveryRecordConfigError,
+  sanitizeModelCapabilitiesForLoad,
   upstreamHttpVersionConfigError,
 } from "../../src/config/provider-validation";
 
 describe("provider config validation leaf", () => {
+  test("DeepSeek upload consent is a bounded exact-model allowlist at load and write boundaries", () => {
+    const base = { adapter: "openai-responses", baseUrl: "https://api.deepseek.com", authMode: "key" };
+    for (const value of [
+      undefined,
+      { "deepseek-flash": { deepseekImageFiles: true } },
+      { "deepseek-future-vision": { deepseekImageFiles: false } },
+    ]) {
+      const candidate = { ...base, modelCapabilities: value };
+      expect(providerConfigSchema.safeParse(candidate).success).toBe(true);
+      expect(providerManagementConfigError("deepseek", candidate)).toBeNull();
+    }
+    for (const value of [
+      { "deepseek-flash": { deepseekImageFiles: "yes" } },
+      { "deepseek-flash": { deepseekImageFiles: null } },
+      { " deepseek-flash ": { deepseekImageFiles: true } },
+    ]) {
+      const candidate = { ...base, modelCapabilities: value };
+      expect(providerConfigSchema.safeParse(candidate).success).toBe(false);
+      expect(providerManagementConfigError("deepseek", candidate)).toContain("modelCapabilities");
+    }
+    expect(modelCapabilitiesConfigError({ "deepseek-flash": { deepseekImageFiles: null } }, true)).toBeNull();
+    const merged = mergeModelCapabilities(
+      { "deepseek-flash": { inputModalities: ["text", "image"], deepseekImageFiles: true } },
+      { "deepseek-flash": { deepseekImageFiles: null } },
+    );
+    expect(merged).toEqual({ "deepseek-flash": { inputModalities: ["text", "image"] } });
+    expect(mergeModelCapabilities(
+      { "deepseek-flash": { deepseekImageFiles: true } },
+      { "deepseek-flash": { deepseekImageFiles: null } },
+    )).toBeUndefined();
+    expect(sanitizeModelCapabilitiesForLoad({
+      "deepseek-flash": { deepseekImageFiles: true },
+      "broken": { deepseekImageFiles: "yes", contextTier: "long_context" },
+    })).toEqual({
+      "deepseek-flash": { deepseekImageFiles: true },
+      "broken": { contextTier: "long_context" },
+    });
+  });
+
+  test("Responses custom-tool support is a strict exact-model boolean capability", () => {
+    const base = { adapter: "openai-responses", baseUrl: "https://gateway.example/v1", authMode: "key" };
+    const valid = { ...base, modelCapabilities: { gpt: { responsesCustomTools: true }, claude: { responsesCustomTools: false } } };
+    expect(providerConfigSchema.safeParse(valid).success).toBe(true);
+    expect(providerManagementConfigError("gateway", valid)).toBeNull();
+    const invalid = { ...base, modelCapabilities: { claude: { responsesCustomTools: "false" } } };
+    expect(providerConfigSchema.safeParse(invalid).success).toBe(false);
+    expect(providerManagementConfigError("gateway", invalid)).toContain("boolean");
+    expect(mergeModelCapabilities(
+      { claude: { inputModalities: ["text"], responsesCustomTools: false } },
+      { claude: { responsesCustomTools: null } },
+    )).toEqual({ claude: { inputModalities: ["text"] } });
+  });
+
+  test("Mistral image caps are bounded integers that PATCH can clear", () => {
+    const base = { adapter: "openai-chat", baseUrl: "https://api.mistral.ai/v1", authMode: "key" };
+    for (const value of [{ "deepseek-v4-1-flash-1017": { mistralMaxImages: 20 } }, { "mistral-medium-latest": { mistralMaxImages: 1 } }]) {
+      const candidate = { ...base, modelCapabilities: value };
+      expect(providerConfigSchema.safeParse(candidate).success).toBe(true);
+      expect(providerManagementConfigError("mistral", candidate)).toBeNull();
+    }
+    for (const mistralMaxImages of [0, 1001, 8.5, "20", null]) {
+      const candidate = { ...base, modelCapabilities: { "m": { mistralMaxImages } } };
+      expect(providerConfigSchema.safeParse(candidate).success).toBe(false);
+      expect(providerManagementConfigError("mistral", candidate)).toContain("modelCapabilities");
+    }
+    expect(mergeModelCapabilities({ m: { mistralMaxImages: 20, contextTier: "default" } }, { m: { mistralMaxImages: null } }))
+      .toEqual({ m: { contextTier: "default" } });
+    expect(sanitizeModelCapabilitiesForLoad({ m: { mistralMaxImages: 20 }, broken: { mistralMaxImages: -1, contextTier: "default" } }))
+      .toEqual({ m: { mistralMaxImages: 20 }, broken: { contextTier: "default" } });
+  });
+
   test("accepts only credential-free HTTP(S) base URLs", () => {
     expect(providerBaseUrlConfigError("https://example.test/v1")).toBeNull();
     expect(providerBaseUrlConfigError("file:///tmp/provider")).toBe("baseUrl must be an http(s) URL");
@@ -36,6 +113,16 @@ describe("provider config validation leaf", () => {
     expect(apiKeyTransportConfigError({ adapter: "openai-chat", authMode: "key", apiKeyTransport: "bearer" })).toContain("anthropic adapter");
     expect(apiKeyTransportConfigError({ adapter: "anthropic", authMode: "oauth", apiKeyTransport: "bearer" })).toContain("API-key authentication");
     expect(apiKeyTransportConfigError({ adapter: "anthropic", authMode: "key", apiKeyTransport: "invalid" as "bearer" })).toContain("x-api-key");
+  });
+
+  test("accepts projectContext only on the native Command Code adapter", () => {
+    const base = { adapter: "command-code", baseUrl: "https://api.commandcode.ai" };
+    expect(providerConfigSchema.safeParse({ ...base, projectContext: "on" }).success).toBe(true);
+    expect(providerConfigSchema.safeParse({ ...base, projectContext: "off" }).success).toBe(true);
+    expect(providerConfigSchema.safeParse({ ...base, projectContext: "invalid" }).success).toBe(false);
+    expect(providerConfigSchema.safeParse({ ...base, adapter: "openai-chat", projectContext: "on" }).success).toBe(false);
+    expect(projectContextConfigError({ adapter: "command-code", projectContext: "on" })).toBeNull();
+    expect(projectContextConfigError({ adapter: "openai-chat", projectContext: "on" })).toContain("only by");
   });
 
   test("shares the upstream HTTP-version enum across write and load boundaries", () => {

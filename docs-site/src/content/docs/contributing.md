@@ -6,41 +6,77 @@ description: Develop opencodex — setup, layout, conventions, and how to add a 
 ## Setup
 
 Source development requires the `bun` CLI on your `PATH`. The published npm package bundles its own
-Bun runtime for users, but this checkout's scripts run through your local Bun installation.
+Bun runtime for users; package scripts may resolve Bun through that bundled dependency.
 
 ```bash
 git clone https://github.com/lidge-jun/opencodex.git
 cd opencodex
 bun install
+bun run setup:hooks  # retire the managed pre-push and post-merge hooks
 bun run dev:proxy    # proxy API in dev mode
 bun run dev:gui      # dashboard dev server (another terminal)
-bun run typecheck    # bun x tsc --noEmit
-bun run test:changed              # routine import-graph test selection
-bun test tests/routing/router.test.ts     # routine focused test
-bun run test                      # complete suite (PR-ready / explicit ask)
+bun run typecheck    # bun check --no-script --noEmit
+bun run test        # full suite (default)
 ```
+
+`bun run setup:hooks` removes an unmodified retired managed `pre-push` or `post-merge`
+hook, preserving custom hooks. A pre-push hook is no longer required.
+`bun run prepush` remains an optional manual check.
 
 `bun run dev` remains an alias for `bun run dev:proxy`. The dashboard dev server is `bun run dev:gui`;
 the packaged dashboard at `GET /` is produced by `bun run build:gui` (`gui/dist`).
 
+The retired `post-merge` hook used to rebuild `gui/dist` after every merge. With the hook gone,
+a merge that changes `gui/` leaves the packaged dashboard stale until you run `bun run build:gui`
+yourself — the dev server is unaffected because it rebuilds on demand.
+
 ## Build and test commands
 
 The root package is Bun-native TypeScript; there is no separate server compile step. Use the checked-in
-scripts so local commands match CI:
+scripts for local verification:
 
 ```bash
-bun run typecheck                 # strict TypeScript check
+bun run typecheck                 # strict Bun-native type check
+bun run typecheck:tsc             # reference check with the installed TypeScript compiler
 bun run test:changed              # import-graph tests against the resolved dev merge base
-bun run test                      # complete tests/ suite (PR-ready / explicit ask)
+bun run test                      # full suite (default)
 bun test tests/routing/router.test.ts     # focused test file
 bun run build:gui                 # Vite GUI build + package preparation
 bun run privacy:scan              # credential/privacy scan used by CI
 bun run prepare:package           # refresh package launchers/assets
 ```
 
+`typecheck` uses Bun's native checker with the root `tsconfig.json`, preserving its `src/` scope
+and strict compiler options without emitting files. `--no-script` keeps it on the type checker
+if a `check` package script is added later. The installed Bun dependency supplies the checker;
+`typecheck:tsc` retains the TypeScript compiler for comparisons and fallback. CI and release preflight
+continue to invoke `tsc` directly, and the GUI retains its own TypeScript build check.
+The `prepublishOnly` hook also uses `typecheck:tsc`, between the audit and GUI build steps;
+an audit or compiler failure stops the remaining steps.
+
+The suite uses Bun 1.4.4 (`package.json`'s `testRunnerBun`) while the shipped runtime is 1.4.4.
+`scripts/test.ts` finds a 1.4.4 binary on PATH or in `~/.bun/bin`, or uses `OCX_TEST_RUNNER_BUN`.
+Install that version locally if it is missing; the resolver never downloads it.
+The roles remain independently checked even when their versions match. Release selection requires
+a successful full cross-platform `lane=all` dispatch on the exact candidate SHA.
+
+Run `bun run test` by default. If a full run is disproportionately expensive for the task size,
+available machine resources, or concurrent worktrees, you must at least run focused regression tests
+that exercise the changed behavior, such as `bun test tests/<domain>/<name>.test.ts`. Explain the
+reason for narrowing the run and report the exact commands, results, and untested scope.
+`bun run test:changed` can supplement this coverage, but it cannot detect every indirect dependency.
+Neither relying only on CI nor skipping local testing is a blanket exemption. Before merge, all
+required CI checks must pass for the exact current PR head.
+
 `test:changed` selects the first comparison ref that exists, in order: `upstream/dev`,
 `origin/dev`, then local `dev`. It reports that ref and the exact `git merge-base HEAD <ref>`
 commit, then passes the merge-base SHA to Bun.
+
+If a test lane times out, the runner prints the stdout and stderr it has already
+captured and exits with code 124. After a process exits, captured pipes have a
+one-second drain limit so a descendant holding a pipe open cannot stall the runner.
+Incomplete capture is reported explicitly and does not count as a successful run,
+even if the direct child exited with code 0.
 
 Tests are Bun tests in domain directories that mirror `src/`: `tests/server/`, `tests/providers/`,
 `tests/adapters/openai/`, `tests/cli/` and so on. `scripts/test-layout/layout.json` is the map
@@ -48,8 +84,7 @@ and `tests/test-layout.test.ts` enforces it, so a new test goes into its domain 
 an entry in the map (the tooling test tells you which one is missing). `tests/helpers/` holds
 shared fixtures and `tests/helpers/repo-root.ts` is how a test reaches repository files;
 `tests/e2e-style/` holds broader native-parity scenarios. Keep a focused regression near the
-existing tests for the subsystem you change (`bun test tests/<domain>` runs one subsystem); run
-the full suite for shared routing, adapters, config, or server behavior.
+existing tests for the subsystem you change (`bun test tests/<domain>` runs one subsystem).
 
 The docs site you're reading lives in `docs-site/` (Astro + Starlight):
 
@@ -59,9 +94,10 @@ cd docs-site && bun install && bun dev
 
 ## Docs publishing
 
-The public docs publish to GitHub Pages at <https://opencodex.me/>. The
-`.github/workflows/deploy-docs.yml` workflow runs on `main` pushes that touch `docs-site/**` or the
-workflow itself, builds `docs-site`, and deploys the generated site. Before pushing docs changes,
+The public docs publish to GitHub Pages at <https://opencodex.me/>. A maintainer manually
+runs `.github/workflows/deploy-docs.yml` from `dev`; it builds the latest published stable release,
+or a specified published stable tag, at its resolved commit. Deployment is separate from npm release.
+Before pushing docs changes,
 run:
 
 ```bash
@@ -74,14 +110,16 @@ bun run build
 
 GitHub Actions intentionally stay small:
 
-- **Cross-platform CI** (`.github/workflows/ci.yml`) runs on pull requests and `main` pushes that
-  touch runtime, tests, package, script, TypeScript, or workflow files. Its Bun matrix covers Linux,
-  Windows, and macOS with install, typecheck, tests, privacy scan, a release-helper build smoke, GUI
-  build, and `ocx help`. A second three-OS lane proves npm global install works without a separately
-  installed Bun by using the package's bundled runtime.
-- **Release** (`.github/workflows/release.yml`) is manual. It does not act as a second full CI
-  pipeline; before dry-run or publish it requires the exact release commit (`GITHUB_SHA`) to already
-  have a successful Cross-platform CI run.
+- **Cross-platform CI** (`.github/workflows/ci.yml`) runs the scoped Linux checks on pull
+  requests; the full Linux, macOS and Windows matrix runs by manual dispatch from `dev` with
+  `lane=all`. A PR green is not full-platform release evidence. After a batch of merges,
+  maintainers run one full dispatch on `dev` rather than one per PR.
+- **Release** (`.github/workflows/release.yml`) is a manual `dev` workflow that selects an exact
+  source with qualifying full-lane evidence, stamps the version in build checkouts, and checks
+  npm and GitHub release history before it publishes. Publication stays off until the maintainer
+  completes the cutover checks and enables it; an interrupted run is recovered by an
+  operator-attested resume that never republishes an npm version. See
+  [`MAINTAINERS.md`](https://github.com/lidge-jun/opencodex/blob/dev/MAINTAINERS.md) for the current procedure.
 - **Stale needs-info** (`.github/workflows/stale-needs-info.yml`) runs daily on the default branch.
   Open issues labeled `needs-info` with no activity for 14 days get a warning; after 7 more idle
   days they close as not planned. Any update clears the stale warning. To keep long-lived work open,
@@ -96,33 +134,15 @@ GitHub Actions intentionally stay small:
   form already seeds `documentation`). Maintainers can re-apply area labels to all open issues with
   workflow_dispatch `backfill_open_areas` after the workflow is on the default branch.
 
-Use the helper for releases:
-
-
-Before running the helper, choose the intended release version and dispatch
-`.github/workflows/dev-version-bump.yml` from the default branch with
-`intended-version=<version>` and `mode=pre-move`. Review and merge the PR it opens
-into `dev`, then promote to `main` or `preview` and run the helper. If `dev` already
-outranks the intended version, the workflow reports `changed=false` and no bump PR
-is needed. Publishing still requires successful CI on the exact release commit.
-
-```bash
-bun run release <version>           # commits/pushes the bump; publish workflow is dry-run by default
-bun run release --bump minor        # derive the next patch, minor, or major version from tags and npm channels
-bun run release <version> --publish # publish after the CI-gated dry run is understood
-bun run release:watch               # watch the newest Release workflow run
-```
-
-`--bump patch|minor|major` is an alternative to an explicit version. Once a preview tag opens a
-higher version core, `--bump patch` refuses to continue the older stable patch line; ship that fix
-in the open preview core instead.
+The legacy version-bump and promotion procedure is not the new release path. Do not use it
+as a substitute while the new publication gates remain unresolved.
 
 ## Branches
 
-- `dev` — the only integration target. Open your pull request here.
-- `main` — releases only. It moves by maintainer-controlled promotion from
-  `dev`; do not open feature pull requests against it.
-- `preview` — the prerelease train.
+- `dev` — the only integration target and the repository default branch. Open your pull
+  request here.
+- `main` and `preview` were deleted once the single-branch model was in place. Their released
+  history remains reachable through tags; neither is an integration or promotion target.
 
 The `dev2-go` line that carried the Go native port has been retired, and the
 dual-track carry policy with it. Its history is published read-only at
@@ -135,32 +155,40 @@ description.
 
 ## Pull requests
 
-- Target **`dev`**. Do not open feature or fix pull requests against **`main`**.
-- Branch from the current **`dev`** tip, not from **`main`**. The required **`enforce-target`** check rejects heads whose merge base sits on the **`main`** tip while the branch is far behind the pull request base (the failure mode seen in #644).
+- Target **`dev`**. The required **`enforce-target`** check rejects any other base
+  except a stacked child targeting another open pull request's head.
+- Branch from the current **`dev`** tip. A head that drifts too far behind `dev`
+  has its review-readiness latest-dev claim unticked rather than being rejected.
 - Write a real description: a **Summary** of what changed and why, plus a **Test plan** (or equivalent substance). Empty bodies, placeholder-only text, and descriptions that use escaped `\n` instead of real line breaks fail the check.
-- If the title or description mentions `gui`, include a screenshot of the UI change in the description; the `enforce-target` check re-runs on description edits until the screenshot is present.
-- Workflow changes in this repository use **`pull_request_target`**. Updated enforcement logic applies only after the workflow is promoted to the repository default branch — the same operational caveat documented in #631.
+- If the pull request changes files under `gui/`, include a screenshot of the UI change in the description; the `enforce-target` check re-runs on description edits until the screenshot is present. Drag the image into the description editor rather than committing it: an image on your branch rides the squash merge into `dev`. Maintainers uploading from the command line use the `pr-assets` branch and link by commit SHA.
+- Workflow changes in this repository use **`pull_request_target`**. Updated enforcement logic applies only after the workflow reaches the repository default branch — the same operational caveat documented in #631.
 
 ## Project maintainers
 
 The current maintainers, their responsibilities, and the review and merge policy are documented in
-[`MAINTAINERS.md`](https://github.com/lidge-jun/opencodex/blob/main/MAINTAINERS.md). GitHub review
+[`MAINTAINERS.md`](https://github.com/lidge-jun/opencodex/blob/dev/MAINTAINERS.md). GitHub review
 ownership for the repository and security-sensitive paths is declared in `.github/CODEOWNERS`.
+
+Contributor pull requests normally need a maintainer's approval. A current maintainer with
+GitHub `maintain` or `admin` access may explicitly integrate a PR into `dev`, including their
+own, without a second maintainer approval. The decision and exact-head verification must be
+recorded; CI, security review and outstanding maintainer objections still apply. This exception
+does not allow direct pushes, force-pushes or deletion.
 
 ## Conventions
 
-- **ES Modules only** (`import`/`export`), TypeScript, `strict` mode. Keep `bun x tsc --noEmit` clean.
+- **ES Modules only** (`import`/`export`), TypeScript, `strict` mode. Keep `bun run typecheck` clean.
 - **~500 lines per file max** — split by responsibility (the `web-search/` and `vision/` sidecars are
   good examples of small, focused modules behind a single `index.ts`).
 - **Handle async errors at boundaries** — sidecars never throw into the request path; they degrade to
   a graceful marker.
 - **Structure SOT** — current maintainer invariants live in `structure/`. Keep public user workflows
-  in `docs-site/` and historical investigation notes in `docs/`.
+  in `docs-site/` and planning and investigation notes in `devlog/`.
 - **Preserve exports** — other modules may depend on them.
 
 ## Adding a provider to the catalog
 
-All provider pickers and seeds derive from the canonical registry (`src/providers/registry.ts`):
+All provider pickers and seeds derive from the canonical registry (`src/providers/registry/entries-extended.ts`):
 
 ```ts
 {
@@ -233,11 +261,16 @@ Use one of the versioned dispositions: `passthrough`, `translated`, `degraded`, 
 Every non-passthrough claim must state its limitation, and every fixture-backed claim must name the
 exact assertion ids that prove it. Add the secret-free request vector under
 `tests/fixtures/compatibility/` and execute it against the production adapter in a focused test.
+A `passthrough` claim may only cite `equals` assertions whose expected value is the caller's own
+value at the same place, on a selector bound to that feature in the manifest test, so a removed,
+rewritten, or unrelated field cannot be labeled lossless. Keep related
+aspects as separate claims when a route can preserve one and lose the other, such as a custom tool
+and its grammar.
 Compatibility manifests are passive data: the ordinary router, Responses handler, and server
 startup path must not import the manifest catalog or activate Compatibility Lab.
 
 ## Verify before you claim done
 
-Run the narrowest command that proves your change — `bun run typecheck` for types, a focused
-`bun test tests/<domain>/<name>.test.ts` or runtime probe for behavior, then the broader gates appropriate to
-the affected surface. opencodex favors small, verifiable commits over large batches.
+Follow the testing policy above and run `bun run typecheck` for type changes, plus the checks
+required for the affected surface. Report the commands, results, and remaining untested scope;
+only claim the validation you actually completed.

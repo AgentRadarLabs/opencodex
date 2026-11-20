@@ -7,19 +7,18 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import {
-  closeSync,
   constants as fsConstants,
   existsSync,
   fstatSync,
   lstatSync,
-  openSync,
   readdirSync,
-  readSync,
   realpathSync,
   statSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { getConfigDir } from "../config";
+import { MAX_AUTH_BYTES, readBounded, readNativeMainAuthBytes, type BoundedReadTestSeam } from "./native-main-auth-file";
+import { loadKeyringBinding } from "../lib/keyring-native";
 import { extractAccountId } from "../oauth/chatgpt";
 import { getCodexHome, readRootTomlString } from "./paths";
 import {
@@ -41,7 +40,7 @@ const KEYRING_SERVICE = "opencodex.native-main-profile.v1";
 const SHARED_METADATA_DIR = ".opencodex-native-main-profiles";
 const INSTANCE_STAGING_DIR = "native-main-profile-staging";
 const LEGACY_METADATA_DIR = "native-main-profiles";
-const MAX_AUTH_BYTES = 4 * 1024 * 1024;
+export { MAX_AUTH_BYTES, readBounded } from "./native-main-auth-file";
 export const MAX_NATIVE_PROFILE_METADATA_BYTES = 4 * 1024 * 1024;
 export const MAX_NATIVE_PROFILE_JOURNAL_BYTES = 17 * 1024 * 1024;
 export const MAX_NATIVE_PROFILES = 32;
@@ -64,13 +63,6 @@ export interface NativeProfileContext {
   recoveryBlockPath: string;
   stageRegistryPath: string;
   lockPath: string;
-}
-
-interface BoundedReadTestSeam {
-  beforeOpen?: (path: string) => void;
-  afterValidatedOpen?: (path: string, fd: number) => void;
-  onBufferAllocated?: (byteLength: number) => void;
-  onRead?: (requestedBytes: number, bytesRead: number, totalBytesRead: number) => void;
 }
 
 function boundedReadTestSeam(context: NativeProfileContext): BoundedReadTestSeam | undefined {
@@ -120,7 +112,7 @@ export class OsNativeProfileKeyProvider implements NativeProfileKeyProvider {
 
   private async entry(homeId: string): Promise<NativeKeyringEntry> {
     try {
-      const { AsyncEntry } = await import("@napi-rs/keyring");
+      const { AsyncEntry } = loadKeyringBinding();
       return new AsyncEntry(KEYRING_SERVICE, homeId) as unknown as NativeKeyringEntry;
     } catch {
       throw new NativeProfileError(
@@ -352,8 +344,9 @@ export function assertNativeProfileLockPath(context: NativeProfileContext): void
 }
 
 export function resolveNativeProfileContext(options: { codexHome?: string; configDir?: string } = {}): NativeProfileContext {
-  const codexHome = canonicalExistingDirectory(options.codexHome ?? getCodexHome(), "The effective CODEX_HOME");
+  // Read-only callers may tolerate an absent native home, but never unsafe OpenCodex storage.
   const configDir = canonicalizeDirectoryPath(options.configDir ?? getConfigDir());
+  const codexHome = canonicalExistingDirectory(options.codexHome ?? getCodexHome(), "The effective CODEX_HOME");
   const homeId = nativeProfileHomeId(codexHome);
   const foldedHomeId = process.platform === "win32" ? legacyWindowsNativeProfileHomeId(codexHome) : homeId;
   const instanceId = createHash("sha256").update(DOMAIN_INSTANCE).update(configDir).digest("hex");
@@ -374,55 +367,6 @@ export function resolveNativeProfileContext(options: { codexHome?: string; confi
     stageRegistryPath: join(rootDir, `${homeId}.stages.json`),
     lockPath: join(codexHome, ".opencodex-native-profile.lock.sqlite"),
   };
-}
-
-function readBounded(path: string, limit: number, testSeam?: BoundedReadTestSeam): Buffer {
-  let fd: number | undefined;
-  let failed = false;
-  try {
-    testSeam?.beforeOpen?.(path);
-    const flags = process.platform === "win32"
-      ? fsConstants.O_RDONLY
-      : fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK;
-    fd = openSync(path, flags);
-    const opened = fstatSync(fd, { bigint: true });
-    if (!opened.isFile() || opened.size > BigInt(limit)) throw new Error("invalid bounded file");
-
-    if (process.platform === "win32") {
-      const pathEntry = lstatSync(path, { bigint: true });
-      if (
-        !pathEntry.isFile()
-        || pathEntry.isSymbolicLink()
-        || pathEntry.dev !== opened.dev
-        || pathEntry.ino !== opened.ino
-      ) throw new Error("invalid bounded file");
-    }
-
-    testSeam?.afterValidatedOpen?.(path, fd);
-    const buffer = Buffer.allocUnsafe(limit + 1);
-    testSeam?.onBufferAllocated?.(buffer.byteLength);
-    let totalBytesRead = 0;
-    while (totalBytesRead < buffer.byteLength) {
-      const requestedBytes = buffer.byteLength - totalBytesRead;
-      const bytesRead = readSync(fd, buffer, totalBytesRead, requestedBytes, totalBytesRead);
-      totalBytesRead += bytesRead;
-      testSeam?.onRead?.(requestedBytes, bytesRead, totalBytesRead);
-      if (bytesRead === 0) break;
-    }
-    if (totalBytesRead > limit) throw new Error("invalid bounded file");
-    return buffer.subarray(0, totalBytesRead);
-  } catch (error) {
-    failed = true;
-    throw error;
-  } finally {
-    if (fd !== undefined) {
-      try {
-        closeSync(fd);
-      } catch (error) {
-        if (!failed) throw error;
-      }
-    }
-  }
 }
 
 export function resolveNativeCredentialStoreMode(context: NativeProfileContext): string {
@@ -499,7 +443,7 @@ export function parseNativeEnvelopeBytes(raw: Buffer): NativeEnvelopeSnapshot {
 export function readNativeEnvelopeResult(path: string): NativeEnvelopeReadResult {
   let raw: Buffer;
   try {
-    raw = readBounded(path, MAX_AUTH_BYTES);
+    raw = readNativeMainAuthBytes(path, "bounded");
   } catch (error) {
     return { status: (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unreadable" };
   }
@@ -584,6 +528,15 @@ function isEncryptedPayload(value: unknown): value is EncryptedNativeEnvelopeV1 
     && typeof v.ciphertext === "string" && v.ciphertext.length > 0
     && typeof v.tag === "string" && v.tag.length > 0
     && typeof v.envelopeSha256 === "string" && HASH_RE.test(v.envelopeSha256);
+}
+
+export function countLocalNativeProfileSlots(raw: Record<string, unknown> | null, homeId: string): { inactive: number; active: boolean } {
+  if (raw === null) return { inactive: 0, active: false };
+  const vault = parseVaultObject(structuredClone(raw), homeId);
+  return {
+    inactive: vault.profiles.filter(profile => profile.state === "inactive").length,
+    active: vault.activeProfileId !== null,
+  };
 }
 
 function parseVaultObject(value: unknown, homeId: string): NativeMainProfileVaultV1 {

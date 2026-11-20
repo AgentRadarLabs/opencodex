@@ -129,7 +129,6 @@ export function isContentEvent(event: AdapterEvent): boolean {
     case "tool_call_end":
     case "web_search_call_begin":
     case "web_search_call_end":
-    case "anthropic_server_block":
       return true;
     default:
       return false;
@@ -173,18 +172,12 @@ export function mergeUsage(
   const cachedInputTokens = sumOptional("cachedInputTokens");
   const cacheReadInputTokens = sumOptional("cacheReadInputTokens");
   const cacheCreationInputTokens = sumOptional("cacheCreationInputTokens");
+  const cacheCreation1hInputTokens = sumOptional("cacheCreation1hInputTokens");
   const reasoningOutputTokens = sumOptional("reasoningOutputTokens");
+  const providerCredits = sumOptional("providerCredits");
   const contextTotalTokens = second.contextTotalTokens ?? first.contextTotalTokens;
   const inputTokens = first.inputTokens + second.inputTokens;
   const outputTokens = first.outputTokens + second.outputTokens;
-  const anthropicServerToolUse: Record<string, number> = {};
-  for (const usage of [first, second]) {
-    for (const [name, value] of Object.entries(usage.anthropicServerToolUse ?? {})) {
-      if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
-        anthropicServerToolUse[name] = (anthropicServerToolUse[name] ?? 0) + value;
-      }
-    }
-  }
   // The attempt that produced the content owns the raw wire usage (openai/codex#41980);
   // an empty first attempt may still be the only one that saw it.
   const rawUsage = second.rawUsage ?? first.rawUsage;
@@ -196,8 +189,9 @@ export function mergeUsage(
     ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
     ...(cacheReadInputTokens !== undefined ? { cacheReadInputTokens } : {}),
     ...(cacheCreationInputTokens !== undefined ? { cacheCreationInputTokens } : {}),
+    ...(cacheCreation1hInputTokens !== undefined ? { cacheCreation1hInputTokens } : {}),
     ...(reasoningOutputTokens !== undefined ? { reasoningOutputTokens } : {}),
-    ...(Object.keys(anthropicServerToolUse).length > 0 ? { anthropicServerToolUse } : {}),
+    ...(providerCredits !== undefined ? { providerCredits } : {}),
     ...(first.estimated || second.estimated ? { estimated: true } : {}),
     ...(rawUsage !== undefined ? { rawUsage } : {}),
   };
@@ -210,6 +204,8 @@ export interface EmptyCompletionGuardOptions {
    * Receives no arguments — the request must not be modified between attempts.
    */
   continuation: () => AsyncIterable<AdapterEvent> | Promise<AsyncIterable<AdapterEvent>>;
+  /** Preserve locally classified retry failures whose precise status must reach the caller. */
+  preserveRetryError?: (event: AdapterEvent) => boolean;
   /** How many times an empty completion is retried; default 1 (the router's single retry). */
   maxRetries?: number;
 }
@@ -249,15 +245,10 @@ export async function* guardEmptyCompletionEventStream(
     heldBytes = 0;
     return released;
   };
-  const queueAttemptBoundary = (): boolean => {
-    if (held.length === 0 || held.at(-1)?.type === "assistant_boundary") return true;
-    const boundary: AdapterEvent = { type: "assistant_boundary" };
-    const boundaryBytes = retainedEventBytes(boundary);
-    if (held.length + 1 > EMPTY_COMPLETION_MAX_BUFFERED_EVENTS
-      || heldBytes + boundaryBytes > EMPTY_COMPLETION_MAX_BUFFERED_BYTES) return false;
-    held.push(boundary);
-    heldBytes += boundaryBytes;
-    return true;
+  // Held events from a discarded attempt are released with the retry's output, so a boundary
+  // keeps the retry's reasoning from being appended to the discarded attempt's reasoning item.
+  const markRetryBoundary = () => {
+    if (held.length > 0 && held.at(-1)?.type !== "assistant_boundary") held.push({ type: "assistant_boundary" });
   };
 
   while (true) {
@@ -295,17 +286,13 @@ export async function* guardEmptyCompletionEventStream(
         if (retries < maxRetries) {
           // Suppress the terminal: the client must never see a completed event
           // for a turn that produced nothing. Retry the identical turn.
+          markRetryBoundary();
           retries += 1;
           try {
             source = await options.continuation();
           } catch {
             yield emptyCompletionRetryFailedEvent(usage, true);
             return;
-          }
-          if (!queueAttemptBoundary()) {
-            yield* releaseHeld();
-            yield { type: "assistant_boundary" };
-            passthrough = true;
           }
           terminalSeen = true;
           break;
@@ -316,11 +303,29 @@ export async function* guardEmptyCompletionEventStream(
         return;
       }
       if (event.type === "error") {
-        if (retries > 0 && event.status !== 499) {
+        if (event.replaySafeBeforeOutput === true && retries < maxRetries) {
+          // The upstream failed the turn before any text or tool call (#6876: Vertex dropped a
+          // malformed function call). Nothing actionable reached the client, so this is the same
+          // replay-safe shape as an empty completion: retry the identical turn once.
+          usage = mergeUsage(usage, event.usage);
+          markRetryBoundary();
+          retries += 1;
+          try {
+            source = await options.continuation();
+          } catch {
+            yield emptyCompletionRetryFailedEvent(usage, true);
+            return;
+          }
+          terminalSeen = true;
+          break;
+        }
+        if (retries > 0 && event.status !== 499 && event.replaySafeBeforeOutput !== true
+          && !options.preserveRetryError?.(event)) {
           // The retry failed upstream. Its body cannot reach the client (the
           // 200 head went out with the first attempt), so state the failure in
           // the stream's own error framing — same move as the router's
-          // empty_completion_retry_failed. Client cancels (499) pass through.
+          // empty_completion_retry_failed. Client cancels (499) pass through, and a
+          // replay-safe failure that repeats keeps its own, more specific message.
           yield emptyCompletionRetryFailedEvent(mergeUsage(usage, event.usage), true);
           return;
         }
@@ -356,17 +361,13 @@ export async function* guardEmptyCompletionEventStream(
       // actionable reached the client. Retry once, then surface a stated error
       // instead of letting the bridge reduce the turn to adapter_eof.
       if (!sawContent && !passthrough && retries < maxRetries) {
+        markRetryBoundary();
         retries += 1;
         try {
           source = await options.continuation();
         } catch {
           yield emptyCompletionRetryFailedEvent(usage, true);
           return;
-        }
-        if (!queueAttemptBoundary()) {
-          yield* releaseHeld();
-          yield { type: "assistant_boundary" };
-          passthrough = true;
         }
         continue;
       }

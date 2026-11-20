@@ -16,6 +16,11 @@ import { parseKiroEvent } from "../../../src/adapters/kiro-events";
 import { resetKiroThrottleStateForTests } from "../../../src/adapters/kiro-retry";
 import { resetKiroCalibration } from "../../../src/adapters/kiro-calibration";
 import { buildResponseJSON } from "../../../src/bridge";
+import {
+  clearDebugSetting,
+  getDebugSettings,
+  setDebugSettings,
+} from "../../../src/lib/debug-settings";
 import { encodeMessage } from "../../../src/lib/eventstream-decoder";
 import { estimateTokens } from "../../../src/lib/token-estimate";
 import { createTranslatorBudget } from "../../../src/lib/translator-budget";
@@ -34,11 +39,16 @@ const origApiRegion = process.env.KIRO_API_REGION;
 const origArn = process.env.KIRO_PROFILE_ARN;
 const origCredsFile = process.env.KIRO_CREDS_FILE;
 const origCredentialsFile = process.env.KIRO_CREDENTIALS_FILE;
-const origDebugFrames = process.env.OCX_DEBUG_FRAMES;
+let origDebug: string | undefined;
+let origDebugFrames: string | undefined;
+let origDebugOverride: boolean | undefined;
 const realFetch = globalThis.fetch;
 let tmp: string;
 
 beforeEach(() => {
+  origDebug = process.env.OCX_DEBUG;
+  origDebugFrames = process.env.OCX_DEBUG_FRAMES;
+  origDebugOverride = getDebugSettings().runtimeOverride.debug;
   tmp = mkdtempSync(join(tmpdir(), "kiro-stream-"));
   process.env.HOME = tmp;
   process.env.KIRO_REGION = "us-east-1";
@@ -46,7 +56,9 @@ beforeEach(() => {
   delete process.env.KIRO_PROFILE_ARN;
   delete process.env.KIRO_CREDS_FILE;
   delete process.env.KIRO_CREDENTIALS_FILE;
+  delete process.env.OCX_DEBUG;
   delete process.env.OCX_DEBUG_FRAMES;
+  clearDebugSetting("debug");
 });
 afterEach(() => {
   globalThis.fetch = realFetch;
@@ -57,7 +69,10 @@ afterEach(() => {
   if (origArn === undefined) delete process.env.KIRO_PROFILE_ARN; else process.env.KIRO_PROFILE_ARN = origArn;
   if (origCredsFile === undefined) delete process.env.KIRO_CREDS_FILE; else process.env.KIRO_CREDS_FILE = origCredsFile;
   if (origCredentialsFile === undefined) delete process.env.KIRO_CREDENTIALS_FILE; else process.env.KIRO_CREDENTIALS_FILE = origCredentialsFile;
+  if (origDebug === undefined) delete process.env.OCX_DEBUG; else process.env.OCX_DEBUG = origDebug;
   if (origDebugFrames === undefined) delete process.env.OCX_DEBUG_FRAMES; else process.env.OCX_DEBUG_FRAMES = origDebugFrames;
+  if (origDebugOverride === undefined) clearDebugSetting("debug");
+  else setDebugSettings({ debug: origDebugOverride });
   removeTreeWithRetry(tmp);
 });
 
@@ -196,6 +211,21 @@ describe("kiro adapter — parseStream", () => {
     expect(providerState).toEqual({ kiro: { conversationId: "returned-conversation-1" } });
   });
 
+  test("request diagnostics do not re-encode the body when provider debug is off", async () => {
+    const encodeSpy = spyOn(TextEncoder.prototype, "encode");
+    try {
+      const adapter = createKiroAdapter(provider);
+      const before = encodeSpy.mock.calls.length;
+      await adapter.buildRequest(parsedWith([{ role: "user", content: "hi" }]));
+      const during = encodeSpy.mock.calls.slice(before);
+      // The diagnostic argument list is evaluated eagerly, so an unguarded call encodes the
+      // full serialized request body on every request even with diagnostics disabled.
+      expect(during.some(([value]) => typeof value === "string" && value.includes("conversationState"))).toBe(false);
+    } finally {
+      encodeSpy.mockRestore();
+    }
+  });
+
   test("invalid returned message metadata cannot poison continuation state", async () => {
     const adapter = createKiroAdapter(provider);
     const request = await adapter.buildRequest(parsedWith([{ role: "user", content: "hi" }]));
@@ -308,43 +338,20 @@ describe("kiro adapter — parseStream", () => {
 
   test("progress-only required response makes exactly one structural text fallback", async () => {
     const requests: Record<string, any>[] = [];
-    const recoveries: Array<string | undefined> = [];
-    let nextRecovery: string | undefined;
-    globalThis.fetch = (async () => {
-      throw new Error("fallback bypassed the request executor");
-    }) as typeof fetch;
-    const executor = (async (_input, init) => {
-      recoveries.push(nextRecovery);
-      nextRecovery = undefined;
+    globalThis.fetch = (async (_input, init) => {
       requests.push(JSON.parse(String(init?.body)));
-      if (requests.length === 1) {
-        return new Response(streamOf(
-          eventFrame({ content: "I am checking." }),
-          eventFrame({ conversationId: "returned-conversation-42" }),
-        ));
-      }
-      if (requests.length === 2) {
-        return new Response(JSON.stringify({
-          __type: "ThrottlingException",
-          message: "USER_REQUEST_RATE_EXCEEDED: please wait",
-        }), { status: 429, headers: { "Retry-After": "0" } });
-      }
       return new Response(streamOf(eventFrame({ content: "Final from fallback." })));
     }) as typeof fetch;
     const adapter = createKiroAdapter(provider);
-    const request = await adapter.buildRequest(parsedWith([{ role: "user", content: "do it" }], [bashTool]));
-    const firstResponse = await adapter.fetchResponse!(request, {
-      stream: true,
-      executor,
-      onRetry: recovery => { nextRecovery = recovery; },
-    });
+    await adapter.buildRequest(parsedWith([{ role: "user", content: "do it" }], [bashTool]));
 
-    const events = await collectAdapterEvents(adapter.parseStream(firstResponse));
+    const events = await collectAdapterEvents(adapter.parseStream(new Response(streamOf(
+      eventFrame({ content: "I am checking." }),
+      eventFrame({ conversationId: "returned-conversation-42" }),
+    ))));
 
-    expect(requests).toHaveLength(3);
-    expect(recoveries).toEqual([undefined, "adapter-retry", "rate-limit-429"]);
-    const retry = requests[1].conversationState;
-    expect(requests[2].conversationState).toEqual(retry);
+    expect(requests).toHaveLength(1);
+    const retry = requests[0].conversationState;
     expect(retry.conversationId).toBe("returned-conversation-42");
     expect(retry.history.at(-1).assistantResponseMessage).toEqual({ content: "I am checking." });
     expect(retry.currentMessage.userInputMessage.content).toBe(KIRO_COMPLETION_RETRY_MESSAGE);
@@ -352,7 +359,6 @@ describe("kiro adapter — parseStream", () => {
       (tool: { toolSpecification: { name: string } }) => tool.toolSpecification.name,
     )).toEqual(["bash", KIRO_COMPLETION_TOOL_NAME]);
     expect(events.filter(event => event.type === "text_delta")).toEqual([
-      { type: "text_delta", text: "I am checking.", phase: "commentary" },
       { type: "text_delta", text: "Final from fallback.", phase: "final_answer" },
     ]);
     expect(events.at(-1)).toMatchObject({
@@ -610,8 +616,6 @@ describe("kiro adapter — parseStream", () => {
 
     expect(fetches).toBe(1);
     expect(events.filter(event => event.type === "text_delta")).toEqual([
-      { type: "text_delta", text: "The file has ", phase: "commentary" },
-      { type: "text_delta", text: "three lines.", phase: "commentary" },
       { type: "text_delta", text: "The file has three lines.", phase: "final_answer" },
     ]);
     expect(events.at(-1)).toMatchObject({ type: "done", endTurn: true });
@@ -682,7 +686,6 @@ describe("kiro adapter — parseStream", () => {
     ))));
 
     expect(events.filter(event => event.type === "text_delta")).toEqual([
-      { type: "text_delta", text: "Done.", phase: "commentary" },
       { type: "text_delta", text: "Done.", phase: "final_answer" },
     ]);
     expect(fetches).toBe(1);
@@ -1000,21 +1003,10 @@ describe("kiro adapter — parseStream", () => {
     expect(JSON.stringify(events)).not.toContain(KIRO_COMPLETION_TOOL_NAME);
   });
 
-  test("duplicate completion and completion mixed with real tools fail closed", async () => {
+  // A completion mixed with real tools is not an error; see kiro-completion-with-real-tools.test.ts.
+  test("duplicate completion fails closed", async () => {
     const cases: Uint8Array[][] = [
       [...completionFrames("one", "complete-1"), ...completionFrames("two", "complete-2")],
-      [
-        eventFrame({ name: "bash", toolUseId: "call-1" }),
-        eventFrame({ input: "{}", name: "bash", toolUseId: "call-1" }),
-        eventFrame({ name: "bash", stop: true, toolUseId: "call-1" }),
-        ...completionFrames("done", "complete-3"),
-      ],
-      [
-        ...completionFrames("done", "complete-4"),
-        eventFrame({ name: "bash", toolUseId: "call-2" }),
-        eventFrame({ input: "{}", name: "bash", toolUseId: "call-2" }),
-        eventFrame({ name: "bash", stop: true, toolUseId: "call-2" }),
-      ],
     ];
     for (const frames of cases) {
       const adapter = createKiroAdapter(provider);
@@ -1535,10 +1527,43 @@ describe("kiro adapter — parseStream", () => {
       cacheCreationInputTokens: 2,
       outputTokens: 4,
       totalTokens: 19,
+      upstreamReported: true,
     });
     // The whole-payload checkpoint must exceed this turn's own total, which is the point of
     // reporting it separately.
     expect(contextTotalTokens).toBeGreaterThan(19);
+  });
+
+  test("unreported cache counters stay unknown instead of being recorded as measured zeros", async () => {
+    const adapter = createKiroAdapter(provider);
+    await adapter.buildRequest(parsedWith([{ role: "user", content: "x".repeat(700) }]));
+    const done = await doneUsage(
+      adapter,
+      eventFrame({ content: "answer" }),
+      eventFrame({
+        tokenUsage: {
+          uncachedInputTokens: 10,
+          outputTokens: 4,
+          totalTokens: 14,
+        },
+      }, "metadataEvent"),
+    );
+    // Kiro said nothing about caching on this turn. Storing 0 would make that indistinguishable
+    // from a measured total miss, which is the difference between routing that preserved a
+    // prompt cache and routing that destroyed it (#4546).
+    expect("cachedInputTokens" in done).toBe(false);
+    expect("cacheReadInputTokens" in done).toBe(false);
+    expect("cacheCreationInputTokens" in done).toBe(false);
+    expect(done.inputTokens).toBe(10);
+  });
+
+  test("a malformed cache counter is still a malformed event", async () => {
+    expect(() => parseKiroEvent(
+      "metadataEvent",
+      new TextEncoder().encode(JSON.stringify({
+        tokenUsage: { uncachedInputTokens: 10, cacheReadInputTokens: -1, outputTokens: 4, totalTokens: 14 },
+      })),
+    )).toThrow();
   });
 
   test("authoritative turn usage floors a smaller payload context estimate", async () => {
@@ -2192,8 +2217,8 @@ describe("kiro adapter — non-streaming parseResponse", () => {
 
 describe("surrogate safety at kiro boundaries", () => {
   test("the reasoning carry never emits a delta ending on a lone high surrogate", async () => {
-    const { KiroThinkingParser } = await import("../../../src/adapters/kiro-thinking");
-    const parser = new KiroThinkingParser();
+    const { InlineThinkTagParser } = await import("../../../src/adapters/inline-think-tags");
+    const parser = new InlineThinkTagParser();
     // An astral char exactly at the carry/send boundary.
     const events = parser.feed("<thinking>🎆aaaaaaaaaaa");
     const emitted = JSON.stringify(events);

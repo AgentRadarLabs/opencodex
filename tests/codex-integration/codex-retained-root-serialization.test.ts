@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, beforeAll, expect, test } from "bun:test";
 import {
   chmodSync,
   existsSync,
@@ -16,13 +16,26 @@ import {
   resolveCodexCatalogSerializationDatabasePath,
   resolveEffectiveUserIdentity,
 } from "../../src/codex/user-identity";
+import { COLD_SPAWN_WARMUP_HOOK_BUDGET_MS, warmModuleGraph } from "../helpers/cold-spawn-warmup";
 import { claimOwnedServiceHome, withOwnedServiceHomePreload } from "../helpers/owned-service-home";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { repoRoot as resolveRepoRoot } from "../helpers/repo-root";
 import { SPAWN_BUDGET_MS } from "../helpers/test-budget";
 import { INTERNAL_DEADLINE_MS } from "../helpers/test-budget";
+import { watchdogMs } from "../helpers/ci-watchdog";
+import { NETWORK_EGRESS_GUARD_PRELOAD } from "../helpers/network-egress-guard";
 
 const repoRoot = resolveRepoRoot();
+// The children run without tests/preload.ts, and the provider refresh reached
+// api.together.xyz through node:https, which their fetch stubs never see (#8848).
+const EGRESS_GUARD_ARGS = ["--preload", NETWORK_EGRESS_GUARD_PRELOAD];
+const CATALOG_WRITE_SERIALIZATION_IMPORT_PROLOGUE = `
+    import { existsSync, writeFileSync } from "node:fs";
+    import { withCatalogWriteSerialization } from "./src/codex/catalog-write-serialization.ts";
+`;
+const CATALOG_SYNC_IMPORT_PROLOGUE = `
+    const { syncCatalogModels } = await import("./src/codex/catalog/sync.ts");
+`;
 const sandboxes: Sandbox[] = [];
 
 interface Sandbox {
@@ -124,6 +137,21 @@ function sandboxChildEnv(sandbox: Sandbox): Record<string, string> {
   return { ...sandbox.env, ...sandbox.serviceManagerEnv };
 }
 
+interface ChildResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+/** One consumer per pipe; barrier diagnostics and final assertions share the result. */
+function captureChildResult(child: ReturnType<typeof Bun.spawn>): Promise<ChildResult> {
+  return Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]).then(([exitCode, stdout, stderr]) => ({ exitCode, stdout, stderr }));
+}
+
 /**
  * Wait for a child to reach its barrier, failing fast with its output if it exits
  * first. The exit branch is a REJECTING promise, so while the race is pending an
@@ -135,15 +163,29 @@ function sandboxChildEnv(sandbox: Sandbox): Record<string, string> {
  * no-op catch attached up front marks that late rejection handled without
  * changing what the race sees.
  */
-async function raceBarrier(child: ReturnType<typeof Bun.spawn>, barrier: Promise<void>): Promise<void> {
-  const exitedEarly = child.exited.then(async exitCode => {
-    const stdout = await new Response(child.stdout).text();
-    const stderr = await new Response(child.stderr).text();
+async function raceBarrier(result: Promise<ChildResult>, barrier: Promise<void>): Promise<void> {
+  const exitedEarly = result.then(({ exitCode, stdout, stderr }) => {
     throw new Error(`sync exited before provider barrier (${exitCode})\nstdout=${stdout}\nstderr=${stderr}`);
   });
   exitedEarly.catch(() => undefined);
   await Promise.race([barrier, exitedEarly]);
 }
+
+test("barrier diagnostics retain both pipes when the child exits first", async () => {
+  const sandbox = makeSandbox("ocx-retained-early-exit-");
+  const child = Bun.spawn([process.execPath, ...EGRESS_GUARD_ARGS, "--eval", `
+    process.stdout.write("fixture-stdout\\n");
+    process.stderr.write("fixture-stderr\\n");
+    process.exitCode = 7;
+  `], { cwd: repoRoot, env: sandboxChildEnv(sandbox), stdout: "pipe", stderr: "pipe" });
+  sandbox.children.add(child);
+  const result = captureChildResult(child);
+
+  await expect(raceBarrier(result, new Promise<void>(() => {}))).rejects.toThrow(
+    "sync exited before provider barrier (7)\nstdout=fixture-stdout\n\nstderr=fixture-stderr\n",
+  );
+  expect(await result).toEqual({ exitCode: 7, stdout: "fixture-stdout\n", stderr: "fixture-stderr\n" });
+}, SPAWN_BUDGET_MS);
 
 // A `bun --eval` child on a loaded windows-latest shard takes 8-11 s just to boot and
 // reach its marker (runs 33590540220 and 33605898170), so a 10 s wait was the coin flip,
@@ -161,7 +203,7 @@ async function runChild(
   sandbox: Sandbox,
   script: string,
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  const child = Bun.spawn([process.execPath, ...withOwnedServiceHomePreload(["--eval", script], sandbox.preloadPath)], {
+  const child = Bun.spawn([process.execPath, ...EGRESS_GUARD_ARGS, ...withOwnedServiceHomePreload(["--eval", script], sandbox.preloadPath)], {
     cwd: repoRoot,
     env: sandboxChildEnv(sandbox),
     stdout: "pipe",
@@ -183,17 +225,16 @@ async function holdCatalogLock(sandbox: Sandbox): Promise<{
   const ready = join(sandbox.root, "lock-ready");
   const release = join(sandbox.root, "lock-release");
   const script = `
-    import { existsSync, writeFileSync } from "node:fs";
-    import { withCatalogWriteSerialization } from "./src/codex/catalog-write-serialization.ts";
+    ${CATALOG_WRITE_SERIALIZATION_IMPORT_PROLOGUE}
     const home = process.env.CODEX_HOME;
     const outcome = withCatalogWriteSerialization(home, () => {
       writeFileSync(${JSON.stringify(ready)}, "ready");
       const waiter = new Int32Array(new SharedArrayBuffer(4));
       while (!existsSync(${JSON.stringify(release)})) Atomics.wait(waiter, 0, 0, 10);
-    });
+    }, { intent: "refresh", writer: "test" });
     if (outcome.kind !== "completed") throw new Error(JSON.stringify(outcome));
   `;
-  const child = Bun.spawn([process.execPath, "--eval", script], {
+  const child = Bun.spawn([process.execPath, ...EGRESS_GUARD_ARGS, "--eval", script], {
     cwd: repoRoot,
     env: sandbox.env,
     stdout: "pipe",
@@ -224,6 +265,16 @@ afterEach(async () => {
     removeTreeWithRetry(sandbox.root);
   }
 });
+
+// The lock holder is this file's first bounded catalog-write-serialization child, so it pays that
+// module graph's cold load before it can publish the ready marker measured below.
+beforeAll(async () => {
+  await warmModuleGraph({
+    graph: "codex/catalog-write-serialization-eval",
+    source: CATALOG_WRITE_SERIALIZATION_IMPORT_PROLOGUE,
+    cwd: repoRoot,
+  });
+}, COLD_SPAWN_WARMUP_HOOK_BUDGET_MS);
 
 test("startup and CLI sync-cache cannot write models_cache while another process owns K", async () => {
   const sandbox = makeSandbox("ocx-retained-cache-");
@@ -290,7 +341,7 @@ test("native restore cannot read-transform-write the catalog while another proce
     `);
     expect(restored.exitCode).toBe(0);
     expect(readFileSync(catalogPath, "utf8")).toBe(before);
-    const source = readFileSync(join(repoRoot, "src/codex/inject.ts"), "utf8");
+    const source = readFileSync(join(repoRoot, "src/codex/inject/restore.ts"), "utf8");
     const restoreRoot = source.slice(source.indexOf("const owningCodexHome"), source.indexOf("// Design B", source.indexOf("const owningCodexHome")));
     expect(restoreRoot).toContain("withCatalogWriteSerialization(owningCodexHome");
     expect(restoreRoot).toContain("restoreCodexCatalogWithPermit");
@@ -338,11 +389,13 @@ for (const publisher of ["convergence", "retained"] as const) {
       port: 0,
       fetch: async request => {
         if (!new URL(request.url).pathname.endsWith("/models")) return new Response("not found", { status: 404 });
-        if (requests++ === 0) {
+        const first = requests++ === 0;
+        if (first) {
           writeFileSync(requested, "requested");
           while (!existsSync(release)) await Bun.sleep(5);
         }
-        return Response.json({ data: [{ id: "race-model" }] });
+        // Distinct snapshots make a stale publish observable in the final catalog.
+        return Response.json({ data: [{ id: first ? "race-model" : "newer-race-model" }] });
       },
     });
     const config = {
@@ -362,7 +415,7 @@ for (const publisher of ["convergence", "retained"] as const) {
     };
     writeFileSync(join(sandbox.opencodexHome, "config.json"), JSON.stringify(config));
     try {
-      const sync = Bun.spawn([process.execPath, ...withOwnedServiceHomePreload(["--eval", `
+      const sync = Bun.spawn([process.execPath, ...EGRESS_GUARD_ARGS, ...withOwnedServiceHomePreload(["--eval", `
         const config = ${JSON.stringify(config)};
         const { handleManagementAPI } = await import("./src/server/management-api.ts");
         const req = new Request("http://localhost/api/sync", { method: "POST", headers: { Host: "localhost" } });
@@ -370,28 +423,43 @@ for (const publisher of ["convergence", "retained"] as const) {
         console.log(JSON.stringify({ status: response.status, body: await response.json() }));
       `], sandbox.preloadPath)], { cwd: repoRoot, env: sandboxChildEnv(sandbox), stdout: "pipe", stderr: "pipe" });
       sandbox.children.add(sync);
+      const syncResult = captureChildResult(sync);
 
-      await raceBarrier(sync, waitForPath(requested, INTERNAL_DEADLINE_MS));
+      // This real child imports the management route before reaching /models.
+      // Keep the CI startup floor, then leave room for the second publisher process.
+      await raceBarrier(syncResult, waitForPath(requested, watchdogMs(INTERNAL_DEADLINE_MS)));
       const published = await runPublisher(sandbox, publisher, config);
       if (published.exitCode !== 0) {
         throw new Error(`${publisher} publisher failed\nstdout=${published.stdout}\nstderr=${published.stderr}`);
       }
       const newer = readFileSync(catalogPath, "utf8");
       expect(newer).not.toBe(initial);
+      const newerSlugs = JSON.parse(newer).models.map((model: { slug: string }) => model.slug);
+      expect(newerSlugs).toContain("fixture/newer-race-model");
+      expect(newerSlugs).not.toContain("fixture/race-model");
 
       writeFileSync(release, "release");
-      const [exitCode, stdout, stderr] = await Promise.all([
-        sync.exited,
-        new Response(sync.stdout).text(),
-        new Response(sync.stderr).text(),
-      ]);
+      // Exercise the losing exit branch before the successful caller reads output.
+      await sync.exited;
+      const { exitCode, stdout, stderr } = await syncResult;
       expect({ exitCode, stdout, stderr }).toMatchObject({ exitCode: 0 });
+      expect(JSON.parse(stdout).status).toBe(200);
       expect(readFileSync(catalogPath, "utf8")).toBe(newer);
     } finally {
       provider.stop(true);
     }
-  }, SPAWN_BUDGET_MS);
+  }, SPAWN_BUDGET_MS * 2);
 }
+
+// This is the first bounded child to load catalog sync, so warm its graph before the provider
+// barrier begins measuring time to the requested marker.
+beforeAll(async () => {
+  await warmModuleGraph({
+    graph: "codex/catalog-sync-eval",
+    source: CATALOG_SYNC_IMPORT_PROLOGUE,
+    cwd: repoRoot,
+  });
+}, COLD_SPAWN_WARMUP_HOOK_BUDGET_MS);
 
 /**
  * Runtime authority can move without touching the catalog at all.
@@ -435,7 +503,7 @@ test("a persisted runtime selection moved by another process during the await bl
     },
   };
 
-  const sync = Bun.spawn([process.execPath, ...withOwnedServiceHomePreload(["--eval", `
+  const sync = Bun.spawn([process.execPath, ...EGRESS_GUARD_ARGS, ...withOwnedServiceHomePreload(["--eval", `
     import { existsSync, writeFileSync } from "node:fs";
     const config = ${JSON.stringify(config)};
     config.providers.together.fetch = async () => {
@@ -443,12 +511,13 @@ test("a persisted runtime selection moved by another process during the await bl
       while (!existsSync(${JSON.stringify(release)})) await Bun.sleep(5);
       return Response.json({ data: [{ id: "runtime-move-model" }] });
     };
-    const { syncCatalogModels } = await import("./src/codex/catalog/sync.ts");
+    ${CATALOG_SYNC_IMPORT_PROLOGUE}
     console.log(JSON.stringify(await syncCatalogModels(config)));
   `], sandbox.preloadPath)], { cwd: repoRoot, env: sandboxChildEnv(sandbox), stdout: "pipe", stderr: "pipe" });
   sandbox.children.add(sync);
+  const syncResult = captureChildResult(sync);
 
-  await raceBarrier(sync, waitForPath(requested, INTERNAL_DEADLINE_MS));
+  await raceBarrier(syncResult, waitForPath(requested, INTERNAL_DEADLINE_MS));
 
   // Another process selects a different Codex runtime. No catalog byte changes.
   writeFileSync(runtimeStatePath, `${JSON.stringify({
@@ -460,11 +529,8 @@ test("a persisted runtime selection moved by another process during the await bl
   }, null, 2)}\n`);
 
   writeFileSync(release, "release");
-  const [exitCode, stdout, stderr] = await Promise.all([
-    sync.exited,
-    new Response(sync.stdout).text(),
-    new Response(sync.stderr).text(),
-  ]);
+  await sync.exited;
+  const { exitCode, stdout, stderr } = await syncResult;
   expect({ exitCode, stderr }).toMatchObject({ exitCode: 0 });
   expect(JSON.parse(stdout.trim())).toMatchObject({ catalogWritten: false });
   expect(readFileSync(catalogPath, "utf8")).toBe(initial);
@@ -497,7 +563,7 @@ test("two processes at the post-approval management seam serialize instead of in
   // Warm the config ownership + mutation database in a single process first.
   // Two cold processes otherwise race to create `.opencodex-owner.json` and both
   // die with EEXIST before approval, which would make this test vacuous.
-  const warm = Bun.spawn([process.execPath, "--eval", `
+  const warm = Bun.spawn([process.execPath, ...EGRESS_GUARD_ARGS, "--eval", `
     const { withConfigMutationLockSync } = await import("./src/config.ts");
     withConfigMutationLockSync(() => undefined);
   `], { cwd: repoRoot, env: sandbox.env, stdout: "pipe", stderr: "pipe" });
@@ -563,7 +629,7 @@ test("two processes at the post-approval management seam serialize instead of in
     writeFileSync(catalogPath, seeded);
 
     const children = (["a", "b"] as const).map(marker => Bun.spawn(
-      [process.execPath, ...withOwnedServiceHomePreload(["--eval", routeScript(marker)], sandbox.preloadPath)],
+      [process.execPath, ...EGRESS_GUARD_ARGS, ...withOwnedServiceHomePreload(["--eval", routeScript(marker)], sandbox.preloadPath)],
       { cwd: repoRoot, env: sandboxChildEnv(sandbox), stdout: "pipe", stderr: "pipe" },
     ));
     for (const child of children) sandbox.children.add(child);
@@ -652,3 +718,34 @@ test("two processes at the post-approval management seam serialize instead of in
   const fromB = slugs.some(s => s.includes("seam-model-b"));
   expect(fromA && fromB).toBe(false);
 }, SPAWN_BUDGET_MS);
+
+for (const ownership of ["foreign", "unknown"] as const) {
+  test(`sync-cache reports ${ownership} owner refusal in human and JSON output`, () => {
+    const sandbox = makeSandbox("ocx-cache-owner-refusal-");
+    const catalogPath = seedCatalog(sandbox, catalogBytes("list", true));
+    const cachePath = join(sandbox.codexHome, "models_cache.json");
+    writeFileSync(cachePath, "cache-before");
+    const foreignHome = join(sandbox.root, "other-opencodex"); mkdirSync(foreignHome);
+    writeFileSync(join(sandbox.codexHome, "opencodex-journal.json"), ownership === "unknown"
+      ? "unreadable journal evidence"
+      : JSON.stringify({ version: 1, originalConfig: "", originalProfile: null, pid: 1,
+        timestamp: "2026-10-04T00:00:00Z", opencodexHome: foreignHome }));
+    const before = readFileSync(catalogPath);
+    for (const json of [false, true]) {
+      const result = Bun.spawnSync([process.execPath,
+        ...withOwnedServiceHomePreload(["run", "src/cli/index.ts", "sync-cache", ...(json ? ["--json"] : [])], sandbox.preloadPath),
+      ], { cwd: repoRoot, env: sandboxChildEnv(sandbox), stdout: "pipe", stderr: "pipe" });
+      expect(result.exitCode).toBe(1);
+      if (json) {
+        expect(JSON.parse(result.stdout.toString())).toMatchObject({ ok: false, wrote: false,
+          outcome: "unavailable", reason: ownership === "foreign" ? "foreign-owner" : "owner-unknown" });
+      } else {
+        const warning = result.stderr.toString();
+        expect(warning).toContain(ownership === "foreign" ? "another OpenCodex home" : "could not be checked");
+        expect(warning).not.toContain(foreignHome);
+      }
+      expect(readFileSync(catalogPath)).toEqual(before);
+      expect(readFileSync(cachePath, "utf8")).toBe("cache-before");
+    }
+  }, SPAWN_BUDGET_MS);
+}

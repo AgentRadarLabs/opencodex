@@ -132,4 +132,48 @@ describe("Google wire compiler", () => {
     const repaired = JSON.parse(repairGoogleInvalidRequestBody(body, error)!);
     expect(repaired.request.generationConfig).toEqual({ maxOutputTokens: 4096 });
   });
+
+  test("keeps the includeThoughts opt-in while still dropping unknown thinking keys", () => {
+    const withOptIn = compileGoogleWireBody({
+      generationConfig: {
+        thinkingConfig: { includeThoughts: true, thinkingLevel: "max", futureThinkingField: true },
+      },
+    });
+    expect(withOptIn.body.generationConfig).toEqual({
+      thinkingConfig: { thinkingLevel: "high", includeThoughts: true },
+    });
+
+    // The flag has to survive on its own too: suffix tier ids deliberately carry no
+    // thinkingLevel, so an includeThoughts-only config is the whole request.
+    const optInOnly = compileGoogleWireBody({
+      generationConfig: { thinkingConfig: { includeThoughts: true } },
+    });
+    expect(optInOnly.body.generationConfig).toEqual({ thinkingConfig: { includeThoughts: true } });
+
+    // Non-boolean / absent values must not invent the key.
+    const notRequested = compileGoogleWireBody({
+      generationConfig: { thinkingConfig: { includeThoughts: "yes", thinkingLevel: "high" } },
+    });
+    expect(notRequested.body.generationConfig).toEqual({ thinkingConfig: { thinkingLevel: "high" } });
+
+    // Gemini 4 Hydrogen supports xhigh natively on the wire.
+    const withXhigh = compileGoogleWireBody({
+      generationConfig: { thinkingConfig: { thinkingLevel: "xhigh" } },
+    });
+    expect(withXhigh.body.generationConfig).toEqual({ thinkingConfig: { thinkingLevel: "xhigh" } });
+
+    // Explicit thinkingBudget (or thinking_budget) is preserved when thinkingLevel is absent.
+    const withBudget = compileGoogleWireBody({
+      generationConfig: { thinkingConfig: { thinkingBudget: 8192, includeThoughts: true } },
+    });
+    expect(withBudget.body.generationConfig).toEqual({
+      thinkingConfig: { thinkingBudget: 8192, includeThoughts: true },
+    });
+    const withDynamicBudget = compileGoogleWireBody({
+      generationConfig: { thinkingConfig: { thinking_budget: -1 } },
+    });
+    expect(withDynamicBudget.body.generationConfig).toEqual({
+      thinkingConfig: { thinkingBudget: -1 },
+    });
+  });
 });

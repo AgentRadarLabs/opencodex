@@ -12,6 +12,7 @@
 @import "./styles/provider-workspace-shell.css";
 @import "./styles/provider-workspace-settings.css";
 @import "./styles/login-url-block.css";
+@import "./styles/oauth-tos-danger.css";
 @import "./styles/provider-overview-dashboard.css";
 @import "./styles-combos-workspace.css";
 @import "./styles-models-workspace.css";
@@ -24,6 +25,7 @@
 @import "./styles-apikeys-workspace.css";
 @import "./styles-codex-set.css";
 @import "./styles-compatibility-matrix.css";
+@import "./styles-remote-workspace.css";
 
 :root {
   /* default: follow the OS; [data-theme] below pins color-scheme so light-dark() obeys it */
@@ -86,9 +88,10 @@
   --radius-round: 50%;
   --radius-pill: 999px;
 
-  /* typography: product UI first, Korean-safe fallbacks, mono only for machine data */
-  --font-ui: "OpenAI Sans", "Pretendard Variable", Pretendard, "Noto Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
-  --font-code: ui-monospace, "SFMono-Regular", "Cascadia Code", "JetBrains Mono", "Noto Sans Mono CJK KR", Menlo, Consolas, monospace;
+  /* Keep product fonts first, then system UI fonts before CJK fallbacks that also cover Latin. */
+  --font-ui: "OpenAI Sans", "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", sans-serif;
+  --font-sans: var(--font-ui);
+  --font-code: ui-monospace, "SFMono-Regular", "Cascadia Code", "JetBrains Mono", "Noto Sans Mono CJK SC", "Noto Sans Mono CJK KR", "Noto Sans Mono CJK JP", Menlo, Consolas, monospace;
   --font: var(--font-ui);
   --mono: var(--font-code);
 
@@ -118,18 +121,11 @@
   --control-lg: 40px;
   --control-touch: 44px;
 
-  --icon-sm: 14px;
-  --icon-md: 16px;
-  --icon-lg: 20px;
-
-  --motion-fast: 120ms;
-  --motion-normal: 180ms;
+  --icon-sm: 14px; --icon-md: 16px; --icon-lg: 20px;
+  --motion-fast: 120ms; --motion-normal: 180ms;
 
   /* stacking: sticky chrome < overlay hosts < popovers/drawers < modals */
-  --z-sticky: 20;
-  --z-overlay: 30;
-  --z-popover: 40;
-  --z-modal: 50;
+  --z-sticky: 20; --z-overlay: 30; --z-popover: 40; --z-modal: 50;
 
   --shadow: 0 1px 2px light-dark(rgba(16, 24, 40, 0.06), rgba(0, 0, 0, 0.5)), 0 10px 28px light-dark(rgba(16, 24, 40, 0.07), rgba(0, 0, 0, 0.30));
   --shadow-sm: 0 1px 2px light-dark(rgba(16, 24, 40, 0.06), rgba(0, 0, 0, 0.4));
@@ -141,18 +137,22 @@
   --toggle-off-bg: light-dark(#d4d4d4, #4a4a4a);
   --toggle-on-bg: light-dark(#0d0d0d, #4ecb9d);
   --toggle-dot-color: light-dark(#ffffff, #0d0d0d);
+
+  /* glass material tokens: rail/nav layer only — content cards stay opaque */
+  --glass-rail:  light-dark(rgba(249, 249, 249, 0.66), rgba(23, 23, 23, 0.62));
+  --glass-panel: light-dark(rgba(255, 255, 255, 0.78), rgba(38, 38, 38, 0.82));
+  --glass-blur:  saturate(1.6) blur(22px);
 }
 
 /* explicit user choice pins the scheme; "system" removes the attribute and falls back to the OS */
 :root[data-theme="light"] { color-scheme: light; }
 :root[data-theme="dark"]  { color-scheme: dark; }
 
-/* glass material tokens: rail/nav layer only — content cards stay opaque */
-:root {
-  --glass-rail:  light-dark(rgba(249, 249, 249, 0.66), rgba(23, 23, 23, 0.62));
-  --glass-panel: light-dark(rgba(255, 255, 255, 0.78), rgba(38, 38, 38, 0.82));
-  --glass-blur:  saturate(1.6) blur(22px);
-}
+/* language-aware font stacks: prioritize native system sans-serif per locale */
+:root:lang(zh), :root:lang(zh-CN), [lang="zh"], [lang="zh-CN"] { --font-ui: "OpenAI Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "WenQuanYi Micro Hei", "Noto Sans SC", system-ui, sans-serif; --font-code: ui-monospace, "SFMono-Regular", "Cascadia Code", "JetBrains Mono", "Noto Sans Mono CJK SC", Menlo, Consolas, monospace; }
+:root:lang(zh-TW), :root:lang(zh-HK), [lang="zh-TW"], [lang="zh-HK"] { --font-ui: "OpenAI Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang TC", "Microsoft JhengHei", "Noto Sans TC", system-ui, sans-serif; --font-code: ui-monospace, "SFMono-Regular", "Cascadia Code", "JetBrains Mono", "Noto Sans Mono CJK TC", Menlo, Consolas, monospace; }
+:root:lang(ja), [lang="ja"] { --font-ui: "OpenAI Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Hiragino Kaku Gothic ProN", "Yu Gothic UI", Meiryo, "Noto Sans JP", system-ui, sans-serif; --font-code: ui-monospace, "SFMono-Regular", "Cascadia Code", "JetBrains Mono", "Noto Sans Mono CJK JP", Menlo, Consolas, monospace; }
+:root:lang(ko), [lang="ko"] { --font-ui: "OpenAI Sans", "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", sans-serif; --font-code: ui-monospace, "SFMono-Regular", "Cascadia Code", "JetBrains Mono", "Noto Sans Mono CJK KR", Menlo, Consolas, monospace; }
 
 * { box-sizing: border-box; }
 
@@ -162,29 +162,15 @@ html { overflow-x: hidden; background: var(--bg); }
 
 body {
   margin: 0;
-  overflow-x: hidden;
+  overflow-x: clip; /* Keep vertical scrolling on the document, not a second body scrollport. */
   background: transparent;
   color: var(--text);
   font-family: var(--font-ui);
   font-size: var(--text-body);
   line-height: var(--leading-body);
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
-}
-
-/* single ambient soft-focus wash behind the app (OpenAI organic-blur grammar).
-   One wash per viewport; the glass rail and modals refract it via backdrop-filter. */
-body::before {
-  content: "";
-  position: fixed;
-  inset: -20%;
-  z-index: -1;
-  pointer-events: none;
-  background:
-    radial-gradient(42% 38% at 12% 6%,  light-dark(rgba(164, 196, 255, 0.42), rgba(96, 130, 200, 0.16)), transparent 70%),
-    radial-gradient(46% 42% at 88% 18%, light-dark(rgba(168, 226, 197, 0.38), rgba(88, 160, 130, 0.13)), transparent 70%),
-    radial-gradient(40% 36% at 70% 92%, light-dark(rgba(255, 224, 194, 0.30), rgba(180, 140, 100, 0.08)), transparent 72%);
-  filter: blur(70px);
 }
 
 a { color: var(--text); text-decoration: underline; text-decoration-color: var(--faint); text-underline-offset: 2px; }
@@ -271,11 +257,15 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
    stays visible in BOTH light and dark (a plain <img> was invisible white-on-white in light). */
 .brand-logo { width: 26px; height: 26px; flex-shrink: 0; background: var(--text);
   -webkit-mask: url(/logo.png) center / contain no-repeat; mask: url(/logo.png) center / contain no-repeat; }
-.brand .name { font-weight: var(--weight-semibold); font-size: var(--text-subtitle); letter-spacing: 0; line-height: 26px; }
+.brand .name { flex-shrink: 0; font-weight: var(--weight-semibold); font-size: var(--text-subtitle); letter-spacing: 0; line-height: 26px; }
 .brand .ver {
   font-family: var(--font-code); font-size: var(--text-micro); color: var(--muted); line-height: var(--leading-tight);
   background: var(--raised); border: 1px solid var(--border); padding: 2px 6px; border-radius: var(--radius-pill);
   align-self: center;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* [Decision Log]
@@ -393,10 +383,6 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 /* Clear the sidebar's 14px padding + 1px border so the menu's left edge sits in the
    main pane instead of straddling the divider (trigger ends at the content edge). */
 .lang-toggle .select-dropdown-beside { top: auto; bottom: 0; left: calc(100% + 20px); right: auto; min-width: 10rem; max-height: min(60vh, 20rem); overflow-y: auto; }
-.theme-toggle { display: flex; align-items: center; gap: 9px; padding: 8px 10px; width: 100%; text-align: left; background: none; border: none; cursor: pointer; color: var(--muted); font: inherit; font-size: var(--text-control); border-radius: var(--radius-sm); transition: background var(--motion-fast), color var(--motion-fast); }
-.theme-toggle:hover { background: var(--accent-soft); color: var(--text); }
-.theme-toggle svg { width: 16px; height: 16px; flex-shrink: 0; }
-.theme-toggle .mode { text-transform: capitalize; }
 .stop-toggle { color: var(--red); }
 .stop-toggle:hover { background: var(--red-soft); color: var(--red); }
 .stop-toggle:disabled { opacity: 0.5; cursor: default; }
@@ -416,7 +402,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .sidebar-orb:disabled { opacity: 0.5; cursor: default; }
 
 .main { min-width: 0; }
-.main-inner { max-width: 980px; margin: 0 auto; padding: 32px 36px 64px; container-type: inline-size; }
+.main-inner { max-width: 1120px; margin: 0 auto; padding: 28px 40px 64px; container-type: inline-size; }
 .main-inner.main-inner--combos {
   max-width: none;
   margin: 0;
@@ -510,7 +496,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
    than the catalog. It sits above the tab strip so it is visible on every models
    sub-tab, not only the catalog one. */
 .page-head-actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
-.codex-stale-banner { display: flex; align-items: center; gap: 10px; margin: 8px 0 4px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--raised); color: var(--text); }
+.codex-stale-banner { display: flex; align-items: center; gap: 10px; margin: 8px 0 4px; padding: 6px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--raised); color: var(--text); }
 .codex-stale-banner-text { flex: 1 1 auto; min-width: 0; font-size: var(--text-control); }
 .page-sub { color: var(--muted); font-size: var(--text-body); margin: 4px 0 22px; max-width: var(--prose-measure); }
 
@@ -1127,7 +1113,6 @@ a.btn, a.btn:hover { text-decoration: none; }
 .input:focus { border-color: var(--faint); outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
 textarea.input { resize: vertical; font-family: var(--font-code); line-height: var(--leading-relaxed); }
 .field-label { font-size: var(--text-label); color: var(--muted); font-weight: var(--weight-medium); margin-bottom: 5px; display: block; }
-select.input { appearance: none; }
 .select-sm {
   padding: 6px 12px; border-radius: var(--radius-pill);
   background: color-mix(in oklab, canvas 75%, transparent);
@@ -1314,6 +1299,7 @@ select.input { appearance: none; }
  decided it. Scoping the display to `:not([hidden])` lets the UA rule win again.
 */
 .notice:not([hidden]) { display: flex; }
+.notice.native-main-notice:not([hidden]) { display: block; }
 .notice { font-size: var(--text-control); line-height: var(--leading-body); padding: 9px 12px; border-radius: var(--radius-sm); margin-bottom: 14px; align-items: center; gap: 8px; max-width: var(--prose-measure); }
 .notice svg { width: 15px; height: 15px; flex-shrink: 0; }
 
@@ -1793,14 +1779,8 @@ dialog.modal-overlay::backdrop {
   z-index: 1;
 }
 
-/* The action cluster is four nowrap items on one line — feedback, the Spark switch,
-   and two labelled buttons. Narrow the window and that line wants ~577px inside a
-   437px column, and because `.page-head` is a plain nowrap flex row the surplus did
-   not wrap or scroll: the trailing "Refresh quotas" button rendered ~140px past its
-   own container and was sliced by the viewport edge. Both axes wrap now — the
-   cluster drops below the title first, then breaks internally if it still does not
-   fit — so every control stays reachable at any width. Wrapping is inert while the
-   line fits, so the wide layout is byte-identical. */
+/* Let feedback wrap below the standalone page title when a translated message is
+   wider than the available row. Account actions use their own wrapping row below. */
 .codex-auth-page-head { align-items: flex-start; flex-wrap: wrap; row-gap: 8px; }
 .codex-auth-page-head__actions {
   display: flex;
@@ -1813,19 +1793,6 @@ dialog.modal-overlay::backdrop {
 /* Once the cluster owns its own line the title no longer competes for width, so it
    takes the full row rather than wrapping "Codex Auth" onto two lines. */
 .codex-auth-page-head > .page-title { flex: 1 1 auto; }
-/* Spark visibility switch: a labelled toggle, not a bare knob. An unlabelled switch sitting
-   between two labelled buttons is a guessing game, and this one changes what every card in the
-   page renders. The label carries the meaning; the toggle carries the state. */
-.codex-auth-spark-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  white-space: nowrap;
-}
-.codex-auth-spark-toggle__label {
-  font-size: 12px;
-  color: var(--muted);
-}
 /* The pause/refresh pair after it moved out of the page head. Right-aligned so it still
    reads as chrome for the account list below rather than a heading of its own, and it
    wraps because both labels grow substantially in several locales. */
@@ -1927,23 +1894,21 @@ dialog.modal-overlay::backdrop {
 }
 
 /*
- * Claude account-pool card — the same inset `.account-pool-strategy-card` above already
- * fixes, on the card that still had it. `.card` has no padding, so each child brings its
- * own 16px: `.card-row`, `.card-sub` and `.setting-row` do, the warning box and the
- * threshold field do not, so those two rendered flush against the card border.
- *
- * The warning takes margin, not padding: it is a bordered box, so its own padding insets
- * the text and leaves the border itself on the card edge. The field takes padding — the
- * `.input` inside is full-width, so the field owns the inset for the whole group.
+ * Claude account-pool card. `.card` has no padding, so each child brings its own 16px inset.
+ * The conditions notice is quiet helper text, not a tinted alert box: it takes the inset as
+ * margin (padding zeroed) so the measure applies to the text. The field takes padding because
+ * the full-width `.input` inside it needs the inset for the whole group.
  */
 .anthropic-pool-card { margin-top: 12px; }
 .anthropic-pool-card__notice {
-  margin: 10px 16px 0;
-  padding: 10px 16px;
-  border: 1px solid var(--border, #c9a227);
-  border-radius: 6px;
-  background: color-mix(in srgb, var(--warn, #c9a227) 12%, transparent);
+  margin: 2px 16px 0;
+  padding: 0;
+  max-width: var(--prose-measure);
+  text-wrap: pretty;
 }
+.anthropic-pool-card__details { margin: 8px 16px 12px; font-size: var(--text-label); line-height: var(--leading-body); color: var(--muted); }
+.anthropic-pool-card__details > summary { cursor: pointer; width: fit-content; color: var(--text); }
+.anthropic-pool-card__details > p { margin: 6px 0 0; max-width: var(--prose-measure); text-wrap: pretty; }
 .anthropic-pool-card__field {
   display: block;
   margin-top: 12px;
@@ -1975,10 +1940,6 @@ dialog.modal-overlay::backdrop {
 .notice-warn:not([hidden]) { display: flex; }
 .notice-warn svg { width: 14px; height: 14px; flex-shrink: 0; color: var(--amber); }
 
-.startup-runtime-notice__text,
-.startup-runtime-notice__fix code {
-  color: inherit;
-}
 /* `.card` carries no padding of its own — `.card-row` and `.card-sub` each inset themselves,
    so a card built from plain children leaves the title and controls flush against the border
    while the hints sit 16px in. Pad the card and flatten the hints, as the auto-switch card does. */
@@ -1998,22 +1959,6 @@ dialog.modal-overlay::backdrop {
 .codex-account-priority-label { font-size: var(--text-label); color: var(--muted); font-weight: var(--weight-medium); white-space: nowrap; }
 .codex-account-priority .select-trigger { max-width: 100%; padding: 4px 9px; font-size: var(--text-label); }
 
-.startup-page-head-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-.startup-runtime-notice-slot {
-  margin-bottom: 12px;
-  min-height: 52px;
-}
-.startup-runtime-notice-slot--pending {
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--amber-soft) 45%, transparent);
-}
-.startup-runtime-notice-slot .startup-runtime-notice { margin-bottom: 0; }
-/* Match hero/panels: beat .notice / .notice-warn 70ch prose measure. */
-.notice.notice-warn.startup-page-notice {
-  max-width: none;
-  width: 100%;
-  box-sizing: border-box;
-}
 /* Message above, command+copy below. */
 .notice.notice-warn.startup-runtime-notice:not([hidden]) {
   display: flex;
@@ -2023,60 +1968,9 @@ dialog.modal-overlay::backdrop {
   align-items: stretch;
   gap: 8px;
 }
-.startup-runtime-notice__text {
-  margin: 0;
-  max-width: none;
-}
-.startup-runtime-notice__fix {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  min-width: 0;
-}
-.startup-runtime-notice__fix code {
-  margin: 0;
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-.startup-runtime-notice__fix .btn {
-  flex: 0 0 auto;
-}
-.startup-hero { display: flex; gap: 16px; align-items: flex-start; margin-bottom: 16px; }
-.startup-hero--safe { border-color: color-mix(in srgb, var(--green) 34%, var(--border)); background: color-mix(in srgb, var(--green-soft) 64%, var(--surface)); }
-.startup-hero--risk { border-color: color-mix(in srgb, var(--amber) 40%, var(--border)); background: color-mix(in srgb, var(--amber-soft) 72%, var(--surface)); }
-.startup-hero--native { border-color: color-mix(in srgb, var(--accent) 20%, var(--border)); }
-.startup-hero-icon { width: 42px; height: 42px; border-radius: var(--radius); display: grid; place-items: center; background: var(--raised); flex: 0 0 auto; }
-.startup-hero-icon svg { width: 21px; height: 21px; }
-.startup-hero-copy h3 { margin: 10px 0 4px; font-size: var(--text-title); }
-.startup-hero-copy p { margin: 0; color: var(--muted); line-height: var(--leading-body); max-width: var(--prose-measure); }
-.startup-state-line { margin: 8px 0 0; font-size: var(--text-control); }
-.startup-recovery-details > summary { cursor: pointer; list-style: none; display: inline-flex; align-items: center; gap: 6px; }
-.startup-recovery-details > summary::-webkit-details-marker { display: none; }
-.startup-recovery-details > summary::before { content: ""; width: 0; height: 0; border-left: 5px solid var(--muted); border-top: 4px solid transparent; border-bottom: 4px solid transparent; transition: transform var(--motion-fast); }
-.startup-recovery-details[open] > summary::before { transform: rotate(90deg); }
-.startup-recovery-details[open] > summary { margin-bottom: 8px; }
-.startup-details, .startup-actions { margin-bottom: 16px; }
-.startup-actions .panel-head > svg { width: 18px; height: 18px; flex: 0 0 auto; }
-.startup-detail-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 0; border-top: 1px solid var(--border-soft); }
-.startup-detail-row > div { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
-.startup-detail-row > .startup-detail-actions { flex-direction: row; align-items: center; justify-content: flex-end; flex: 0 0 auto; gap: 8px; }
-.startup-detail-row span:not(.badge) { color: var(--muted); font-size: var(--text-label); line-height: var(--leading-body); }
-.startup-actions > .muted { margin: -4px 0 14px; font-size: var(--text-control); max-width: var(--prose-measure); }
-.startup-tray-buttons { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; min-height: 36px; }
-.startup-tray-error { margin-top: 12px; }
-.startup-command-list { border: 1px solid var(--border-soft); border-radius: var(--radius-sm); overflow: hidden; }
-.startup-command-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px; }
-.startup-command-row + .startup-command-row { border-top: 1px solid var(--border-soft); }
-.startup-command-row > div { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
-.startup-command-row strong { font-size: var(--text-control); }
-.startup-command-row code { color: var(--muted); font-size: var(--text-label); overflow-wrap: anywhere; }
-.startup-action-notice { margin: 14px 0 0; }
+
 @media (max-width: 700px) {
-  .startup-command-row { align-items: flex-start; }
-  .startup-detail-row { align-items: flex-start; }
-  .startup-detail-row > .startup-detail-actions { flex-direction: column; align-items: flex-end; }
+
 }
 .modal-desc { font-size: var(--text-control); line-height: var(--leading-body); color: var(--muted); margin-bottom: 14px; max-width: var(--prose-measure); }
 .modal-actions { display: flex; gap: 8px; margin-top: 16px; }
@@ -2149,6 +2043,13 @@ table.logs-table {
   gap: var(--space-2);
   margin-bottom: var(--space-3);
 }
+.logs-filter-status { display: inline-flex; align-items: center; gap: var(--space-2); margin-left: auto; }
+.logs-toolbar-secondary { margin-top: calc(var(--space-1) * -1); }
+.logs-filter-container { min-width: 0; }
+.logs-filter-container .logs-filter-field { min-width: 0; max-width: 100%; flex-wrap: wrap; }
+.logs-filter-container .logs-filter-field .input { min-width: 0; max-width: 100%; }
+.logs-filter-container .logs-filter-status { flex-wrap: wrap; max-width: 100%; }
+.logs-filter-container .logs-segmented { max-width: 100%; flex-wrap: wrap; }
 
 .logs-segmented {
   display: inline-flex;
@@ -2390,6 +2291,7 @@ button.prov-account-row.active { cursor: default; }
    reused as an off-canvas drawer — 10 destinations no longer fit an always-visible
    strip or chip grid without eating half the viewport. */
 @media (max-width: 760px) {
+  html:has(.sidebar.open) { overflow-y: hidden; } /* Lock the document behind the drawer. */
   /* rows: topbar auto + main fills — without this, align-content stretch splits the
      leftover viewport height between the two rows and inflates the top bar */
   .app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
@@ -2414,7 +2316,7 @@ button.prov-account-row.active { cursor: default; }
   .mobile-topbar .brand .name {
     min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .mobile-topbar .brand .ver { flex-shrink: 0; }
+  .mobile-topbar .brand .ver { flex-shrink: 1; }
   .mobile-topbar .stop-toggle { width: auto; min-width: 44px; min-height: 44px; justify-content: center; padding: 8px; }
   /* Both orbs keep the 44x44 touch target the single stop button had; a bare 28px
      .sidebar-orb would be a regression on the surface where it matters most. */
@@ -2497,11 +2399,50 @@ button.prov-account-row.active { cursor: default; }
 /* Top-align with Storage: centering against the taller filter chips dropped the "Usage" title. */
 .usage-head { flex-wrap: wrap; align-items: flex-start; }
 .usage-filters { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+/* Custom range: a disclosure, not a second filter row. It reuses the chip language of the
+   segmented presets above it so the page reads as one control area, and the panel is
+   `width: max-content` because a four-control form stretched to 1200px is what made the old
+   flex-end row look like a stray band across the page. */
+.usage-range { display: grid; justify-items: start; gap: 8px; margin: 10px 0 4px; }
+.usage-range-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; max-width: 100%; }
+.usage-range-toggle {
+  display: inline-flex; align-items: center; gap: 6px;
+  min-height: var(--control-sm); padding: 4px 12px;
+  border: 1px solid var(--border); border-radius: var(--radius-pill);
+  background: var(--surface); color: var(--muted);
+  font: inherit; font-size: var(--text-label); font-weight: var(--weight-medium);
+  white-space: nowrap; cursor: pointer;
+  transition: color var(--motion-fast), background var(--motion-fast), border-color var(--motion-fast);
+}
+.usage-range-toggle:hover { background: var(--raised); color: var(--text); }
+.usage-range-toggle[aria-expanded="true"] { color: var(--text); }
+.usage-range-toggle.is-active { border-color: var(--accent); color: var(--text); }
+.usage-range-chevron { flex: 0 0 auto; transition: transform var(--motion-fast); }
+.usage-range-toggle[aria-expanded="true"] .usage-range-chevron { transform: rotate(90deg); }
+.usage-range-applied { margin: 0; min-width: 0; }
+.usage-range-panel {
+  display: grid; gap: 10px; width: max-content; max-width: 100%;
+  padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+/* `align-items: end` is the fix for the old row: a label+input stack is twice the height of a
+   `btn-sm`, so centering left Apply and Clear floating beside the middle of the fields.
+   Every track is `auto` on purpose. A fixed 200px cap does not survive contact with a
+   `datetime-local` control: its intrinsic minimum is about 206px in Chrome at this font size,
+   and it grows again for locales whose date format is longer than `mm/dd/yyyy`. The fields
+   then overflow their tracks and eat the gap, which is the exact rhythm defect this block
+   exists to fix. */
+.usage-range-fields { display: grid; grid-template-columns: repeat(4, auto); justify-content: start; align-items: end; gap: 8px; }
+.usage-range-field { display: grid; gap: 4px; min-width: 0; }
+.usage-range-field .field-label { margin: 0; }
+.usage-range-fields .input { height: var(--control-md); padding-block: 0; }
+.usage-range-action { min-height: var(--control-md); }
+.usage-range-panel > p { margin: 0; }
 .usage-segmented { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius-pill); padding: 2px; gap: 2px; background: var(--surface); }
 .usage-segmented-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: none; background: transparent; color: var(--muted); padding: 4px 12px; border-radius: var(--radius-pill); cursor: pointer; font: inherit; white-space: nowrap; }
 .usage-segmented-btn.active { background: var(--raised); color: var(--text); font-weight: var(--weight-semibold); }
 .usage-source-mark { width: var(--icon-sm); height: var(--icon-sm); flex: 0 0 auto; object-fit: contain; }
-/* Only monochrome source marks (Grok) are inverted for dark themes. Brand-colored
+/* Monochrome source marks (Grok, OpenCode and Aside) are inverted for dark themes. Brand-colored
    marks (Claude, Codex/OpenAI) must keep their brand color; inverting shifts the hue. */
 :root[data-theme="dark"] .usage-source-mark--mono { filter: invert(1); }
 
@@ -2518,6 +2459,11 @@ button.prov-account-row.active { cursor: default; }
 
 @media (max-width: 640px) {
   .usage-source-btn .usage-source-label-collapsible { display: none; }
+  /* Two 200px columns plus both actions stop fitting a phone content width; the panel takes
+     the full row and every control keeps the same height it has on desktop. */
+  .usage-range-panel { width: 100%; }
+  .usage-range-fields { grid-template-columns: minmax(0, 1fr); }
+  .usage-range-action { width: 100%; }
 }
 
 @media (max-width: 360px) {
@@ -2555,7 +2501,7 @@ button.prov-account-row.active { cursor: default; }
 .heatmap-cell-4 { background: var(--green); }
 .heatmap-legend { display: inline-flex; align-items: center; gap: 4px; font-size: var(--text-label); align-self: flex-end; position: sticky; right: 0; }
 .heatmap-legend .heatmap-cell { width: 10px; height: 10px; }
-.heatmap-tip { position: fixed; z-index: 10; transform: translate(-50%, -100%) translateY(-8px); pointer-events: none;
+.heatmap-tip { position: fixed; z-index: var(--z-popover); pointer-events: none;
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 6px 10px;
   box-shadow: var(--shadow-sm); white-space: nowrap; font-size: var(--text-label); }
 .heatmap-tip-date { font-weight: var(--weight-semibold); color: var(--text); margin-bottom: 2px; }
@@ -2566,7 +2512,7 @@ button.prov-account-row.active { cursor: default; }
 
 /* 7d view: per-day request bar chart (replaces the year heatmap on the 7d toggle). */
 .daybars { display: grid; grid-template-columns: repeat(7, 1fr); gap: 10px; align-items: end; height: 180px; padding-top: 8px; }
-.daybar { position: relative; display: flex; flex-direction: column; align-items: center; gap: 6px; height: 100%; justify-content: flex-end; }
+.daybar { appearance: none; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; cursor: pointer; position: relative; display: flex; flex-direction: column; align-items: center; gap: 6px; height: 100%; justify-content: flex-end; }
 .daybar-track { width: 100%; max-width: 48px; flex: 1; display: flex; align-items: flex-end; background: var(--border); border-radius: var(--radius-xs); overflow: hidden; }
 /* Full-height stack scaled on Y — avoids layout thrash from animating height. */
 .daybar-stack {
@@ -2585,9 +2531,9 @@ button.prov-account-row.active { cursor: default; }
 .daybar-count { font-size: var(--text-label); font-weight: var(--weight-semibold); color: var(--text); }
 .daybar-label { font-size: var(--text-caption); white-space: nowrap; }
 .daybar:hover .daybar-track { outline: 1px solid var(--border); }
-.daybar-tip { position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%); z-index: 5;
+.daybar-tip { position: fixed; z-index: var(--z-popover);
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 10px;
-  min-width: 160px; box-shadow: var(--shadow-sm); pointer-events: none; }
+  min-width: min(160px, calc(100vw - 16px)); box-shadow: var(--shadow-sm); pointer-events: none; }
 .daybar-tip-date { font-size: var(--text-label); font-weight: var(--weight-semibold); color: var(--text); margin-bottom: 6px; white-space: nowrap; }
 .daybar-tip-row { display: flex; align-items: center; gap: 8px; font-size: var(--text-label); line-height: var(--leading-relaxed); }
 .daybar-tip-swatch { width: 10px; height: 10px; border-radius: var(--radius-2xs); flex-shrink: 0; }
@@ -2628,6 +2574,53 @@ button.prov-account-row.active { cursor: default; }
 
 /* ---- model row hover tooltip ---- */
 .model-row-wrap { position: relative; }
+.models-model-identity {
+  display: inline-flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+}
+.models-model-friendly {
+  max-width: min(42vw, 420px);
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.models-display-name-trigger { flex-shrink: 0; }
+.model-display-name-dialog { max-width: 460px; }
+.model-display-name-identity,
+.model-display-name-current {
+  display: grid;
+  gap: 5px;
+  margin-bottom: 16px;
+}
+.model-display-name-identity code {
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+.model-display-name-current {
+  grid-template-columns: 1fr auto;
+  align-items: center;
+}
+.model-display-name-current > .text-label { grid-column: 1 / -1; }
+.model-display-name-current strong { min-width: 0; overflow-wrap: anywhere; }
+.model-display-name-dialog > .input { margin-bottom: 6px; }
+.model-display-name-dialog > .small { text-wrap: balance; }
+.model-display-name-error {
+  margin-top: 8px;
+  color: var(--red);
+  font-size: var(--text-label);
+  line-height: var(--leading-body);
+}
+@media (max-width: 560px) {
+  .models-model-friendly { max-width: 58vw; }
+  .model-display-name-current { grid-template-columns: 1fr; }
+  .model-display-name-current > .text-label { grid-column: auto; }
+  .model-display-name-dialog .modal-actions { align-items: stretch; flex-direction: column; }
+  .model-display-name-dialog .modal-actions .btn { width: 100%; }
+}
 .model-tip {
   z-index: 10;
   background: var(--surface);
@@ -2680,7 +2673,6 @@ button.prov-account-row.active { cursor: default; }
   to { opacity: 1; }
 }
 
-
 /* Invisible full-area control for native <dialog> backdrop dismiss (a11y). */
 .modal-backdrop-dismiss {
   position: fixed;
@@ -2714,7 +2706,7 @@ button.prov-account-row.active { cursor: default; }
 }
 .claude-desktop-toolbar {
   display: flex;
-  justify-content: flex-end;
+  justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;
   margin-bottom: 12px;
 }
 .claude-tabs button {
@@ -2833,6 +2825,8 @@ button.prov-account-row.active { cursor: default; }
 .claude-move-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; align-items: end; margin-top: 10px; }
 .claude-move-row > label { grid-column: 1 / -1; margin: 0; }
 .claude-move-row .input { min-width: 0; height: 34px; padding-block: 4px; }
+.claude-remove-row { display: flex; gap: 8px; align-items: center; justify-content: space-between; margin-top: 10px; }
+.claude-remove-hint { color: var(--muted); font-size: 11.5px; }
 .sr-only {
   position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
   clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;

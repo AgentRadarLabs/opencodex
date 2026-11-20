@@ -5,6 +5,8 @@ export const CODEX_CONFIGURED_CAPACITY_WEIGHTS = {
   team: 1,
   business: 1,
   prolite: 5,
+  // Business Premium has 5x Standard included usage; this is display calibration only (#7440).
+  self_serve_business_prolite: 5,
   pro: 20,
 } as const;
 
@@ -13,7 +15,7 @@ export const CODEX_CONFIGURED_CAPACITY_WEIGHTS = {
  *
  * `CodexAccount.plan` is an unrestricted upstream string and cannot be enumerated: the
  * bundled model snapshot alone carries 21 distinct plan names (`edu_plus`, `finserv`,
- * `k12`, `quorum`, `self_serve_business_usage_based`, …) against the five listed above.
+ * `k12`, `quorum`, `self_serve_business_usage_based`, …) against the calibrated entries above.
  * Treating an unlisted plan as unknown dropped the account from the estimate entirely and
  * reported "incomplete coverage" — which is how a Business seat upgraded to Premium
  * disappeared from its own capacity report (#3155), and it was already happening to the
@@ -36,6 +38,15 @@ export const CODEX_CAPACITY_MAX_QUOTA_AGE_MS = 30 * 60_000;
 export type CodexCapacityQuota = {
   fiveHourPercent?: number;
   fiveHourResetAt?: number;
+  /**
+   * Local observation time for the burst-window percentage.
+   *
+   * Carried because the terminal-short-window rule needs it whenever the reading has no reset
+   * instant, and the dashboard's account-switch warning evaluates that rule against this DTO.
+   * Dropping it here made the warning return "no opinion" for a snapshot routing was already
+   * refusing on (#5045).
+   */
+  shortObservedAt?: number;
   weeklyPercent?: number;
   weeklyResetAt?: number;
   monthlyPercent?: number;
@@ -48,6 +59,12 @@ export interface CodexCapacityAccount {
   isMain: boolean;
   active?: boolean;
   plan?: unknown;
+  /**
+   * Explicit capacity weight for providers without a calibrated plan table (Anthropic seats
+   * report no tier). When set it replaces the Codex plan lookup and the account is not counted
+   * as an uncalibrated plan.
+   */
+  weight?: number;
   paused: boolean;
   needsReauth?: boolean;
   quota: CodexCapacityQuota | null;
@@ -113,7 +130,8 @@ function isCalibratedPlan(plan: unknown): boolean {
   return !!normalized && Object.hasOwn(CODEX_CONFIGURED_CAPACITY_WEIGHTS, normalized);
 }
 
-function configuredWeight(plan: unknown): number {
+/** The configured capacity weight of a Codex plan; the default weight when uncalibrated. */
+export function codexCapacityWeight(plan: unknown): number {
   const normalized = codexPlanKey(plan);
   return normalized && Object.hasOwn(CODEX_CONFIGURED_CAPACITY_WEIGHTS, normalized)
     ? CODEX_CONFIGURED_CAPACITY_WEIGHTS[normalized as keyof typeof CODEX_CONFIGURED_CAPACITY_WEIGHTS]
@@ -215,10 +233,13 @@ export function aggregateCodexPoolCapacity(
   let staleQuotaAccounts = 0;
 
   for (const account of accounts) {
-    const weight = configuredWeight(account.plan);
+    const explicitWeight = typeof account.weight === "number" && Number.isFinite(account.weight) && account.weight > 0
+      ? account.weight
+      : undefined;
+    const weight = explicitWeight ?? codexCapacityWeight(account.plan);
     // Still reported, so the operator can see the estimate is conservative for this seat —
     // but no longer a reason to drop the account from the aggregate (#3155).
-    if (!isCalibratedPlan(account.plan)) unknownPlanAccounts += 1;
+    if (explicitWeight === undefined && !isCalibratedPlan(account.plan)) unknownPlanAccounts += 1;
     if (account.paused) pausedAccounts += 1;
     if (account.needsReauth) reauthAccounts += 1;
     const quota = account.quota;

@@ -8,7 +8,8 @@ import {
 import { readJsonOrThrow } from "../fetch-json";
 import type { TKey } from "../i18n/shared";
 import type { StartupHealthStatus } from "../startup-health-ui";
-import { shadowSourceModelList } from "./shadow-call-source";
+import { shadowSourceModelList, type ShadowCallSourceOption } from "./shadow-call-source";
+import type { AnthropicInstanceId, AnthropicPoolOptions } from "./claude-manual-env";
 
 export type DashboardSection = "overview" | "providers" | "models";
 
@@ -48,6 +49,9 @@ export interface ProviderInfo { name: string; adapter: string; baseUrl: string; 
 export interface ModelInfo { id: string; provider: string; namespaced: string; owned_by?: string; reasoningEfforts?: string[] }
 export interface SettingsData {
   codexAutoStart: boolean;
+  codexDesktopAuthless?: boolean;
+  codexClientCompaction?: boolean;
+  catalogRefreshPending?: boolean;
   /** Whether a login may open a browser on the machine running the proxy. */
   oauthOpenBrowser?: boolean;
   port: number;
@@ -60,6 +64,7 @@ export interface SettingsData {
     autostartEnabled: boolean;
     shimCoverage: "full" | "cli-only" | "none";
     diagnosticStale: boolean;
+    desktop?: { owned?: boolean; supervisor?: unknown; loginState?: unknown; running?: boolean; viable?: boolean; supervisionUnknown?: boolean };
   };
 }
 export type SidecarBackend = "openai" | "anthropic";
@@ -75,6 +80,8 @@ export type VisionReasoning = "low" | "medium" | "high" | "xhigh" | "max";
 export interface SidecarSetting {
   // Shared by the web-search and vision cards; vision may carry "routed".
   backend?: VisionBackend;
+  anthropicInstance?: AnthropicInstanceId;
+  anthropicPool?: AnthropicPoolOptions;
   model: string;
   reasoning?: VisionReasoning;
   streamRoutedModelOutput?: boolean;
@@ -99,6 +106,9 @@ export interface WebSearchPickerOption {
 export interface SidecarData {
   webSearch: SidecarSetting;
   vision: SidecarSetting;
+  /** The Codex-side write a sidecar PUT attempted, when the switch actually moved.
+   *  Absent on an older server; the client then shows nothing rather than guessing. */
+  codexWebSearch?: SidecarCodexApply;
   /** Server-computed eligible describers. Optional: an older server omits it and
    *  the client falls back to the legacy provider-name list rather than showing
    *  an empty picker. */
@@ -108,10 +118,19 @@ export interface SidecarData {
    *  falls back to the legacy list; a current server's [] means none. */
   webSearchModels?: WebSearchModelOption[];
 }
+
+/** The Codex-config apply report a management write returns (same shape as the Desktop switches'). */
+export interface SidecarCodexApply {
+  applied?: boolean;
+  reason?: string;
+  retryable?: boolean;
+  detail?: string;
+}
 export interface SidecarPatch {
-  webSearch?: { backend?: SidecarBackend | null; model?: string; streamRoutedModelOutput?: boolean };
+  webSearch?: { backend?: SidecarBackend | null; anthropicInstance?: AnthropicInstanceId | null; model?: string; streamRoutedModelOutput?: boolean; enabled?: boolean };
   vision?: {
     backend?: VisionBackend | null;
+    anthropicInstance?: AnthropicInstanceId | null;
     model?: string;
     reasoning?: VisionReasoning;
     enabled?: boolean;
@@ -119,13 +138,20 @@ export interface SidecarPatch {
     timeoutMs?: number;
   };
 }
-export interface ShadowCallData { enabled: boolean; model: string; sourceModels?: string[] }
-export interface UsageSummary30d { summary: { requests: number; totalTokens: number; coverageRatio: number } }
+export interface ShadowCallData {
+  enabled: boolean;
+  model: string;
+  sourceModels?: string[];
+  /** Runtime-owned source inventory; older runtimes omit it. */
+  sourceModelOptions?: ShadowCallSourceOption[];
+}
+export type UsageSummary30d = import("../usage-summary-resource").UsageReadMetadata & { summary: { requests: number; totalTokens: number; coverageRatio: number } };
 export type UpdateChannel = "latest" | "preview";
-export type Installer = "npm" | "bun" | "source";
+export type Installer = "bun" | "mise" | "npm" | "pnpm" | "source";
 export type UpdateJobStatus = "running" | "restarting" | "succeeded" | "failed";
 export interface SyncResult {
   ok: boolean;
+  status?: "applied" | "skipped" | "catalog-only" | "refused";
   added: number;
   catalogPath: string | null;
   catalogExists: boolean;
@@ -185,6 +211,8 @@ export function updateReasonLabel(reason: string | undefined, t: (key: TKey) => 
     case "source_checkout": return t("dash.updateReason.source_checkout");
     case "latest_unavailable": return t("dash.updateReason.latest_unavailable");
     case "already_latest": return t("dash.updateReason.already_latest");
+    case "externally_managed": return t("dash.updateReason.externally_managed");
+    case "external_ownership_invalid": return t("dash.updateReason.external_ownership_invalid");
     default: return t("dash.updateReason.unknown");
   }
 }
@@ -202,6 +230,7 @@ export function mergeSidecarSetting(
   current: SidecarSetting,
   update?: {
     backend?: VisionBackend | null;
+    anthropicInstance?: AnthropicInstanceId | null;
     model?: string;
     reasoning?: VisionReasoning;
     streamRoutedModelOutput?: boolean;
@@ -214,6 +243,9 @@ export function mergeSidecarSetting(
   if (update?.model !== undefined) merged.model = update.model;
   if (update?.backend === null) delete merged.backend;
   else if (update?.backend !== undefined) merged.backend = update.backend;
+  if (update?.anthropicInstance === null) delete merged.anthropicInstance;
+  else if (update?.anthropicInstance !== undefined) merged.anthropicInstance = update.anthropicInstance;
+  if (update?.backend !== undefined && update.backend !== "anthropic") delete merged.anthropicInstance;
   if (update?.reasoning !== undefined) merged.reasoning = update.reasoning;
   if (update?.streamRoutedModelOutput !== undefined) merged.streamRoutedModelOutput = update.streamRoutedModelOutput;
   if (update?.enabled !== undefined) merged.enabled = update.enabled;
@@ -229,6 +261,41 @@ export function visionReasoningPatch(reasoning: VisionReasoning): SidecarPatch {
 
 export function visionEnabledPatch(enabled: boolean): SidecarPatch {
   return { vision: { enabled } };
+}
+
+/**
+ * The web-search master switch, as the Dashboard's Off row sends it. Off is the operator saying
+ * "no native web search at all": OpenCodex stops intercepting it AND writes Codex's own
+ * `web_search` mode off, which is what lets an MCP search server be the only search path.
+ */
+export function webSearchEnabledPatch(enabled: boolean): SidecarPatch {
+  return { webSearch: { enabled } };
+}
+
+/**
+ * True when the last sidecar save asked for a Codex-config write and the write did not happen.
+ *
+ * The sidecar's own switch is stored either way — this is the client-side half that keeps an
+ * operator from reading a stored "Off" as a native `web_search` tool that is already gone. The
+ * ordinary "nothing moved" answer (`not_requested`) stays silent: it is not a failure.
+ */
+export function sidecarCodexWritePending(report: SidecarCodexApply | undefined): boolean {
+  return report?.applied === false && report.reason !== "not_requested";
+}
+
+/**
+ * Which Codex-config report the Dashboard keeps after a save.
+ *
+ * A save that did not move the web-search switch (`not_requested`) says nothing about the Codex
+ * file — a Vision save answers that way while the failed web-search write is still outstanding. So
+ * a pending report outlives it instead of being cleared by an answer that never described the
+ * file. An applied write and the model sync both replace it with a settled report.
+ */
+export function nextSidecarCodexApply(
+  previous: SidecarCodexApply | undefined,
+  report: SidecarCodexApply | undefined,
+): SidecarCodexApply | undefined {
+  return report?.reason === "not_requested" && sidecarCodexWritePending(previous) ? previous : report;
 }
 
 export function visionMaxDescriptionsPatch(maxDescriptionsPerTurn: number): SidecarPatch {
@@ -407,7 +474,22 @@ export function shadowCallModelOptions(models: ModelInfo[], current: string | un
 }
 
 export function sidecarBackendForModel(models: ModelInfo[], modelId: string): SidecarBackend {
-  return models.find(model => model.id === modelId)?.provider === "anthropic" ? "anthropic" : "openai";
+  const provider = models.find(model => model.id === modelId)?.provider;
+  return provider === "anthropic" || provider === "anthropic2" ? "anthropic" : "openai";
+}
+
+/** Backend transitions must remove an old explicit pool in the same PATCH. */
+export function sidecarPatchForSave(current: SidecarData, patch: SidecarPatch): SidecarPatch {
+  function clearPool<T extends { backend?: string | null; anthropicInstance?: AnthropicInstanceId | null }>(
+    setting: SidecarSetting, update: T,
+  ): T {
+    return update.backend !== undefined && update.backend !== "anthropic" && setting.anthropicInstance !== undefined
+      ? { ...update, anthropicInstance: null } : update;
+  }
+  return { ...patch,
+    ...(patch.webSearch ? { webSearch: clearPool(current.webSearch, patch.webSearch) } : {}),
+    ...(patch.vision ? { vision: clearPool(current.vision, patch.vision) } : {}),
+  };
 }
 
 /** Server provenance wins; catalog inference supports only legacy option rows. */

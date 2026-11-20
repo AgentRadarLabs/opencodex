@@ -15,6 +15,7 @@ mock.module("../../src/oauth", () => ({
 }));
 
 import { CLAUDE_CODE_SYSTEM_INSTRUCTION } from "../../src/oauth/anthropic";
+import { CLAUDE_CLI_USER_AGENT } from "../../src/providers/claude-cli-identity";
 import { parseRequest } from "../../src/responses/parser";
 import { handleManagementAPI } from "../../src/server/management-api";
 import type { OcxConfig, OcxProviderConfig } from "../../src/types";
@@ -71,6 +72,34 @@ describe("Anthropic vision executor", () => {
   afterEach(() => {
     globalThis.fetch = originalFetch;
     oauthAccessError = undefined;
+  });
+
+  test.each([64 * 1024, 80 * 1024])("keeps only complete partial description frames at %i bytes without waiting for cancel", async (size) => {
+    const prefix = `data: ${JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: "partial 한글" } })}\n\n`;
+    const tail = `data: ${JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: "discard" } })}`;
+    const encoder = new TextEncoder();
+    const body = prefix + ":" + "x".repeat(64 * 1024 - encoder.encode(prefix + "\n\n" + tail).length - 1) + "\n\n" + tail;
+    let cancelled = false;
+    const out = await parseAnthropicVisionSSE(new Response(new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(encoder.encode(body + "z".repeat(size - 64 * 1024))); },
+      cancel() { cancelled = true; return new Promise<void>(() => {}); },
+    }, { highWaterMark: 0 })));
+    expect(cancelled).toBe(true);
+    expect(out).toEqual({ text: "partial 한글" });
+  });
+
+  test.each([401, 503])("bounds HTTP %i error bodies even when cancellation never settles", async (status) => {
+    let reads = 0;
+    let cancelled = false;
+    globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+      pull(controller) { reads += 1; controller.enqueue(new Uint8Array(4096).fill(120)); },
+      cancel() { cancelled = true; return new Promise<void>(() => {}); },
+    }, { highWaterMark: 0 }), { status })) as typeof fetch;
+    const out = await describeImageAnthropic(DATA_IMAGE, "high", "", "anthropic-vision-test", anthropicProvider, settings);
+    expect(reads).toBe(16);
+    expect(cancelled).toBe(true);
+    expect(out.error).toBe(status === 401
+      ? `anthropic vision sidecar auth failed: ${PUBLIC_OAUTH_ERROR}` : "anthropic vision sidecar HTTP 503");
   });
 
   test("projects OAuth, upstream-auth, and transport failures onto safe replacement errors", async () => {
@@ -153,6 +182,7 @@ describe("Anthropic vision executor", () => {
   test("POSTs /v1/messages with the Claude Code OAuth fingerprint and a base64 image block", async () => {
     let captured: { url: string; headers: Headers; body: Record<string, unknown> } | undefined;
     globalThis.fetch = (async (url, init) => {
+      expect(init?.redirect).toBe("manual");
       captured = {
         url: String(url),
         headers: new Headers(init?.headers),
@@ -178,7 +208,7 @@ describe("Anthropic vision executor", () => {
     expect(captured?.headers.get("x-app")).toBe("cli");
     expect(captured?.headers.get("x-claude-code-session-id")).toBeTruthy();
     expect(captured?.headers.get("x-client-request-id")).toBeTruthy();
-    expect(captured?.headers.get("user-agent")).toBe("@anthropic-ai/sdk/0.74.0");
+    expect(captured?.headers.get("user-agent")).toBe(CLAUDE_CLI_USER_AGENT);
 
     expect(captured?.body.model).toBe("claude-sonnet-5");
     expect(captured?.body.max_tokens).toBe(1024);
@@ -223,6 +253,27 @@ describe("Anthropic vision executor", () => {
       { type: "content_block_delta", delta: { type: "text_delta", text: "second" } },
     ], { crlf: true, unterminated: true, chunkSize: 1 }));
     expect(result).toEqual({ text: "first second" });
+  });
+
+  test("an unterminated frame cannot buffer the stream without bound", async () => {
+    // A sidecar that never emits a frame separator: without a cap the parser accumulates the
+    // whole response in memory before it can fold anything.
+    let produced = 0;
+    let cancelled = false;
+    const chunk = new TextEncoder().encode(`data: {"filler":"${"x".repeat(64 * 1024)}"}`);
+    const body = new ReadableStream<Uint8Array>({
+      pull(c) {
+        if (produced > 8 * 1024 * 1024) { c.close(); return; }
+        produced += chunk.byteLength;
+        c.enqueue(chunk);
+      },
+      cancel() { cancelled = true; },
+    });
+    const out = await parseAnthropicVisionSSE(new Response(body, { status: 200 }));
+    expect(cancelled).toBe(true);
+    // The cap stops the read long before the producer would have finished on its own.
+    expect(produced).toBeLessThan(1024 * 1024);
+    expect(out.text).toBe("");
   });
 
   test("malformed and terminal-error streams degrade to explicit errors", async () => {
@@ -327,6 +378,7 @@ describe("Anthropic vision planning and management config", () => {
         enabled: true,
         model: "claude-sonnet-5",
         backend: "anthropic",
+        anthropicPool: { backend: "anthropic", mixed: false, available: [] },
         reasoning: "low",
         maxDescriptionsPerTurn: 4,
         timeoutMs: 45_000,
@@ -339,11 +391,16 @@ describe("Anthropic vision planning and management config", () => {
         config,
       );
       const getBody = await get!.json() as Record<string, any>;
-      expect(getBody.webSearch).toEqual({ model: "claude-haiku-4-5", backend: "anthropic", streamRoutedModelOutput: false });
+      // No provider is configured, so the Pool options report Anthropic with no usable pool.
+      expect(getBody.webSearch).toEqual({
+        enabled: true, model: "claude-haiku-4-5", backend: "anthropic", streamRoutedModelOutput: false,
+        anthropicPool: { backend: "anthropic", mixed: false, available: [] },
+      });
       expect(getBody.vision).toEqual({
         enabled: true,
         model: "claude-sonnet-5",
         backend: "anthropic",
+        anthropicPool: { backend: "anthropic", mixed: false, available: [] },
         reasoning: "low",
         maxDescriptionsPerTurn: 4,
         timeoutMs: 45_000,
@@ -363,10 +420,17 @@ describe("Anthropic vision planning and management config", () => {
       );
       expect(clear.status).toBe(200);
       const clearBody = await clear.json() as Record<string, any>;
-      expect(clearBody.webSearch).toEqual({ model: "gpt-5.6-luna", streamRoutedModelOutput: false });
-      expect(clearBody.vision).toEqual({
+      expect(clearBody.webSearch).toEqual({
+        enabled: true, model: "gpt-5.6-luna", streamRoutedModelOutput: false,
+        anthropicPool: { mixed: false, available: [] },
+      });
+      // Clearing the backend leaves no selected pool; the derived backend label follows the default model.
+      const { anthropicPool: clearedVisionPool, ...clearedVision } = clearBody.vision;
+      expect(clearedVisionPool).toMatchObject({ mixed: false, available: [] });
+      expect(clearedVisionPool.selected).toBeUndefined();
+      expect(clearedVision).toEqual({
         enabled: true,
-        model: "gpt-5.4-mini",
+        model: "gpt-5.6-luna",
         reasoning: "low",
         maxDescriptionsPerTurn: 4,
         timeoutMs: 45_000,

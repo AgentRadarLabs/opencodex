@@ -6,14 +6,18 @@ import {
 import { clampNumberDraft } from "../clamp-draft";
 import { NumberStepper } from "./NumberStepper";
 import { Select } from "../ui";
+import { HelpButton, HelpRegion } from "./v2-accounts/surface";
+import { useHelp } from "./v2-accounts/use-help";
 
 const STRATEGY_LABEL_KEYS = {
+  "reset-first": "accountPool.strategyResetFirst",
   quota: "accountPool.strategyQuota",
   "round-robin": "accountPool.strategyRoundRobin",
   "fill-first": "accountPool.strategyFillFirst",
 } as const;
 
 const STRATEGY_HINT_KEYS = {
+  "reset-first": "accountPool.strategyHintResetFirst",
   quota: "accountPool.strategyHintQuota",
   "round-robin": "accountPool.strategyHintRoundRobin",
   "fill-first": "accountPool.strategyHintFillFirst",
@@ -21,6 +25,8 @@ const STRATEGY_HINT_KEYS = {
 
 export interface AccountPoolStrategyControlsProps {
   strategy: AccountPoolStrategy;
+  codex?: boolean;
+  threshold?: number;
   stickyDraft: string;
   disabled?: boolean;
   strategySelectId?: string;
@@ -41,6 +47,8 @@ export interface AccountPoolStrategyControlsProps {
  */
 export default function AccountPoolStrategyControls({
   strategy,
+  codex = false,
+  threshold,
   stickyDraft,
   disabled = false,
   strategySelectId = "account-pool-strategy",
@@ -50,10 +58,28 @@ export default function AccountPoolStrategyControls({
   onStickyCommit,
 }: AccountPoolStrategyControlsProps) {
   const t = useT();
-  const strategyOptions = ACCOUNT_POOL_STRATEGIES.map((value) => ({
+  const help = useHelp();
+  const strategyOptions = ACCOUNT_POOL_STRATEGIES.filter(value => codex || value !== "reset-first").map((value) => ({
     value,
     label: t(STRATEGY_LABEL_KEYS[value]),
   }));
+
+  const thresholdSummary = (() => {
+    if (threshold === undefined) return null;
+    if (strategy === "round-robin") {
+      return t("accountPool.thresholdNotUsed");
+    }
+    if (threshold > 0) {
+      if (strategy === "fill-first") {
+        return t("accountPool.drainAtThreshold", { threshold: String(threshold) });
+      }
+      if (strategy === "reset-first") {
+        return t("accountPool.resetBelowThreshold", { threshold: String(threshold) });
+      }
+      return t("accountPool.switchAtThreshold", { threshold: String(threshold) });
+    }
+    return t("accountPool.proactiveSwitchingOff");
+  })();
 
   return (
     <div className="account-pool-strategy-controls">
@@ -68,10 +94,17 @@ export default function AccountPoolStrategyControls({
       */}
       <div className="setting-row">
         <div className="setting-label">
-          <span className="title" id={`${strategySelectId}-label`}>{t("accountPool.strategy")}</span>
-          <span className="desc">{t("accountPool.strategyDesc")}</span>
-          <span className="desc">{t(STRATEGY_HINT_KEYS[strategy])}</span>
-          <span className="desc">{t("accountPool.unboundDefinition")}</span>
+          {/* The choice is the state and stays on screen; why it behaves that way opens
+              behind the "?" (all three lines, kept in the document while closed). */}
+          <span className="acc-strategy-title flex items-center gap-1.5">
+            <span className="title" id={`${strategySelectId}-label`}>{t("accountPool.strategy")}</span>
+            <HelpButton open={help.open} controls={help.id} name={t("accountPool.strategy")} onToggle={help.toggle} />
+          </span>
+          <HelpRegion id={help.id} open={help.open} className="acc-strategy-help mt-1.5 flex flex-col gap-1.5">
+            <span className="desc">{t("accountPool.strategyDesc")}</span>
+            <span className="desc">{t(STRATEGY_HINT_KEYS[strategy])}</span>
+            <span className="desc">{t("accountPool.unboundDefinition")}</span>
+          </HelpRegion>
         </div>
         <div className="setting-controls">
           <Select
@@ -82,6 +115,11 @@ export default function AccountPoolStrategyControls({
             label={t("accountPool.strategy")}
             onChange={(next) => onStrategyChange(next as AccountPoolStrategy)}
           />
+          {thresholdSummary && (
+            <span className="badge badge-muted account-pool-threshold-badge" data-testid="account-pool-threshold-summary">
+              {thresholdSummary}
+            </span>
+          )}
         </div>
       </div>
       {strategy === "round-robin" && (

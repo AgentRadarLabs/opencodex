@@ -4,9 +4,11 @@
 export type { OcxTool, OcxToolChoice } from "./types/tools";
 export {
   CODE_MODE_EXEC_TOOL_NAME,
+  CODE_MODE_HELPER_WIRE_NAMES,
   dottedToolName,
   namespacedToolName,
   normalizeDeclaredToolName,
+  isCodeModeMcpDirectName,
   toolChoiceAliases,
   createToolChoiceResolver,
   toolChoiceCandidates,
@@ -14,17 +16,27 @@ export {
   resolveToolChoiceWireName,
   modelInList,
   isAllowedToolChoice,
+  requiresToolCall,
   toolChoiceToolPredicate,
   declaresCodeModeExec,
+  toolRestrictsCallers,
+  NAMESPACED_BARE_ALIAS_EXCLUDED_NAMES,
 } from "./types/tools";
 
 export type { UpstreamHttpVersion, ReasoningSummaryDelivery, CodexAccountMode } from "./types/wire";
+export type { ThinkingDisplayPolicy } from "./types/wire";
+export type { AnthropicInstanceId } from "./providers/anthropic-instance-id";
+export { ANTHROPIC_INSTANCE_IDS, ANTHROPIC_PRIMARY_INSTANCE, ANTHROPIC_POOL2_INSTANCE, isAnthropicInstanceId } from "./providers/anthropic-instance-id";
+export type { AnthropicAccountPoolConfig, AnthropicModelRoute } from "./types/anthropic-account-pool";
+export type { OcxComboJevEffortMode } from "./types/combo-jev-effort-mode";
 export {
   UPSTREAM_HTTP_VERSION_VALUES,
   REASONING_SUMMARY_DELIVERY_VALUES,
+  THINKING_DISPLAY_VALUES,
   OPENAI_PROVIDER_TIER_VERSION,
   MODEL_ADAPTER_OVERRIDE_ALLOWED,
   captureWireAdapterHardPins,
+  captureWireAdapterHardPinPrefixes,
   isWirePinnedModel,
   pinnedWireAdapter,
 } from "./types/wire";
@@ -32,6 +44,7 @@ export {
 export type {
   OcxReasoningReplayIdentity,
   OcxReasoningReplayScopeRef,
+  OcxReplayedWebSearchCell,
   OcxParsedRequest,
   OcxContext,
   OcxMessage,
@@ -41,6 +54,8 @@ export type {
   OcxToolResultMessage,
   OcxTextContent,
   OcxImageContent,
+  OcxAudioContent,
+  OcxDocumentContent,
   OcxContentPart,
   OcxThinkingContent,
   OcxToolCall,
@@ -51,29 +66,40 @@ export type {
   OcxProviderContinuationOwner,
   OcxProviderContinuationState,
   AdapterEvent,
+  AnthropicServerBlocks,
   OcxUrlCitation,
   OcxUsage,
+  PerMessageEffortTurn,
 } from "./types/request";
 
 export type {
+  OcxApiSurfacesConfig,
+  OcxProtocolsConfig,
   OcxClaudeCodeConfig,
   OcxClaudeDesktopFamily,
   OcxClaudeDesktopAssignment,
+  OcxClaudeDesktopModelVisibility,
   OcxClaudeDesktopProfile,
   StorageCleanupPolicy,
   OcxCustomModel,
   OcxApiKeyEntry,
   OcxClientIntegrationsConfig,
+  OcxOpencodeClientExportConfig,
   OcxConfigRebaseProvenance,
   OcxHubConfig,
   OcxRemoteGuiConfig,
   OcxConnectedClientId,
   OcxClientConnectionConfig,
   OcxConfig,
+  SkillsCatalogRefresh,
+  OcxSkillsConfig,
+  CodexLowQuotaProtectionConfig,
   OcxAccountPoolRotationStrategy,
   OcxAccountPoolQuotaWindow,
+  OcxComboCooldownWaitPolicy,
   OcxComboStrategy,
   OcxComboDefaultEffort,
+  OcxComboDefaultEffortMode,
   OcxComboReasoningEffortMode,
   OcxComboTarget,
   OcxComboConfig,
@@ -92,16 +118,24 @@ export type {
   OcxSearchConfig,
   OcxVisionSidecarConfig,
   OcxWebSearchSidecarConfig,
+  OcxClaudeCodeToolLoadingConfig,
 } from "./types/config";
 
 export type {
   RefreshPolicy,
+  CacheAffinityMode,
+  CacheAffinityOutcome,
+  CacheAffinityLogReason,
   OpenRouterProviderRouting,
   VercelGatewayRouting,
   ResponsesItemIdRepairConfig,
   RateLimitRetryPolicy,
   TransientRetryPolicy,
+  ResetReplayPolicy,
+  ProviderWebSearchBridgeBackend,
+  ProviderWebSearchBridgeConfig,
   ProviderCostOverlay,
+  PromptLengthPricing,
   RequestPacingRule,
   ProviderRequestPacingConfig,
   FastWire,
@@ -109,10 +143,16 @@ export type {
   TierObservationContext,
   TierDecision,
   OcxProviderConfig,
+  ModelCapabilities,
+  ReasoningCapabilities,
 } from "./types/provider";
+
+export { PROVIDER_WEB_SEARCH_BRIDGE_BACKENDS } from "./types/provider";
 
 export type {
   CodexAccount,
   CodexAccountCredentials,
   CodexAccountCredentialRecord,
 } from "./types/accounts";
+
+export type { OcxTelemetryConfig, OcxTelemetryDecision } from "./types/telemetry";

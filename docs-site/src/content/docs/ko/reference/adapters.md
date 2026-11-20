@@ -23,6 +23,13 @@ interface ProviderAdapter {
 스트림으로 표현할 수 없는 전송 방식을 지원합니다. 이후
 [`bridge.ts`](/ko/reference/architecture/#브리지)가 이벤트를 Responses SSE로 바꿉니다.
 
+## 공통 도구 인자 보정
+
+브리지는 도구 스키마에 따라 정수 필드의 정수형 실수와 문자열 전용 필드의 안전한 정수를
+보정합니다. 안전한 정수 범위를 벗어난 값, 오버플로 숫자, 보정하지 않는 정수가 아닌 소수는 원래 토큰을 정확히 유지하면서
+다른 안전한 필드는 계속 보정합니다. 중첩 배열과 중복 키의 unsafe 토큰도 모두 보존하므로,
+타임아웃 보정이 관련 없는 식별자를 조용히 바꾸지 않습니다.
+
 ## `openai-chat`
 
 **대상:** OpenAI **Chat Completions**(`POST {baseUrl}/chat/completions`)와 모든 호환 프로바이더
@@ -120,6 +127,7 @@ Ollama 공급자에 `adapter: "ollama-native"`로 설정할 수도 있습니다.
   어댑터는 reasoning effort를 budget으로 매핑하고(minimal 1024 … max 32000), 출력 여유를 둔
   안전한 `max_tokens`를 계산합니다. thinking이 켜지면 Anthropic에서 금지한
   **`temperature`/`top_p`를 제거**합니다.
+- **적응형 thinking 표시:** 적응형 thinking 모델(Opus 4.7+, Sonnet 5, Fable)에는 `thinking.display: "summarized"`를 보내므로, 긴 사고가 몇 분 동안의 heartbeat 대신 reasoning delta로 Chat과 Responses 클라이언트에 전달됩니다. reasoning 요약을 숨기는 요청(`reasoning.summary: "none"`)은 공급자 기본값을 그대로 씁니다. 단, `api.anthropic.com`의 Opus 5.5는 `display: "updates"`가 기본이며, `reasoning.summary`를 `"concise"` 또는 `"detailed"`로 명시하면 updates 베타 없이 `"summarized"`를 사용합니다. [Opus 5.5 진행 업데이트](/guides/providers/#claude-opus-55-progress-updates)를 참고하세요.
 - 항상 `anthropic-version: 2023-06-01`을 보냅니다. `content_block_delta`(`text_delta`,
   `thinking_delta`, `input_json_delta`)를 스트리밍합니다.
 
@@ -129,6 +137,18 @@ Ollama 공급자에 `adapter: "ollama-native"`로 설정할 수도 있습니다.
 `/v1beta/models/{model}:streamGenerateContent`, 나머지 모드는 각 Google 네이티브 엔드포인트를
 사용합니다.
 **인증:** `googleMode`에 따라 API 키, Vertex ADC, Google Antigravity OAuth 중 하나를 선택합니다.
+
+대시보드의 Google Vertex AI 프리셋에서 프로젝트 ID와 리전을 선택적으로 입력할 수 있습니다.
+API 키를 비우고 `GOOGLE_CLOUD_API_KEY`가 설정되지 않았다면 **프록시 호스트**의 ADC를
+사용합니다. ADC에는 프로젝트와 리전이 필요하며, 폼 또는 프록시 호스트의
+`GOOGLE_CLOUD_PROJECT` / `GCLOUD_PROJECT` 및 `GOOGLE_CLOUD_LOCATION`으로 설정합니다.
+provider를 추가했다고 자격증명이나 권한의 유효성이 검증되는 것은 아닙니다. API 키에
+프로젝트를 지정하지 않으면 Vertex express 모드를 사용합니다.
+대시보드 프리셋은 설정한 기본 모델로 시작하는 정적 목록을 사용합니다. ADC를 쓰면 연결 테스트가
+액세스 토큰을 한 번 발급받아 자격증명을 확인하지만 Vertex 권한까지 확인하지는 않습니다. 프록시가
+현재 ADC 소스로 토큰을 발급받은 뒤에는 provider가 검증됨으로 표시됩니다. 정적 목록의 API 키는 테스트하지 않습니다.
+기존 Vertex 항목에서 `liveModels`를 생략하면 일반 검색 엔드포인트를 통한 기존 실시간 검색이 유지됩니다.
+`liveModels: false`는 정적 목록을 사용하며 설정 화면에서 두 모드를 전환할 수 있습니다.
 
 - 시스템 프롬프트 → `systemInstruction`; 메시지 → `contents[]`(assistant → `model`); 툴 →
   `functionDeclarations`. data URL 이미지 → `inline_data`.
@@ -146,8 +166,29 @@ Ollama 공급자에 `adapter: "ollama-native"`로 설정할 수도 있습니다.
   block을 보냅니다.
 - `application/vnd.amazon.eventstream`을 디코딩해 text/thinking/tool 이벤트를 복원하고, 잘린 툴
   JSON을 감지합니다. 업스트림이 토큰 수를 반환하지 않아 사용량은 추정합니다.
+  디코더는 종료 시 전송 계층 정리 완료를 기다리지 않고 취소를 시작하므로, 정리 작업이
+  멈춰도 읽기를 중단한 소비자가 디코더 종료를 계속 기다리지 않습니다.
 - `fetchResponse`에서 제한된 횟수만 재시도하고 오류를 분류/마스킹합니다. 비스트리밍 파서는 웹 검색
   루프를 위해 같은 이벤트 스트림을 끝까지 소비합니다.
+- 요청마다 클라이언트 툴을 최대 48개, 변환된 툴 JSON을 96 KB까지 보내고, 툴 설명은 1,024자
+  (`gpt-5.6-sol`은 9,216자)로 자릅니다. tool search로 불러온 툴과 Codex code-mode 실행 툴을
+  먼저 넣고, 생략된 툴은 모델에 알립니다. 프록시 환경에 `OCX_KIRO_TOOL_BUDGET=off`를 두면
+  클라이언트 카탈로그 전체를, `OCX_KIRO_TOOL_DESCRIPTION_LIMIT=off`를 두면 설명 전체를
+  보냅니다. 둘 다 요청 변환 시점에 읽고 모든 Kiro 모델에 적용되며 다른 한도는 그대로 둡니다.
+  예산을 끄면 한도 자체가 없어져 우선순위를 매기거나 생략할 대상이 없습니다. 선언한 툴이 모두
+  선언 순서대로 전송되고 생략 안내도 사라지며, Kiro가 받아들이는 수보다 많이 선언한
+  클라이언트는 잘린 카탈로그 대신 업스트림 `ValidationException`을 받습니다. 요청 크기도
+  클라이언트 카탈로그를 따라 커집니다. 이 스위치는 더 큰 요청을 받아들이는 계정을 위한
+  선택 해제이며, 과대한 카탈로그를 안전하게 만드는 수단이 아닙니다.
+- Kiro 검증기가 거부하는 JSON Schema 키워드(`pattern`, `minLength`, `maximum`,
+  `additionalProperties` 등 29개)를 툴과 구조화 출력 스키마에서 제거하되, 프로브가 해당
+  모델에서 통과를 확인한 키워드는 남깁니다. `claude-opus-4.5`는 전부 남습니다.
+  `claude-opus-5.5`는 Claude Desktop과 Claude Code 카탈로그가 쓰는 12개(`$schema`, `additionalProperties`, `pattern`, `format`, `minLength`, `maxLength`, `minimum`, `maximum`, `exclusiveMinimum`, `minItems`, `maxItems`, `propertyNames`)가 남으며, 프로덕션 트래픽에서
+  확인되었습니다. `claude-sonnet-5.5`는 `pattern`, `maximum`만 남습니다. 나머지는 제거된 상태로 남습니다. 그 두 모델에
+  다른 키워드를 보낸 요청이 없기 때문입니다. 나머지 Claude id를 포함한 다른 Kiro 모델은
+  전부 제거합니다. 예외를 모델별·키워드별로 두는 이유는 이 wire가 이미 reasoning effort에서
+  Claude 모델을 나누기 때문이며, Kiro가 거부하는 키워드는 힌트를 잃는 데 그치지 않고 요청
+  전체를 실패시킵니다.
 ### 완료와 네이티브 stop reason
 
 Kiro의 어시스턴트 텍스트에는 그 자체로 턴 종료를 알리는 신뢰할 만한 구분이 없습니다. 다만 종단
@@ -167,10 +208,39 @@ commentary로 유지하고 비공개 완료 툴을 한 번 검증합니다.
 
 ### Reasoning effort
 
-`gpt-5.6-sol`과 `claude-opus-5`는 네이티브 effort를 지원하며 요청 필드 이름이 다릅니다.
-`low` / `medium` / `high` / `xhigh` / `max` 값은 각각
-`additionalModelRequestFields.reasoning.effort`와 `output_config.effort`로 전송됩니다.
+GPT-5.6 계열과 GPT-6 계열(`gpt-6-sol`, `gpt-6-luna`, `gpt-6.1-sol`, `gpt-6.1-terra`)은
+`additionalModelRequestFields.reasoning.effort`를, 아래에 나열한 Claude 모델은
+`additionalModelRequestFields.output_config.effort`를 사용합니다.
+`gpt-5.6-luna`와 `gpt-5.6-terra`는 검증된 `low`, `medium`, `high`, `max`만 네이티브 필드로 전송합니다.
+두 모델의 `xhigh`는 네이티브 동작이 검증되지 않아 기존의 제한된 thinking 지시문 방식을 유지합니다.
+`gpt-5.6-sol`과 GPT-6 계열은 같은 `reasoning.effort` 필드로 네이티브 `low`, `medium`, `high`,
+`xhigh`, `max`를 그대로 사용합니다.
 
+Kiro는 `claude-opus-5`, `claude-opus-5.5`, `claude-opus-4.8`, `claude-opus-4.7`,
+`claude-opus-4.6`, `claude-sonnet-5.5`, `claude-sonnet-5`, `claude-sonnet-4.6`,
+`claude-haiku-5.5`에 `low`, `medium`, `high`, `xhigh`, `max`를 `output_config.effort`로
+받아들입니다. 예외가 하나 있습니다. `claude-opus-4.6`과 `claude-sonnet-4.6`은 네이티브 `xhigh`를
+거부하므로 그 단계만 에뮬레이션 thinking 블록을 씁니다.
+
+Kiro에는 `minimal` 단계가 없습니다. `claude-opus-5`와 `claude-opus-5.5`를 뺀 위의 아홉 모델은
+네이티브 effort를 쓰기 전에도 동작하던 요청을 실패시키지 않으려고 `minimal`에서 에뮬레이션 블록을
+유지합니다. 이 두 Opus 5 모델과 네이티브 effort를 쓰는 GPT 모델은 `minimal`을 아무것도 보내기 전에
+400 `invalid_request_error`로 거부합니다.
+
+거부를 알리는 방식은 표면마다 다릅니다. Responses 요청은 모델과 거부된 effort를 밝히는 문장을
+`error.message`에 담습니다. Messages와 Chat Completions 경로는 그 자리에 프록시의 고정 문구인
+`The provider rejected the request.`를 넣습니다. 두 경로 모두 어댑터의 세부 문장을 그대로 전달하지
+않고 자기 문구로 바꾸기 때문입니다. 모델과 effort를 밝히는 쪽은 Responses뿐입니다. 스트리밍과
+비스트리밍은 모든 표면에서 같은 응답을 냅니다. 거부는 업스트림 요청 본문을 만드는 도중에 일어나므로
+스트림이 열리지 않고 업스트림 호출도 없습니다.
+
+호출자가 보낸 `ultra`는 파싱할 때 `max`로 바뀝니다. `pinnedReasoningEffort`,
+`modelPinnedReasoningEfforts`, `modelPinnedEfforts` pin은 그 뒤에 적용됩니다. 네이티브 Kiro
+effort를 쓰는 모델에서는 어댑터가 pin의 `ultra`도 `max`로 바꿉니다. 에뮬레이션 모델에서는
+해당 pin을 버리고 추론 신호 없이 요청을 보냅니다.
+
+`claude-haiku-4.5`, `claude-opus-4.5`, `claude-sonnet-4.5`와 위에 없는 Kiro 모델은 모든
+effort에서 에뮬레이션을 씁니다. 조절 항목이 있다고 네이티브 지원을 뜻하지는 않습니다.
 
 ## `cursor`
 
@@ -201,7 +271,7 @@ discovery에 모두 적용됩니다.
   범위가 제한된 Desktop 대체 식별자는 프로세스 로컬 HMAC 파생 소유자만 보관하며, 원본
   session/thread 헤더나 OAuth/authorization 자료를 checkpoint 상태에 쓰지 않습니다. OAuth 기반
   live transport와 계정별 live model discovery는 아직 실험 기능입니다. 로그인과 transport 설정은
-  [공급자 가이드](/ko/guides/providers/)와 [Cursor 공급자 설정](/ko/reference/configuration/providers/#cursor-provider-adapter-cursor)을
+  [공급자 가이드](/ko/guides/providers/)와 [Cursor 공급자 설정](/ko/reference/configuration/providers/#cursor-공급자-adapter-cursor)을
   참고하세요. checkpoint 재사용 자체는 자동이며 사용자 설정이 없습니다.
 - `cursor/grok-4.5-fast`는 선택 가능한 모델로 유지하되, Cursor에는 정식 `grok-4.5` 모델을 보내고
   별도의 `effort`, `fast=true` 값은 `requested_model.parameters`에 담습니다.
@@ -209,6 +279,17 @@ discovery에 모두 적용됩니다.
   `mcpServers`와 `desktopExecutor` 통합은 각각 별도 opt-in입니다. `nativeLocalExec: "on"`은
   더 넓은 내장 executor를 켜며 Codex 승인/샌드박스 규칙을 우회합니다. 예전 설정인
   `unsafeAllowNativeLocalExec: true`는 `nativeLocalExec`을 지정하지 않았을 때만 같은 뜻입니다.
+
+## `devin`
+
+**대상:** Cognition의 `exa.api_server_pb.ApiServerService/GetChatMessage`(`server.codeium.com`, Connect 스트리밍).
+**인증:** `provider.apiKey` 또는 전달된 authorization 헤더의 Devin/Cognition API 키. 로그인은 먼저 설치된 Devin CLI가 이미 보유한 자격을 가져오려 시도합니다 — `devin auth login`이 CLI 자체의 PKCE 로그인을 완료하고 `devin-session-token`을 자기 `credentials.toml`에 쓰는데, 이는 `SeatManagementService.RegisterUser`가 브라우저 사인인에 발급하는 것과 같은 자격입니다. 쓸 수 있는 CLI 자격이 없으면 Auth0 브라우저 사인인으로 폴백해 붙여넣은 토큰을 `RegisterUser`로 장기 키에 교환합니다. `devin-cli`는 deprecated alias로만 남아 `ocx login devin-cli`도 `devin`으로 라우팅되며, 구 id로 저장된 설정은 스타트업에서 리라이트됩니다.
+
+- 일반 fetch/parse 대신 `runTurn`을 씁니다. 요청과 서버 이벤트는 `devin/cloud-direct/wire.ts`의 수동 protobuf 프레이밍으로 다룹니다.
+- `GetCascadeModelConfigs`로 계정별 모델을 조회하고, 플랜에 없는 모델은 요청 시점이 아니라 목록에서 걸러집니다.
+- Cognition은 도구 설명 길이 제한과 정확 문구 차단 목록을 적용합니다. 어댑터가 알려진 문구를 바꾸고 긴 설명을 잘라냅니다.
+- 키는 갱신되지 않습니다. 만료되거나 폐기되면 `ocx login devin`을 다시 실행하세요.
+- CLI 임포트 경로를 써도 로컬인 것은 자격뿐이며, 턴은 어느 경로든 Cognition으로 갑니다. 예전 빌드에는 `devin-cli` id 아래 로컬 `devin acp` 자식 프로세스에 Agent Client Protocol 세션으로 턴을 실행하는 두 번째 어댑터가 있었지만 제거됐습니다. 그 어댑터를 아직 가리키는 저장 설정은 스타트업에서 `devin`으로 리라이트되며, `"devin-acp"` 같은 커스텀 이름 행도 마찬가지입니다.
 
 ## `azure-openai` (별칭: `azure`)
 
@@ -218,6 +299,9 @@ discovery에 모두 적용됩니다.
 - 요청 구성은 Responses passthrough에 맡깁니다. `baseUrl`에 해석되지 않은 템플릿 placeholder가
   없는지 검증하고 `Authorization`을 `api-key`로 바꿉니다. 설정 URL이 Azure v1 Responses API를
   직접 가리키므로 `api-version`은 덧붙이지 않습니다.
+- 다른 프로바이더가 만든 추론 상태에 대한 Responses 복구를 똑같이 적용합니다.
+  `400 invalid_encrypted_content`를 받으면 그 상태(암호화된 내용과 추론 항목의 `rs_…` id)를 빼고
+  한 번만 다시 보냅니다.
 
 ## 이미지 유틸리티 (`image.ts`)
 

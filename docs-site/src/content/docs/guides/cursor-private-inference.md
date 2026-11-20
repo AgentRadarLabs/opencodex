@@ -42,7 +42,7 @@ Both builds are named "Cursor" in the Dock and share a bundle id, so check `prod
 |---|---|
 | macOS | `/Applications/Cursor Private Inference.app/Contents/Resources/app/product.json` |
 | Windows | `%LOCALAPPDATA%\\Programs\\cursor-private-inference\\resources\\app\\product.json` |
-| Linux | `<install root>/resources/app/product.json` (an AppImage must be extracted first) |
+| Linux | `<install root>/resources/app/product.json` (an AppImage must be extracted first). The dashboard looks for `cursor*` install roots under `/opt`, `/usr/share` and `~/.local/share`. |
 
 `nameLong` is `"Cursor Private Inference"` for the local-agent build and `"Cursor"` for the
 regular one; `version` is the build (3.18.25 at the time of writing). The dashboard's
@@ -64,7 +64,7 @@ end up in the same place.
 | Field | Value |
 |---|---|
 | Base URL | `http://127.0.0.1:10100/v1` (include `/v1`; plain `http://` loopback is accepted) |
-| API Key | the value of `OPENCODEX_API_AUTH_TOKEN` if your service uses API auth, otherwise any placeholder such as `opencodex-loopback` |
+| API Key | an accepted OpenCodex key when API-key admission is enabled: `OPENCODEX_API_AUTH_TOKEN` or a configured client API key; use `opencodex-loopback` only when the configuration accepts that placeholder |
 
 Click **Refresh model list**. The picker fills with opencodex's `/v1/models`; switch on the
 rows you want.
@@ -105,9 +105,18 @@ bundle, so there is no switch to flip. What it does is hand you the values and s
 they took.
 
 - **Installed builds.** Whether Cursor Private Inference (with its path and version) and
-  regular Cursor (path only) are present. If only regular Cursor is found, the tab says so and links back here:
-  regular Cursor routes custom endpoints through Cursor's servers, so a loopback proxy is
-  unreachable without a public tunnel.
+  regular Cursor (path only) are present. If only regular Cursor is found, the tab says so, links
+  back here, and offers a **Look up the Private Inference installer** button. Pressing it asks
+  Cursor's own update channel which local-mode installer it advertises for this platform and CPU
+  (the `cursor-local` channel on `api2.cursor.sh`) and shows that version with a link to the
+  `downloads.cursor.com/local-mode/` installer. Nothing is requested until you press the button:
+  opening the tab and its periodic refresh never contact Cursor's channel. opencodex only displays the
+  link: it never downloads, launches or installs anything. The answer is cached for 30 minutes
+  (5 after a failure). When the channel cannot be reached, answers with something unusable, or
+  Cursor ships no build for this computer (only x64 and arm64 on Windows, macOS and Linux have
+  one), the tab says the installer could not be resolved; the gateway values below stay valid
+  either way. Regular Cursor itself still routes custom
+  endpoints through Cursor's servers, so it cannot reach a loopback proxy.
 - **Gateway values.** The Base URL on the proxy's own listening port (from its runtime record,
   so a reverse-proxied dashboard still shows the port Cursor on this machine can reach), with a
   Copy button. The API Key row depends on the bind: when it needs no credential the row is
@@ -198,7 +207,7 @@ itself.
 
 | Symptom | Check |
 |---|---|
-| 401 from the gateway | the API Key does not match `OPENCODEX_API_AUTH_TOKEN`; for a loopback bind without API auth any value works |
+| 401 from the gateway | the credential does not match an accepted data token or client API key; use an authorized key. The placeholder applies only to loopback configurations that accept unauthenticated model requests |
 | picker is empty | opencodex is not running, or the Base URL is missing `/v1`; press Refresh model list after fixing |
 | models listed but no Reasoning control | opencodex older than v2.41, or the id is not in Cursor's table (the dashboard marks it —); turn on `cursorEffortRows` or set a provider default |
 | a schema change is not picked up | Cursor caches `/models` per Base URL string with no expiry; Refresh model list re-reads it, otherwise restart the app or temporarily save a different spelling of the URL (`localhost` vs `127.0.0.1`) |

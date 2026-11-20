@@ -401,6 +401,25 @@ describe("classifier unit behavior", () => {
     expect(parseConfig("{{{", "json")).toBe(PARSE_FAILED);
   });
 
+  test("parseConfig refuses typed TOML dates before a JSON clone can turn them into strings", () => {
+    for (const literal of [
+      "2026-09-05T10:00:00Z",
+      "2026-09-05T10:00:00-07:00",
+      "2026-09-05T10:00:00.123456",
+      "2026-09-05",
+      "10:00:00.123456",
+    ]) {
+      for (const text of [
+        `expires = ${literal}\n`,
+        `[user]\nexpires = ${literal}\n`,
+        `items = [{ expires = ${literal} }]\n`,
+      ]) {
+        expect(parseConfig(text, "toml")).toBe(PARSE_FAILED);
+      }
+      expect(parseConfig(`expires = "${literal}"\n`, "toml")).toEqual({ expires: literal });
+    }
+  });
+
   test("parseConfig refuses json number literals a rewrite would change", () => {
     // Overflow to Infinity — a rewrite would bake in null.
     expect(parseConfig("{\"a\": 1e999}", "json")).toBe(PARSE_FAILED);
@@ -680,12 +699,31 @@ describe("ownership is scoped to recorded fragments", () => {
     expect(result).toEqual({ state: "stale" });
   });
 
+  test("Hermes also ignores whole-file edits outside its registry-declared fragment", () => {
+    // Hermes declares sourcePreservingYaml: { path: ["providers", "opencodex"] }.
+    const contribution = { ...ownedContribution, clientId: "hermes" as const };
+    const clientRecord: OwnershipRecord = {
+      ...record,
+      clientId: "hermes",
+      configPath: "/tmp/hermes-config.yaml",
+      blockFingerprint: fingerprint(canonicalContribution(contribution)),
+    };
+    const result = classifyIntegration({
+      fileText: textWithExtra,
+      fileIsRegular: true,
+      parsed: documentWithExtra,
+      record: clientRecord,
+      contribution,
+    });
+    expect(result).toEqual({ state: "current" });
+  });
+
   // Re-serializing a whole document in these formats would drop any comments
   // the user keeps next to our block, so file-level drift stays a hard
   // conflict for every one of them — a regression that narrowed the condition
   // (say, to yaml only) must fail here, not in a user's config.
   for (const { clientId, configPath } of [
-    { clientId: "hermes" as const, configPath: "/tmp/hermes-config.yaml" },
+    { clientId: "gajae" as const, configPath: "/tmp/gajae-models.yaml" },
     { clientId: "openclaw" as const, configPath: "/tmp/openclaw.json5" },
     { clientId: "kimi" as const, configPath: "/tmp/kimi-config.toml" },
   ]) {
@@ -756,14 +794,31 @@ describe("installation detection is independent of config state", () => {
  * from. Rationale and the per-client table: 020 §1 amendment.
  */
 describe("the loopback-only set is one fact, read through one seam", () => {
-  test("omp, pi, kimi, gajae, dsh, mcode, zcode, prime and aside are loopback-only and nobody else is", () => {
+  test("identifies exactly the registered loopback-only clients", () => {
     const loopbackOnly = INTEGRATION_CLIENT_IDS.filter(id => isLoopbackOnly(id));
-    expect(loopbackOnly).toEqual(["pi", "omp", "kimi", "gajae", "dsh", "mcode", "zcode", "prime", "aside"]);
+    expect(loopbackOnly).toEqual(["qoder", "qoder-cn", "workbuddy", "workbuddy-ai", "pi", "omp", "kimi", "gajae", "dsh", "mcode", "zcode", "commandcode", "prime", "aside", "raycast", "omo", "cline", "droid", "gentle-shell", "t3code"]);
   });
 
   test("the registry restates nothing — it reads the export spec", () => {
     for (const id of INTEGRATION_CLIENT_IDS) {
       expect(isLoopbackOnly(id)).toBe(EXPORT_CLIENTS[id].loopbackOnly);
     }
+  });
+});
+
+describe("the managed file size bound", () => {
+  test("a config past the read bound classifies unsafe, never absent", () => {
+    mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+    const path = join(home, ".pi", "agent", "models.json");
+    writeFileSync(path, `{"pad":"${"x".repeat(4 * 1024 * 1024)}"}\n`);
+    const status = readIntegrationState(input());
+    /*
+     * Too large to read is a read failure like any other: the file reports
+     * unsafe rather than absent, so nothing mistakes it for an empty target
+     * a write could replace.
+     */
+    expect(status.state).toBe("unsafe");
+    expect(status.reason).toBe("unparseable");
+    expect(loadTarget(fileIO(), path)).toEqual({ ok: false, why: "read-failed" });
   });
 });

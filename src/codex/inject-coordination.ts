@@ -7,8 +7,12 @@
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 
+import { publishCodexArtifact, publishCodexConfigIfUnchanged } from "./inject/config-write-section";
+import { ConfigWriteContentChanged, configDigest, publishedConfigDigest, withConfigWriteLockHeld, type LockHandle } from "./config-write-lock";
 import { atomicWriteFile } from "../config";
-import type { CodexWriteLockResult } from "./codex-write-lock";
+import type { CodexWriteLockResult, CodexWriteLockSkipReason } from "./codex-write-lock";
+import { HUB_GATED_SKIP_MESSAGE } from "./desired-state";
+import { siblingSkipMessage } from "./sibling-start";
 import { inspectCodexCoordinatorPath } from "./coordinator-doctor";
 import { JOURNAL_PATH } from "./journal";
 import { updateIntegrationRecord } from "./integration-record";
@@ -171,8 +175,9 @@ export interface CodexPreImages {
 function readOrNull(path: string): string | null {
   try {
     return readFileSync(path, "utf-8");
-  } catch {
-    return null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
   }
 }
 
@@ -183,6 +188,9 @@ export function captureCodexPreImages(): CodexPreImages {
     journal: readOrNull(JOURNAL_PATH),
   };
 }
+
+/** The profile bytes one injection published, set just before it writes them. */
+export interface CodexProfilePublish { published?: string }
 
 /**
  * How many transactions of evidence the ledger keeps.
@@ -361,29 +369,95 @@ export function recordCodexNativeTransactionProvenance(
  *
  * Every surface is attempted even after one fails: a second failure is worth
  * knowing about, and stopping early would leave more unrestored than necessary.
+ *
+ * `profilePublish`, when given, limits the profile surface to bytes this
+ * operation wrote: it is reverted only if `published` is set and the file still
+ * holds exactly those bytes. A refusal before the publish, or a profile another
+ * writer replaced since, is left as it is.
  */
+let afterCompensationDecisionForTests: ((surface: string) => void) | undefined;
+/** Test seam: runs after compensation decided a surface must be restored and before it publishes. */
+export function setAfterCompensationDecisionForTests(hook: typeof afterCompensationDecisionForTests): void {
+  afterCompensationDecisionForTests = hook;
+}
+
 export function restoreCodexPreImages(
   pre: CodexPreImages,
+  heldConfigWriteLock?: LockHandle,
+  profilePublish?: CodexProfilePublish,
 ): { complete: boolean; unrestored: readonly string[] } {
-  const unrestored: string[] = [];
   const surfaces: readonly [string, string, string | null][] = [
     ["config", CODEX_CONFIG_PATH, pre.config],
     ["profile", CODEX_PROFILE_PATH, pre.profile],
     ["journal", JOURNAL_PATH, pre.journal],
   ];
+  /*
+   * What a surface needs. One already holding its preimage needs nothing, and must not be made to
+   * pass a destination check: a foreign atomic rename of config.toml would otherwise fail the
+   * untouched profile and journal too. With a held lock (every injection and restore section),
+   * config.toml is reverted only when this section published it and it still holds that
+   * publication; any other bytes there belong to another writer. A direct call without a held lock
+   * has no publication record and keeps the unconditional config restore it always had.
+   */
+  // Returns the bytes the decision was made on (undefined when unreadable), so the restore can
+  // refuse when the file changed after it was judged to be OpenCodex's.
+  type Decision = readonly ["skip" | "foreign" | "restore", (string | null)?];
+  const decide = (name: string, path: string, bytes: string | null, held: LockHandle | undefined): Decision => {
+    let current: string | null;
+    // An unreadable surface proves nothing; the guarded restore attempt reports it as unrestored.
+    try { current = readOrNull(path); } catch { return ["restore"]; }
+    if (current === bytes) return ["skip", current];
+    if (name === "profile" && profilePublish
+      && (profilePublish.published === undefined || current !== profilePublish.published)) return ["skip", current];
+    if (name !== "config") return ["restore", current];
+    const ours = held ? publishedConfigDigest(held) : undefined;
+    if (ours === undefined) return [held ? "skip" : "restore", current];
+    return [configDigest(current) === ours ? "restore" : "foreign", current];
+  };
+  if (surfaces.every(([name, path, bytes]) => decide(name, path, bytes, heldConfigWriteLock)[0] === "skip")) {
+    return { complete: true, unrestored: [] };
+  }
+  const locked = withConfigWriteLockHeld(CODEX_CONFIG_PATH, heldConfigWriteLock, held => {
+  const unrestored: string[] = [];
   for (const [name, path, bytes] of surfaces) {
+    // The current journal remains recovery authority until both artifacts are restored.
+    if (name === "journal" && unrestored.length > 0) { unrestored.push(name); continue; }
     try {
-      if (bytes === null) {
-        // Absent before, so absent after. A leftover file is not a restoration.
-        if (existsSync(path)) require("node:fs").unlinkSync(path);
-      } else if (readOrNull(path) !== bytes) {
-        atomicWriteFile(path, bytes);
+      const [need, decided] = decide(name, path, bytes, heldConfigWriteLock === undefined ? undefined : held);
+      if (need === "skip") continue;
+      if (need === "foreign") { unrestored.push(name); continue; }
+      afterCompensationDecisionForTests?.(name);
+      if (name === "config" && heldConfigWriteLock !== undefined) {
+        if (decided === undefined) throw new ConfigWriteContentChanged();
+        // Publish over, or remove, only the exact bytes judged to be this section's publication.
+        if (bytes !== null) { publishCodexConfigIfUnchanged(held, "compensate", decided, bytes); continue; }
+        publishCodexArtifact(path, held, (destination, hooks) => {
+          hooks.validateBeforeRename?.(destination);
+          if (readOrNull(destination) !== decided) throw new ConfigWriteContentChanged();
+          if (existsSync(destination)) require("node:fs").unlinkSync(destination);
+          hooks.afterRename?.(destination);
+        });
+        continue;
       }
+      publishCodexArtifact(path, held, (destination, hooks) => {
+        if (bytes === null) {
+          hooks.validateBeforeRename?.(destination);
+          if (existsSync(destination)) require("node:fs").unlinkSync(destination);
+          hooks.afterRename?.(destination);
+        } else if (readOrNull(destination) !== bytes) atomicWriteFile(destination, bytes, undefined, hooks);
+      });
     } catch {
       unrestored.push(name);
     }
   }
   return { complete: unrestored.length === 0, unrestored };
+  });
+  if (locked.ok) return locked.value;
+  // The section can no longer publish (its destination changed). Name only what still differs
+  // from its preimage; a surface already holding it was not left partial.
+  const unrestored = surfaces.filter(([name, path, bytes]) => decide(name, path, bytes, heldConfigWriteLock)[0] !== "skip").map(([name]) => name);
+  if (unrestored.length > 0 && !unrestored.includes("journal")) unrestored.push("journal");
+  return { complete: false, unrestored };
 }
 
 export function buildInjectWitness(
@@ -443,16 +517,22 @@ export function recomputeInjectWitness(options: {
 export function codexInjectLockOutcome(
   result: Exclude<CodexWriteLockResult<unknown>, { status: "acquired" }>,
 ): { success: false; message: string; retryable: boolean } | {
-  success: true; status: "skipped"; skippedReason: "desired_disabled" | "desired_enabled"; message: string;
+  success: true; status: "skipped"; skippedReason: CodexWriteLockSkipReason; message: string;
 } {
   if (result.status === "skipped") {
     return {
       success: true,
       status: "skipped",
       skippedReason: result.reason,
-      message: result.reason === "desired_disabled"
-        ? "Codex integration is OFF; no Codex config, catalog, cache, or history was changed."
-        : "Codex integration was re-enabled; native restore was skipped.",
+      // Four distinct facts, four sentences. The hub gate in particular must not borrow the
+      // toggle's wording — that is the phantom "integration is OFF" report from #4236.
+      message: result.reason === "hub-gated"
+        ? `${HUB_GATED_SKIP_MESSAGE} No Codex config, catalog, cache, or history was changed.`
+        : result.reason === "sibling"
+        ? `${siblingSkipMessage()} No Codex config, catalog, cache, or history was changed.`
+        : result.reason === "desired_disabled"
+          ? "Codex integration is OFF; no Codex config, catalog, cache, or history was changed."
+          : "Codex integration was re-enabled; native restore was skipped.",
     };
   }
   if (result.status === "busy") {

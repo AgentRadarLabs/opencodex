@@ -1,6 +1,8 @@
 import type { KiroOAuthMetadata } from "../oauth/types";
+import type { NativeReasoningOwner } from "../responses/reasoning-replay-cache";
 import type { OcxTool, OcxToolChoice } from "./tools";
 import type { TierDecision, TierObservationContext } from "./provider";
+import type { TranslatorBudget } from "../lib/translator-budget";
 
 /** Exact provider/credential namespace for process-local reasoning replay. */
 export interface OcxReasoningReplayIdentity {
@@ -31,12 +33,26 @@ export interface OcxReasoningReplayIdentity {
  */
 export interface OcxReasoningReplayScopeRef {
   /**
-   * Conversation namespace for replay state. Historically this was always the Codex parent-thread
-   * id; headerless Responses callers use a raw sanitized thread/Cursor/session fallback, never the
-   * hashed request-log conversation id.
+   * Process-local caller principal from resolveContextPrincipal. Absent when the caller presented
+   * no identity (keyless loopback); replay state keyed by it then fails closed.
+   */
+  readonly clientPrincipalId?: string;
+  /**
+   * Conversation namespace for replay state. The request's own thread-id wins so a child agent
+   * cannot write its route into the parent's record (#8632); otherwise this is the Codex
+   * parent-thread id, and headerless Responses callers use a raw sanitized thread/Cursor/session
+   * fallback, never the hashed request-log conversation id.
    */
   readonly clientThreadId: string;
   current?: Readonly<OcxReasoningReplayIdentity>;
+}
+
+/** One replayed hosted search cell, rebuilt as the `web_search` call/result pair `callId`. */
+export interface OcxReplayedWebSearchCell {
+  /** The client-visible cell id; absent when the cell carried no usable id (no recorded result). */
+  cellId?: string;
+  callId: string;
+  failed: boolean;
 }
 
 export interface OcxParsedRequest {
@@ -45,11 +61,41 @@ export interface OcxParsedRequest {
   _responseModelId?: string;
   /** Selected OpenAI API virtual-model id retained after it rewrites the upstream wire model. */
   _openAiVirtualSelectedModelId?: string;
+  /** Serialized-only model id (xAI OAuth Fast lane); policy keeps reading `modelId`. */
+  _wireModelOverride?: string;
   previousResponseId?: string;
   context: OcxContext;
   stream: boolean;
   options: OcxRequestOptions;
   _rawBody?: unknown;
+  /** Trusted ingress provenance: preserve Chat's tool defaults only on the final Responses wire. */
+  _chatCompletionsInput?: boolean;
+  /** Claude replay tags, retained only until each route binding verifies them. */
+  _nativeReasoningReplay?: ReadonlyMap<string, string>;
+  _nativeReasoningBoundOwner?: NativeReasoningOwner;
+  _nativeReasoningMint?: { owner?: NativeReasoningOwner };
+  /**
+   * The Claude client's typed Anthropic web tools, as declared. Only the anthropic adapter reads
+   * them, and only for api.anthropic.com; every other destination never sees them.
+   */
+  _anthropicServerTools?: readonly Record<string, unknown>[];
+  /**
+   * Routed Anthropic compaction summary: build tools and system exactly as the ordinary request
+   * would (prompt-cache prefix), then send tool_choice none so no client or hosted tool runs.
+   */
+  _summaryProhibitsToolCalls?: boolean;
+  /**
+   * Completed server-tool exchanges from the Claude client's history, keyed by the block that
+   * followed them (`call:<tool_use id>` / `text:<text>`). Same audience as `_anthropicServerTools`.
+   */
+  _anthropicServerReplay?: ReadonlyMap<string, readonly Record<string, unknown>[]>;
+  /**
+   * The caller's `instructions` prefix through its last cache-marked system block. The anthropic
+   * adapter ends a system block there so the breakpoint stays off the per-turn tail.
+   */
+  _anthropicSystemCachePrefix?: string;
+  /** The request arrived on the Anthropic Messages surface (Claude Code, Claude Desktop). */
+  _anthropicInbound?: boolean;
   /**
    * Boundary between replayed history and this turn's newly appended input. Usually the
    * items the proxy restored from local previous_response_id state; also set when the
@@ -68,15 +114,43 @@ export interface OcxParsedRequest {
   _cursorConversationId?: string;
   /** Stable upstream client thread identity, used only to derive provider-scoped continuation ids. */
   _clientThreadId?: string;
+  /**
+   * This request's OWN Codex thread id (`thread-id`), as opposed to `_clientThreadId`, which
+   * carries `x-codex-parent-thread-id` and is therefore shared by every parallel child of one
+   * parent. Only a surface that must distinguish siblings should read it.
+   */
+  _codexOwnThreadId?: string;
+  /** True when promptCacheKey identifies a shared cache cohort rather than one conversation. */
+  _promptCacheKeyIsSharedCohort?: boolean;
   /** Cursor-only thread owner; may be an opaque process-local Desktop session/thread identity. */
   _cursorClientThreadId?: string;
   /** Conversation/provider/account/model-bound namespace for reasoning replay state. */
   _reasoningReplayScope?: OcxReasoningReplayScopeRef;
+  /** Trusted configuration snapshot; never read from the client's request body. */
+  _nativeReasoningRetention?: Readonly<{ modelSwitch: boolean; accountSwitch: boolean }>;
   /**
    * Set by bindRouteReasoningReplayScope after a proven serving-identity change, or by
    * prepareOpaqueBlobRecovery after an authoritative rejection; consumers strip replayed blobs.
    */
   _stripReasoningEncryptedContent?: boolean;
+  /** Native compaction remains nonportable even when reasoning-only retention is enabled. */
+  _stripNativeCompactionEncryptedContent?: boolean;
+  /** Retention kept reasoning ciphertext across a model/account change; arms streamed rejection recovery. */
+  _nativeReasoningRetainedAcrossRoute?: boolean;
+  /**
+   * Set when replayed reasoning item ids name items in a store this destination cannot read: by
+   * prepareOpaqueBlobRecovery before the one recovery rebuild, and by bindRouteReasoningReplayScope
+   * while the rejection memo is live or after a proven switch to a different destination or
+   * credential. The Responses passthrough then removes the `id` of every replayed reasoning item,
+   * whether or not it carries a blob. A stateful destination resolves a replayed id against its own
+   * store, so keeping it turns the send into `Item with id 'rs_…' not found` (#5583). A model
+   * change on the same destination and credential does not set this.
+   */
+  _dropForeignReasoningItemIds?: boolean;
+  /** Final-route opt-in: emit v2 collaboration message arguments as plaintext on ChatGPT. */
+  _plaintextV2AgentMessages?: boolean;
+  _plaintextV2Decision?: boolean;
+  _plaintextV2EverPrepared?: boolean;
   /**
    * Optional authenticated tenant/operator namespace for Cursor thread→conversation derivation.
    * When absent (single-operator local proxy), derivation stays local-scoped.
@@ -89,6 +163,9 @@ export interface OcxParsedRequest {
   _cursorIsolateConversation?: boolean;
   /** Account-scoped, non-secret Kiro request metadata selected with the OAuth access token. */
   _kiroAuthContext?: Pick<KiroOAuthMetadata, "profileArn" | "apiRegion" | "ssoRegion" | "authType">;
+  /** Account-scoped Zed user identity paired with the long-lived access token. */
+  _zedAuthContext?: { userId: string };
+  _workbuddyAuthContext?: import("../oauth/types").WorkBuddyOAuthMetadata;
   /** Provider-private continuation metadata resolved from the Responses previous_response_id chain. */
   _providerContinuation?: OcxProviderContinuationState;
   /** Persisted continuation considered only after the final physical route is known. */
@@ -98,9 +175,15 @@ export interface OcxParsedRequest {
   /**
    * The hosted `{type:"web_search", ...}` tool config, stashed when Codex enables web search. Routed
    * (non-OpenAI) providers can't run it server-side, so the proxy re-exposes it as a function tool and
-   * executes searches via the gpt-5.4-mini sidecar (see src/web-search). Absent when not requested.
+   * executes searches via the gpt-5.6-luna sidecar (see src/web-search). Absent when not requested.
    */
   _webSearch?: Record<string, unknown>;
+  /**
+   * Replayed hosted `web_search_call` cells the parser rebuilt as `web_search` call/result pairs
+   * (src/responses/web-search-replay.ts). The web-search sidecar swaps in the result it recorded for
+   * a cell, or removes the pairs when it does not run (src/web-search/sidecar-search-replay.ts).
+   */
+  _replayedWebSearchCells?: OcxReplayedWebSearchCell[];
   /** Hosted image_generation tool config stashed for the image bridge sidecar (see src/images). */
   _imageGeneration?: { toolNames: Set<string>; originalTool?: Record<string, unknown> };
   /**
@@ -110,18 +193,57 @@ export interface OcxParsedRequest {
    */
   _structuredOutput?: boolean;
   /**
+   * True for a Claude Messages `output_config.format` json_schema. Anthropic promises an answer
+   * that conforms to that schema, whatever `strict` the Responses translation states for
+   * OpenAI-compatible destinations, so an emulating adapter (Kiro) holds it to full conformance.
+   * Process-local; never forwarded.
+   */
+  _structuredOutputConformance?: boolean;
+  /**
    * True when the input carried `{type:"compaction_trigger"}` — Codex remote compaction v2 asking
    * this turn to produce a `{type:"compaction"}` output item. Routed adapters can't natively;
    * the server runs the model as a summarizer and the bridge emits a synthetic compaction item
    * (see src/responses/compaction.ts).
    */
   _compactionRequest?: boolean;
+  /** Request-owned encoding of readable routed v2 retention; never used for native ciphertext. */
+  _compactionRetention?: { encode(summary: string): string; commit(): void };
+  /** Manual compaction moved to another provider: summarize portably even on a canonical ChatGPT target. */
+  _portableCompaction?: boolean;
+  /**
+   * Codex memory pipeline phase this turn belongs to, when `memoryModels` routes it
+   * (src/server/responses/memory-models.ts). Read at the effort choke point, which runs after the
+   * route is known.
+   */
+  _memoryModelPhase?: "extract" | "consolidation";
   /**
    * True when the current request newly introduced a stored compaction summary/marker. Historical
    * markers restored by previous_response_id expansion were already acknowledged and do not reset
    * provider-private continuation caches again on every later turn.
    */
   _contextCompactionBoundary?: boolean;
+  /**
+   * Codex's own per-turn metadata for this request says `history_initialization: "New"` (HTTP header,
+   * or a WebSocket frame's own `client_metadata`). Read once in request preparation; the experimental
+   * Anthropic `perMessageEffort` option takes it as the new-transcript receipt (#6895).
+   */
+  _codexNewHistory?: boolean;
+  /** This turn's per-message effort bookkeeping (src/adapters/anthropic/per-message-effort.ts). */
+  _perMessageEffort?: PerMessageEffortTurn;
+  /**
+   * Core-owned registration slot for the optional advisor subsystem (src/advisor). Set per request
+   * by the sidecar planner, never at module load: the core Responses path only sees this
+   * structural shape, so an advisor-disabled install imports no advisor module. When present, the
+   * adapter delivery wraps the worker's event stream with it — the guard holds synthetic
+   * `advisor` tool calls, consults the configured expert model, and re-dispatches the worker.
+   */
+  _advisorGuard?: (options: {
+    parsed: OcxParsedRequest;
+    translatorBudget?: TranslatorBudget;
+    firstEvents: AsyncIterable<AdapterEvent>;
+    /** One bounded worker continuation re-dispatch (same machinery as the terminal guard). */
+    continuation: (parsed: OcxParsedRequest) => AsyncIterable<AdapterEvent> | Promise<AsyncIterable<AdapterEvent>>;
+  }) => AsyncGenerator<AdapterEvent>;
 }
 
 export interface OcxContext {
@@ -150,9 +272,11 @@ export interface OcxAssistantMessage {
   model?: string;
   timestamp: number;
   /**
-   * Kiro `reasoningContent.redactedContent` for THIS assistant turn — an opaque encrypted blob
-   * Kiro replays to preserve model reasoning across turns. Provider-specific and unrenderable, so
-   * it rides the message rather than a content part: any other adapter simply ignores it.
+   * Kiro's encrypted reasoning blob for THIS assistant turn — the opaque value from the turn's
+   * `reasoningContentEvent` (`signature` for the GPT-5.6 family, `redactedContent` for the base64
+   * shape), tagged with the wire field it must be replayed on (see kiro/reasoning.ts). Kiro
+   * replays it to preserve model reasoning across turns. Provider-specific and unrenderable, so it
+   * rides the message rather than a content part: any other adapter simply ignores it.
    */
   kiroRedactedReasoning?: string;
 }
@@ -192,12 +316,62 @@ export interface OcxImageContent {
 
 export interface OcxVideoContent {
   type: "video";
-  /** A base64 `data:` URL from an OpenAI-compatible `video_url` part. */
+  /**
+   * A base64 `data:` URL from an OpenAI-compatible `video_url` part, or a URI
+   * the upstream can fetch itself (a YouTube watch URL, a Files API uri).
+   */
   videoUrl: string;
+  /**
+   * Gemini's agentic video mode, carried verbatim from the caller's
+   * `video_url.processing` (#3271). Absent for every request that does not ask
+   * for it, so no existing traffic gains a field.
+   */
+  processing?: string;
 }
 
-/** A user/developer message content part: text or native media. */
-export type OcxContentPart = OcxTextContent | OcxImageContent | OcxVideoContent;
+/**
+ * An attached document carried as bytes rather than as a description of itself.
+ *
+ * Both inbound parsers used to reduce an attachment to a title before any adapter ran, so no
+ * adapter could forward one even to a target that has a representation for it, and the caller
+ * could not tell "the model read the document" from "the model was told a document existed"
+ * (#5212).
+ *
+ * `text` is that marker, derived once from what the part knows and kept on the part itself.
+ * Every text-only consumer in the tree reaches a `.text` fallback for a part it does not
+ * recognize, so carrying it here means a wire with no document representation still states the
+ * attachment instead of emitting `undefined` or a mislabelled `[video]`. Only the wires that
+ * have a counterpart read `data`.
+ */
+export interface OcxDocumentContent {
+  type: "document";
+  /** `[document: name]` marker, for every wire with no document representation. */
+  text: string;
+  /** IANA media type of the payload, for example `application/pdf`. */
+  mediaType: string;
+  /** Base64 payload with no `data:` prefix. */
+  data: string;
+  /** The document's own name: an Anthropic document title or a Chat file part's filename. */
+  filename?: string;
+}
+
+/**
+ * Inline audio carried by Codex's Responses input. Chat Completions accepts this as an
+ * `input_audio` content part only for WAV and MP3 payloads, so the normalized form keeps the
+ * base64 bytes and a wire-safe format label rather than the original data URL.
+ */
+export interface OcxAudioContent {
+  type: "audio";
+  /** Base64 payload with no `data:` prefix. */
+  data: string;
+  /** Chat Completions input_audio supports WAV and MP3. */
+  format: "mp3" | "wav";
+  /** Text marker for wires that cannot carry the bytes. */
+  text: string;
+}
+
+/** A user/developer message content part: text, native media, or an attached document. */
+export type OcxContentPart = OcxTextContent | OcxImageContent | OcxVideoContent | OcxDocumentContent | OcxAudioContent;
 
 export interface OcxThinkingContent {
   type: "thinking";
@@ -245,7 +419,14 @@ export interface OcxRequestOptions {
   toolChoice?: OcxToolChoice;
   parallelToolCalls?: boolean;
   reasoning?: string;
+  /**
+   * Independent reasoning toggle resolved at client-compatibility ingress. This is distinct from
+   * the strength-like `reasoning` effort: toggle-only models consume this value as `thinking.type`.
+   */
+  thinkingEnabled?: boolean;
   hideThinkingSummary?: boolean;
+  /** Provider policy: suppress raw content-channel reasoning while summaries stay visible. */
+  hideRawReasoning?: boolean;
   serviceTier?: string;
   /** Final outbound tier action, resolved after the provider/model wire is settled. */
   tierDecision?: TierDecision;
@@ -260,7 +441,7 @@ export interface OcxRequestOptions {
    * upstream wire has an equivalent. The openai-chat adapter re-nests it as chat
    * `response_format`, the exact inverse of responseFormatToText in src/chat/inbound.ts.
    * The native passthrough ignores it (it forwards `_rawBody.text` verbatim) and Kiro
-   * keeps rejecting structured output via `_structuredOutput`.
+   * emulates it through a private structured-output tool (src/adapters/kiro/structured-output.ts).
    */
   textFormat?: {
     type: "json_schema" | "json_object";
@@ -305,21 +486,28 @@ export interface OcxProviderContinuationState {
   [provider: string]: Record<string, unknown> | undefined;
 }
 
+/** One Anthropic server-side call as the API returned it: `server_tool_use` + its `*_tool_result`. */
+export interface AnthropicServerBlocks { use: Record<string, unknown>; result: Record<string, unknown> }
+
 export type AdapterEvent =
-  | { type: "heartbeat" }
-  | { type: "text_delta"; text: string; phase?: OcxMessagePhase }
+  | { type: "heartbeat"; replayUnsafe?: true; preflightReady?: true }
+  | { type: "text_delta"; text: string; phase?: OcxMessagePhase;
+      /** Complete documented Anthropic progress block: text remains signed thinking on replay. */
+      anthropicThinkingSignature?: string }
   | { type: "thinking_delta"; thinking: string }
   // Anthropic extended-thinking round-trip: signature_delta for the current thinking block, and
   // opaque redacted_thinking blocks. Both must be replayed verbatim or tool-use turns 400.
-  | { type: "thinking_signature"; signature: string }
+  // afterOutput marks a turn-level attestation emitted after text/tools, not a new thinking block.
+  | { type: "thinking_signature"; signature: string; afterOutput?: true }
   | { type: "redacted_thinking"; data: string }
-  // Kiro reasoning round-trip: the encrypted `redactedContent` blob for the CURRENT assistant turn.
-  // Never rendered — it only rides the reasoning item's envelope so the next request can replay it.
+  // Kiro reasoning round-trip: the encrypted reasoning blob for the CURRENT assistant turn, tagged
+  // with the wire field it arrived on. Never rendered — it only rides the reasoning item's envelope
+  // so the next request can replay it verbatim.
   | { type: "kiro_redacted_reasoning"; data: string }
   | { type: "reasoning_raw_delta"; text: string }
   | { type: "tool_call_start"; id: string; name: string; providerMetadata?: OcxProviderOpaqueToolCallMetadata }
   | { type: "tool_call_delta"; arguments: string }
-  | { type: "tool_call_end" }
+  | { type: "tool_call_end"; incomplete?: true }
   /** Internal boundary between a guarded first pass and its one-shot continuation. */
   | { type: "assistant_boundary" }
   // Native web-search activity surfaced by the web-search sidecar so Codex renders a "Searched the
@@ -328,31 +516,19 @@ export type AdapterEvent =
   // "Searching the web" spinner, then `end` once it resolves. The bridge maps begin → an
   // output_item.added(in_progress) and end → the matching output_item.done(completed|failed) under
   // the SAME output index, so the activity animates instead of flashing completed instantly.
+  // `itemId` lets the loop name the client-visible cell so it can record the result for replay.
+  | { type: "web_search_call_begin"; id: string; itemId?: string }
   | {
-      type: "web_search_call_begin";
-      id: string;
-      anthropicServerTool?: Record<string, unknown>;
+      type: "web_search_call_end"; id: string; itemId?: string; queries: string[]; status?: "completed" | "failed"; sources?: OcxUrlCitation[];
+      /** Anthropic's server-side call (adapters/anthropic.ts): its `server_tool_use` and result block, verbatim. */
+      anthropic?: AnthropicServerBlocks;
     }
-  | {
-      type: "web_search_call_end";
-      id: string;
-      queries: string[];
-      status?: "completed" | "failed";
-      sources?: OcxUrlCitation[];
-      anthropicServerToolResult?: Record<string, unknown>;
-    }
-  /** Opaque native Anthropic blocks retained only for immediate Messages round-trip. */
-  | { type: "anthropic_server_block"; block: Record<string, unknown> }
-  | { type: "anthropic_citation_delta"; delta: Record<string, unknown> }
   | {
       type: "done";
       usage?: OcxUsage;
       /** Native opaque compaction ciphertext returned by a Responses backend. */
       compactionEncryptedContent?: string;
       stopReason?: string;
-      /** Exact Anthropic terminal fields, present only for canonical source replay. */
-      anthropicStopReason?: string;
-      anthropicStopSequence?: string | null;
       endTurn?: boolean;
       providerState?: OcxProviderContinuationState;
     }
@@ -376,7 +552,14 @@ export type AdapterEvent =
       /** Responses error type and code when the adapter has a structured provider failure. */
       errorType?: string;
       code?: string;
+      /** Proxy-internal permission to consider API-key recovery; never serialized. */
+      apiKeyRecovery?: true;
       retryable?: boolean;
+      /**
+       * Proxy-internal, never serialized: the upstream failed the turn before producing text or a
+       * tool call, so the opt-in empty-completion guard may replay the identical request once.
+       */
+      replaySafeBeforeOutput?: boolean;
     };
 
 /**
@@ -390,15 +573,30 @@ export interface OcxUrlCitation {
 }
 
 /**
+ * One turn's per-message effort state (#6895). Spread copies of the parsed request share it, so a
+ * rebuild of the same turn is seen as a second build.
+ */
+export interface PerMessageEffortTurn {
+  /** The pending decision this turn owns, until it commits or is abandoned. */
+  token?: string;
+  generation: string;
+  builds: number;
+}
+
+/**
  * Canonical usage convention (devlog/260711_claude_inbound/070):
  * - `inputTokens` is the TOTAL prompt size, INCLUDING cache reads and cache writes
  *   (OpenAI Responses convention). Anthropic parse sites normalize into this shape.
  * - `cachedInputTokens` is cache READ tokens only (a subset of `inputTokens`).
  * - `cacheReadInputTokens`/`cacheCreationInputTokens` carry the read/write split when
  *   the provider reports both; reads mirror `cachedInputTokens`.
+ * - `cacheCreation1hInputTokens` is the 1-hour-TTL subset of `cacheCreationInputTokens`
+ *   (Anthropic `cache_creation.ephemeral_1h_input_tokens`), priced at the 1h write tier.
  * - `totalTokens` = inputTokens + outputTokens. Never re-add cache detail on top.
  */
 export interface OcxUsage {
+  /** Provider-reported credit spend, independent of token estimates and USD pricing. */
+  providerCredits?: number;
   inputTokens: number;
   outputTokens: number;
   /**
@@ -407,14 +605,22 @@ export interface OcxUsage {
    * `contextTotalTokens - outputTokens` so output is never added to an absolute checkpoint twice.
    */
   contextTotalTokens?: number;
+  /** Anthropic server-tool request counters (`usage.server_tool_use`), keyed by counter name. */
+  anthropicServerToolUse?: Record<string, number>;
   totalTokens?: number;
   cachedInputTokens?: number;
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
+  cacheCreation1hInputTokens?: number;
   reasoningOutputTokens?: number;
-  /** Native Anthropic server-tool usage counts retained for immediate Messages round-trip. */
-  anthropicServerToolUse?: Record<string, number>;
   estimated?: boolean;
+  /**
+   * The adapter read these counts off the upstream's own usage frame. Only an adapter whose
+   * provider is estimated by default (usageForFinalLog) sets it, and a merge keeps it only when
+   * every leg had it. A figure taken off a bridged wire or guessed never carries it, so the
+   * provider default still marks those as estimated.
+   */
+  upstreamReported?: true;
   /**
    * The raw upstream usage object for Responses-shaped upstreams (openai/codex#41980 parity):
    * codex-rs preserves the complete `response.usage` object through its own pipeline, so fields

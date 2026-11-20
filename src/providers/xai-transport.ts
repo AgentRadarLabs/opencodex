@@ -1,17 +1,21 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { OcxProviderConfig } from "../types";
+import { isEgressTransparentExecutor, markEgressTransparentExecutor } from "../lib/provider-egress";
+import { isPassiveKeyTransparent, markPassiveKeyTransparent } from "../lib/passive-key-fetch-proof";
+import { configuredOutboundFetch } from "../lib/proxy-env";
 import { resolveGithubCopilotTransport } from "./github-copilot-transport";
+import { resolveMistralTransport } from "./mistral-transport";
 
 export const XAI_GROK_CLI_BASE_URL = "https://cli-chat-proxy.grok.com/v1";
 
-/** The two hosts that serve xAI's Responses API: the public API and the Grok CLI proxy. */
-const XAI_RESPONSES_HOSTS = new Set(["api.x.ai", "cli-chat-proxy.grok.com"]);
+/** Exact xAI Responses hosts: global and US public APIs, and the Grok CLI proxy. */
+const XAI_RESPONSES_HOSTS = new Set(["api.x.ai", "us.api.x.ai", "cli-chat-proxy.grok.com"]);
 
 /**
  * True when this provider's Responses traffic terminates at xAI itself.
  *
- * Probed 2026-08-22 one field per request: the two hosts accept and refuse exactly the same
- * web_search fields, so they are one dialect rather than two. Matching is exact-host over
+ * The global API and CLI proxy were probed 2026-08-22; the US regional API documents
+ * the same request parameters. Matching is exact-host over
  * https, which keeps lookalikes (`api.x.ai.evil.test`) and nonstandard ports out.
  */
 export function isXaiResponsesDestination(provider: Pick<OcxProviderConfig, "baseUrl">): boolean {
@@ -26,8 +30,8 @@ export function isXaiResponsesDestination(provider: Pick<OcxProviderConfig, "bas
 }
 
 export const XAI_GROK_COMPATIBILITY = {
-  version: "0.2.93",
-  userAgent: "opencodex-grok/0.2.93",
+  version: "1.0.46",
+  userAgent: "opencodex-grok/1.0.46",
   headers: {
     clientIdentifier: "x-grok-client-identifier",
     clientVersion: "x-grok-client-version",
@@ -119,7 +123,7 @@ export function resolveProviderTransport(
   if (providerName === "github-copilot") {
     return resolveGithubCopilotTransport(provider, apiBaseUrl);
   }
-  if (providerName !== "xai") return provider;
+  if (providerName !== "xai") return resolveMistralTransport(provider);
 
   const cacheKey = promptCacheKey?.trim();
   const affinity = cacheKey ? deriveXaiConvId(cacheKey) : undefined;
@@ -156,9 +160,20 @@ export function resolveProviderTransport(
   // transient retries reuse one id so the upstream can dedupe them. A rotated key resolves a
   // fresh transport, which gets its own id.
   const requestId = configuredRequestId ?? randomUUID();
-  const baseFetch = provider.fetch ?? globalThis.fetch;
+  // Without a configured executor the default routes through `configuredOutboundFetch` rather
+  // than the bare global fetch, so a per-provider SOCKS5 route reaches the SOCKS transport.
+  // Bare Bun fetch ignores a socks5 value, which would have sent the request unproxied while
+  // the configuration named a proxy.
+  const baseFetch = provider.fetch
+    ?? markEgressTransparentExecutor(((input, init) => configuredOutboundFetch(input, init)) as typeof globalThis.fetch);
+  if (!provider.fetch) markPassiveKeyTransparent(baseFetch);
   const attemptFetch = ((input, init) =>
     baseFetch(input, withGeneratedRequestId(init, requestId, stableHeaders))) as typeof globalThis.fetch;
+  // This wrapper only adds a header and forwards the init, so it carries a request-scoped proxy
+  // option through to whatever it wraps — but only if what it wraps carries it too. A
+  // configured executor owns its own routing and is not assumed to.
+  if (isEgressTransparentExecutor(baseFetch)) markEgressTransparentExecutor(attemptFetch);
+  if (isPassiveKeyTransparent(baseFetch) && !Object.keys(stableHeaders).some(name => ["authorization", "x-api-key", "api-key"].includes(name.toLowerCase()))) markPassiveKeyTransparent(attemptFetch);
 
   return {
     ...provider,

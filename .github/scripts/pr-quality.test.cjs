@@ -3,9 +3,7 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const {
-  ANCESTRY_BEHIND_THRESHOLD,
   REVIEW_READINESS_ITEMS,
-  isWrongAncestry,
   authorHasPushPermission,
   assessPrDescription,
   hasGuiCue,
@@ -16,38 +14,14 @@ const {
   buildReviewReadinessSection,
   extractReviewReadiness,
   appendReviewReadinessSection,
+  reviewReadinessMigrationRequired,
+  reviewReadinessUsesCurrentPolicy,
   stripReviewReadinessSection,
   uncheckReviewReadinessBoxes,
   REVIEW_READINESS_CLAIM_INDEX,
   resetReviewReadinessSection,
   collectPrQualityFailures,
 } = require("./pr-quality.cjs");
-
-describe("isWrongAncestry", () => {
-  it("flags #644-shaped compares (0 behind main, far behind base, few ahead of main)", () => {
-    assert.equal(
-      isWrongAncestry({ behindMain: 0, behindBase: 44, aheadMain: 1 }),
-      true,
-    );
-  });
-
-  it("uses threshold 20 by default", () => {
-    assert.equal(ANCESTRY_BEHIND_THRESHOLD, 20);
-    assert.equal(isWrongAncestry({ behindMain: 0, behindBase: 20, aheadMain: 1 }), true);
-    assert.equal(isWrongAncestry({ behindMain: 0, behindBase: 19, aheadMain: 1 }), false);
-  });
-
-  it("passes when head is behind main (not sitting on main tip)", () => {
-    assert.equal(isWrongAncestry({ behindMain: 1, behindBase: 44, aheadMain: 1 }), false);
-  });
-
-  it("passes stale dev-based branches that are many commits ahead of main", () => {
-    assert.equal(
-      isWrongAncestry({ behindMain: 0, behindBase: 44, aheadMain: 50 }),
-      false,
-    );
-  });
-});
 
 describe("authorHasPushPermission", () => {
   it("accepts write/maintain/admin only", () => {
@@ -409,7 +383,7 @@ describe("review readiness checklist", () => {
 
   it("treats a reworded but complete section as complete", () => {
     const reworded = SECTION
-      .replace("All CI tests are green on my local testing.", "Local suite green.")
+      .replace("Required local validation passed; commands, results, and any full-suite exception are documented.", "Local suite green.")
       .replaceAll("- [ ] ", "- [x] ");
     const result = extractReviewReadiness(reworded);
     assert.equal(result.present, true);
@@ -585,7 +559,7 @@ describe("uncheckReviewReadinessBoxes", () => {
     "<!-- pr-quality-readiness-checklist:start -->",
     "## Review readiness checklist",
     "",
-    "- [x] All CI tests are green on my local testing.",
+    "- [x] Required local validation passed; commands, results, and any full-suite exception are documented.",
     "- [x] I pushed my PR to the latest dev commit.",
     "- [x] I resolved all correct Codex and CodeRabbit findings.",
     "- [x] My PR is ready for review.",
@@ -596,7 +570,7 @@ describe("uncheckReviewReadinessBoxes", () => {
     const body = uncheckReviewReadinessBoxes(checkedBody, [
       REVIEW_READINESS_CLAIM_INDEX.latest_dev,
     ]);
-    assert.ok(body.includes("- [x] All CI tests are green on my local testing."));
+    assert.ok(body.includes("- [x] Required local validation passed; commands, results, and any full-suite exception are documented."));
     assert.ok(body.includes("- [ ] I pushed my PR to the latest dev commit."));
     assert.ok(body.includes("- [x] My PR is ready for review."));
   });
@@ -606,7 +580,7 @@ describe("uncheckReviewReadinessBoxes", () => {
       0,
       REVIEW_READINESS_CLAIM_INDEX.latest_dev,
     ]);
-    assert.ok(body.includes("- [ ] All CI tests are green on my local testing."));
+    assert.ok(body.includes("- [ ] Required local validation passed; commands, results, and any full-suite exception are documented."));
     assert.ok(body.includes("- [ ] I pushed my PR to the latest dev commit."));
     assert.ok(body.includes("- [x] I resolved all correct Codex and CodeRabbit findings."));
     assert.ok(body.includes("- [x] My PR is ready for review."));
@@ -678,12 +652,8 @@ describe("collectPrQualityFailures", () => {
       baseRef: "main",
       allowedBases: allowed,
       body: "## Summary\n" + "x".repeat(50) + "\n\n## Test plan\n" + "y".repeat(50),
-      behindMain: 0,
-      behindBase: 0,
-      authorPermission: "read",
     });
     assert.ok(failures.some((f) => f.code === "wrong_base"));
-    assert.ok(!failures.some((f) => f.code === "wrong_ancestry"));
   });
 
   it("reports wrong_base and bad_description together for main + empty body", () => {
@@ -691,16 +661,16 @@ describe("collectPrQualityFailures", () => {
       baseRef: "main",
       allowedBases: allowed,
       body: "",
-      behindMain: 0,
-      behindBase: 0,
-      authorPermission: "read",
     });
     assert.ok(failures.some((f) => f.code === "wrong_base"));
     assert.ok(failures.some((f) => f.code === "bad_description"));
-    assert.ok(!failures.some((f) => f.code === "wrong_ancestry"));
   });
 
-  it("reports wrong_ancestry for contributor on #644-shaped compare", () => {
+  it("no longer fails a contributor for sitting on the deleted main tip", () => {
+    // The old `main...head` heuristic flagged a head that was level with
+    // `main` but far behind `dev`. `main` no longer exists, so there is no tip
+    // to compare against and no ancestry failure to raise. Being far behind
+    // `dev` is handled by the review-readiness latest-dev claim instead.
     const failures = collectPrQualityFailures({
       baseRef: "dev",
       allowedBases: allowed,
@@ -712,91 +682,17 @@ describe("collectPrQualityFailures", () => {
         "- Launch the tray app after setting CODEX_HOME",
         "- Confirm the listener and launcher use the same workspace root",
       ].join("\n"),
-      behindMain: 0,
-      behindBase: 44,
-      aheadMain: 1,
-      authorPermission: "read",
     });
-    assert.deepEqual(
-      failures.map((f) => f.code),
-      ["wrong_ancestry"],
-    );
+    assert.deepEqual(failures, []);
   });
 
-  it("skips ancestry for push permission but still flags bad description", () => {
+  it("still flags a bad description for a contributor head", () => {
     const failures = collectPrQualityFailures({
       baseRef: "dev",
       allowedBases: allowed,
       body: "",
-      behindMain: 0,
-      behindBase: 44,
-      aheadMain: 1,
-      authorPermission: "write",
     });
-    assert.ok(!failures.some((f) => f.code === "wrong_ancestry"));
-    assert.ok(failures.some((f) => f.code === "bad_description"));
-  });
-
-  it("applies ancestry when permission lookup failed (fail closed)", () => {
-    const failures = collectPrQualityFailures({
-      baseRef: "dev",
-      allowedBases: allowed,
-      body: [
-        "## Summary",
-        "This change updates the Windows tray launcher so it resolves CODEX_HOME through the shared helper instead of a hardcoded path.",
-        "",
-        "## Test plan",
-        "- Launch the tray app after setting CODEX_HOME",
-        "- Confirm the listener and launcher use the same workspace root",
-      ].join("\n"),
-      behindMain: 0,
-      behindBase: 44,
-      aheadMain: 1,
-      authorPermission: null,
-      permissionLookupFailed: true,
-    });
-    assert.ok(failures.some((f) => f.code === "wrong_ancestry"));
-  });
-
-  it("does not flag stale dev-based branches that are far ahead of main", () => {
-    const failures = collectPrQualityFailures({
-      baseRef: "dev",
-      allowedBases: allowed,
-      body: [
-        "## Summary",
-        "This change updates the Windows tray launcher so it resolves CODEX_HOME through the shared helper instead of a hardcoded path.",
-        "",
-        "## Test plan",
-        "- Launch the tray app after setting CODEX_HOME",
-        "- Confirm the listener and launcher use the same workspace root",
-      ].join("\n"),
-      behindMain: 0,
-      behindBase: 44,
-      aheadMain: 50,
-      authorPermission: "read",
-    });
-    assert.ok(!failures.some((f) => f.code === "wrong_ancestry"));
-  });
-
-  it("skips ancestry when compare lookup failed (cannot evaluate)", () => {
-    const failures = collectPrQualityFailures({
-      baseRef: "dev",
-      allowedBases: allowed,
-      body: [
-        "## Summary",
-        "This change updates the Windows tray launcher so it resolves CODEX_HOME through the shared helper instead of a hardcoded path.",
-        "",
-        "## Test plan",
-        "- Launch the tray app after setting CODEX_HOME",
-        "- Confirm the listener and launcher use the same workspace root",
-      ].join("\n"),
-      behindMain: 0,
-      behindBase: 0,
-      aheadMain: 0,
-      authorPermission: "read",
-      ancestryLookupFailed: true,
-    });
-    assert.ok(!failures.some((f) => f.code === "wrong_ancestry"));
+    assert.deepEqual(failures.map((f) => f.code), ["bad_description"]);
   });
 
   it("skips wrong_base when stackedBase is set", () => {
@@ -811,14 +707,9 @@ describe("collectPrQualityFailures", () => {
         "- Launch the tray app after setting CODEX_HOME",
         "- Confirm the listener and launcher use the same workspace root",
       ].join("\n"),
-      behindMain: 0,
-      behindBase: 44,
-      aheadMain: 1,
-      authorPermission: "read",
       stackedBase: true,
     });
     assert.ok(!failures.some((f) => f.code === "wrong_base"));
-    assert.ok(!failures.some((f) => f.code === "wrong_ancestry"));
   });
 
   it("still flags wrong_base for non-allow-list bases without stackedBase", () => {
@@ -826,9 +717,6 @@ describe("collectPrQualityFailures", () => {
       baseRef: "main",
       allowedBases: allowed,
       body: "fix stuff",
-      behindMain: 0,
-      behindBase: 0,
-      authorPermission: "read",
       stackedBase: false,
     });
     assert.ok(failures.some((f) => f.code === "wrong_base"));
@@ -840,9 +728,6 @@ describe("collectPrQualityFailures", () => {
       allowedBases: allowed,
       title: "Fix dashboard spacing",
       body: richBody,
-      behindMain: 0,
-      behindBase: 0,
-      authorPermission: "read",
       changedFilePaths: ["gui/src/App.tsx"],
     });
     assert.ok(failures.some((f) => f.code === "missing_ui_screenshot"));
@@ -854,9 +739,6 @@ describe("collectPrQualityFailures", () => {
       allowedBases: allowed,
       title: "GUI: fix provider list spacing",
       body: richBody,
-      behindMain: 0,
-      behindBase: 0,
-      authorPermission: "read",
       changedFilePaths: ["scripts/foo.ts"],
     });
     assert.ok(!failures.some((f) => f.code === "missing_ui_screenshot"));
@@ -869,9 +751,6 @@ describe("collectPrQualityFailures", () => {
       allowedBases: allowed,
       title: "Large refactor",
       body: richBody,
-      behindMain: 0,
-      behindBase: 0,
-      authorPermission: "read",
       changedFilePaths: truncatedPaths,
       filesTruncated: true,
     });
@@ -886,9 +765,6 @@ describe("collectPrQualityFailures", () => {
       allowedBases: allowed,
       title: "Large refactor with gui tweak",
       body: richBody,
-      behindMain: 0,
-      behindBase: 0,
-      authorPermission: "read",
       changedFilePaths: truncatedPaths,
       filesTruncated: true,
     });
@@ -907,9 +783,6 @@ describe("collectPrQualityFailures", () => {
         "## Test plan",
         "- Ran bun test tests/ci-workflows/ci-workflows.test.ts",
       ].join("\n"),
-      behindMain: 0,
-      behindBase: 0,
-      authorPermission: "read",
       changedFilePaths: ["scripts/foo.ts"],
     });
     assert.ok(!failures.some((f) => f.code === "missing_ui_screenshot"));
@@ -927,9 +800,6 @@ describe("collectPrQualityFailures", () => {
         "## Test plan",
         "- Ran bun test tests/ci-workflows/ci-workflows.test.ts",
       ].join("\n"),
-      behindMain: 0,
-      behindBase: 0,
-      authorPermission: "read",
       changedFilePaths: ["gui/src/styles.css"],
     });
     assert.ok(failures.some((f) => f.code === "missing_ui_screenshot"));
@@ -947,9 +817,6 @@ describe("collectPrQualityFailures", () => {
         "## Test plan",
         "- Ran bun test tests/ci-workflows/ci-workflows.test.ts",
       ].join("\n"),
-      behindMain: 0,
-      behindBase: 0,
-      authorPermission: "read",
       changedFilePaths: ["gui/src/App.tsx"],
       guiOverrideComments: [
         { author_association: "OWNER", body: "no gui changes here" },
@@ -970,9 +837,6 @@ describe("collectPrQualityFailures", () => {
         "## Test plan",
         "- Ran bun test tests/ci-workflows/ci-workflows.test.ts",
       ].join("\n"),
-      behindMain: 0,
-      behindBase: 0,
-      authorPermission: "read",
       changedFilePaths: ["gui/src/App.tsx"],
       guiOverrideComments: [
         { author_association: "CONTRIBUTOR", body: "no gui changes here" },
@@ -995,9 +859,6 @@ describe("collectPrQualityFailures", () => {
         "## Test plan",
         "- Ran bun test tests/ci-workflows/ci-workflows.test.ts",
       ].join("\n"),
-      behindMain: 0,
-      behindBase: 0,
-      authorPermission: "read",
       changedFilePaths: ["gui/src/App.tsx"],
     });
     assert.ok(!failures.some((f) => f.code === "missing_ui_screenshot"));
@@ -1019,9 +880,6 @@ describe("collectPrQualityFailures", () => {
         "## Test plan",
         "- Ran bun test tests/ci-workflows/ci-workflows.test.ts",
       ].join("\n"),
-      behindMain: 0,
-      behindBase: 0,
-      authorPermission: "read",
       changedFilePaths: ["gui/src/App.tsx"],
     });
     assert.ok(!failures.some((f) => f.code === "missing_ui_screenshot"));
@@ -1043,9 +901,6 @@ describe("collectPrQualityFailures", () => {
         "## Test plan",
         "- Ran bun test tests/ci-workflows/ci-workflows.test.ts",
       ].join("\n"),
-      behindMain: 0,
-      behindBase: 0,
-      authorPermission: "read",
       changedFilePaths: ["gui/src/App.tsx"],
     });
     assert.ok(failures.some((f) => f.code === "missing_ui_screenshot"));
@@ -1069,9 +924,6 @@ describe("collectPrQualityFailures", () => {
         "- [ ] Docs or release notes were updated when needed.",
         "- [ ] Security-sensitive changes were reviewed for secrets, auth, and unsafe defaults.",
       ].join("\n"),
-      behindMain: 0,
-      behindBase: 0,
-      authorPermission: "read",
     });
     assert.ok(!failures.some((f) => f.code === "missing_ui_screenshot"));
   });
@@ -1099,5 +951,100 @@ describe("comment stripping respects fenced code (regression)", () => {
   it("still ignores a screenshot inside a real HTML comment", () => {
     const body = ["<!--", "![hidden](https://example.invalid/hidden.png)", "-->"].join("\n");
     assert.equal(hasScreenshotEvidence(body), false);
+  });
+});
+
+// #4443: the box used to ask for the exact `dev` tip while the gate cleared the
+// claim at up to READINESS_LATEST_DEV_BEHIND_MAX behind. On a fast-moving dev an
+// author reading the box literally resyncs for unrelated commits, every resync
+// moves the head, head-drift unticks all four boxes, and the exact-head CI
+// evidence is thrown away — with no reduction in merge risk, because the gate
+// was already satisfied.
+describe("the latest-dev readiness box states the condition the gate enforces", () => {
+  const {
+    READINESS_LATEST_DEV_BEHIND_MAX,
+    readinessClaimViolations,
+  } = require("./pr-quality-state.cjs");
+
+  const latestDevItem = () =>
+    REVIEW_READINESS_ITEMS[REVIEW_READINESS_CLAIM_INDEX.latest_dev];
+
+  it("no longer demands the exact tip", () => {
+    assert.ok(!/latest dev commit/i.test(latestDevItem()));
+  });
+
+  it("names the threshold the gate actually uses", () => {
+    // Derived, not transcribed: the sentence carries the same number
+    // `readinessClaimViolations` compares against.
+    assert.ok(latestDevItem().includes(String(READINESS_LATEST_DEV_BEHIND_MAX)));
+  });
+
+  it("promises exactly what the gate clears", () => {
+    // The sentence is only honest if the gate agrees at the boundary.
+    assert.deepEqual(
+      readinessClaimViolations({ behindBase: READINESS_LATEST_DEV_BEHIND_MAX }),
+      []
+    );
+    assert.deepEqual(
+      readinessClaimViolations({ behindBase: READINESS_LATEST_DEV_BEHIND_MAX + 1 }),
+      ["latest_dev"]
+    );
+  });
+
+  it("still leaves the exact tip available to a maintainer", () => {
+    assert.match(latestDevItem(), /maintainer/i);
+  });
+
+  it("keeps the four-box contract", () => {
+    assert.equal(REVIEW_READINESS_ITEMS.length, 4);
+    const section = buildReviewReadinessSection();
+    assert.equal((section.match(/^\s*[-*]\s+\[[ xX]\]\s+/gm) || []).length, 4);
+  });
+
+  it("does not disturb a checklist that already carries the old wording", () => {
+    // The compatibility contract: `extractReviewReadiness` reads box count and
+    // checked state, never item text, and appending is idempotent. An open PR
+    // keeps its sentence and its ticks.
+    const legacy = [
+      "Body.",
+      "",
+      "<!-- pr-quality-readiness-checklist:start -->",
+      "## Review readiness checklist",
+      "",
+      "- [x] All CI tests are green on my local testing.",
+      "- [x] I pushed my PR to the latest dev commit.",
+      "- [x] I resolved all correct Codex and CodeRabbit findings.",
+      "- [x] My PR is ready for review.",
+      "<!-- pr-quality-readiness-checklist:end -->",
+    ].join("\n");
+
+    const readiness = extractReviewReadiness(legacy);
+    assert.equal(readiness.complete, true);
+    assert.equal(readiness.total, 4);
+    assert.equal(appendReviewReadinessSection(legacy), legacy);
+  });
+});
+
+describe("managed checklist wording classification", () => {
+  const oldItem = "All CI tests are green on my local testing.";
+  const legacy = buildReviewReadinessSection().replace(REVIEW_READINESS_ITEMS[0], oldItem);
+  for (const mark of [" ", "x", "X"]) {
+    for (const ending of ["\n", "\r\n"]) {
+      it(`recognizes old first item with ${JSON.stringify(mark)} and ${JSON.stringify(ending)}`, () => {
+        const body = legacy.replace(`- [ ] ${oldItem}`, ` * [${mark}] ${oldItem}  `).replaceAll("\n", ending);
+        assert.equal(reviewReadinessMigrationRequired(body), true);
+        assert.equal(reviewReadinessUsesCurrentPolicy(body), false);
+      });
+    }
+  }
+  it("preserves custom later labels and refuses malformed or displaced first items", () => {
+    assert.equal(reviewReadinessMigrationRequired(legacy.replace(REVIEW_READINESS_ITEMS[1], "Author's branch attestation.")), true);
+    for (const body of [null, "", oldItem, legacy + legacy,
+      legacy.replace("<!-- pr-quality-readiness-checklist:end -->", ""),
+      legacy.replace(oldItem, oldItem + " Extra"),
+      legacy.replace(oldItem, "Custom").replace(REVIEW_READINESS_ITEMS[1], oldItem),
+      legacy.replace(`- [ ] ${REVIEW_READINESS_ITEMS[3]}`, ""),
+    ]) assert.equal(reviewReadinessMigrationRequired(body), false);
+    assert.equal(reviewReadinessUsesCurrentPolicy(buildReviewReadinessSection()), true);
   });
 });

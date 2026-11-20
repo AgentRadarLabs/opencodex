@@ -7,6 +7,7 @@
  */
 import { expect, test, describe } from "bun:test";
 import {
+  JEV_AUTO_CREATE_HASH,
   MODELS_TAB_HASHES,
   hashBelongsToPage,
   readPageFromHash,
@@ -44,6 +45,13 @@ describe("nested Models hashes", () => {
     for (const hash of MODELS_TAB_HASHES) {
       expect(resolveAppHashChange(hash)).toEqual({ page: "models", replaceTo: null });
     }
+  });
+
+  test("the JEV Auto create action is the only registered Combo deep link", () => {
+    expect(JEV_AUTO_CREATE_HASH).toBe("models/combos/jev-auto");
+    expect(hashBelongsToPage(JEV_AUTO_CREATE_HASH, "models")).toBe(true);
+    expect(resolveAppHashChange(JEV_AUTO_CREATE_HASH)).toEqual({ page: "models", replaceTo: null });
+    expect(readModelsTab(`#${JEV_AUTO_CREATE_HASH}`)).toBe("combos");
   });
 });
 
@@ -136,6 +144,7 @@ describe("legacy lab hash", () => {
     expect(readModelsTab("#labs")).toBe("catalog");
     expect(readModelsTab("#label")).toBe("catalog");
     expect(readModelsTab("#lab-legacy")).toBe("catalog");
-    expect(resolveAppHashChange("labs")).toEqual({ page: "dashboard", replaceTo: "dashboard" });
+    // An unknown page lands on Home (design system v2), so a stale #labs bookmark does too.
+    expect(resolveAppHashChange("labs")).toEqual({ page: "home", replaceTo: "home" });
   });
 });

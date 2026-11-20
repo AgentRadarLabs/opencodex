@@ -1,41 +1,81 @@
 import type { AdapterEvent, OcxParsedRequest } from "../types";
-import type { AttemptRecoveryKind } from "../usage/log";
 import type { TranslatorBudget } from "../lib/translator-budget";
+import type { RequestExecutionBudget } from "../lib/request-execution-budget";
+import type { AttemptRecoveryKind, AttemptRecoveryWithheld } from "../usage/log";
 import type { AdapterTierMetadata } from "../providers/fastwire";
-
-export interface AnthropicMessagesSource {
-  readonly body: Readonly<Record<string, unknown>>;
-  readonly headers: {
-    readonly anthropicVersion?: string;
-    readonly anthropicBeta?: string;
-  };
-  /** Source contains Anthropic-native tools that translated routes cannot represent. */
-  readonly requiresExactReplay?: true;
-}
+import type { ProviderRequestSlot } from "../providers/request-pacing";
 
 /** Metadata about the caller's incoming request, for auth-forwarding adapters. */
 export interface IncomingMeta {
   headers: Headers;
+  /** Canonical routed provider identity for provider-specific wire fields. */
+  providerName?: string;
+  /** Trusted caller has durable structural replay ownership for earlier completed tools. */
+  completedToolBlocks?: boolean;
   translatorBudget: TranslatorBudget;
   abortSignal?: AbortSignal;
+  /** Lease acquired before the response is committed; the physical send transfers it to its body. */
+  pacingSlot?: ProviderRequestSlot;
+  /** Internal queued rebuild already owns the outer provider fetch admission. */
+  dispatchPacingHeld?: boolean;
+  /** Combo children must surface a pre-output refusal so the selector can try the next target. */
+  comboAttempt?: boolean;
   /**
    * Provider-scoped fetch prepared by the Responses router. Stateful transports that emit more
    * than one physical HTTP request per logical turn must reuse it so every request participates in
    * the same pacing queue and custom provider fetch seam.
    */
   providerFetch?: typeof globalThis.fetch;
-  /** Validated original Messages body, available only to exact canonical Anthropic replay. */
-  anthropicMessagesSource?: AnthropicMessagesSource;
+  /** Synchronous selection fence for adapter-owned sends; call after async setup, before dispatch. */
+  beforePhysicalSend?: () => void;
   /**
    * Image-normalization ladder bias for upstream-413 tightened retries: every image
-   * starts one tier lower (devlog/260714_image_normalization_pipeline/030). Only the
-   * anthropic adapter consumes it; others ignore it.
+   * starts one tier lower (devlog/260714_image_normalization_pipeline/030). Consumed by
+   * the anthropic and openai-chat adapters; others ignore it.
    */
   imageTierBias?: number;
+  /**
+   * The enclosing request's send budget, for adapters that own their upstream transport.
+   *
+   * A `runTurn` adapter never receives an `AdapterFetchContext`, so the budget that bounds every
+   * other leg could not reach it: Cursor re-sends a whole turn up to three times inside one
+   * adapter call, and the request cap counted that as one send. Optional, and absent means
+   * unlimited, because adapter unit tests build a meta with neither a budget nor a request
+   * behind it (#4546).
+   */
+  sendBudget?: RequestExecutionBudget;
+  /**
+   * Physical-send observations for runTurn adapters. Without the same callback carried by
+   * AdapterFetchContext, an adapter-owned replay spends the shared budget but remains absent
+   * from the request's sendCount.
+   */
+  onPhysicalSend?: (send: { ordinal: number; recovery?: AttemptRecoveryKind }) => void;
+  /**
+   * Recovery refusals for runTurn adapters. A refused replay is not a send, so this separate
+   * channel explains why recovery stopped without inflating physical-send telemetry.
+   */
+  onRecoveryWithheld?: (withheld: { reason: AttemptRecoveryWithheld }) => void;
+}
+
+export interface AdapterStreamContext {
+  /** Per-exchange authority: this parser feeds a bridge with signed structural output IDs. */
+  completedToolBlocks?: boolean;
 }
 
 export interface ProviderAdapter {
   name: string;
+
+  /**
+   * This adapter reports every physical inference send through `IncomingMeta.onPhysicalSend`,
+   * including its first.
+   *
+   * The caller normally logs the first send before handing control over, which is correct for a
+   * transport whose sends it can see. An adapter that admits its own sends through the shared
+   * budget can have that first send refused, and a send logged before admission is a send the
+   * log claims and the wire never made. Setting this moves the first send's accounting to the
+   * boundary where it is actually dispatched.
+   */
+  reportsPhysicalSends?: boolean;
 
   /**
    * Convert an already-read provider HTTP error into client-safe text. This hook must be pure and
@@ -75,13 +115,12 @@ export interface ProviderAdapter {
     response: Response,
     budget: TranslatorBudget,
     tierMetadata?: AdapterTierMetadata,
-    request?: AdapterRequest,
+    streamContext?: AdapterStreamContext,
   ): AsyncGenerator<AdapterEvent>;
   parseResponse?(
     response: Response,
     budget: TranslatorBudget,
     tierMetadata?: AdapterTierMetadata,
-    request?: AdapterRequest,
   ): Promise<AdapterEvent[]>;
   runTurn?(
     parsed: OcxParsedRequest,
@@ -98,12 +137,12 @@ export interface AdapterRequest {
     method: string;
     headers: Record<string, string>;
     body: string;
-    /** Effective Anthropic prompt-cache lifetime represented by the final wire body. */
+    /** Effective Anthropic prompt-cache lifetime of the final wire body (5 min or 1 h). */
     promptCacheTtlMs?: number;
-    /** True only when body replays validated source on exact canonical Anthropic Messages. */
-    anthropicSourceReplay?: boolean;
-    /** Exact caller-declared tool names preserved on source replay. */
-    anthropicSourceToolNames?: ReadonlySet<string>;
+    /** Caller tool identities replaced by hosted tools in this exact build; empty clears prior builds. */
+    hostedToolSubstitutions?: ReadonlyArray<{ name: string; namespace?: string; callType: string }>;
+    /** Exact final wire model, captured before serialization for model-scoped transport gates. */
+    outboundModelId?: string;
     /** Final upstream wire names of custom tools lowered to functions while building this request. */
     convertedRoutedCustomToolNames?: ReadonlySet<string>;
     /** Native custom-tool wire names authorized for representation-only response repair. */
@@ -112,6 +151,12 @@ export interface AdapterRequest {
     convertedRoutedToolSearchNames?: ReadonlySet<string>;
     /** Upstream-only aliases for namespace tools flattened in this request. */
     convertedRoutedNamespaceToolAliases?: ReadonlyMap<string, { namespace: string; name: string; kind: "function" | "custom" }>;
+    /** Request-declared collaboration child names eligible for plaintext-v2 alias restoration. */
+    plaintextV2AgentMessageToolNames?: ReadonlySet<string>;
+    /** Collaboration message-tool names actually rewritten to fixed aliases in this request. */
+    plaintextV2AgentMessageAliasedToolNames?: ReadonlySet<string>;
+    /** Upstream-only <=64-char aliases for Meta Muse tool names rewritten in this request. */
+    convertedMuseToolNameAliases?: ReadonlyMap<string, string>;
     /** Releases observation of a serialized request body after its final fetch attempt settles. */
     releaseBodyObservation?: () => void;
     /** Exact reasoning parameter emitted by the adapter, for request-log diagnostics only. */
@@ -144,9 +189,11 @@ export interface AdapterRequest {
 }
 
 export interface AdapterFetchContext {
+  /** Kiro may hand a pooled refusal to the outer account rotator before same-account retry. */
+  kiroPreferAccountFailover?: boolean;
   /** Remains attached to the returned response body after the response headers arrive. */
   abortSignal?: AbortSignal;
-  /** Deadline for receiving response headers on each attempt, not for consuming the response body. */
+  /** Response-header deadline per attempt; non-positive disables it. Body cancellation stays linked. */
   timeoutMs?: number;
   /** Return final non-2xx responses untouched so the caller can own the error-body read. */
   returnRawErrors?: boolean;
@@ -154,8 +201,33 @@ export interface AdapterFetchContext {
   stream?: boolean;
   /** Custom fetch executor to use for physical upstream network requests (defaults to globalThis.fetch). */
   executor?: typeof globalThis.fetch;
-  /** Set the recovery label consumed by the next executor dispatch. Does not itself record a send. */
-  onRetry?: (recovery: AttemptRecoveryKind) => void;
+  /**
+   * The logical request's send budget (#4546). Optional and unlimited when absent, so an
+   * adapter unit test that calls a transport context-free keeps its own retry shape. An
+   * adapter that retries internally must admit EVERY physical send against it: counting one
+   * adapter entry as one send is how a nested 3x3 ladder stayed invisible to a request cap.
+   */
+  sendBudget?: RequestExecutionBudget;
+  /**
+   * Observes every physical upstream send this adapter makes, including its own inner retries.
+   *
+   * `ordinal` counts from 1 within this fetch call, so a caller that already recorded the entry
+   * send records only ordinals above 1 and an adapter that never retries internally logs exactly
+   * what it logs today. Kiro and Cursor were unpinnable without this: they report one send per
+   * adapter call however many requests they actually made, so their inner ladders were invisible
+   * to `sendCount` and no regression could assert a count for them (#4546).
+   */
+  onPhysicalSend?: (send: { ordinal: number; recovery?: AttemptRecoveryKind }) => void;
+  /**
+   * Observes a recovery this adapter was ready to make and did not, because the send budget
+   * refused the dispatch.
+   *
+   * Separate from `onPhysicalSend` because nothing was sent: folding it in would inflate
+   * `sendCount`, the one number that means "requests this proxy actually made". Without it a
+   * log with one send cannot distinguish "no recovery was eligible" from "one was and the
+   * budget withheld it", and those need opposite follow-ups (#5044).
+   */
+  onRecoveryWithheld?: (withheld: { reason: AttemptRecoveryWithheld }) => void;
 }
 
 /**

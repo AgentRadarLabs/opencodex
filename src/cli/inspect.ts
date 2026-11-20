@@ -35,6 +35,7 @@ const USAGE = `Usage:
   ocx inspect windows-tray [--json]
   ocx integration native [list] [--json]
   ocx integration native <claude|claude-desktop|codex|grok> <on|off> [--json]
+  ocx integration native cursor [status|local-installer] [--json]
   ocx agent request-user-input [on|off] [--json]`;
 
 /** A read that takes no arguments beyond `--json`. */
@@ -108,8 +109,17 @@ async function nativeIntegration(argv: string[], deps: RuntimeApiDeps): Promise<
     throw new CliUsageError(`expected on or off after ${action}`, USAGE);
   }
 
-  // Toggling rewrites the client's own config file, which is why each client has its own route
-  // rather than one route with a client parameter.
+  // A native switch is a Home-only decision. The native route (/api/native-integrations/<client>)
+  // writes the Home's switch, records no Home route intent, and runs the client's own transition
+  // (Claude Desktop first-party included); Children keep inheriting their saved default. A Child
+  // refuses here with the Home command for its own device.
+  const { readLinkChildContext } = await import("./link-child");
+  const routeDeps = deps as import("./route-to").RouteToDeps;
+  if ((routeDeps.readChildContext ?? readLinkChildContext)()) {
+    const { routeToAction } = await import("./route-to");
+    await routeToAction([action, state, ...(wantsJson ? ["--json"] : [])], routeDeps);
+    return;
+  }
   const result = await runtimeRequest(`/api/native-integrations/${action}`, {
     method: "PUT",
     headers: { "content-type": "application/json" },
@@ -220,6 +230,10 @@ export async function handleInspectCommand(argv: string[], deps: RuntimeApiDeps 
 }
 
 export async function handleIntegrationCommand(argv: string[], deps: RuntimeApiDeps = {}): Promise<number> {
+  if (argv[0] === "native" && argv[1] === "cursor") {
+    const { handleCursorIntegrationCommand } = await import("./integration-cursor");
+    return handleCursorIntegrationCommand(argv.slice(2), deps);
+  }
   return runCliAction(async () => {
     const [sub, ...rest] = argv;
     if (sub === "native" || sub === undefined) await nativeIntegration(sub === undefined ? [] : rest, deps);

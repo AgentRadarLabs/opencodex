@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { COALESCE_MAX_CHUNK_LENGTH, createAdapterEventQueue, PREFLIGHT_HEARTBEAT_RETAIN_LIMIT, preflightAdapterEvents } from "../../src/adapters/run-turn-queue";
+import {
+  classifyZeroOutputTokenLimit,
+  COALESCE_MAX_CHUNK_LENGTH,
+  createAdapterEventQueue,
+  DEFAULT_MAX_BACKLOG_CODE_UNITS,
+  DEFAULT_MAX_EVENT_CODE_UNITS,
+  PREFLIGHT_HEARTBEAT_RETAIN_LIMIT,
+  preflightAdapterEvents,
+  retainedEventCodeUnits,
+} from "../../src/adapters/run-turn-queue";
 import type { AdapterEvent } from "../../src/types";
 
 const text = (value: string): AdapterEvent => ({ type: "text_delta", text: value });
@@ -144,6 +153,26 @@ describe("run-turn adapter event queue", () => {
     expect(await queue.collect()).toEqual([heartbeat]);
   });
 
+  test("heartbeat coalescing latches a later replay-unsafe marker", async () => {
+    const queue = createAdapterEventQueue();
+
+    queue.push(heartbeat);
+    queue.push({ type: "heartbeat", replayUnsafe: true });
+    queue.close();
+
+    expect(await queue.collect()).toEqual([{ type: "heartbeat", replayUnsafe: true }]);
+  });
+
+  test("heartbeat coalescing does not clear an existing replay-unsafe marker", async () => {
+    const queue = createAdapterEventQueue();
+
+    queue.push({ type: "heartbeat", replayUnsafe: true });
+    queue.push(heartbeat);
+    queue.close();
+
+    expect(await queue.collect()).toEqual([{ type: "heartbeat", replayUnsafe: true }]);
+  });
+
   test("a tool event breaks text coalescing on both sides", async () => {
     const queue = createAdapterEventQueue();
 
@@ -239,6 +268,43 @@ describe("run-turn adapter event queue", () => {
 });
 
 describe("run-turn adapter event preflight", () => {
+  test("a cooldown heartbeat commits preflight while preserving later output", async () => {
+    const ready: AdapterEvent = { type: "heartbeat", preflightReady: true };
+    const values = [ready, text("resumed"), done];
+
+    const preflight = await preflightAdapterEvents(events(values));
+
+    expect(preflight.error).toBeUndefined();
+    expect(preflight.replayUnsafe).toBe(false);
+    expect(await collect(preflight.stream)).toEqual(values);
+  });
+
+  test("buffered preflight continues past a cooldown heartbeat to the first refusal", async () => {
+    const ready: AdapterEvent = { type: "heartbeat", preflightReady: true };
+    const error: AdapterEvent = { type: "error", status: 429, message: "rate limited" };
+
+    const preflight = await preflightAdapterEvents(events([ready, error]), undefined, { honorReady: false });
+
+    expect(preflight.error).toEqual(error);
+    expect(preflight.ready).toBeUndefined();
+    expect(await collect(preflight.stream)).toEqual([ready, error]);
+  });
+
+  test("queued heartbeat coalescing retains the cooldown preflight signal", async () => {
+    const queue = createAdapterEventQueue();
+    queue.push(heartbeat);
+    queue.push({ type: "heartbeat", preflightReady: true });
+    queue.push(text("resumed"));
+    queue.close();
+
+    const preflight = await preflightAdapterEvents(queue.stream());
+
+    expect(await collect(preflight.stream)).toEqual([
+      { type: "heartbeat", preflightReady: true },
+      text("resumed"),
+    ]);
+  });
+
   test("10,000 leading heartbeats retain only the bounded tail and still complete", async () => {
     const values = [...Array.from({ length: 10_000 }, () => heartbeat), done];
     const preflight = await preflightAdapterEvents(events(values));
@@ -256,6 +322,24 @@ describe("run-turn adapter event preflight", () => {
     expect(await collect(preflight.stream)).toEqual([heartbeat, error]);
   });
 
+  test("replay-unsafe state survives heartbeat buffer eviction", async () => {
+    const unsafeHeartbeat: AdapterEvent = { type: "heartbeat", replayUnsafe: true };
+    const error: AdapterEvent = { type: "error", message: "rate limited" };
+    const values = [
+      unsafeHeartbeat,
+      ...Array.from({ length: PREFLIGHT_HEARTBEAT_RETAIN_LIMIT + 1 }, () => heartbeat),
+      error,
+    ];
+    const preflight = await preflightAdapterEvents(events(values));
+    expect(preflight.replayUnsafe).toBe(true);
+    const repeated = await preflightAdapterEvents(preflight.stream);
+    expect(repeated.replayUnsafe).toBe(true);
+    expect(await collect(repeated.stream)).toEqual([
+      ...Array.from({ length: PREFLIGHT_HEARTBEAT_RETAIN_LIMIT }, () => unsafeHeartbeat),
+      error,
+    ]);
+  });
+
   test("heartbeat text done commits and replays the full order once", async () => {
     const values = [heartbeat, text("once"), done];
     const preflight = await preflightAdapterEvents(events(values));
@@ -270,6 +354,95 @@ describe("run-turn adapter event preflight", () => {
     const preflight = await preflightAdapterEvents(events(values));
     expect(preflight.error).toBeUndefined();
     expect(preflight.empty).toBe(false);
+    expect(await collect(preflight.stream)).toEqual(values);
+  });
+
+  test("timeout transfers the pending next read to replay exactly once", async () => {
+    const pending = Promise.withResolvers<IteratorResult<AdapterEvent>>();
+    let nextCalls = 0;
+    const source: AsyncIterable<AdapterEvent> = {
+      [Symbol.asyncIterator]() {
+        return {
+          next() {
+            nextCalls++;
+            if (nextCalls === 1) return Promise.resolve({ done: false, value: heartbeat });
+            if (nextCalls === 2) return pending.promise;
+            return Promise.resolve({ done: true, value: undefined });
+          },
+        };
+      },
+    };
+    const preflightPromise = preflightAdapterEvents(source, undefined, { maxWaitMs: 20 });
+    let guard: ReturnType<typeof setTimeout> | undefined;
+    const preflight = await Promise.race([
+      preflightPromise,
+      new Promise<null>(resolve => { guard = setTimeout(() => resolve(null), 500); }),
+    ]);
+    if (guard !== undefined) clearTimeout(guard);
+    if (preflight === null) {
+      pending.resolve({ done: false, value: text("late") });
+      await preflightPromise;
+    }
+    expect(preflight).not.toBeNull();
+    if (preflight === null) return;
+
+    expect(preflight.timedOut).toBe(true);
+    expect(nextCalls).toBe(2);
+    pending.resolve({ done: false, value: text("late") });
+    expect(await collect(preflight.stream)).toEqual([heartbeat, text("late")]);
+    expect(nextCalls).toBe(3);
+  });
+
+  test("an expired preflight wait is timed out, not empty, without reading ahead", async () => {
+    let nextCalls = 0;
+    const source: AsyncIterable<AdapterEvent> = {
+      [Symbol.asyncIterator]() {
+        return {
+          next() {
+            nextCalls++;
+            return Promise.resolve(nextCalls === 1
+              ? { done: false, value: text("resume") }
+              : { done: true, value: undefined });
+          },
+        };
+      },
+    };
+    const preflight = await preflightAdapterEvents(source, undefined, { maxWaitMs: 0 });
+    expect(preflight.timedOut).toBe(true);
+    expect(preflight.empty).toBe(false);
+    expect(nextCalls).toBe(0);
+    expect(await collect(preflight.stream)).toEqual([text("resume")]);
+    expect(nextCalls).toBe(2);
+  });
+
+  test("first-event classifier replaces only the first meaningful event", async () => {
+    const values: AdapterEvent[] = [
+      heartbeat,
+      { type: "tool_call_start", id: "call_stale", name: "stale_tool" },
+      text("must not run"),
+    ];
+    const classified: Extract<AdapterEvent, { type: "error" }> = {
+      type: "error",
+      status: 502,
+      message: "undeclared tool",
+    };
+    const preflight = await preflightAdapterEvents(events(values), event =>
+      event.type === "tool_call_start" ? classified : undefined);
+    expect(preflight.error).toEqual(classified);
+    expect(preflight.empty).toBe(false);
+    expect(await collect(preflight.stream)).toEqual([heartbeat, classified]);
+  });
+
+  test("first-event classifier cannot replace after a replay-unsafe heartbeat", async () => {
+    const tool: AdapterEvent = { type: "tool_call_start", id: "call_stale", name: "stale_tool" };
+    const values: AdapterEvent[] = [{ type: "heartbeat", replayUnsafe: true }, tool];
+    const preflight = await preflightAdapterEvents(events(values), () => ({
+      type: "error",
+      status: 502,
+      message: "must not replace",
+    }));
+    expect(preflight.error).toBeUndefined();
+    expect(preflight.replayUnsafe).toBe(true);
     expect(await collect(preflight.stream)).toEqual(values);
   });
 
@@ -302,5 +475,396 @@ describe("run-turn adapter event preflight", () => {
     expect(cancelled).toBe(1);
     expect(await collect(preflight.stream)).toEqual([{ type: "error", message: "stop" }]);
     expect(cancelled).toBe(1);
+  });
+
+  test("buffers reasoning events until first content event", async () => {
+    const thinking: AdapterEvent = { type: "thinking_delta", thinking: "pondering" };
+    const content: AdapterEvent = text("answer");
+    const values = [heartbeat, thinking, content, done];
+    const preflight = await preflightAdapterEvents(events(values));
+    expect(preflight.error).toBeUndefined();
+    expect(preflight.empty).toBe(false);
+    expect(await collect(preflight.stream)).toEqual(values);
+  });
+
+  test("reasoning followed by max_output_tokens terminal fails over via zero-output classifier", async () => {
+    const thinking: AdapterEvent = { type: "thinking_delta", thinking: "pondering" };
+    const limitTerminal: AdapterEvent = {
+      type: "incomplete",
+      reason: "max_output_tokens",
+      usage: { inputTokens: 50, outputTokens: 100, totalTokens: 150 },
+    };
+    const preflight = await preflightAdapterEvents(
+      events([heartbeat, thinking, limitTerminal]),
+      classifyZeroOutputTokenLimit,
+    );
+    expect(preflight.error).toEqual({
+      type: "error",
+      status: 502,
+      errorType: "upstream_error",
+      code: "zero_output_token_limit",
+      message: "Provider reached its output token limit before producing output",
+      usage: { inputTokens: 50, outputTokens: 100, totalTokens: 150 },
+    });
+    expect(preflight.empty).toBe(false);
+    expect(await collect(preflight.stream)).toEqual([heartbeat, thinking, preflight.error]);
+  });
+
+  test("reasoning followed by done length stopReason fails over via zero-output classifier", async () => {
+    const thinking: AdapterEvent = { type: "thinking_delta", thinking: "pondering" };
+    const doneLimit: AdapterEvent = {
+      type: "done",
+      stopReason: "length",
+      usage: { inputTokens: 50, outputTokens: 100, totalTokens: 150 },
+    };
+    const preflight = await preflightAdapterEvents(
+      events([heartbeat, thinking, doneLimit]),
+      classifyZeroOutputTokenLimit,
+    );
+    expect(preflight.error?.code).toBe("zero_output_token_limit");
+  });
+
+  test("returns on first reasoning event promptly when no classifier or compaction is set", async () => {
+    let continuedAfterThinking = false;
+    async function* source(): AsyncGenerator<AdapterEvent> {
+      yield heartbeat;
+      yield { type: "thinking_delta", thinking: "pondering" };
+      continuedAfterThinking = true;
+      yield text("answer");
+      yield done;
+    }
+    const preflight = await preflightAdapterEvents(source());
+    expect(preflight.error).toBeUndefined();
+    expect(preflight.empty).toBe(false);
+    expect(continuedAfterThinking).toBe(false);
+    expect(await collect(preflight.stream)).toEqual([
+      heartbeat,
+      { type: "thinking_delta", thinking: "pondering" },
+      text("answer"),
+      done,
+    ]);
+    expect(continuedAfterThinking).toBe(true);
+  });
+
+  test("retains at most PREFLIGHT_HEARTBEAT_RETAIN_LIMIT heartbeats when reasoning precedes many heartbeats, preserving replayUnsafe", async () => {
+    const thinking: AdapterEvent = { type: "thinking_delta", thinking: "pondering" };
+    const unsafeHeartbeat: AdapterEvent = { type: "heartbeat", replayUnsafe: true };
+    const plainHeartbeats: AdapterEvent[] = Array.from({ length: 19 }, () => ({ type: "heartbeat" }));
+    const values = [thinking, unsafeHeartbeat, ...plainHeartbeats, done];
+
+    const preflight = await preflightAdapterEvents(events(values), classifyZeroOutputTokenLimit);
+    expect(preflight.replayUnsafe).toBe(true);
+    const collected = await collect(preflight.stream);
+    // 1 thinking + 16 retained heartbeats + 1 done = 18 total
+    expect(collected).toHaveLength(18);
+    expect(collected[0]).toEqual(thinking);
+    expect(collected.at(-1)).toEqual(done);
+    // Every retained heartbeat must have replayUnsafe: true latched
+    const heartbeats = collected.slice(1, -1);
+    expect(heartbeats).toHaveLength(16);
+    expect(heartbeats.every(h => h.type === "heartbeat" && h.replayUnsafe === true)).toBe(true);
+  });
+
+  test("heartbeat-only stream EOF is reported as empty: true, preserving replayUnsafe latch", async () => {
+    const unsafeHeartbeat: AdapterEvent = { type: "heartbeat", replayUnsafe: true };
+    const preflight = await preflightAdapterEvents(events([heartbeat, unsafeHeartbeat]));
+    expect(preflight.empty).toBe(true);
+    expect(preflight.replayUnsafe).toBe(true);
+  });
+
+  test("reasoning-only stream EOF is reported as empty: false", async () => {
+    const thinking: AdapterEvent = { type: "thinking_delta", thinking: "pondering" };
+    const preflight = await preflightAdapterEvents(events([heartbeat, thinking]));
+    expect(preflight.empty).toBe(false);
+    expect(preflight.replayUnsafe).toBe(false);
+  });
+
+  test("reasoning trickling past maxReasoningHoldMs commits the target and streams buffered reasoning", async () => {
+    let continuedAfterHold = false;
+    async function* tricklingSource(): AsyncGenerator<AdapterEvent> {
+      yield heartbeat;
+      yield { type: "thinking_delta", thinking: "first thought" };
+      await new Promise(resolve => setTimeout(resolve, 60));
+      continuedAfterHold = true;
+      yield { type: "thinking_delta", thinking: "second thought" };
+      yield text("answer");
+      yield done;
+    }
+
+    const preflight = await preflightAdapterEvents(
+      tricklingSource(),
+      classifyZeroOutputTokenLimit,
+      { maxReasoningHoldMs: 20 },
+    );
+    expect(preflight.error).toBeUndefined();
+    expect(preflight.empty).toBe(false);
+    expect(preflight.replayUnsafe).toBe(false);
+
+    const collected = await collect(preflight.stream);
+    expect(collected).toEqual([
+      heartbeat,
+      { type: "thinking_delta", thinking: "first thought" },
+      { type: "thinking_delta", thinking: "second thought" },
+      text("answer"),
+      done,
+    ]);
+    expect(continuedAfterHold).toBe(true);
+  });
+});
+
+describe("run-turn adapter event queue retained-payload budgets", () => {
+  const BACKLOG_EXCEEDED = "consumer stalled: adapter event backlog exceeded — turn aborted";
+  const EVENT_TOO_LARGE = "adapter event exceeds the single-event retained-string budget — turn aborted";
+
+  test("a stalled consumer is bounded by retained payload, not by the event count alone", async () => {
+    let backlogExceeded = 0;
+    const queue = createAdapterEventQueue({
+      maxBacklogCodeUnits: 8,
+      maxEventCodeUnits: 8,
+      onBacklogExceeded: () => { backlogExceeded += 1; },
+    });
+
+    // Each event on its own is within the per-event budget, so only the
+    // aggregate can be what refuses the second one.
+    expect(retainedEventCodeUnits(toolStart("0"))).toBeLessThanOrEqual(8);
+    queue.push(toolStart("0"));
+    queue.push(toolStart("1"));
+
+    expect(backlogExceeded).toBe(1);
+    expect(await queue.collect()).toEqual([
+      toolStart("0"),
+      { type: "error", message: BACKLOG_EXCEEDED },
+    ]);
+    expect(queue.retainedCodeUnits()).toBe(0);
+  });
+
+  test("one oversized event is refused with its own cause even into an empty queue", async () => {
+    let backlogExceeded = 0;
+    const queue = createAdapterEventQueue({
+      maxEventCodeUnits: 8,
+      onBacklogExceeded: () => { backlogExceeded += 1; },
+    });
+
+    // The aggregate has its whole default budget free; this refusal is about
+    // the single event, and it has to say so rather than blame the consumer.
+    queue.push(text("x".repeat(9)));
+
+    expect(backlogExceeded).toBe(1);
+    expect(await queue.collect()).toEqual([{ type: "error", message: EVENT_TOO_LARGE }]);
+    expect(queue.retainedCodeUnits()).toBe(0);
+  });
+
+  test("accumulated coalescing is charged by retained growth, not once per merged delta", async () => {
+    let backlogExceeded = 0;
+    const queue = createAdapterEventQueue({
+      maxBacklogCodeUnits: 16,
+      onBacklogExceeded: () => { backlogExceeded += 1; },
+    });
+
+    // Three 2-character deltas sharing one 10-character phase. Retained growth
+    // is 12 then +2 then +2; charging each whole event instead would bill 36
+    // and abort a turn holding sixteen code units.
+    queue.push(phasedText("ab", "commentary"));
+    queue.push(phasedText("cd", "commentary"));
+    queue.push(phasedText("ef", "commentary"));
+
+    expect(backlogExceeded).toBe(0);
+    expect(queue.retainedCodeUnits()).toBe(16);
+    queue.close();
+    expect(await queue.collect()).toEqual([phasedText("abcdef", "commentary")]);
+    expect(queue.retainedCodeUnits()).toBe(0);
+  });
+
+  test("an event handed straight to a waiting consumer is never charged or capped", async () => {
+    let backlogExceeded = 0;
+    const queue = createAdapterEventQueue({
+      maxBacklogCodeUnits: 4,
+      maxEventCodeUnits: 4,
+      onBacklogExceeded: () => { backlogExceeded += 1; },
+    });
+    const iterator = queue.stream()[Symbol.asyncIterator]();
+
+    const pending = iterator.next();
+    queue.push(text("x".repeat(1_000)));
+
+    // The queue never held it, so neither budget has anything to say about it:
+    // both govern retained payload, and refusing this would abort a turn over
+    // memory the queue does not own.
+    expect(await pending).toEqual({ done: false, value: text("x".repeat(1_000)) });
+    expect(backlogExceeded).toBe(0);
+    expect(queue.retainedCodeUnits()).toBe(0);
+    queue.close();
+  });
+
+  test("a long synchronous burst well past one mebibyte still completes", async () => {
+    let backlogExceeded = 0;
+    const queue = createAdapterEventQueue({
+      onBacklogExceeded: () => { backlogExceeded += 1; },
+    });
+
+    // A synchronous producer legally fills the queue before its consumer is
+    // scheduled — the image loop does this with over a million one-character
+    // deltas, which coalesce into more than a mebibyte of retained text. A
+    // retained budget sized near that burst aborts healthy turns, so the
+    // default has to sit well above it.
+    const chunk = "x".repeat(64);
+    for (let i = 0; i < 20_000; i++) queue.push(text(chunk));
+    queue.close();
+
+    const collected = await queue.collect();
+    expect(backlogExceeded).toBe(0);
+    expect(collected.map(event => (event.type === "text_delta" ? event.text.length : 0))
+      .reduce((sum, length) => sum + length, 0)).toBe(20_000 * 64);
+    expect(collected.every(event => event.type === "text_delta")).toBe(true);
+    expect(queue.retainedCodeUnits()).toBe(0);
+  });
+
+  test("draining after an abort releases exactly what was charged", async () => {
+    const queue = createAdapterEventQueue({ maxBacklogCodeUnits: 8, maxEventCodeUnits: 8 });
+
+    queue.push(toolStart("0"));
+    expect(queue.retainedCodeUnits()).toBeGreaterThan(0);
+    queue.push(toolStart("1"));
+
+    // The terminal record is admitted past the budget it reports, and is then
+    // charged and released like any other item, so the counter lands on zero
+    // rather than on the size of an explanation nobody paid for.
+    const iterator = queue.stream()[Symbol.asyncIterator]();
+    expect(await iterator.next()).toEqual({ done: false, value: toolStart("0") });
+    expect(await iterator.next()).toEqual({ done: false, value: { type: "error", message: BACKLOG_EXCEEDED } });
+    expect(await iterator.next()).toEqual({ done: true, value: undefined });
+    expect(queue.retainedCodeUnits()).toBe(0);
+  });
+
+  test("a cancel race leaves nothing charged behind", async () => {
+    const queue = createAdapterEventQueue({ maxBacklogCodeUnits: 64 });
+    const iterator = queue.stream()[Symbol.asyncIterator]();
+
+    queue.push(text("abcd"));
+    queue.push(thinking("wxyz"));
+    expect(await iterator.next()).toEqual({ done: false, value: text("abcd") });
+
+    // The consumer walks away mid-stream and the turn is closed underneath it.
+    await iterator.return?.();
+    queue.close();
+    queue.push(text("after close"));
+
+    // What is still queued is still charged — and nothing more, so a second
+    // drain returns the counter to zero without a phantom balance.
+    expect(queue.retainedCodeUnits()).toBe(4);
+    expect(await queue.collect()).toEqual([thinking("wxyz")]);
+    expect(queue.retainedCodeUnits()).toBe(0);
+  });
+
+  test("the retention measure counts payload strings and skips the discriminant", () => {
+    expect(retainedEventCodeUnits(text("abcd"))).toBe(4);
+    expect(retainedEventCodeUnits(heartbeat)).toBe(0);
+    expect(retainedEventCodeUnits(phasedText("ab", "commentary"))).toBe(12);
+    // A malformed adapter emission has to become a terminal event, not a
+    // TypeError thrown out of push() with the queue half-updated.
+    expect(retainedEventCodeUnits(null as unknown as AdapterEvent)).toBe(0);
+    expect(retainedEventCodeUnits("oops" as unknown as AdapterEvent)).toBe(0);
+    // Nested provider-shaped payload is counted; a cycle terminates.
+    const cyclic: Record<string, unknown> = { owner: "abc" };
+    cyclic.self = cyclic;
+    expect(retainedEventCodeUnits({ type: "done", providerState: cyclic } as unknown as AdapterEvent)).toBe(3);
+  });
+
+  test("both budgets must be positive safe integers", () => {
+    const invalid = [Number.NaN, Number.POSITIVE_INFINITY, 0, -4, 2.5, Number.MAX_SAFE_INTEGER + 1];
+    for (const value of invalid) {
+      expect(() => createAdapterEventQueue({ maxBacklogCodeUnits: value }))
+        .toThrow("maxBacklogCodeUnits must be a positive safe integer");
+      expect(() => createAdapterEventQueue({ maxEventCodeUnits: value }))
+        .toThrow("maxEventCodeUnits must be a positive safe integer");
+    }
+    expect(DEFAULT_MAX_EVENT_CODE_UNITS).toBeLessThan(DEFAULT_MAX_BACKLOG_CODE_UNITS);
+  });
+});
+
+describe("classifyZeroOutputTokenLimit", () => {
+  test("classifies incomplete with max_output_tokens as retryable zero-output error", () => {
+    const event: AdapterEvent = {
+      type: "incomplete",
+      reason: "max_output_tokens",
+      usage: { inputTokens: 42, outputTokens: 0, totalTokens: 42 },
+    };
+    expect(classifyZeroOutputTokenLimit(event)).toEqual({
+      type: "error",
+      status: 502,
+      errorType: "upstream_error",
+      code: "zero_output_token_limit",
+      message: "Provider reached its output token limit before producing output",
+      usage: { inputTokens: 42, outputTokens: 0, totalTokens: 42 },
+    });
+  });
+
+  test("classifies done with max_tokens, length, or max_output_tokens as zero-output error", () => {
+    for (const stopReason of ["max_tokens", "length", "max_output_tokens"]) {
+      const event: AdapterEvent = {
+        type: "done",
+        stopReason,
+        usage: { inputTokens: 50, outputTokens: 0, totalTokens: 50 },
+      };
+      expect(classifyZeroOutputTokenLimit(event)).toEqual({
+        type: "error",
+        status: 502,
+        errorType: "upstream_error",
+        code: "zero_output_token_limit",
+        message: "Provider reached its output token limit before producing output",
+        usage: { inputTokens: 50, outputTokens: 0, totalTokens: 50 },
+      });
+    }
+  });
+
+  test("ignores incomplete with non-token-limit reasons", () => {
+    expect(classifyZeroOutputTokenLimit({ type: "incomplete", reason: "content_filter" })).toBeUndefined();
+    expect(classifyZeroOutputTokenLimit({ type: "incomplete", reason: "cancelled" })).toBeUndefined();
+  });
+
+  test("ignores done with normal stop reasons or continuation pauses", () => {
+    expect(classifyZeroOutputTokenLimit({ type: "done", stopReason: "stop" })).toBeUndefined();
+    expect(classifyZeroOutputTokenLimit({ type: "done", stopReason: "end_turn" })).toBeUndefined();
+    expect(classifyZeroOutputTokenLimit({ type: "done", stopReason: "pause_turn" })).toBeUndefined();
+    expect(classifyZeroOutputTokenLimit({ type: "done", stopReason: "PAUSE_TURN" })).toBeUndefined();
+    expect(classifyZeroOutputTokenLimit({ type: "done" })).toBeUndefined();
+  });
+
+  test("ignores non-replayable terminals: retryable=false, endTurn=false, providerState, or compactionEncryptedContent", () => {
+    expect(classifyZeroOutputTokenLimit({
+      type: "incomplete",
+      reason: "max_output_tokens",
+      retryable: false,
+    })).toBeUndefined();
+
+    expect(classifyZeroOutputTokenLimit({
+      type: "incomplete",
+      reason: "max_output_tokens",
+      endTurn: false,
+    })).toBeUndefined();
+
+    expect(classifyZeroOutputTokenLimit({
+      type: "incomplete",
+      reason: "max_output_tokens",
+      providerState: { cursor: "opaque" },
+    })).toBeUndefined();
+
+    expect(classifyZeroOutputTokenLimit({
+      type: "done",
+      stopReason: "max_tokens",
+      endTurn: false,
+    })).toBeUndefined();
+
+    expect(classifyZeroOutputTokenLimit({
+      type: "done",
+      stopReason: "max_tokens",
+      providerState: { cursor: "opaque" },
+    })).toBeUndefined();
+
+    expect(classifyZeroOutputTokenLimit({
+      type: "done",
+      stopReason: "max_tokens",
+      compactionEncryptedContent: "encrypted_blob",
+    })).toBeUndefined();
   });
 });

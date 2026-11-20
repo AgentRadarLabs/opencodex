@@ -1,12 +1,16 @@
 import { matchesLogConversationId } from "../log-conversation-id";
-import type { LogSurface, LogSurfaceFilter } from "./logs-surface-filter";
-import { logMatchesSurface } from "./logs-surface-filter";
+import type { DeliveryMode } from "../../../src/protocols/contract";
+import { parseProtocolTraceV1 } from "../../../src/protocols/dto";
 
 export type LogTimeWindow = "all" | "15m" | "1h" | "24h";
 export type LogStatusFilter = "all" | "success" | "errors";
+/** Final protocol delivery mode, or `none` for rows without an observed path (PF-02). */
+export type LogProtocolModeFilter = "all" | DeliveryMode | "none";
+export const LOG_PROTOCOL_MODE_FILTERS: readonly LogProtocolModeFilter[] = [
+  "all", "native", "translated", "legacy-bridge", "blocked", "none",
+];
 
 export interface LogFilterState {
-  surface: LogSurfaceFilter;
   model: string;
   provider: string;
   status: LogStatusFilter;
@@ -15,11 +19,12 @@ export interface LogFilterState {
   maxTokPerSec?: number;
   interceptedOnly: boolean;
   conversationId: string;
-  conversationQueryHash?: string;
+  conversationQueryHash?: readonly string[];
+  /** Absent means "all", so filter states saved before this field existed stay valid. */
+  protocolMode?: LogProtocolModeFilter;
 }
 
 export const DEFAULT_LOG_FILTER_STATE: LogFilterState = {
-  surface: "all",
   model: "",
   provider: "",
   status: "all",
@@ -37,12 +42,13 @@ export interface FilterableLogEntry {
   timestamp?: unknown;
   model?: unknown;
   resolvedModel?: unknown;
+  servedModel?: unknown;
   provider?: unknown;
-  surface?: LogSurface;
   status?: unknown;
   conversationId?: string;
   shadowCallRewrittenFrom?: unknown;
   attempts?: unknown;
+  protocolTrace?: unknown;
   displayMetrics?: {
     tokPerSecond?: { kind: "value"; value: number } | { kind: "unavailable" };
   };
@@ -50,15 +56,15 @@ export interface FilterableLogEntry {
 
 /** Return whether any filter differs from the inert default state. */
 export function hasActiveLogFilters(filters: LogFilterState): boolean {
-  return filters.surface !== "all"
-    || filters.model.trim() !== ""
+  return filters.model.trim() !== ""
     || filters.provider.trim() !== ""
     || filters.status !== "all"
     || filters.timeWindow !== "all"
     || filters.minTokPerSec !== undefined
     || filters.maxTokPerSec !== undefined
     || filters.interceptedOnly
-    || filters.conversationId.trim() !== "";
+    || filters.conversationId.trim() !== ""
+    || (filters.protocolMode ?? "all") !== "all";
 }
 
 /** Safely retain only object-shaped failover attempts from untrusted log data. */
@@ -94,10 +100,16 @@ export function filterLogs<T extends FilterableLogEntry>(
   const providerQuery = filters.provider.trim().toLowerCase();
   const conversationQuery = filters.conversationId.trim();
   const since = timeThreshold(filters.timeWindow, now);
+  const protocolMode = filters.protocolMode ?? "all";
 
   return logs.filter(log => {
-    if (!logMatchesSurface(log, filters.surface)) return false;
     if (filters.interceptedOnly && typeof log.shadowCallRewrittenFrom !== "string") return false;
+    if (protocolMode !== "all") {
+      // Validated like the detail panel, so a row the panel reports as "no path data" is the
+      // row the `none` filter selects.
+      const traceMode = parseProtocolTraceV1(log.protocolTrace)?.mode;
+      if (protocolMode === "none" ? traceMode !== undefined : traceMode !== protocolMode) return false;
+    }
     if (conversationQuery && !matchesLogConversationId(
       log.conversationId,
       conversationQuery,
@@ -116,11 +128,15 @@ export function filterLogs<T extends FilterableLogEntry>(
         || log.status > 599)) return false;
 
     const logAttempts = attempts(log);
+    // Model options represent complete identities from the current log snapshot. Match
+    // selections exactly (case/whitespace-insensitive), while the standalone
+    // logMatchesModelQuery helper retains its free-text substring semantics.
     if (modelQuery && ![
       normalized(log.model),
       normalized(log.resolvedModel),
+      normalized(log.servedModel),
       ...logAttempts.map(attempt => normalized(attempt.model)),
-    ].some(value => value?.includes(modelQuery))) return false;
+    ].some(value => value === modelQuery)) return false;
 
     if (providerQuery && ![
       normalized(log.provider),
@@ -161,7 +177,7 @@ export function extractLogFilterOptions(logs: readonly FilterableLogEntry[]): {
   const models = new Map<string, string>();
   const providers = new Map<string, string>();
   for (const log of logs) {
-    for (const value of [log.model, log.resolvedModel, ...attempts(log).map(attempt => attempt.model)]) {
+    for (const value of [log.model, log.resolvedModel, log.servedModel, ...attempts(log).map(attempt => attempt.model)]) {
       addOption(models, value);
     }
     for (const value of [log.provider, ...attempts(log).map(attempt => attempt.provider)]) {

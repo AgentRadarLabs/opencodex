@@ -109,6 +109,7 @@ interface ProviderAdapter {
 - **Extended thinking 计算：** Anthropic 要求 `max_tokens > thinking.budget_tokens`。adapter 把
   reasoning effort 映射成 budget（minimal 1024 … max 32000），再计算留有输出余量的安全
   `max_tokens`；启用 thinking 后会**移除 `temperature`/`top_p`**，因为 Anthropic 禁止此组合。
+- **自适应 thinking 显示：** 自适应 thinking 模型（Opus 4.7+、Sonnet 5、Fable）会收到 `thinking.display: "summarized"`，因此长时间思考会以 reasoning 增量送达 Chat 和 Responses 客户端，而不是几分钟的 heartbeat。隐藏推理摘要的请求（`reasoning.summary: "none"`）保持提供方默认值。但 `api.anthropic.com` 上的 Opus 5.5 默认使用 `display: "updates"`；显式设置 `reasoning.summary` 为 `"concise"` 或 `"detailed"` 时，使用 `"summarized"`，不添加 updates beta。详见 [Opus 5.5 进度更新](/guides/providers/#claude-opus-55-progress-updates)。
 - 始终发送 `anthropic-version: 2023-06-01`。流式输出
   `content_block_delta`（`text_delta`、`thinking_delta`、`input_json_delta`）。
 
@@ -117,6 +118,17 @@ interface ProviderAdapter {
 **目标：** Google **Gemini**、**Vertex AI** 和 Antigravity **Cloud Code Assist**。AI Studio 使用
 `/v1beta/models/{model}:streamGenerateContent`，其他模式使用各自的 Google 原生 endpoint。
 **认证：** 根据 `googleMode` 选择 API key、Vertex ADC 或 Google Antigravity OAuth。
+
+在仪表盘的 Google Vertex AI 预设中，项目 ID 和位置为可选输入。API key 留空且未设置
+`GOOGLE_CLOUD_API_KEY` 时，代理使用 **代理主机**上的 ADC。ADC 还需要项目和位置，可在
+表单中填写，或由代理主机上的 `GOOGLE_CLOUD_PROJECT` / `GCLOUD_PROJECT` 和
+`GOOGLE_CLOUD_LOCATION` 提供。添加 provider 不代表凭据或权限已验证。API key 未指定
+项目时使用 Vertex express 模式。
+仪表盘预设使用以配置的默认模型为起点的静态目录。使用 ADC 时，连接测试会换取一次访问令牌，
+能证明凭据可用，但不证明 Vertex 权限；代理用当前 ADC 来源换到过令牌后，provider 显示为已验证。
+静态目录下的 API key 不做测试。
+已有 Vertex 配置省略 `liveModels` 时会保留通过通用发现端点进行实时发现的原有行为。
+设置 `liveModels: false` 使用静态目录，也可在设置页面切换这两种模式。
 
 - 系统提示词 → `systemInstruction`；消息 → `contents[]`（assistant → `model`）；工具 →
   `functionDeclarations`；data URL 图像 → `inline_data`。
@@ -132,10 +144,28 @@ interface ProviderAdapter {
 token。
 
 - 构建 Kiro `conversationState`，映射 Codex 工具和工具结果，并发送 Kiro wire 支持的 image block。
+- 每条消息最多保留 20 张内联图，整次请求最多 100 张；超限时先省略最早的历史图片，并在受影响的消息中留下文字标记，当前轮次的新图片继续保留。
+- 内联图片的 data URL 缺少逗号或图片字节时，会省略该图片，并在对应用户消息或工具结果中留下文字标记；远端图片引用使用另一种标记，两者都不会回显 URL。
 - 解码 `application/vnd.amazon.eventstream`，重建 text/thinking/tool event，检测被截断的工具
   JSON。上游不返回 token 数量，因此 usage 采用估算值。
 - 经 `fetchResponse` 负责有界重试和分类/脱敏后的错误；非流式 parser 会排空同一 event stream，
   供 web-search loop 使用。
+- 每次请求最多发送 48 个客户端工具、96 KB 的转换后工具 JSON，并把每个工具说明截断到 1,024 个字符
+  （`gpt-5.6-sol` 为 9,216 个）。通过 tool search 加载的工具和 Codex code-mode 执行工具
+  优先入选，被省略的工具会告知模型。在代理环境中设置 `OCX_KIRO_TOOL_BUDGET=off` 可发送完整的
+  客户端目录，设置 `OCX_KIRO_TOOL_DESCRIPTION_LIMIT=off` 可发送完整说明。两者都在请求转换时读取，
+  对所有 Kiro 模型生效，其他限制保持不变。关闭预算后限制本身消失，不再有需要排序或省略的对象：
+  声明的全部工具按声明顺序上线，省略提示也随之消失，声明数量超过 Kiro 上限的客户端会收到上游
+  `ValidationException`，而不是被裁剪的目录。请求大小也会随客户端目录增长。这些开关面向已实测
+  能接受更大请求的账户，并不能让过大的目录变得安全。
+- 移除 Kiro 校验器拒绝的 JSON Schema 关键字（`pattern`、`minLength`、`maximum`、
+  `additionalProperties` 等 29 个），但保留探针在对应模型上实测通过的关键字。
+  `claude-opus-4.5` 全部保留；`claude-opus-5.5` 保留 Claude Desktop 与 Claude Code 目录使用的 12 个
+  （`$schema`、`additionalProperties`、`pattern`、`format`、`minLength`、`maxLength`、`minimum`、`maximum`、`exclusiveMinimum`、`minItems`、`maxItems`、`propertyNames`），已在生产流量中实测；
+  `claude-sonnet-5.5` 只保留 `pattern`、`maximum`。其余仍然移除，
+  因为没有请求向这两个模型发送过其他关键字。包括其余 Claude id 在内的其他 Kiro 模型全部移除。
+  例外按模型和关键字划分，是因为这条 wire 在 reasoning effort 上已经区分 Claude 模型，而 Kiro
+  拒绝的关键字不只是丢掉提示，还会让整个请求失败。
 ### 完成与原生 stop reason
 
 Kiro 的 assistant 文本本身没有可靠的回合结束标记，但终止的 `metadataEvent` 可能带有原生 `stopReason`。
@@ -154,10 +184,36 @@ Kiro 的 assistant 文本本身没有可靠的回合结束标记，但终止的 
 
 ### Reasoning effort
 
-`gpt-5.6-sol` 和 `claude-opus-5` 支持原生 effort，且请求字段名不同。`low` / `medium` / `high` /
-`xhigh` / `max` 分别通过 `additionalModelRequestFields.reasoning.effort` 和
-`output_config.effort` 发送。
+GPT-5.6 系列和 GPT-6 系列（`gpt-6-sol`、`gpt-6-luna`、`gpt-6.1-sol`、`gpt-6.1-terra`）使用
+`additionalModelRequestFields.reasoning.effort`，下列 Claude 模型使用
+`additionalModelRequestFields.output_config.effort`。`gpt-5.6-luna` 和 `gpt-5.6-terra`
+仅通过原生字段发送已验证的 `low`、`medium`、`high` 和 `max`。
+这两个模型的原生 `xhigh` 尚未验证，因此仍使用原有的有界 thinking 指令模拟。
+`gpt-5.6-sol` 和 GPT-6 系列通过同一个 `reasoning.effort` 字段保留原生
+`low`、`medium`、`high`、`xhigh`、`max`。
 
+Kiro 对 `claude-opus-5`、`claude-opus-5.5`、`claude-opus-4.8`、`claude-opus-4.7`、
+`claude-opus-4.6`、`claude-sonnet-5.5`、`claude-sonnet-5`、`claude-sonnet-4.6` 和
+`claude-haiku-5.5` 在 `low`、`medium`、`high`、`xhigh` 和 `max` 上接受
+`output_config.effort`。有一个例外：`claude-opus-4.6` 和 `claude-sonnet-4.6` 拒绝原生
+`xhigh`，因此该档位保留模拟 thinking 块。
+
+Kiro 没有 `minimal` 档位。除 `claude-opus-5` 和 `claude-opus-5.5` 外的上述九个模型在
+`minimal` 时保留模拟块，而不是让启用原生 effort 之前可用的请求失败。这两个 Opus 5 模型以及使用
+原生 effort 的 GPT 模型会在发送任何内容之前以 400 `invalid_request_error` 拒绝 `minimal`。
+
+各接口表达这次拒绝的方式不同。Responses 请求把标明模型和被拒绝 effort 的句子放进
+`error.message`。Messages 与 Chat Completions 路径在该位置放代理自己的固定文案
+`The provider rejected the request.`，因为这两条路径不会转述适配器的细节，而是用自有文案替换。
+只有 Responses 会标明模型和 effort。流式与非流式在所有接口上返回相同内容：拒绝发生在构建上游
+请求体时，因此没有打开流，也没有发出上游调用。
+
+调用方的 `ultra` 在解析时转换为 `max`。`pinnedReasoningEffort`、`modelPinnedReasoningEfforts`
+和 `modelPinnedEfforts` 固定值在解析后应用；对于使用原生 Kiro effort 的模型，适配器也会将固定的
+`ultra` 转为 `max`。对于模拟推理模型，该固定值会被丢弃，请求不带推理信号发送。
+
+`claude-haiku-4.5`、`claude-opus-4.5`、`claude-sonnet-4.5` 以及上面未列出的 Kiro
+模型在每个 effort 上都使用模拟推理；提供 effort 选项并不代表原生支持。
 
 ## `cursor`
 
@@ -183,7 +239,7 @@ Cursor 的 HTTP/1.1 兼容传输：通过 `agent.v1.AgentService/RunSSE` 接收 
   受限的 Desktop fallback 只保存进程本地由 HMAC 派生的 owner；原始 session/thread header 与
   OAuth/authorization 材料不会写入 checkpoint state。基于 OAuth 的 live transport 和按账号过滤的
   live model discovery 仍是实验功能；登录与 transport 设置参见[提供商指南](/zh-cn/guides/providers/)
-  和 [Cursor 提供商配置](/zh-cn/reference/configuration/providers/#cursor-provider-adapter-cursor)。
+  和 [Cursor 提供商配置](/zh-cn/reference/configuration/providers/#cursor-提供者adapter-cursor)。
   checkpoint 复用本身是自动的，没有用户设置。
 - 模型实时发现和推理都会遵守 `upstreamHttpVersion`。`auto`、`http2` 与 `h2` 保持原有 HTTP/2
   transport；只有 `http1.1` 与 `h1` 会选择兼容模式。
@@ -194,6 +250,17 @@ Cursor 的 HTTP/1.1 兼容传输：通过 `agent.v1.AgentService/RunSSE` 接收 
   executor，并绕过 Codex 审批和 sandbox 语义；旧的 `unsafeAllowNativeLocalExec: true` 仅在
   `nativeLocalExec` 未设置时等同。
 
+## `devin`
+
+**目标：** Cognition 的 `exa.api_server_pb.ApiServerService/GetChatMessage`（`server.codeium.com`，Connect 流式）。
+**认证：** 来自 `provider.apiKey` 或转发的 authorization 头的 Devin/Cognition API 密钥。登录会先尝试导入已安装 Devin CLI 已持有的凭据：`devin auth login` 会完成 CLI 自身的 PKCE 登录并把 `devin-session-token` 写入它自己的 `credentials.toml`，这与 `SeatManagementService.RegisterUser` 为浏览器登录签发的凭据相同。没有可用的 CLI 凭据时，登录回退到 Auth0 浏览器页面，再通过 `RegisterUser` 把粘贴的令牌换成长期密钥。`devin-cli` 仅作为已弃用的别名保留：`ocx login devin-cli` 仍会路由到 `devin`，以旧 id 保存的配置会在启动时被重写。
+
+- 使用 `runTurn` 而非常规的 fetch/parse 路径。请求与服务端事件由 `devin/cloud-direct/wire.ts` 手写的 protobuf 分帧处理。
+- 通过 `GetCascadeModelConfigs` 按账号获取模型；不在套餐内的模型在列表阶段就被过滤，而不是到请求时才失败。
+- Cognition 对工具说明有长度上限和精确短语黑名单。适配器会改写已知短语并截断过长的说明。
+- 密钥不会刷新。失效后请重新执行 `ocx login devin`。
+- 即使走 CLI 导入路径，本地的也只有凭据，请求本身无论哪条路径都发往 Cognition。早期版本曾在 `devin-cli` id 下提供第二个适配器，把请求作为对本地 `devin acp` 子进程的 Agent Client Protocol 会话来执行，现已移除。仍引用该适配器的已保存配置会在启动时重写为 `devin`，包括 `"devin-acp"` 这类自定义名称的行。
+
 ## `azure-openai`（别名：`azure`）
 
 **目标：** **Azure OpenAI**。封装 `openai-responses`，因此同样是 `passthrough: true`。
@@ -202,6 +269,8 @@ Cursor 的 HTTP/1.1 兼容传输：通过 `agent.v1.AgentService/RunSSE` 接收 
 - 把请求构建交给 Responses passthrough，验证 `baseUrl` 不含未解析的 template placeholder，
   再用 `api-key` 替换 `Authorization`。配置的 URL 直接指向 Azure v1 Responses API，因此 adapter
   不会追加 `api-version`。
+- 与 Responses 共用针对其他 provider 所生成推理状态的恢复：收到 `400 invalid_encrypted_content`
+  后，去掉该状态（加密内容和推理项的 `rs_…` id）并只重发一次。
 
 ## 图像工具（`image.ts`）
 

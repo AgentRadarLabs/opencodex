@@ -3,6 +3,8 @@ title: Codex App 模型选择器
 description: opencodex 中的模型如何通过共享 Codex 目录出现在 Codex App、Codex CLI 和 Codex TUI 中。
 ---
 
+默认值为 `false`。在 `config.json` 中设置 `"omitDisabledNativeModels": true` 并运行 `ocx sync`，即可从目录、缓存和 Codex 格式的 HTTP 模型列表中移除已禁用的 native 行。移除前经过验证的继承模板会单独保留，因此 routed 行的元数据不变，直接请求的路由也不变。下文的 hide 说明适用于默认设置。
+
 opencodex 不会修改 Codex App。它会写入 Codex CLI/TUI 使用的同一套 Codex 配置和模型目录。
 app-server 会读取这份共享状态，但部分 Codex Desktop 版本还会在 renderer 中应用第二层远程
 allowlist，因此仍可能从选择器里删掉路由模型。
@@ -61,16 +63,17 @@ visibility = "list"
 
 ## 当前稳定模型覆盖
 
-原生回退集合包含 `gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`、`gpt-5.3-codex-spark` 以及 GPT-5.6 Sol/Terra/Luna。对于 GPT-5.5/5.4 家族，opencodex 会保留已安装 Codex 目录中更丰富的实时条目，只在缺失时才合成条目。内置的上游快照只用于 GPT-5.6，因为它提供的是每个模型真实的身份和元数据，而不是较旧模板的近似版本。
+原生回退集合包含 `gpt-5.5` 以及 GPT-5.6 Sol/Terra/Luna。对于 GPT-5.5 家族，opencodex 会保留已安装 Codex 目录中更丰富的实时条目，只在缺失时才合成条目。内置的上游快照只用于 GPT-5.6，因为它提供的是每个模型真实的身份和元数据，而不是较旧模板的近似版本。
 
 | 路由 | 选择器 id 与目录元数据 |
 | --- | --- |
-| Codex 登录（账户限定的选择器行未启用） | 显示 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 等裸原生 id，并按 `codexAccountMode` 使用 Pool 或 Direct。GPT-5.6 行使用 922,000-token 目录窗口。 |
+| Codex 登录（账户限定的选择器行未启用） | 显示 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 等裸原生 id，并按 `codexAccountMode` 使用 Pool 或 Direct。GPT-5.6 行使用 922,000-token 目录窗口。 `gpt-6.1-terra`：默认上下文 500,000 / 长上下文 872,000。 |
 | Codex 登录（账户限定的选择器行已启用且存在有效 selector） | 为每个有效 selector 与受支持原生模型的组合显示 `<selector>/<native-openai-model>` 行。每行只使用映射账户，裸原生行会从选择器中隐藏。原生 metadata 与 context window 会保留。 |
-| OpenAI（API key） | 恰好八个命名空间行：`gpt-5.5`、`gpt-5.6`、Sol/Terra/Luna，以及三个 `*-pro` 虚拟 id（八个条目均为 1,050,000 context / 922,000 max input） |
+| OpenAI（API key） | 命名空间模型包括 `gpt-5.5`、`gpt-5.6`、Sol/Terra/Luna、`*-pro` 虚拟 id 和 Daybreak 别名（上下文 1,050,000；最大输入 922,000）。`openai-apikey/gpt-6.1-terra` 的上下文为 1,050,000，最大输出为 128,000。 |
 | OpenRouter | `openrouter/openai/gpt-5.6-sol`、`openrouter/openai/gpt-5.6-terra`、`openrouter/openai/gpt-5.6-luna`（922,000） |
-| Cursor | 静态回退包含 `cursor/gpt-5.6-sol`、`cursor/gpt-5.6-terra`、`cursor/gpt-5.6-luna`（1,000,000），以及 Grok 4.5/4.6 的普通和 Fast 条目（500,000）。4.6 还提供 `xhigh`；实时账户发现会决定最终哪些条目仍然可见。 |
-| xAI | 实时发现具有权威性。回退目录包含 `xai/grok-4.6`，默认模型仍为 `xai/grok-4.5`；两者的上下文窗口均为 500,000。Grok 4.6 提供 `low` / `medium` / `high` / `xhigh`（上游默认值为 `high`），Grok 4.5 最高为 `high`。 |
+| OpenRouter | `openrouter/openai/gpt-6.1-terra` (1,050,000) |
+| Cursor | 静态回退包含 `cursor/gpt-5.6-sol`、`cursor/gpt-5.6-terra`、`cursor/gpt-5.6-luna`（1,000,000），以及 Grok 4.5/4.6/4.7 的普通和 Fast 条目（500,000）。4.6 和 4.7 还提供 `xhigh`；实时账户发现会决定最终哪些条目仍然可见。 |
+| xAI | 实时发现具有权威性。回退目录包含 `xai/grok-4.6` 和 `xai/grok-4.7`，默认模型仍为 `xai/grok-4.5`；三者的上下文窗口均为 500,000。Grok 4.6 和 4.7 提供 `low` / `medium` / `high` / `xhigh`（上游默认值为 `high`），Grok 4.5 最高为 `high`。 |
 
 固定的 GPT-5.6 条目保留了精确的上游阶梯。Sol 和 Terra 暴露从 `low` 到 `ultra` 的档位；Luna 只到 `max`。Sol 默认是 `low`，Terra 和 Luna 默认是 `medium`。`ultra` 是面向客户端的最大 reasoning 加主动委派选项，在后端会以 `max` 传入。选择器里的一个条目只表示目录已经准备好：关联的账户或 API key 仍然必须有权使用该模型。
 
@@ -117,7 +120,7 @@ fast_mode = true
 
 ## 子代理选择
 
-Codex 会按 `priority` 升序对选择器可见的目录条目排序，并把前五个作为 `spawn_agent` 模型 override 暴露出来。仪表盘 Subagents 页面最多可以选择并保存五个裸原生 id 或路由 `provider/model` id。手动设置的 `subagentModels` 也支持账户限定的 `<selector>/<native-openai-model>` id，但仪表盘不会提供这些精确 id；保存该页面会用仪表盘中可见的选项替换整个列表。opencodex 会按所选顺序分配较低的目录 priority；启用账户限定的选择器行时，裸原生选择会展开为 selector-qualified 分组。其他模型仍然可以通过精确 id 调用。
+Codex 会按 `priority` 升序对选择器可见的目录条目排序，并把前五个作为 `spawn_agent` 模型 override 暴露出来。仪表盘 Subagents 页面最多可以选择并保存五个裸原生 id 或路由 `provider/model` id。手动设置的 `subagentModels` 也支持账户限定的 `<selector>/<native-openai-model>` id。保存列表时，仪表盘会保留这些已保存的精确 id，包括当前目录中已不可用的模型。opencodex 会按所选顺序分配较低的目录 priority；启用账户限定的选择器行时，裸原生选择会展开为 selector-qualified 分组。其他模型仍然可以通过精确 id 调用。
 
 精选模型列表与 Dashboard 的 **Sub-agent delegation** 选择彼此独立。它只决定 Codex 先提供哪些 override；它不会自己选择模型，也不会触发委派。
 

@@ -1,4 +1,8 @@
-import { STOP_HISTORY_INCOMPLETE_EXIT_CODE } from "./stop-contract.mjs";
+import {
+  STOP_HISTORY_DEFERRED_EXIT_CODE,
+  STOP_HISTORY_INCOMPLETE_EXIT_CODE,
+  STOP_TEARDOWN_HANDED_OVER_EXIT_CODE,
+} from "./stop-contract.mjs";
 
 /**
  * May an update replace package files after `ocx stop` returned?
@@ -22,13 +26,28 @@ import { STOP_HISTORY_INCOMPLETE_EXIT_CODE } from "./stop-contract.mjs";
  *   absence, and replacing files under a live server leaves it running a mix of old and
  *   new modules.
  * - `ok` / `history-only` — proceed; the second also prints the manifest warning.
+ * - `history-deferred` — proceed; the stop is down but restored nothing, because the
+ *   Codex history preflight refused first (#4718). The receipts it kept are the ONLY
+ *   obligations it left, which the child proved before choosing this status, so
+ *   `teardownOutstanding` seeing them is expected rather than disqualifying. Every other
+ *   gate still applies: runtime records and a live or unreadable endpoint abort exactly
+ *   as they do for a clean stop, because package replacement under a live server is the
+ *   danger this function exists to prevent, and a history refusal says nothing about it.
+ * - `handed-over` — proceed; the stop is down and kept its receipt on purpose so the
+ *   proxy this update restarts can take the routing over without a native gap (#7423).
+ *   It is gated exactly like `history-deferred`: the child proved its receipt is the only
+ *   obligation, and runtime records or a live or unreadable endpoint still abort.
  */
 export function decidePostStopUpdate({ status, hasRuntimeState, liveness, teardownOutstanding = false }) {
   const historyOnly = status === STOP_HISTORY_INCOMPLETE_EXIT_CODE;
-  if (status !== 0 && !historyOnly) return { proceed: false, reason: "stop-failed" };
+  const historyDeferred = status === STOP_HISTORY_DEFERRED_EXIT_CODE;
+  const handedOver = status === STOP_TEARDOWN_HANDED_OVER_EXIT_CODE;
+  if (status !== 0 && !historyOnly && !historyDeferred && !handedOver) return { proceed: false, reason: "stop-failed" };
   if (hasRuntimeState) return { proceed: false, reason: "runtime-state" };
-  if (teardownOutstanding) return { proceed: false, reason: "teardown-outstanding" };
+  if (teardownOutstanding && !historyDeferred && !handedOver) return { proceed: false, reason: "teardown-outstanding" };
   if (liveness === "live") return { proceed: false, reason: "proxy-live" };
   if (liveness !== "dead") return { proceed: false, reason: "proxy-unknown" };
+  if (historyDeferred) return { proceed: true, reason: "history-deferred" };
+  if (handedOver) return { proceed: true, reason: "handed-over" };
   return { proceed: true, reason: historyOnly ? "history-only" : "ok" };
 }

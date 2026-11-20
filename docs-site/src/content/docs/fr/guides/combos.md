@@ -140,6 +140,8 @@ chaque requête commence par Anthropic. Un échec d’Anthropic autorisant une n
 échec similaire d’OpenAI peut la faire basculer vers Google. Une erreur terminale interrompt immédiatement le traitement au lieu de
 essayer les cibles restantes.
 
+Une réponse HTTP 400 d'un fournisseur peut toujours être spécifique à une cible. L'enveloppe opaque de fournisseur d'OpenRouter (`Provider returned error` avec un `code: 400` numérique, aucun `type`, et `metadata.raw: "ERROR"`) est traitée comme locale à la cible et permet au combo d'essayer la cible suivante sans placer la cible défaillante en période de refroidissement. Les 400 typés sans code, les erreurs connues de schéma `response_format` malformé et une enveloppe dont la racine énonce son propre code terminal restent terminales ; une racine qui énonce son propre signal de rebond (`model_not_found`, `insufficient_quota`, `usage_limit_exceeded`, `free_rate_limited`, `input_admission_refused` ou `unsupported_input_modality`) n'ajoute aucun nouveau verdict, et un code vide est traité comme une absence de code. Les incompatibilités de cibles reconnues décrites plus loin dans ce guide continuent d'avancer.
+
 ### Round-robin : lots pondérés lisses
 
 `round-robin` utilise un round-robin pondéré en douceur. Un poids cible plus grand donne à cet objectif un plus grand
@@ -190,6 +192,8 @@ indique la réinitialisation de fenêtre à venir la plus proche (cinq heures, h
 Le fournisseur dont le quota se renouvelle en premier est ainsi sollicité. Les cibles dépourvues de données de quota
 récentes et les égalités conservent l’ordre de configuration. `weight` et `stickyLimit` n’affectent pas cette stratégie.
 
+Ce classement et l’exclusion des fournisseurs avant l’envoi exigent des limites récentes d’inférence de modèles applicables dans leur ensemble à l’unique clé API actuelle. Les résumés OAuth ou du compte courant, les routes transmettant les identifiants de l’appelant, les configurations à plusieurs clés et les instantanés dont les identifiants ou la destination ont changé servent uniquement à l’affichage pour cette décision préalable. Il en va de même lorsque les en-têtes `Authorization`, `x-api-key` ou `x-goog-api-key` remplacent les identifiants ; les fenêtres réservées à la recherche ou à MCP sont exclues. Si aucune cible admissible n’a de réinitialisation applicable, l’ordre de configuration prévaut. La sélection des comptes et les nouvelles tentatives appliquent toujours leurs limites habituelles.
+
 ## Que se passe-t-il lorsqu'une cible échoue
 
 Les échecs d’un combo se répartissent entre ceux qui entraînent un **basculement** et les échecs **terminaux**.
@@ -198,38 +202,44 @@ Les échecs d’un combo se répartissent entre ceux qui entraînent un **bascul
 | --- | --- |
 | HTTP 401, 403, 404, 408, 429, ou n'importe quel 5xx | Refroidissez la cible et passez à la prochaine cible éligible. |
 | Erreur classée comme erreur d’authentification, d’abonnement, de quota, de limitation de débit, de surcharge ou de serveur en amont | Place la cible en période de refroidissement et bascule, même si le statut seul ne suffit pas. |
-| Annulation client (499), `origin_rejected`, refus de cyber-politique, débordement de contexte ou demande invalide | Arrêtez et renvoyez l'erreur ; une autre cible ne rendrait pas la demande valide. |
+| Annulation client (499), `origin_rejected`, refus de cyber-politique ou autre demande invalide | Arrêtez et renvoyez l'erreur ; une autre cible ne rendrait pas la demande valide. |
+| Dépassement de contexte confirmé avant la sortie, y compris HTTP 400 | Essaie la prochaine cible admissible non tentée sans refroidissement ; à épuisement, renvoie la première erreur de contexte HTTP 400 confirmée (un refus de contexte avec un autre statut fait aussi passer à la cible suivante, sans être conservé). |
+| Rejet structuré de `user`, valeur non prise en charge pour `reasoning.effort`/`reasoning_effort`, rejet d'entrée d'image propre à un modèle (`param: input`), ou refus d'un média d'entrée que la route ne peut pas lire (`unsupported_input_modality`) | En cas de refus d'effort, tente le niveau publié immédiatement inférieur sur la même cible tant que le budget d'envoi le permet ; si aucun niveau ne fonctionne, bascule avant l'engagement de sortie sans refroidissement si le refus correspond à une enveloppe de compatibilité reconnue, sinon reste terminal. Les autres incompatibilités répertoriées basculent sans refroidissement ; voir Compatibilité des paramètres facultatifs ci-dessous. |
+| Premier appel d'outil d'un tour Responses exécuté par un adaptateur interne (`runTurn`) que la requête courante n'a pas déclaré, avant toute sortie et tout effet de bord non rejouable | Met la cible en refroidissement et bascule avec le même catalogue d'outils. Après une sortie visible ou un effet de bord non rejouable, le refus est définitif. Les requêtes Chat Completions et Anthropic Messages ne changent pas. |
 | Toute autre erreur non classifiée | Arrêtez et renvoyez l'erreur. |
 
-Une cible sautée entre en temps de recharge pendant 60 secondes par défaut. Si la réponse en amont inclut un
-valeur `Retry-After` valide, opencodex l’utilise à la place. Les secondes numériques et les valeurs de date HTTP sont
-accepté, et chaque temps de recharge est limité à 10 minutes.
+Une cible sautée utilise par défaut un temps de recharge en amont : 5 secondes pour les codes de limitation de débit `1302`/`1305`, 10 minutes pour une fenêtre d’utilisation épuisée (quel que soit le statut HTTP, y compris 502) ou pour un échec d’identifiants ou de facturation, et 60 secondes dans les autres cas. Si la réponse en amont inclut une
+valeur `Retry-After` valide, opencodex l’utilise à la place ; les en-têtes de réinitialisation Codex viennent ensuite, puis le `cooldownMs` configuré. Les secondes numériques et les valeurs de date HTTP sont
+acceptées, et un délai explicite `Retry-After` est plafonné à 24 heures ; les autres temps de recharge restent plafonnés à 10 minutes.
 
 La requête actuelle ne réessaye jamais la même cible tentée. Les demandes ultérieures l'ignorent jusqu'à ce qu'il soit
-le temps de recharge expire. S’il ne reste aucune cible éligible, le proxy renvoie HTTP 503 avec
+le temps de recharge expire. Si aucune cible n’a été tentée et qu’aucune n’est éligible, le proxy renvoie HTTP 503 avec
 `error.code = "combo_unavailable"`.
+
+Après un refus de contexte HTTP 400 confirmé, l’épuisement des cibles ou du budget d’envoi renvoie
+le premier refus sous `context_length_exceeded`, avant toute erreur ultérieure réessayable, même de quota.
+Cela inclut les cibles restantes incompatibles avec la relecture du raisonnement ou sans consentement
+de dépense. L’annulation, un refus fatal ultérieur ou un refus explicite de la politique de repli reste
+prioritaire ; aucune cible facturée sans consentement ne reçoit la requête.
 
 :::note
 Le basculement est intentionnellement limité. Il facilite la disponibilité, l'authentification et l'authentification spécifiques à la cible.
 échecs de quota et de surcharge ; il ne cache pas les erreurs des appelants ni les refus de politique.
+Sur une requête Responses hors combo, un 403 de politique xAI de la liste autorisée est réécrit en HTTP 200 `incomplete/content_filter` avant que Codex ne le relance comme un échec de transport ; voir [xAI policy refusals](/fr/reference/proxy-formats/#xai-policy-refusals). Les sauts de combo classent toujours le HTTP 403 d'origine comme un saut.
 :::
 
 ## Effort de raisonnement par défaut
 
-`defaultEffort` fournit `reasoning.effort` uniquement lorsque toutes ces conditions sont vraies :
+`defaultEffort` complète un `reasoning.effort` absent si le combo possède une valeur par défaut non nulle et si la liste des niveaux acceptés par la cible est connue et non vide. La valeur configurée est conservée si elle est acceptée ; sinon, le niveau accepté le plus élevé ne la dépassant pas est choisi, ou le niveau le plus bas si aucun n’est inférieur. Une liste inconnue ou vide n’ajoute aucune valeur par défaut.
 
-1. le combo a un défaut non nul ;
-2. l'appelant n'a pas fait d'effort ; et
-3. le catalogue de la cible sélectionnée annonce cet effort précis.
+Cette étape conserve un effort existant et les autres champs reasoning. La normalisation des capacités ci-dessous peut supprimer séparément les paramètres effort/thinking non acceptés. Valeurs possibles : `low`, `medium`, `high`, `xhigh`, `max`, `ultra` ; l’absence du champ ou `null` désactive l’ajout.
 
-Si la requête n'a pas d'objet `reasoning`, opencodex en crée un. Si `reasoning` existe sans
-`effort`, il préserve les autres champs et ajoute la valeur par défaut. Un effort fourni par l’appelant n’est
-jamais écrasé.
 
-Lorsque la capacité cible est inconnue ou n'inclut pas l'effort configuré, opencodex omet le
-par défaut et laisse le comportement de la cible inchangé. Les valeurs prises en charge sont `low`, `medium`,
-`high`, `xhigh`, `max` et `ultra` ; omettez le champ ou réglez-le sur `null` pour laisser l'effort entièrement à
-l'appelant et la cible.
+## Capacités reasoning mixtes
+
+`reasoningEffortMode` vaut `"strict"` par défaut : le catalogue publie l’intersection des listes effort de toutes les cibles, y compris les listes explicitement vides. `"adaptive"` exclut ces listes vides pour conserver le sélecteur dans un combo mixte. Une liste inconnue ne limite l’intersection dans aucun des deux modes.
+
+À l’envoi, une liste explicitement vide supprime les paramètres effort et thinking dans les deux modes ; une liste inconnue les supprime uniquement en adaptive. `reasoning.summary` et les autres champs hors effort sont conservés. La résolution des cibles connues non vides reste inchangée. Les cibles inconnues en strict et les déclarations inconnues du native Chat ordinaire conservent les paramètres de l’appelant. L’ajout d’une valeur par défaut ne remplace pas un effort existant, mais cette normalisation peut supprimer les paramètres non pris en charge.
 
 ## Capacité d’entrée d’images / multimodale
 
@@ -276,12 +286,10 @@ flux de travail des tâches.
 ### Tableau de bord
 
 Ouvrez le tableau de bord local et choisissez **Modèles → Combos**. L'espace de travail crée, modifie, renomme et supprime
-combos, et son sélecteur de cible exclut les modèles désactivés et les combos imbriqués.
+les combos. Les sélecteurs de modèles incluent les modèles masqués : la visibilité ne concerne que les listes externes, pas la sélection interne des combos. Sélectionner un modèle masqué ne le rend pas visible. Le sélecteur de cible exclut toujours les fournisseurs désactivés, les combos imbriqués et les fournisseurs JEV réservés au service de décision.
 
 Chaque cible affiche aussi un badge de quota en direct : **Disponible**, **Quota épuisé** ou **Quota inconnu**.
-Enregistrer et Créer ne sont désactivés que lorsque chaque cible activée dispose de preuves fraîches et complètes
-que son quota est épuisé. Les données manquantes, obsolètes, mal formées ou agrégées de façon incomplète restent
-inconnues et ne verrouillent jamais un contrôle. La récupération du quota réactive automatiquement l’action.
+L’éditeur bloque Enregistrer et Créer pour une raison de quota uniquement lorsque chaque cible utilisable dispose d’une confirmation serveur encore valide indiquant que la limite d’inférence liée à ses identifiants configurés est épuisée. Les quotas de compte, de modèle, de recherche et de MCP fournis uniquement à titre d’affichage, ainsi que les informations de routage absentes ou expirées, ne déclenchent pas ce blocage. Le blocage expire à la réinitialisation applicable ou à l’expiration de la validité des données et fait l’objet d’une nouvelle vérification lorsque la page devient active ou visible ; Actualiser recharge à la fois les données des combos et les quotas.
 
 ### CLI
 
@@ -295,8 +303,8 @@ ocx combo remove <id> --yes
 ```
 
 `set` accepte également `--strategy`, `--sticky`, `--effort`, `--alias`, `--native-alias`,
-`--display-name` et `--rename-from`. Utilisez `-` comme valeur de `--effort`, `--alias` ou
-`--display-name` pour effacer ce champ. `--native-alias` exige un alias de modèle natif non qualifié actuellement
+`--display-name`, `--description` et `--rename-from`. Utilisez `-` comme valeur de `--effort`, `--alias`,
+`--display-name` ou `--description` pour effacer ce champ. `--native-alias` exige un alias de modèle natif non qualifié actuellement
 pris en charge et un nom d’affichage non vide. `create` et `update` sont des alias pour `set` ; `delete` est un alias pour
 `remove` ; et les mêmes sous-commandes sont disponibles sous `ocx route combo`.
 
@@ -334,13 +342,15 @@ Les combos sont stockés dans l'objet `combos` de niveau supérieur, saisi par l
 | --- | --- | --- | --- |
 | `targets` | Oui | — | Tableau ordonné non vide de `{ provider, model, weight? }` cibles configurées. Les paires provider/model en double sont rejetées. |
 | `targets[].weight` | Non | `1` | Entier de 1 à 10 000. Utilisé par `round-robin` et `random` ; ignoré par `failover`, `least-used` et `reset-window`. |
-| `strategy` | Non | `"failover"` | Valeurs autorisées : `"failover"`, `"round-robin"`, `"random"`, `"least-used"` et `"reset-window"`. |
+| `strategy` | Non | `"failover"` | Valeurs autorisées : `"failover"`, `"round-robin"`, `"random"`, `"least-used"`, `"reset-window"` et `"jev"`. JEV décide uniquement de la première cible éligible et de l’effort ; le fallback Combo ordinaire gère les tentatives suivantes. |
 | `stickyLimit` | Non | `1` | Nombre entier de 1 à 100 requêtes réussies par sélection à tour de rôle. S’applique uniquement à `round-robin`. |
 | `defaultEffort` | Non | `null` | `low`, `medium`, `high`, `xhigh`, `max` ou `ultra` ; appliqué uniquement lorsque l'appelant omet ses efforts et que la cible annonce son soutien. |
+| `reasoningEffortMode` | Non | `"strict"` | `strict` ou `adaptive` ; choisit l’intersection des capacités et la normalisation par cible. |
 | `imageInput` | Non | `"auto"` | `"auto"` ou `"disabled"`. `"auto"` publie les images uniquement si toutes les cibles les prennent en charge ; `"disabled"` impose le texte seul, retire les images des modalités publiées et rejette les requêtes qui en contiennent avant leur distribution. |
 | `alias` | Non | aucun | Identifiant de modèle public tronqué facultatif ; utilisez les règles d'alias ci-dessus. Une valeur vide est stockée sans alias. |
 | `nativeAlias` | Non | `false` | Autoriser explicitement un `alias` natif nu actuellement pris en charge à avoir la priorité sur le routage et le catalogue. Jamais déduit de l'alias. |
 | `displayName` | Non | aucun | Étiquette de catalogue délimitée en affichage uniquement. Obligatoire et non vide lorsque `nativeAlias` est vrai. |
+| `description` | Non | aucun | Description de ligne de catalogue en affichage uniquement, avec les mêmes limites que `displayName`. Sans valeur, le texte généré `Routed via opencodex → combo (combo).` est conservé. |
 
 ## Dépannage
 
@@ -354,8 +364,7 @@ exécution d'une instance opencodex qui reçoit des requêtes de modèle.
 
 Chaque cible est actuellement inéligible : par exemple, son fournisseur est désactivé, il est en phase de refroidissement,
 elle a déjà été tentée pour cette requête, ou une tâche v2 chiffrée l'exclut. Vérifier la cible
-état du fournisseur et erreurs récentes en amont. Pour les temps de recharge, attendez la valeur par défaut de 60 secondes ou la
-délai indiqué par `Retry-After` en amont (jamais plus de 10 minutes), puis réessayez.
+état du fournisseur et erreurs récentes en amont. Pour les temps de recharge, suivez d’abord la valeur `Retry-After` observée, puis les en-têtes de réinitialisation Codex, puis le `cooldownMs` configuré ; à défaut, le fallback en amont s’applique (5 secondes pour les codes `1302`/`1305`, 10 minutes pour une fenêtre d’utilisation épuisée, quel que soit le statut HTTP, ou pour un échec d’identifiants ou de facturation, 60 secondes sinon). Un `Retry-After` explicite est plafonné à 24 heures, les autres temps de recharge à 10 minutes, puis réessayez.
 
 ### Pourquoi mon alias a-t-il été rejeté ?
 
@@ -366,5 +375,15 @@ message de validation.
 
 ### Pourquoi le basculement s'est-il arrêté après la première erreur ?
 
-L’erreur était terminale plutôt que spécifique à la cible. Corriger une entrée invalide, réduire un contexte surdimensionné,
+L’erreur était terminale plutôt que spécifique à la cible. Corriger une entrée invalide,
 gérer un refus de politique ou corriger l’origine de la demande rejetée. Les combos ne sautent pas dans ces cas-là.
+
+## Compatibilité des paramètres facultatifs
+
+Exception aux erreurs 400 terminales : l'enveloppe opaque d'OpenRouter (`Provider returned error` avec `code: 400`, aucun `type` et `metadata.raw: "ERROR"`), ou un rejet structuré de `user`, une valeur non prise en charge pour `reasoning.effort`/`reasoning_effort`, un rejet d’entrée d’image propre à un modèle (`param: input`), ou le refus d’un média d’entrée que la route ne peut pas lire (`unsupported_input_modality`), ainsi qu'après l'enveloppe fournisseur exacte `{"code":"invalid-argument","error":"Invalid reasoning effort."}`. Lorsqu'une cible de combo refuse l'effort de raisonnement demandé, le combo réessaye d'abord cette cible au niveau d'effort publié immédiatement inférieur, un niveau par refus et dans la limite du budget d'envoi partagé ; cela s'applique à tout refus d'effort reconnu. Si aucun niveau inférieur ne réussit, un refus correspondant à l'une des formes ci-dessus passe à une autre cible sans refroidir la cible rejetée, en conservant le 400 initial de cette cible lorsqu'il ne reste plus d'envoi disponible pour le niveau suivant ; les autres refus d'effort restent terminaux. Une route qui refuse le média de la requête avec le code `unsupported_input_modality` avance de la même façon. Ce sont des incompatibilités pour cette requête, et non la preuve que la cible est défaillante. Les requêtes directes conservent leur réparation unique par rétrogradation d'effort. La récupération de compatibilité ne transforme pas silencieusement `none` en un effort différent et n'élargit pas le saut de combo à des requêtes invalides arbitraires. Le refus de sécurité, l’annulation et une sortie déjà commencée restent non rejouables. Une requête à cible unique renvoie toujours un rejet non résolu en amont.
+
+[Canonical compatibility details](/guides/combos/#request-local-target-compatibility).
+
+## Réservation d’une tentative de récupération
+
+Une tentative de récupération activée par `cooldownReprobe: { enabled: true }` appartient uniquement à la requête qui l’a réservée ; les autres requêtes restent soumises aux délais de refroidissement enregistrés. La réservation est conservée pendant l’attente et la sélection JEV. Une cible redevenue utilisable pendant l’attente peut être réessayée si son délai enregistré n’a pas changé. Un nouvel enregistrement annule la réservation de cette cible. Un succès ne supprime que le délai inchangé de la cible ayant répondu ; les cibles non essayées et les nouveaux échecs conservent leurs délais. La désactivation du fournisseur, les quotas, l’admissibilité de la requête et l’annulation restent vérifiés. Voir les [réglages et limites](/guides/combos/#retry-all-cooled-targets-opt-in).

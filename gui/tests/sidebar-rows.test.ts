@@ -18,23 +18,74 @@ const raw = await Bun.file(new URL("../src/App.tsx", import.meta.url)).text();
  */
 const src = raw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
 
-test("every row maps one-to-one onto a page", () => {
-  // The duplicate-row machinery is gone with the row that needed it.
-  expect(src).not.toContain("activeHashes");
-  expect(src).not.toContain("isNavEntryActive");
-  expect(src).not.toContain('tkey: "nav.claude"');
+test("the sidebar is eleven group rows in two tiers, owning every sidebar page once", async () => {
+  const { NAV_GROUPS, NAV_TIERS, groupForPage } = await import("../src/nav-groups");
+  const { VALID_PAGES } = await import("../src/app-routing");
 
-  const navBlock = src.slice(src.indexOf("const NAV: NavEntry[] = ["), src.indexOf("];", src.indexOf("const NAV: NavEntry[] = [")));
-  const ids = [...navBlock.matchAll(/\{ id: "([^"]+)"/g)].map(m => m[1]);
-
-  // The exact nine, in order. A count alone would pass if a row were swapped for
-  // another, and Routing folding into Models is precisely that kind of change.
-  expect(ids).toEqual([
-    "dashboard", "codex-set", "providers", "models", "subagents",
-    "logs", "usage", "storage", "integrations",
+  // Design system v2 sorts rows by how often people touch them. The tiers print in this
+  // order, and every row belongs to exactly one of them.
+  expect(NAV_TIERS.map(entry => entry.tier)).toEqual(["daily", "advanced"]);
+  // The exact rows, in order. A count alone would pass if a row were swapped for another.
+  expect(NAV_GROUPS.map(group => [group.id, group.tier])).toEqual([
+    ["home", "daily"], ["connect", "daily"], ["providers", "daily"], ["models", "daily"], ["accounts", "daily"], ["subagents", "daily"], ["usage-logs", "daily"], ["remote", "daily"],
+    ["proxy", "advanced"], ["advisor", "advanced"], ["advanced", "advanced"],
   ]);
-  // No two rows share a page id, which is what made the correction helper necessary.
-  expect(new Set(ids).size).toBe(ids.length);
+  expect(Object.fromEntries(NAV_GROUPS.map(group => [group.id, [...group.pages]]))).toEqual({
+    // Startup is a Home tab.
+    home: ["home", "startup"],
+    models: ["models"],
+    accounts: ["codex-set"],
+    // Providers sits on its own row under Route.
+    providers: ["providers"],
+    subagents: ["subagents"],
+    // Usage leads, so the row opens Usage first.
+    "usage-logs": ["usage", "logs", "storage"],
+    // Claude is a tab inside the Route page, owned through `embedded`.
+    connect: ["integrations", "setup"],
+    remote: ["remote", "remote-workspace"],
+    // Fine-tuning surfaces stay one click away instead of hiding behind the hub.
+    proxy: ["dashboard"],
+    advisor: ["advisor"],
+    advanced: ["advanced"],
+  });
+  expect(NAV_GROUPS.find(group => group.id === "connect")?.embedded).toEqual(["claude"]);
+
+  // Every routable page belongs to exactly one row; a page in two rows would light both up.
+  const owned = NAV_GROUPS.flatMap(group => [...group.pages, ...(group.embedded ?? [])]);
+  expect(new Set(owned).size).toBe(owned.length);
+  expect(new Set(owned)).toEqual(new Set(VALID_PAGES));
+  expect(groupForPage("setup")?.id).toBe("connect");
+  expect(groupForPage("storage")?.id).toBe("usage-logs");
+  expect(groupForPage("dashboard")?.id).toBe("proxy");
+  expect(groupForPage("claude")?.id).toBe("connect");
+  expect(groupForPage("remote-workspace")?.id).toBe("remote");
+
+  // The sidebar renders the table, one tier at a time, rather than a copy of it.
+  const nav = await Bun.file(new URL("../src/components/sidebar-nav.tsx", import.meta.url)).text();
+  expect(src).toContain("<SidebarNav");
+  expect(nav).toContain("NAV_TIERS.map(");
+  expect(nav).toContain("NAV_GROUPS.filter(group => group.tier === tier)");
+  expect(src).not.toContain("const NAV: NavEntry[]");
+});
+
+test("the section switcher lives outside the page-keyed error boundary", () => {
+  /*
+   * The boundary is keyed by the shell page and remounts on every navigation between
+   * shells. Inside it, the switcher would be destroyed by its own click and keyboard
+   * focus would fall to <body>; the component test cannot see that, because it is App's
+   * placement. Claude and Integrations share one shell key, so Connect's tabs survive.
+   */
+  const mainInnerAt = src.indexOf('className={`main-inner');
+  const switcherAt = src.indexOf("<SectionSwitcher");
+  // The page boundary is the first one inside .main-inner; App has others elsewhere.
+  const boundaryAt = src.indexOf("<ErrorBoundary", mainInnerAt);
+  expect(mainInnerAt).toBeGreaterThan(-1);
+  expect(src.slice(boundaryAt, boundaryAt + 80)).toContain("key={shellPage}");
+  expect(src).toContain('const shellPage: Page = page === "claude" ? "integrations" : page;');
+  expect(switcherAt).toBeGreaterThan(mainInnerAt);
+  expect(switcherAt).toBeLessThan(boundaryAt);
+  // Hiding the switcher under a focused button must not drop focus to <body>.
+  expect(src).toContain("onFocusOrphaned={focusAfterSwitcher}");
 });
 
 test("the sidebar is navigation only", () => {
@@ -67,7 +118,7 @@ test("the foot's four rows share one text column and one trailing inset", async 
   };
 
   // The column every label sits in, owned by the rows that carry an icon.
-  for (const selector of [".lang-toggle", ".theme-toggle", ".sidebar-link"]) {
+  for (const selector of [".lang-toggle", ".sidebar-link"]) {
     expect(rule(selector)).toContain("padding: 8px 10px");
     expect(rule(selector)).toContain("gap: 9px");
   }

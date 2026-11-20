@@ -27,6 +27,11 @@ If the file cannot be parsed, opencodex backs it up as
 `config.json.invalid-<timestamp>`, warns on the console, and starts with defaults. A missing file also
 uses the fresh-install default: one `openai` forward provider.
 
+Local `ocx config set`, `unset`, `import`, offline `ocx effort`, custom-model add/remove, and
+provider add/remove/set-default refuse an invalid or unreadable existing `config.json` without
+changing its bytes. Run `ocx config validate` and repair the file before retrying. Import also
+requires a readable, valid target when a config already exists.
+
 ## Precedence and defaults
 
 ### Provider and model aliases
@@ -48,6 +53,10 @@ Aliases are optional short request names. They never change the native model id 
 
 Aliases match case-insensitively. A model alias works as `or/opus` or, when globally unique, bare `opus`; an ambiguous bare alias reports its qualified candidates. Codex model pickers show the qualified alias while preserving the canonical `provider/model` routing id. A provider's `defaultAliases` value overrides `defaultModelAliases`. Built-ins are skipped when multiple models in one provider match the same pattern.
 
+### Native reasoning retention
+
+Native reasoning ciphertext retention on model and account changes has two opt-in settings, both off by default. Configure them on the dashboard overview or see [Native reasoning retention](/reference/configuration/server/#native-reasoning-retention) for the exact scope and experimental account behavior.
+
 ### Cursor effort rows
 
 `cursorEffortRows` is an optional boolean and defaults to `false`. When enabled, the raw OpenAI-style
@@ -61,14 +70,15 @@ a known configured model id. Cursor may require a model-list refresh or restart 
 
 `fastRows` is an optional boolean and defaults to `true`. The raw OpenAI-style
 `/v1/models` list, Claude Code discovery, and client config exports (including pi, OpenCode,
-OMP, Hermes, OpenClaw, Kimi, Gajae, DSH, MCode, ZCode, Prime, and Aside) add a `<base-id>--fast` selector for every model whose
+OMP, Hermes, OpenClaw, Kimi, gjc, DSH, MCode, ZCode, Prime, Aside, Raycast, omo, Cline, Kilo, and Command Code) add a `<base-id>--fast` selector for every model whose
 resolved Fast policy is eligible. Selecting one routes the base model and requests the `priority`
 service tier — the same Fast the Codex app exposes through its picker toggle. The base row stays
 listed, so the row is an addition rather than a replacement.
 
 Set `"fastRows": false` to hide generated Fast selectors. Malformed values also disable them.
-Refresh the client model list or regenerate/refresh an existing managed client configuration to
-receive the new entries. Connected clients use the serving proxy's availability metadata; older
+The Models Dashboard exposes the same setting and refreshes connected integrations when possible.
+If an external picker does not change after saving, refresh its integration or client catalog.
+Connected clients use the serving proxy's availability metadata; older
 proxies without that metadata do not gain guessed Fast entries. Codex keeps its native Fast toggle.
 
 The suffix is `--fast`, with two hyphens, because a terminal `-fast` is already a real model id for
@@ -122,4 +132,9 @@ opencodex writes managed `config.toml` and `opencodex-catalog.json` files throug
 followed by rename (`atomicWriteFile`).
 This prevents partial files when concurrent writers, such as `ocx stop` and the proxy shutdown handler,
 restore Codex at the same time.
+On Windows, if `opencodex-catalog.json` carries the read-only attribute and blocks the rename, opencodex
+clears the attribute and retries once; a write that still fails reports `Codex catalog is read-only: <path>`
+instead of a bare `EPERM`.
+If a managed TOML file contains an integer outside JavaScript's safe range, the rewrite is refused
+instead of rounding the value, and the file is left unchanged.
 :::

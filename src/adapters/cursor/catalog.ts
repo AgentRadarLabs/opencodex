@@ -3,6 +3,7 @@ import {
   normalizeCursorClaudeId,
   type NormalizedCursorClaudeId,
 } from "./claude-id";
+import { createHash } from "node:crypto";
 
 /**
  * Cursor umbrella catalog — the single source of truth for cursor model
@@ -60,6 +61,8 @@ const CONTEXT_500K = 500 * K;
 const CONTEXT_1M = 1_000 * K;
 /** Gemini publishes the exact power-of-two window, not a rounded 1M. */
 const CONTEXT_GEMINI = 1_048_576;
+/** Meta publishes 1,048,576 for both Muse Spark 1.3 tiers (dev.meta.ai/docs/models). */
+const CONTEXT_MUSE = 1_048_576;
 
 const FULL = ["low", "medium", "high", "xhigh", "max"] as const;
 const T = "thinking-then-effort" as const;
@@ -137,6 +140,25 @@ export const CURSOR_CAPABILITIES: Record<string, CursorCapability> = {
       thinking: { levels: FULL, order: T },
     },
   },
+  // 261008 Haiku 5.5: cursor.com/docs/models/claude-haiku-5-5, 1M and low..max.
+  // Preemptive regular-only shape until GetUsableModels confirms a thinking variant.
+  "claude-haiku-5-5": {
+    displayName: "Claude Haiku 5.5",
+    window: CONTEXT_1M,
+    defaultVariant: "regular",
+    variants: { regular: { levels: FULL } },
+  },
+  // 260929 Claude Sonnet 5.5: cursor.com/docs/models/claude-sonnet-5-5 lists it (1M max context),
+  // but the live GetUsableModels roster does not yet. Shaped like Opus 5.5 (flat effort ids, no
+  // thinking variant); re-shape from the roster once it appears.
+  "claude-sonnet-5-5": {
+    displayName: "Claude Sonnet 5.5",
+    window: CONTEXT_1M,
+    defaultVariant: "regular",
+    variants: {
+      regular: { levels: FULL },
+    },
+  },
   "claude-sonnet-5": {
     displayName: "Claude Sonnet 5",
     window: CONTEXT_1M,
@@ -181,6 +203,17 @@ export const CURSOR_CAPABILITIES: Record<string, CursorCapability> = {
       thinkingFast: { levels: FULL, order: T },
     },
   },
+  // 260923 Claude Opus 5.5: live GetUsableModels roster advertises flat effort-suffixed
+  // wire ids (claude-opus-5-5-{low..max} and -fast) rather than a thinking variant.
+  "claude-opus-5-5": {
+    displayName: "Claude Opus 5.5",
+    window: CONTEXT_1M,
+    defaultVariant: "regular",
+    variants: {
+      regular: { levels: FULL },
+      fast: { levels: FULL },
+    },
+  },
   "glm-5.2": {
     displayName: "GLM 5.2",
     window: CONTEXT_1M,
@@ -211,6 +244,23 @@ export const CURSOR_CAPABILITIES: Record<string, CursorCapability> = {
     defaultVariant: "regular",
     variants: { regular: { levels: ["low", "medium", "high"] } },
   },
+  // 261014 preemptive, like gemini-3.8-flash: Cursor's models page lists Gemini 4 Argon, but the
+  // live GetUsableModels id is unverified. Inert until the live roster lists this id.
+  "gemini-4-argon": {
+    displayName: "Gemini 4 Argon",
+    window: CONTEXT_GEMINI,
+    defaultVariant: "regular",
+    variants: { regular: { levels: ["low", "medium", "high"] } },
+  },
+  // Seeded from the live GetUsableModels roster attached to #4820, which advertises six
+  // muse-spark-1.3 effort variants. The ladder stops at xhigh on purpose: see the matching
+  // effort-map entry for why Cursor advertising `-max` is not evidence that it runs.
+  "muse-spark-1.3": {
+    displayName: "Muse Spark 1.3",
+    window: CONTEXT_MUSE,
+    defaultVariant: "regular",
+    variants: { regular: { levels: ["minimal", "low", "medium", "high", "xhigh"] } },
+  },
   "kimi-k3": {
     displayName: "Kimi K3",
     window: CONTEXT_1M,
@@ -233,6 +283,16 @@ export const CURSOR_CAPABILITIES: Record<string, CursorCapability> = {
     window: CONTEXT_500K,
     defaultVariant: "regular",
     wirePrefix: "cursor-",
+    variants: {
+      regular: { levels: ["low", "medium", "high", "xhigh"] },
+      fast: { levels: ["low", "medium", "high", "xhigh"] },
+    },
+  },
+  // Live Cursor ids and xAI's 500k window: devlog/_fin/260923_grok47_parity/010_probe-evidence.md.
+  "grok-4.7": {
+    displayName: "Cursor Grok 4.7",
+    window: CONTEXT_500K,
+    defaultVariant: "regular",
     variants: {
       regular: { levels: ["low", "medium", "high", "xhigh"] },
       fast: { levels: ["low", "medium", "high", "xhigh"] },
@@ -413,9 +473,11 @@ export function parseCursorVariantId(rawId: string): ParsedCursorVariantId {
   }
   let thinking = false;
   let level: string | undefined;
-  const thinkingLevel = /^(.*)-thinking-([a-z-]+)$/.exec(stem);
-  if (thinkingLevel && CURSOR_CAPABILITIES[thinkingLevel[1]!] && (LEVEL_TOKENS as readonly string[]).includes(thinkingLevel[2]!)) {
-    return finishParse(thinkingLevel[1]!, true, fast, thinkingLevel[2]!);
+  const thinkingAt = stem.lastIndexOf("-thinking-");
+  const thinkingBase = thinkingAt < 0 ? "" : stem.slice(0, thinkingAt);
+  const thinkingLevel = thinkingAt < 0 ? "" : stem.slice(thinkingAt + "-thinking-".length);
+  if (/^[a-z-]+$/.test(thinkingLevel) && CURSOR_CAPABILITIES[thinkingBase] && (LEVEL_TOKENS as readonly string[]).includes(thinkingLevel)) {
+    return finishParse(thinkingBase, true, fast, thinkingLevel);
   }
   const levelThinking = stem.endsWith("-thinking") ? stripLevelSuffix(stem.slice(0, -"-thinking".length)) : undefined;
   if (levelThinking && CURSOR_CAPABILITIES[levelThinking.stem]) {
@@ -588,7 +650,7 @@ export function resolveCursorSelection(
   pickedId: string,
   reasoning: string | undefined,
   liveMaxModeIds?: ReadonlySet<string>,
-  options: { fast?: boolean } = {},
+  options: { fast?: boolean; liveRosterScope?: string } = {},
 ): CursorResolvedSelection {
   const parsed = parseCursorVariantId(pickedId);
   if (!parsed.known) {
@@ -606,7 +668,10 @@ export function resolveCursorSelection(
   const requested = parsed.level ?? reasoning;
   const effort = cursorVariantEffort(spec, requested);
   const requestedClaude = normalizeCursorClaudeId(pickedId);
-  const claudeIdentity = liveCursorClaudeWireIdentities.get(parsed.baseId)
+  const scopedClaudeIdentities = options.liveRosterScope
+    ? liveCursorClaudeWireIdentitiesByScope.get(options.liveRosterScope)
+    : liveCursorClaudeWireIdentities;
+  const claudeIdentity = scopedClaudeIdentities?.get(parsed.baseId)
     ?? (requestedClaude
       ? { sourceBaseId: requestedClaude.sourceBaseId, spelling: requestedClaude.spelling }
       : undefined);
@@ -615,7 +680,9 @@ export function resolveCursorSelection(
     ? `${capability.wirePrefix}${canonicalId}`
     : canonicalId;
   const ultraRequested = parsed.ultra || reasoning?.toLowerCase() === "ultra";
-  const evidence = liveMaxModeIds ?? liveCursorMaxModeBases;
+  const evidence = liveMaxModeIds
+    ?? (options.liveRosterScope ? liveCursorMaxModeBasesByScope.get(options.liveRosterScope) : undefined)
+    ?? liveCursorMaxModeBases;
   const maxModeArmed = capability.maxModeVerified === true || evidence.has(parsed.baseId);
   return { wireId, canonicalId, maxMode: ultraRequested && maxModeArmed, known: true };
 }
@@ -628,15 +695,36 @@ export function resolveCursorSelection(
  */
 let liveCursorMaxModeBases: ReadonlySet<string> = new Set();
 let liveCursorClaudeWireIdentities: ReadonlyMap<string, CursorLiveClaudeWireIdentity> = new Map();
+const liveCursorMaxModeBasesByScope = new Map<string, ReadonlySet<string>>();
+const liveCursorClaudeWireIdentitiesByScope = new Map<string, ReadonlyMap<string, CursorLiveClaudeWireIdentity>>();
+const liveCursorRosterScopesByProvider = new Map<string, Set<string>>();
 
-export function recordLiveCursorClaudeModels(liveIds: readonly string[]): void {
+/** Non-secret key binding live roster evidence to one upstream destination and credential. */
+export function cursorLiveRosterScope(baseUrl: string | undefined, credential: string): string {
+  const destination = (baseUrl?.trim().replace(/\/+$/, "") || "https://api2.cursor.sh");
+  return createHash("sha256")
+    .update("ocx:cursor:live-roster\0")
+    .update(destination)
+    .update("\0")
+    .update(credential)
+    .digest("hex");
+}
+
+export function recordLiveCursorClaudeModels(liveIds: readonly string[], scope?: { provider: string; key: string }): void {
   const next = new Map<string, CursorLiveClaudeWireIdentity>();
   for (const rawId of liveIds) {
     const n = normalizeCursorClaudeId(rawId.startsWith("cursor-") ? rawId.slice(7) : rawId);
     if (!n || !CURSOR_CAPABILITIES[n.canonicalBaseId]) continue;
     if (!next.has(n.canonicalBaseId)) next.set(n.canonicalBaseId, { sourceBaseId: n.sourceBaseId, spelling: n.spelling });
   }
-  liveCursorClaudeWireIdentities = next;
+  if (scope) {
+    liveCursorClaudeWireIdentitiesByScope.set(scope.key, next);
+    const scopes = liveCursorRosterScopesByProvider.get(scope.provider) ?? new Set<string>();
+    scopes.add(scope.key);
+    liveCursorRosterScopesByProvider.set(scope.provider, scopes);
+  } else {
+    liveCursorClaudeWireIdentities = next;
+  }
 }
 
 export function liveCursorClaudeWireIdentitiesForTests(): ReadonlyMap<string, CursorLiveClaudeWireIdentity> {
@@ -645,15 +733,32 @@ export function liveCursorClaudeWireIdentitiesForTests(): ReadonlyMap<string, Cu
 
 export function resetLiveCursorClaudeWireIdentitiesForTests(): void {
   liveCursorClaudeWireIdentities = new Map();
+  liveCursorClaudeWireIdentitiesByScope.clear();
+  liveCursorRosterScopesByProvider.clear();
 }
 
-export function recordLiveCursorMaxModeModels(liveIds: readonly string[]): void {
+export function recordLiveCursorMaxModeModels(liveIds: readonly string[], scope?: { provider: string; key: string }): void {
   const bases = new Set<string>();
   for (const id of liveIds) {
     const parsed = parseCursorVariantId(id);
     if (parsed.known) bases.add(parsed.baseId);
   }
-  liveCursorMaxModeBases = bases;
+  if (scope) liveCursorMaxModeBasesByScope.set(scope.key, bases);
+  else liveCursorMaxModeBases = bases;
+}
+
+export function clearLiveCursorRosterState(provider?: string): void {
+  if (!provider) {
+    liveCursorClaudeWireIdentitiesByScope.clear();
+    liveCursorMaxModeBasesByScope.clear();
+    liveCursorRosterScopesByProvider.clear();
+    return;
+  }
+  for (const scope of liveCursorRosterScopesByProvider.get(provider) ?? []) {
+    liveCursorClaudeWireIdentitiesByScope.delete(scope);
+    liveCursorMaxModeBasesByScope.delete(scope);
+  }
+  liveCursorRosterScopesByProvider.delete(provider);
 }
 
 export function liveCursorMaxModeBasesForTests(): ReadonlySet<string> {
@@ -686,6 +791,8 @@ export function cursorGrokFastSelection(
   const kind = fast === true ? upgradeToFast(parsed.baseId, parsed.kind) : parsed.kind;
   if (!parsed.known || kind !== "fast") return undefined;
   const capability = CURSOR_CAPABILITIES[parsed.baseId];
+  // 4.7 has no cursor- prefix and uses a flattened effort-fast id instead:
+  // devlog/_fin/260923_grok47_parity/010_probe-evidence.md.
   if (capability?.wirePrefix !== "cursor-") return undefined;
   const spec = capability.variants.fast;
   if (!spec) return undefined;

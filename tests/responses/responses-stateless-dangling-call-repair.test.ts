@@ -13,8 +13,11 @@ import { providerConfigSeed } from "../../src/providers/derive";
 import { getProviderRegistryEntry } from "../../src/providers/registry";
 import { handleResponses } from "../../src/server/responses/core";
 import type { OcxConfig } from "../../src/types";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 
 const MODEL = "deepseek-v4-flash";
+const PLACEHOLDER = JSON.stringify({ type: "reasoning", summary: [], content: [{ type: "reasoning_text", text: " " }] });
+let releaseSpendHome: (() => void) | undefined;
 
 function deepseekProvider(): ReturnType<typeof providerConfigSeed> & { apiKey: string } {
   return { ...providerConfigSeed(getProviderRegistryEntry("deepseek")!), apiKey: "sk-test" };
@@ -22,7 +25,12 @@ function deepseekProvider(): ReturnType<typeof providerConfigSeed> & { apiKey: s
 
 describe("stateless Responses wire repairs orphaned tool calls", () => {
   const originalFetch = globalThis.fetch;
-  afterEach(() => { globalThis.fetch = originalFetch; });
+  afterEach(() => {
+    // Release the lease before later teardown can replace the preload sandbox home.
+    releaseSpendHome?.();
+    releaseSpendHome = undefined;
+    globalThis.fetch = originalFetch;
+  });
 
   async function drive(input: unknown[]): Promise<{ url: string; body: Record<string, unknown> }> {
     const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
@@ -34,6 +42,8 @@ describe("stateless Responses wire repairs orphaned tool calls", () => {
       return Response.json({ id: "resp_deepseek", object: "response", status: "completed", output: [] });
     }) as typeof fetch;
     const config = { providers: { deepseek: deepseekProvider() } } as unknown as OcxConfig;
+    // Direct dispatch needs the writer lease that prevents spend-ledger ownership failures.
+    releaseSpendHome = acquireOwnedSpendHome();
     await handleResponses(
       new Request("http://localhost/v1/responses", {
         method: "POST",
@@ -43,7 +53,14 @@ describe("stateless Responses wire repairs orphaned tool calls", () => {
       config,
       { model: "", provider: "" },
     );
-    return requests[0] ?? { url: "", body: {} };
+    const sent = requests[0] ?? { url: "", body: {} };
+    // A bare call turn also gains the fixed plaintext reasoning placeholder on this strict wire
+    // (#7298, covered in deepseek-bare-tool-call-replay.test.ts). These cases pin call/output
+    // repair, so read the input without that one item; real reasoning items are kept.
+    if (Array.isArray(sent.body.input)) {
+      sent.body.input = (sent.body.input as unknown[]).filter(item => JSON.stringify(item) !== PLACEHOLDER);
+    }
+    return sent;
   }
 
   test("synthesizes a function_call_output after a dangling function_call", async () => {

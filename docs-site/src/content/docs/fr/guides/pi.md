@@ -3,10 +3,7 @@ title: Pi
 description: Utilisez n’importe quel modèle routé depuis Pi — ocx export produit un bloc de fournisseur personnalisé pour le fichier models.json de Pi, relié au proxy en cours d’exécution.
 ---
 
-Pi lit ses fournisseurs dans un fichier JSON global unique plutôt que dans des variables d’environnement ;
-opencodex ne lance donc pas Pi. À la place, `ocx export` sérialise le bloc du fournisseur `opencodex` —
-URL de base, liste des modèles et référence de variable d’environnement interpolée par Pi — que vous fusionnez ensuite dans votre
-propre configuration.
+Pi lit ses fournisseurs dans un fichier JSON global unique. opencodex ne lance pas Pi : `ocx export` sérialise le bloc du fournisseur `opencodex`, avec l’URL de base, les modèles et une valeur de clé locale non secrète, puis vous le fusionnez dans votre configuration.
 
 ## Démarrage rapide
 
@@ -14,11 +11,15 @@ Démarrez le proxy, puis imprimez la configuration :
 
 ```bash
 ocx start
+```
+
+Laissez ce processus en cours. Dans un second terminal, affichez la configuration :
+
+```bash
 ocx export --client pi
 ```
 
-La sortie commence par le JSON, puis affiche le chemin de destination, l’avertissement de fusion, la ligne
-d’exportation de la variable d’environnement et le nombre de modèles dotés de limites de contexte faisant autorité.
+La sortie commence par le JSON, puis affiche le chemin de destination, l’avertissement de fusion, une indication d’utilisation locale et le nombre de modèles dont les limites de contexte sont connues. Cet export prend uniquement en charge un proxy de bouclage sans authentification ; il ne configure pas l’accès distant.
 
 ```json
 {
@@ -26,14 +27,18 @@ d’exportation de la variable d’environnement et le nombre de modèles dotés
     "opencodex": {
       "baseUrl": "http://127.0.0.1:10100/v1",
       "api": "openai-completions",
-      "apiKey": "$OPENCODEX_API_KEY",
+      "apiKey": "opencodex-loopback",
+      "compat": {
+        "sendSessionAffinityHeaders": true,
+        "supportsDeveloperRole": false
+      },
       "models": [
         {
           "id": "anthropic/claude-opus-5",
           "name": "Claude Opus 5 (anthropic)",
           "input": ["text"],
           "contextWindow": 200000,
-          "maxTokens": 32000
+          "maxTokens": 128000
         }
       ]
     }
@@ -41,10 +46,21 @@ d’exportation de la variable d’environnement et le nombre de modèles dotés
 }
 ```
 
+Les fournisseurs Pi générés activent `compat.sendSessionAffinityHeaders`. Conservez ce réglage lors de la fusion ou de la modification manuelle du fournisseur : Pi transmet un identifiant de session stable, dont OpenCodex dérive l’affinité pour la destination canonique OpenCode Go. Pi peut omettre cet identifiant lorsque `cacheRetention` vaut `none`.
+
+Les fournisseurs Pi générés définissent aussi `compat.supportsDeveloperRole` à `false` : Pi envoie alors son prompt système avec le rôle `system` au lieu de `developer`. OpenCodex transmet les rôles Chat Completions tels quels, et plusieurs amonts compatibles OpenAI refusent `developer` avec une erreur 400 ; tous acceptent `system`.
+
 Les identifiants de modèle sont les sélecteurs canoniques du proxy : les modèles routés apparaissent donc sous la forme `provider/model`
 (`anthropic/claude-opus-5`) et les slugs natifs OpenAI restent sans préfixe (`gpt-5.6-sol`). Le `name`
 suffixe — `(anthropic)`, `(native)`, `(routed)` — permet de distinguer, dans le sélecteur de Pi, deux modèles de même nom
 provenant de services en amont différents.
+
+Pour un identifiant de modèle imbriqué, l'export Pi utilise le sélecteur brut avec ses barres obliques
+dès que le proxy en cours d'exécution prouve qu'il atteint le même modèle : par exemple,
+`openrouter/openrouter/free` sélectionne le modèle `openrouter/free` d'OpenRouter, et sa ligne Fast est
+`openrouter/openrouter/free--fast`. Un modèle que le proxy ne peut pas prouver ainsi, par exemple parce
+que son inventaire ne l'a pas encore chargé ou qu'un autre modèle possède déjà l'écriture brute, garde
+son sélecteur encodé. Les alias personnalisés gardent leurs noms.
 
 ## Où ça va
 
@@ -70,27 +86,7 @@ fournisseur ou modification de la visibilité du modèle, et fusionnez le nouvea
 
 ## La clé d'admission
 
-Deux clés différentes sont ici faciles à confondre, et seule la première apparaît dans ce fichier :
-
-| Clé | Qu'est-ce que c'est | Où il vit |
-| --- | --- | --- |
-| Clé d'admission proxy | Les propres informations d'identification de opencodex, générées dans l'onglet **API** du tableau de bord | référencé par `apiKey` comme `$OPENCODEX_API_KEY` ; la valeur reste dans votre environnement |
-| Clé du fournisseur | votre touche Anthropic / OpenAI / OpenRouter | La propre configuration de opencodex, selon [Fournisseurs](/fr/guides/providers/) |
-
-La configuration exportée ne contient que la référence, jamais le secret. Pi interpole une valeur simple de la forme `$NAME` ;
-la variable est :
-
-```bash
-export OPENCODEX_API_KEY=<your key>
-```
-
-Ce nom est propre à Pi. opencode utilise une autre variable
-(`OPENCODEX_OPENCODE_API_KEY`, sous la forme `{env:…}`) — voir le [guide opencode](/fr/guides/opencode/).
-
-**Un proxy lié à l’interface de bouclage n’a besoin d’aucune clé.** Par défaut, opencodex se lie à `127.0.0.1` et n’y exige
-aucune authentification ; la référence `$OPENCODEX_API_KEY` est donc inerte et la variable peut rester indéfinie.
-Cela n'a d'importance que lorsque `hostname` est défini au-delà du bouclage, ce qui est également le cas lorsque le proxy
-refuse de démarrer sans jeton — voir [Accès à distance](/fr/reference/configuration/server/#accès-à-distance).
+La valeur `apiKey` exportée est `opencodex-loopback`, un marqueur non secret. Aucune variable de clé n’est à exporter. L’exportateur accepte uniquement un proxy de bouclage sans authentification et refuse les proxys distants ou protégés par jeton. Les identifiants des fournisseurs restent dans la configuration d’opencodex, comme décrit dans [Fournisseurs](/fr/guides/providers/) ; ne placez jamais de clé du fournisseur dans ce bloc Pi. Pour un accès distant, utilisez une intégration qui prend en charge les identifiants d’accès au proxy. Modifier le marqueur n’active pas l’export Pi distant.
 
 ## Métadonnées du modèle
 
@@ -98,9 +94,7 @@ refuse de démarrer sans jeton — voir [Accès à distance](/fr/reference/confi
 faisant autorité. Dans le cas contraire, les deux champs sont omis pour ce modèle et Pi applique ses propres valeurs par défaut ;
 `ocx export` affiche le nombre de lignes concernées.
 
-`maxTokens` est un budget de `32000` destiné à satisfaire le schéma. Il est plafonné à la fenêtre de contexte, de sorte qu’un
-modèle doté d’un petit contexte ne reçoive jamais davantage de sortie que de contexte. Cette valeur ne constitue pas une affirmation sur la
-limite maximale réelle d’un modèle donné.
+La limite de sortie utilise le maximum connu du modèle dans le catalogue ou les métadonnées générées. La valeur `32000` ne sert que de repli si cette limite est inconnue. La limite est toujours plafonnée à la fenêtre de contexte, et les limites connues inférieures à `32000` sont conservées.
 
 Le champ `cost` est volontairement absent. Il exige les quatre champs de prix, alors qu’OpenCodex ne possède
 aucune donnée tarifaire pour les modèles routés ; émettre des zéros reviendrait à affirmer que tous les

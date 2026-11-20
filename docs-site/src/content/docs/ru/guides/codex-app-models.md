@@ -3,6 +3,8 @@ title: Селектор моделей Codex App
 description: Как модели opencodex появляются в Codex App, Codex CLI и Codex TUI через общий каталог Codex.
 ---
 
+По умолчанию `false`. Установите `"omitDisabledNativeModels": true` в `config.json` и выполните `ocx sync`, чтобы исключить отключённые native-строки из каталога, кеша и HTTP-списка моделей в формате Codex. Проверенный до исключения шаблон сохраняет метаданные routed-строк. Маршрутизация прямых запросов не меняется. Описание скрытия ниже относится к настройкам по умолчанию.
+
 opencodex не патчит Codex App. Он записывает ту же конфигурацию Codex и тот же каталог моделей,
 которыми пользуются Codex CLI/TUI. App-server читает это общее состояние, но некоторые версии
 Codex Desktop применяют в renderer дополнительный remote allowlist и могут удалить routed-строки
@@ -77,20 +79,20 @@ visibility = "list"
 
 ## Текущее покрытие стабильных моделей
 
-Нативный fallback-набор включает `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`,
-`gpt-5.3-codex-spark` и GPT-5.6 Sol/Terra/Luna. Для семейства GPT-5.5/5.4 opencodex сохраняет
+Нативный fallback-набор включает `gpt-5.5` и GPT-5.6 Sol/Terra/Luna. Для семейства GPT-5.5 opencodex сохраняет
 более богатые живые записи установленного каталога Codex и синтезирует только отсутствующую
 запись. Bundled upstream-snapshot используется только для GPT-5.6, где он даёт настоящую
 per-model identity и метаданные вместо приближения по старому шаблону.
 
 | Маршрут | Id в селекторе и метаданные каталога |
 | --- | --- |
-| Вход Codex (строки с указанием аккаунта выключены) | Bare native-id, например `gpt-5.6-sol`, `gpt-5.6-terra` и `gpt-5.6-luna`; Pool или Direct выбирается через `codexAccountMode`. У строк GPT-5.6 окно каталога 922 000 токенов. |
+| Вход Codex (строки с указанием аккаунта выключены) | Bare native-id, например `gpt-5.6-sol`, `gpt-5.6-terra` и `gpt-5.6-luna`; Pool или Direct выбирается через `codexAccountMode`. У строк GPT-5.6 окно каталога 922 000 токенов. `gpt-6.1-terra`: контекст 500,000 по умолчанию / 872,000 расширенный. |
 | Вход Codex (строки с указанием аккаунта включены и есть подходящие селекторы) | По одной строке `<selector>/<native-openai-model>` для каждой пары подходящего селектора и поддерживаемой нативной модели; каждая строка использует только сопоставленный аккаунт, а bare native-строки скрыты из picker'а. Нативные метаданные и окна контекста сохраняются. |
-| OpenAI (API key) | Ровно восемь namespaced-строк: `gpt-5.5`, `gpt-5.6`, Sol/Terra/Luna и три виртуальных id `*-pro` (контекст 922,000; максимум входа 922,000 у всех восьми) |
+| OpenAI (API key) | Модели с пространством имён включают `gpt-5.5`, `gpt-5.6`, Sol/Terra/Luna, виртуальные id `*-pro` и псевдонимы Daybreak (контекст 1,050,000; максимум входа 922,000). `openai-apikey/gpt-6.1-terra` добавляет контекст 1,050,000 и максимум выхода 128,000. |
 | OpenRouter | `openrouter/openai/gpt-5.6-sol`, `openrouter/openai/gpt-5.6-terra`, `openrouter/openai/gpt-5.6-luna` (922,000) |
-| Cursor | Статический fallback включает `cursor/gpt-5.6-sol`, `cursor/gpt-5.6-terra` и `cursor/gpt-5.6-luna` (1,000,000), а также обычные/Fast-строки Grok 4.5 и 4.6 (500,000). Для 4.6 доступен ещё `xhigh`; какие строки останутся видимыми, решает live-discovery аккаунта. |
-| xAI | Live-discovery авторитетно. Fallback-каталог включает `xai/grok-4.6`, а моделью по умолчанию остаётся `xai/grok-4.5`; у обеих окно 500,000 токенов. Grok 4.6 поддерживает `low` / `medium` / `high` / `xhigh` (upstream-default: `high`), а Grok 4.5 — только до `high`. |
+| OpenRouter | `openrouter/openai/gpt-6.1-terra` (1,050,000) |
+| Cursor | Статический fallback включает `cursor/gpt-5.6-sol`, `cursor/gpt-5.6-terra` и `cursor/gpt-5.6-luna` (1,000,000), а также обычные/Fast-строки Grok 4.5, 4.6 и 4.7 (500,000). Для 4.6 и 4.7 доступен ещё `xhigh`; какие строки останутся видимыми, решает live-discovery аккаунта. |
+| xAI | Live-discovery имеет приоритет. Fallback-каталог включает `xai/grok-4.6` и `xai/grok-4.7`, а моделью по умолчанию остаётся `xai/grok-4.5`; у всех трёх окно 500,000 токенов. Grok 4.6 и 4.7 поддерживают `low` / `medium` / `high` / `xhigh` (upstream-default: `high`), а Grok 4.5 — только до `high`. |
 
 Закреплённые записи GPT-5.6 сохраняют точную upstream-лестницу. Sol и Terra дают диапазон от
 `low` до `ultra`; у Luna верхняя ступень — `max`. По умолчанию у Sol стоит `low`, а у Terra и
@@ -158,9 +160,7 @@ capability-гейтом — `service_tier` удаляется только ко�
 Codex сортирует видимые в picker'е записи каталога по возрастанию `priority` и рекламирует первые
 пять как model-override для `spawn_agent`. Страница Subagents в дашборде позволяет выбрать и
 сохранить до пяти bare native-id или routed provider-id `provider/model`. Настроенный вручную
-`subagentModels` также принимает account-qualified id `<selector>/<native-openai-model>`, но
-дашборд не предлагает эти точные id; сохранение страницы заменяет список вариантами, доступными в
-дашборде. opencodex назначает им низкие приоритеты каталога в выбранном порядке; при включённых
+`subagentModels` также принимает account-qualified id `<selector>/<native-openai-model>`. При сохранении списка дашборд сохраняет эти точные id, включая модели, которых нет в текущем каталоге. opencodex назначает им низкие приоритеты каталога в выбранном порядке; при включённых
 строках picker'а с указанием аккаунта bare native-выбор разворачивается в группы selector-qualified строк. Остальные
 модели всё равно можно вызывать по точному id.
 

@@ -1,3 +1,4 @@
+import { readResponsesCoreSource } from "../helpers/responses-core-source";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -249,6 +250,13 @@ describe("CL-09 bounded passive production projection", () => {
     expect(fallbackRoute.signals[0]).toMatchObject({ attemptOrdinal: 2, subjectId: subjectB, httpStatus: 200 });
   });
 
+  test("passive visibility disappears with its existing usage-history source", () => {
+    const subjectId = "1".repeat(64);
+    const entry = usageEntryWithAttempt({ labRouteSubjectId: subjectId });
+    expect(derivePassiveProductionSignals([entry], subjectId).signals).toHaveLength(1);
+    expect(derivePassiveProductionSignals([], subjectId).signals).toHaveLength(0);
+  });
+
   test("projects only physical attempts and keeps the first physical duplicate ordinal", () => {
     const subjectId = "8".repeat(64);
     const entry = usageEntryWithAttempt({ labRouteSubjectId: subjectId });
@@ -269,7 +277,6 @@ describe("CL-09 bounded passive production projection", () => {
     ]);
     expect(result.summary.recentProductionAttempts).toBe(2);
   });
-
   test("classifies cancellation against the final physical attempt", () => {
     const subjectId = "9".repeat(64);
     const entry = usageEntryWithAttempt({
@@ -291,21 +298,6 @@ describe("CL-09 bounded passive production projection", () => {
     expect(result.signals).toHaveLength(1);
     expect(result.signals[0]?.outcome).toBe("client_cancel");
   });
-
-  test("preserves explicit empty attempts as no passive evidence", () => {
-    const subjectId = "a".repeat(64);
-    const entry = usageEntryWithAttempt({ labRouteSubjectId: subjectId });
-    entry.attempts = [];
-
-    expect(derivePassiveProductionSignals([entry], subjectId).signals).toEqual([]);
-  });
-
-  test("passive visibility disappears with its existing usage-history source", () => {
-    const subjectId = "1".repeat(64);
-    const entry = usageEntryWithAttempt({ labRouteSubjectId: subjectId });
-    expect(derivePassiveProductionSignals([entry], subjectId).signals).toHaveLength(1);
-    expect(derivePassiveProductionSignals([], subjectId).signals).toHaveLength(0);
-  });
 });
 
 describe("CL-09 no-feedback architecture guards", () => {
@@ -322,7 +314,7 @@ describe("CL-09 no-feedback architecture guards", () => {
   });
 
   test("production request path only links the exact subject and never reads passive history", () => {
-    const source = readFileSync("src/server/responses/core.ts", "utf8");
+    const source = readResponsesCoreSource();
     // Inverted by devlog/_fin/260814_lab_core_decoupling: subject construction moved OUT of
     // the per-request path into a core-owned slot, so an install with no routing profile
     // executes no Lab code. Core must now name only the slot, never Lab.

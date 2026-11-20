@@ -18,6 +18,18 @@ import type { OcxConfig } from "../../../src/types";
 import { SERVER_BUDGET_MS } from "../../helpers/test-budget";
 import { removeTreeWithRetry } from "../../helpers/remove-tree";
 
+test("public discovery separates reasoning, toggle and real strength controls", () => {
+  const fixed = modelCapabilityFields({ supportsReasoning: true, supportsThinkingToggle: false, supportsReasoningEffort: false });
+  expect(fixed.capabilities).toMatchObject({ supports_reasoning: true, supports_thinking_toggle: false, supports_reasoning_effort: false });
+  expect(fixed.capabilities.reasoning_effort).toBeUndefined();
+  const toggle = modelCapabilityFields({ supportsReasoning: true, supportsThinkingToggle: true, supportsReasoningEffort: false, defaultThinkingEnabled: false, reasoningEfforts: ["none", "high"] });
+  expect(toggle.capabilities).toMatchObject({ supports_reasoning: true, supports_thinking_toggle: true, supports_reasoning_effort: false, default_thinking_enabled: false });
+  expect(toggle.capabilities.reasoning_effort).toBeUndefined();
+  const both = modelCapabilityFields({ supportsReasoning: true, supportsThinkingToggle: true, supportsReasoningEffort: true, reasoningEfforts: ["low", "high"] });
+  expect(both.capabilities.reasoning_effort).toEqual(["low", "high"]);
+  expect(modelCapabilityFields({}).capabilities.supports_thinking_toggle).toBeUndefined();
+});
+
 // Cursor's local-agent runtime ("Private Inference" build) only enables its reasoning-effort
 // control when a GET /v1/models row carries api_types (+ optional capabilities). These cases
 // start a real server and read the raw OpenAI-shape list, like the Grok discovery tests.
@@ -80,12 +92,46 @@ describe("modelCapabilityFields", () => {
       output_modalities: ["text"],
       supports_tool_use: true,
       supports_streaming: true,
-      supports_reasoning: false,
     });
     expect("context_length" in fields.capabilities).toBe(false);
     expect("input_modalities" in fields.capabilities).toBe(false);
     expect("supports_vision" in fields.capabilities).toBe(false);
     expect("reasoning_effort" in fields.capabilities).toBe(false);
+    expect("supports_reasoning" in fields.capabilities).toBe(false);
+  });
+
+  test.each([{ supportsThinkingToggle: true }, { supportsReasoningEffort: true }])("positive reasoning axis infers support: %j", input => {
+    const fields = modelCapabilityFields(input);
+    expect(fields.capabilities.supports_reasoning).toBe(true);
+    expect(fields.capabilities.reasoning_effort).toBeUndefined();
+  });
+
+  test("negative axes alone leave reasoning unknown and explicit false suppresses efforts", () => {
+    expect(modelCapabilityFields({ supportsThinkingToggle: false, supportsReasoningEffort: false })
+      .capabilities.supports_reasoning).toBeUndefined();
+    const fields = modelCapabilityFields({ supportsReasoning: false, supportsThinkingToggle: true,
+      supportsReasoningEffort: true, reasoningEfforts: ["low", "high"] });
+    expect(fields.capabilities.supports_reasoning).toBe(false);
+    expect(fields.capabilities.reasoning_effort).toBeUndefined();
+  });
+
+  test("legacy empty ladders retain the negative discovery signal without overriding declared axes", () => {
+    const legacy = modelCapabilityFields({ reasoningEfforts: [] }).capabilities;
+    expect(legacy.supports_reasoning).toBe(false);
+    expect(legacy).not.toHaveProperty("reasoning_effort");
+    expect(legacy).not.toHaveProperty("supports_thinking_toggle");
+    expect(legacy).not.toHaveProperty("supports_reasoning_effort");
+    for (const axes of [{ supportsReasoning: true }, { supportsThinkingToggle: true },
+      { supportsReasoning: true, supportsThinkingToggle: true, supportsReasoningEffort: false }]) {
+      const explicit = modelCapabilityFields({ reasoningEfforts: [], ...axes }).capabilities;
+      expect(explicit.supports_reasoning).toBe(true);
+      expect(explicit).not.toHaveProperty("reasoning_effort");
+    }
+    for (const axes of [{ supportsThinkingToggle: false }, { supportsReasoningEffort: false }]) {
+      expect(modelCapabilityFields({ reasoningEfforts: [], ...axes }).capabilities.supports_reasoning)
+        .toBeUndefined();
+    }
+    expect(modelCapabilityFields({}).capabilities).not.toHaveProperty("supports_reasoning");
   });
 
   test("non-positive context and text-only modalities are reported honestly", () => {
@@ -121,7 +167,36 @@ describe("modelCapabilityFields", () => {
     expect("max_output_tokens" in modelCapabilityFields({ maxOutputTokens: Number.MAX_SAFE_INTEGER + 2 }).capabilities)
       .toBe(false);
     expect(modelCapabilityFields({ maxOutputTokens: 1.9 }).capabilities.supports_reasoning)
-      .toBe(false);
+      .toBeUndefined();
+  });
+
+  test("mirrors top-level context_window and max_output_tokens for external and legacy client discovery", () => {
+    const fields = modelCapabilityFields({ contextWindow: 200000, maxOutputTokens: 64000 });
+    expect(fields.context_window).toBe(200000);
+    expect(fields.context_length).toBe(200000);
+    expect(fields.max_output_tokens).toBe(64000);
+    expect(fields.capabilities.context_length).toBe(200000);
+    expect(fields.capabilities.max_output_tokens).toBe(64000);
+
+    // Empty or non-positive / unsafe inputs: keys omitted entirely
+    const empty = modelCapabilityFields({});
+    expect("context_window" in empty).toBe(false);
+    expect("context_length" in empty).toBe(false);
+    expect("max_output_tokens" in empty).toBe(false);
+
+    for (const value of [0, -50, Number.NaN, Number.MAX_SAFE_INTEGER + 2]) {
+      const fields = modelCapabilityFields({ contextWindow: value, maxOutputTokens: value });
+      expect("context_window" in fields).toBe(false);
+      expect("context_length" in fields).toBe(false);
+      expect("max_output_tokens" in fields).toBe(false);
+    }
+  });
+
+  test("mirrors the effective long context window at the top level", () => {
+    const fields = modelCapabilityFields({ contextWindow: 272000, longContextWindow: 922000 });
+    expect(fields.capabilities.context_length).toBe(922000);
+    expect(fields.context_window).toBe(922000);
+    expect(fields.context_length).toBe(922000);
   });
 });
 
@@ -162,9 +237,13 @@ describe("raw /v1/models list advertises Cursor local-agent capabilities", () =>
         supports_tool_use: true,
         supports_streaming: true,
         supports_reasoning: true,
+        supports_reasoning_effort: true,
         supports_vision: true,
         reasoning_effort: ["low", "high", "max"],
       });
+      expect(k3!.context_window).toBe(200000);
+      expect(k3!.context_length).toBe(200000);
+      expect(k3!.max_output_tokens).toBe(64_000);
       // Grok Build's discovery fields stay untouched next to the new keys.
       expect(k3!.supports_reasoning_effort).toBe(true);
       expect(k3!.reasoning_effort).toBe("high");
@@ -186,6 +265,9 @@ describe("raw /v1/models list advertises Cursor local-agent capabilities", () =>
       // Native GPT-5.6: 272k default window, 922k opt-in ceiling → Cursor Context selector.
       expect(solCaps.context_length).toBe(922000);
       expect(solCaps.max_output_tokens).toBe(128_000);
+      expect(sol!.context_window).toBe(922000);
+      expect(sol!.context_length).toBe(922000);
+      expect(sol!.max_output_tokens).toBe(128_000);
       expect(sol!.pricing).toEqual({ overrides: [{ min_prompt_tokens: 272000 }] });
       expect("long_context_threshold_tokens" in sol!).toBe(false);
       expect(solCaps.supports_vision).toBe(true);

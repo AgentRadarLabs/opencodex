@@ -3,13 +3,21 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { invalidateCodexModelsCache } from "../../src/codex/catalog";
-import { invalidateCodexModelsCacheWithPermit } from "../../src/codex/catalog/sync";
+import { invalidateCodexModelsCacheWithPermit, invalidateCodexModelsCacheWithPermitOutcome } from "../../src/codex/catalog/sync";
 import { withCatalogWriteSerialization } from "../../src/codex/catalog-write-serialization";
-import { afterCatalogWriteHandleAppServers } from "../../src/codex/app-server-processes";
+import {
+  collectCodexAppServerCatalogStateForRequest,
+  resetCodexAppServerCatalogStateCache,
+  afterCatalogWriteHandleAppServers,
+} from "../../src/codex/app-server-processes";
 import { refreshCodexModelCatalog } from "../../src/codex/refresh";
 import { syncModelsToCodex } from "../../src/codex/sync";
+import { flushConfigDirHardening } from "../../src/config/paths";
 import type { OcxConfig } from "../../src/types";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+
+/** Every K acquisition states its intent (#6529); these tests exercise the lock, not the intent. */
+const TEST_CATALOG_WRITE = { intent: "cache", writer: "test" } as const;
 
 const emptyConfig = {
   port: 10100,
@@ -32,7 +40,9 @@ describe("invalidateCodexModelsCache write gate (#476 / #518)", () => {
     process.env.OPENCODEX_HOME = opencodexHome;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await flushConfigDirHardening(opencodexHome);
+    resetCodexAppServerCatalogStateCache();
     if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = previousCodexHome;
     if (previousOpenCodexHome === undefined) delete process.env.OPENCODEX_HOME;
@@ -57,6 +67,23 @@ describe("invalidateCodexModelsCache write gate (#476 / #518)", () => {
     expect(cache.models).toEqual([{ slug: "gpt-5.5" }]);
   });
 
+  test("distinguishes an unchanged cache from a failed refresh", () => {
+    writeFileSync(join(codexHome, "opencodex-catalog.json"), JSON.stringify({
+      models: [{ slug: "gpt-5.5" }],
+    }, null, 2) + "\n");
+    const invalidate = () => withCatalogWriteSerialization(codexHome, permit =>
+      invalidateCodexModelsCacheWithPermitOutcome(permit, codexHome), TEST_CATALOG_WRITE);
+
+    expect(invalidate()).toMatchObject({ kind: "completed", value: "written" });
+    const cachePath = join(codexHome, "models_cache.json");
+    const before = readFileSync(cachePath);
+    expect(invalidate()).toMatchObject({ kind: "completed", value: "unchanged" });
+    expect(readFileSync(cachePath)).toEqual(before);
+
+    writeFileSync(join(codexHome, "opencodex-catalog.json"), "{ not-json");
+    expect(invalidate()).toMatchObject({ kind: "completed", value: "failed" });
+  });
+
   test("permit-bound invalidation stays on its owning home after ambient drift", () => {
     const ambientCodexHome = mkdtempSync(join(tmpdir(), "ocx-invalidate-ambient-"));
     try {
@@ -70,7 +97,7 @@ describe("invalidateCodexModelsCache write gate (#476 / #518)", () => {
       process.env.CODEX_HOME = ambientCodexHome;
 
       const outcome = withCatalogWriteSerialization(codexHome, permit =>
-        invalidateCodexModelsCacheWithPermit(permit, codexHome));
+        invalidateCodexModelsCacheWithPermit(permit, codexHome), TEST_CATALOG_WRITE);
 
       expect(outcome).toMatchObject({ kind: "completed", value: true });
       expect(existsSync(join(ambientCodexHome, "models_cache.json"))).toBe(false);
@@ -297,5 +324,56 @@ describe("invalidateCodexModelsCache write gate (#476 / #518)", () => {
     expect(listed).toBe(0);
     expect(errors).toEqual([]);
     expect(logs).toEqual([]);
+  });
+  test("sync invalidates a cached not-running observation before a catalog write", async () => {
+    let snapshots: Array<{ pid: number; commandLine: string }> = [];
+    const io = {
+      platform: "win32" as const,
+      now: () => 3_000,
+      listSnapshotsAsync: async () => snapshots,
+      readStartMsBatchAsync: async (pids: readonly number[]) => new Map(pids.map(pid => [pid, 1_000])),
+      catalogMtimeMs: () => 2_000,
+    };
+    resetCodexAppServerCatalogStateCache();
+    expect((await collectCodexAppServerCatalogStateForRequest(io)).state).toBe("not_running");
+    snapshots = [{ pid: 42, commandLine: "codex app-server" }];
+    // Prove the real request cache is warm; injected synchronous IO bypasses it.
+    expect((await collectCodexAppServerCatalogStateForRequest(io)).state).toBe("not_running");
+
+    writeFileSync(join(codexHome, "opencodex-catalog.json"), JSON.stringify({ models: [{ slug: "gpt-5.5" }] }));
+    expect(invalidateCodexModelsCache({ allowWhenDesiredDisabled: true })).toBe(true);
+
+    expect((await collectCodexAppServerCatalogStateForRequest(io)).state).toBe("stale");
+  });
+
+  test("sync invalidates cached process state even when catalog refresh is a no-op", async () => {
+    let snapshots: Array<{ pid: number; commandLine: string }> = [];
+    const io = {
+      platform: "win32" as const,
+      now: () => 3_000,
+      listSnapshotsAsync: async () => snapshots,
+      readStartMsBatchAsync: async (pids: readonly number[]) => new Map(pids.map(pid => [pid, 1_000])),
+      catalogMtimeMs: () => 2_000,
+    };
+    resetCodexAppServerCatalogStateCache();
+    expect((await collectCodexAppServerCatalogStateForRequest(io)).state).toBe("not_running");
+    snapshots = [{ pid: 42, commandLine: "codex app-server" }];
+    // Prove the real request cache is warm; injected synchronous IO bypasses it.
+    expect((await collectCodexAppServerCatalogStateForRequest(io)).state).toBe("not_running");
+
+    await syncModelsToCodex(19107, emptyConfig, null, {
+      refreshCodexModelCatalog: async () => ({
+        added: 0,
+        path: join(codexHome, "opencodex-catalog.json"),
+        catalogExists: false,
+        catalogWritten: false,
+        cacheSynced: false,
+        comboOmissions: [],
+      }),
+      injectCodexConfig: async () => ({ success: true, message: "injected" }),
+      currentExternalCodexModelProvider: () => null,
+    });
+
+    expect((await collectCodexAppServerCatalogStateForRequest(io)).state).toBe("stale");
   });
 });

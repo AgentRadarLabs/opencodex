@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { handleExportCommand, exportModelsFromProxyRows } from "../../src/cli/export-command";
+import { buildClientConfigText, EXPORT_CLIENTS, isExportClientId } from "../../src/clients/config-export";
 import { resetCodexModelEntitlementCacheForTests } from "../../src/codex/model-entitlements";
 import { handleManagementAPI } from "../../src/server/management-api";
 import type { OcxConfig } from "../../src/types";
@@ -58,6 +59,17 @@ function fakeProxy(rows: unknown = ROWS) {
     fetch(req) {
       const url = new URL(req.url);
       if (url.pathname === "/api/models") return Response.json(rows);
+      // Pi is built by the serving proxy (#8172). This stands in for that route over the same
+      // rows, so the CLI framing below is exercised without a model catalog gather.
+      const client = url.searchParams.get("client") ?? "";
+      if (url.pathname === "/api/client-config" && isExportClientId(client)) {
+        const built = buildClientConfigText(client, {
+          baseUrl: `http://127.0.0.1:${server.port}/v1`,
+          models: exportModelsFromProxyRows(rows as Parameters<typeof exportModelsFromProxyRows>[0], config()),
+          config: config(),
+        });
+        return Response.json({ client, format: EXPORT_CLIENTS[client].format, config: built.document, text: built.text });
+      }
       return new Response("not found", { status: 404 });
     },
   });
@@ -204,6 +216,24 @@ describe("ocx export --json (accept criterion 1)", () => {
     expect(parsed.provider.opencodex!.options.baseURL).not.toContain(":10100/");
   });
 
+  test("OpenCode export keeps the live port when saved listener settings point at a future port", async () => {
+    const code = await handleExportCommand(["--client", "opencode", "--json"], {
+      baseUrl: "http://127.0.0.1:10100",
+      configImpl: () => config({
+        hostname: "0.0.0.0",
+        unauthenticatedLoopbackListener: { enabled: true, port: 10999 },
+      }),
+      fetchImpl: (async input => {
+        expect(String(input)).toBe("http://127.0.0.1:10100/api/models");
+        return Response.json(ROWS);
+      }) as typeof fetch,
+    });
+    expect(code).toBe(0);
+    const parsed = JSON.parse(stdout()) as { provider: Record<string, { options: { baseURL: string } }> };
+    expect(parsed.provider.opencodex!.options.baseURL).toBe("http://127.0.0.1:10100/v1");
+    expect(parsed.provider.opencodex!.options.baseURL).not.toContain(":10999/");
+  });
+
   test("disabled rows never reach the exported config", async () => {
     const proxy = fakeProxy();
     const result = await run(["--client", "pi", "--json"], { baseUrl: proxy.baseUrl });
@@ -211,6 +241,16 @@ describe("ocx export --json (accept criterion 1)", () => {
     const ids = parsed.providers.opencodex!.models.map(model => model.id);
     expect(ids).not.toContain("banned/hidden");
     expect(ids).toEqual(["anthropic/claude-opus-5", "custom/no-context", "gpt-5.6-luna"]);
+  });
+
+  test("Pi uses the selected catalog without changing its provenance", async () => {
+    const proxy = fakeProxy();
+    const pi = await run(["--client", "pi", "--json"], { baseUrl: proxy.baseUrl });
+    expect(pi.code).toBe(0);
+    const piRows = JSON.parse(pi.stdout) as { providers: { opencodex: { models: Array<{ id: string }> } } };
+    expect(piRows.providers.opencodex.models.map(row => row.id)).toEqual([
+      "anthropic/claude-opus-5", "custom/no-context", "gpt-5.6-luna",
+    ]);
   });
 });
 
@@ -221,6 +261,10 @@ describe("ocx export human output (accept criterion 2)", () => {
 
     expect(result.code).toBe(0);
     expect(result.stdout.startsWith("{\n")).toBe(true);
+    logs.length = 0;
+    const structured = await run(["--client", "opencode", "--json"], { baseUrl: proxy.baseUrl });
+    expect(structured.code).toBe(0);
+    expect(JSON.parse(result.stdout.split("\n\n")[0]!)).toEqual(JSON.parse(structured.stdout));
     expect(result.stdout).toContain(join("opencode", "opencode.json"));
     expect(result.stdout).toContain("Merge this generated configuration into that file; do not replace it.");
     expect(result.stdout).toContain("export OPENCODEX_OPENCODE_API_KEY=");
@@ -351,24 +395,22 @@ describe("ocx export with no live proxy (accept criterion 5)", () => {
    * would be discovered and the assertion would pass for the wrong reason.
    */
   test("fails through the runtime-api error naming ocx start, emitting no config", () => {
-    const probe = Bun.serve({ port: 0, fetch: () => new Response("") });
-    const deadPort = probe.port;
-    probe.stop(true);
-
     const home = tempDir();
     // Must pass config validation: a rejected config falls back to the DEFAULT config, whose
     // port 10100 may host the developer's own proxy — the test would then probe a live one.
     writeFileSync(
       join(home, "config.json"),
       JSON.stringify({
-        port: deadPort,
+        // The child preload injects ECONNREFUSED at this exact endpoint.
+        port: 42101,
         defaultProvider: "mock",
         providers: { mock: { adapter: "openai-chat", baseUrl: "http://127.0.0.1/v1", allowPrivateNetwork: true } },
       }),
       "utf8",
     );
 
-    const result = spawnSync(process.execPath, [cliPath, "export", "--client", "opencode", "--json"], {
+    const preload = join(repoRoot, "tests", "fixtures", "refused-local-probe-preload.ts");
+    const result = spawnSync(process.execPath, ["--preload", preload, cliPath, "export", "--client", "opencode", "--json"], {
       cwd: repoRoot,
       env: { ...process.env, OPENCODEX_HOME: home },
       encoding: "utf8",
@@ -376,6 +418,7 @@ describe("ocx export with no live proxy (accept criterion 5)", () => {
 
     expect(result.status).not.toBe(0);
     expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("[refused-probe] ECONNREFUSED");
     expect(result.stderr).toContain("ocx start");
     // Routed by the dispatcher, not swallowed by the unknown-command branch.
     expect(result.stderr).not.toContain("Unknown command");
@@ -386,6 +429,29 @@ describe("ocx export with no live proxy (accept criterion 5)", () => {
     const result = await run(["--client", "opencode", "--json"], { baseUrl: proxy.baseUrl });
     expect(result.code).not.toBe(0);
     expect(result.stdout).toBe("");
+  });
+});
+
+describe("Pi nested selectors come from the serving proxy (#8172)", () => {
+  test("the serving proxy proves the raw selector; the CLI's saved configuration is never consulted", async () => {
+    const previous = process.env.OPENCODEX_HOME;
+    process.env.OPENCODEX_HOME = tempDir();
+    const nested = (models: string[]) => config({ defaultProvider: "nested", providers: { nested: {
+      adapter: "openai-chat", baseUrl: "https://nested.example.test/v1", liveModels: false, models,
+    } } });
+    try {
+      // The saved configuration knows nothing about the model; it cannot prove or veto the selector.
+      const proxy = managementProxy(nested(["org/free"]));
+      const result = await run(["--client", "pi", "--json"], { baseUrl: proxy.baseUrl, config: nested([]) });
+      expect(result.code).toBe(0);
+      const ids = (JSON.parse(result.stdout) as { providers: { opencodex: { models: Array<{ id: string }> } } })
+        .providers.opencodex.models.map(model => model.id);
+      expect(ids).toContain("nested/org/free");
+      expect(ids).not.toContain("nested/org-free");
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previous;
+    }
   });
 });
 
@@ -428,5 +494,194 @@ describe("export row filtering", () => {
     const [model] = exportModelsFromProxyRows([ROWS[0]!], config());
     expect(model?.reasoningEfforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
     expect(model?.defaultReasoningEffort).toBe("high");
+  });
+});
+
+describe("export allowlist parity", () => {
+  test("the first export rereads selection completed during model discovery", async () => {
+    const previous = process.env.OPENCODEX_HOME;
+    const home = tempDir();
+    const path = join(home, "config.json");
+    const pending = config({
+      defaultProvider: "pending", fastRows: false,
+      providers: { pending: {
+        adapter: "openai-chat", baseUrl: "https://fixture.example.test/v1", liveModels: false,
+        models: ["chosen", "other"],
+        initialModelSelection: { version: 1, registrationId: crypto.randomUUID(), status: "pending" },
+      } },
+    });
+    const ready = structuredClone(pending);
+    ready.providers.pending!.initialModelSelection!.status = "ready";
+    ready.providers.pending!.selectedModels = ["chosen"];
+    const rows = ["chosen", "other"].map(id => ({ provider: "pending", id, namespaced: `pending/${id}` }));
+    expect(exportModelsFromProxyRows(rows, pending)).toEqual([]);
+    let requests = 0;
+    try {
+      process.env.OPENCODEX_HOME = home;
+      writeFileSync(path, JSON.stringify(pending));
+      const code = await handleExportCommand(["--client", "opencode", "--json"], {
+        baseUrl: "http://127.0.0.1:10123",
+        fetchImpl: async input => {
+          expect(String(input)).toBe("http://127.0.0.1:10123/api/models");
+          requests += 1;
+          // The server publishes its finalized selection before returning the rows.
+          writeFileSync(path, JSON.stringify(ready));
+          return Response.json(rows);
+        },
+      });
+      expect(code).toBe(0);
+      expect(requests).toBe(1);
+      expect(Object.keys(JSON.parse(stdout()).provider.opencodex.models))
+        .toEqual(["pending/chosen"]);
+      expect(pending.providers.pending!.initialModelSelection!.status).toBe("pending");
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previous;
+    }
+  });
+
+  test("post-discovery filtering retains injected config provenance instead of reading local policy", async () => {
+    const previous = process.env.OPENCODEX_HOME;
+    const home = tempDir();
+    const path = join(home, "config.json");
+    const local = config({ providers: { custom: {
+      adapter: "openai-chat", baseUrl: "https://local.example.test/v1", selectedModels: ["local-only"],
+    } } });
+    const remote = config({ providers: { custom: {
+      adapter: "openai-chat", baseUrl: "https://remote.example.test/v1", selectedModels: ["remote-only"],
+      initialModelSelection: { version: 1, registrationId: crypto.randomUUID(), status: "pending" },
+    } } });
+    const ready = structuredClone(remote);
+    ready.providers.custom!.initialModelSelection!.status = "ready";
+    let resolved = remote;
+    const events: string[] = [];
+    try {
+      process.env.OPENCODEX_HOME = home;
+      const localBytes = JSON.stringify(local);
+      writeFileSync(path, localBytes);
+      const code = await handleExportCommand(["--client", "opencode", "--json"], {
+        baseUrl: "http://127.0.0.1:10123",
+        configImpl: () => { events.push("config"); return structuredClone(resolved); },
+        fetchImpl: async () => {
+          events.push("fetch");
+          resolved = ready;
+          return Response.json(["local-only", "remote-only"].map(id => ({ provider: "custom", id, namespaced: `custom/${id}` })));
+        },
+      });
+      expect(code).toBe(0);
+      expect(events).toEqual(["fetch", "config"]);
+      expect(Object.keys(JSON.parse(stdout()).provider.opencodex.models))
+        .toEqual(["custom/remote-only"]);
+      expect(readFileSync(path, "utf8")).toBe(localBytes);
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previous;
+    }
+  });
+
+  test("filters the full management roster before deduplication and keeps other providers", () => {
+    const cfg = config();
+    cfg.providers.xai = {
+      adapter: "openai-chat", baseUrl: "https://api.x.ai/v1",
+      selectedModels: ["grok-4.6"],
+    };
+    const rows = [
+      { provider: "xai", id: "grok-4.5", namespaced: "xai/grok-4.5", disabled: false },
+      { provider: "xai", id: "grok-4.6", namespaced: "xai/grok-4.6", disabled: true },
+      { provider: "xai", id: "grok-4.6", namespaced: "xai/grok-4.6", reasoningEfforts: ["high"] },
+      { provider: "other", id: "model", namespaced: "other/model" },
+    ];
+    const exported = exportModelsFromProxyRows(rows, cfg);
+    expect(exported.map(row => row.namespaced)).toEqual(["xai/grok-4.6", "other/model"]);
+    expect(exported[0]!.reasoningEfforts).toEqual(["high"]);
+    cfg.disabledModels = ["xai/grok-4.6"];
+    expect(exportModelsFromProxyRows(rows, cfg).map(row => row.namespaced)).toEqual(["other/model"]);
+  });
+
+  test("uses the catalog's encoded-id selection equivalence", () => {
+    const cfg = config();
+    cfg.providers.slash = {
+      adapter: "openai-chat", baseUrl: "https://fixture.invalid/v1", selectedModels: ["org-model"],
+    };
+    expect(exportModelsFromProxyRows([
+      { provider: "slash", id: "org/model", namespaced: "slash/org-model" },
+      { provider: "slash", id: "other", namespaced: "slash/other" },
+    ], cfg).map(row => row.namespaced)).toEqual(["slash/org-model"]);
+  });
+});
+
+describe("keyless exports use the live management admission policy", () => {
+  for (const client of ["raycast", "droid", "qoder"] as const) for (const secondary of [false, true]) {
+    test(`${client} live wildcard bind with secondary=${secondary} wins over saved loopback config`, async () => {
+      const oldHome = process.env.OPENCODEX_HOME;
+      const oldCodexHome = process.env.CODEX_HOME;
+      const root = tempDir();
+      process.env.OPENCODEX_HOME = join(root, "ocx");
+      process.env.CODEX_HOME = join(root, "codex");
+      mkdirSync(process.env.CODEX_HOME, { recursive: true });
+      try {
+        const liveConfig = config({
+          hostname: "0.0.0.0",
+          providers: { mock: {
+            adapter: "openai-chat", baseUrl: "http://127.0.0.1/v1",
+            liveModels: false, models: ["fixture-model"],
+          } },
+          ...(secondary ? { unauthenticatedLoopbackListener: { enabled: true, port: 10237 } } : {}),
+        });
+        const proxy = managementProxy(liveConfig);
+        const out = join(root, "providers.yaml");
+        writeFileSync(out, "keep existing export\n");
+        const result = await run(["--client", client, "--json", "--out", out, "--force"], {
+          baseUrl: proxy.baseUrl,
+          // Deliberately contradict both live bind and secondary port.
+          config: config({ unauthenticatedLoopbackListener: { enabled: true, port: 10999 } }),
+        });
+        if (secondary) {
+          expect(result.code).toBe(0);
+          const document = JSON.parse(result.stdout) as { providers?: Array<{ base_url: string }> & { opencodex?: { baseUrl: string } }; customModels?: Array<{ baseUrl: string }> };
+          expect(client === "raycast" ? document.providers?.[0]?.base_url
+            : client === "qoder" ? document.providers?.opencodex?.baseUrl : document.customModels?.[0]?.baseUrl)
+            .toBe("http://127.0.0.1:10237/v1");
+          expect(readFileSync(out, "utf8")).toContain("10237/v1");
+          expect(readFileSync(out, "utf8")).not.toContain("10999");
+        } else {
+          expect(result.code).not.toBe(0);
+          expect(result.stdout).toBe("");
+          expect(result.stderr).toContain("non_loopback");
+          expect(readFileSync(out, "utf8")).toBe("keep existing export\n");
+        }
+      } finally {
+        if (oldHome === undefined) delete process.env.OPENCODEX_HOME;
+        else process.env.OPENCODEX_HOME = oldHome;
+        if (oldCodexHome === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = oldCodexHome;
+      }
+    });
+  }
+});
+
+describe("ocx export with an unresolvable client destination", () => {
+  test("exports and writes --out once, reporting the destination as unknown", async () => {
+    const proxy = fakeProxy();
+    const oldDataDir = process.env.ZCODE_DATA_DIR;
+    // A relative override is a ClientPathError, the same class the ZCode bootstrap
+    // resolver raises for malformed or relative dataBaseDir settings (#6932).
+    process.env.ZCODE_DATA_DIR = "relative-zcode-root";
+    try {
+      const target = join(tempDir(), "zcode-config.json");
+      const result = await run(["--client", "zcode", "--out", target], { baseUrl: proxy.baseUrl });
+      expect(result.code).toBe(0);
+      expect(existsSync(target)).toBe(true);
+      expect(result.stdout).toContain("Destination: unknown (");
+      expect(result.stdout).toContain("ZCODE_DATA_DIR");
+
+      logs = [];
+      const json = await run(["--client", "zcode", "--json"], { baseUrl: proxy.baseUrl });
+      expect(json.code).toBe(0);
+      expect(() => JSON.parse(json.stdout)).not.toThrow();
+    } finally {
+      if (oldDataDir === undefined) delete process.env.ZCODE_DATA_DIR;
+      else process.env.ZCODE_DATA_DIR = oldDataDir;
+    }
   });
 });

@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { shouldInjectApiAuthHeader } from "../../codex/loopback-target";
+import { isExportModelNames, supportsAliasModelNames } from "../../clients/config-export/model-names";
 
 /**
  * Codex parses a catalog entry's `input_modalities` as a closed enum, and one out-of-enum
@@ -10,9 +12,17 @@ import { readFileSync } from "node:fs";
  * be handed back to the GUI and CLI as if it were real, and the offline `ocx models add` path
  * already refuses it. Validate at ingress so all three paths agree.
  */
-const ALLOWED_INPUT_MODALITIES = new Set(["text", "image", "audio"]);
+/**
+ * The modalities a declaration may carry. `video` is missing on purpose: the wire carries text
+ * and image parts, so advertising it would be a promise no request path can keep.
+ */
+type DeclaredInputModality = NonNullable<ModelCapabilities["inputModalities"]>[number];
 
-function readInputModalities(raw: unknown): { values?: string[]; error?: string } {
+// A plain string set on purpose: the lookup runs against unvalidated input, and the enum lives in
+// the return type below, where the cast is the validator's stated guarantee.
+const ALLOWED_INPUT_MODALITIES: ReadonlySet<string> = new Set(["text", "image", "audio"]);
+
+function readInputModalities(raw: unknown): { values?: DeclaredInputModality[]; error?: string } {
   if (raw === undefined) return {};
   if (!Array.isArray(raw)) return { error: "inputModalities must be an array" };
   // Reject non-strings rather than filtering them out. Dropping them silently accepted a
@@ -27,7 +37,7 @@ function readInputModalities(raw: unknown): { values?: string[]; error?: string 
   if (rejected.length > 0) {
     return { error: `unsupported input modality: ${rejected.join(", ")} (allowed: text, image, audio)` };
   }
-  return { values: raw as string[] };
+  return { values: raw as DeclaredInputModality[] };
 }
 
 /**
@@ -72,7 +82,8 @@ function readDefaultReasoningEffort(raw: unknown, efforts: string[] | undefined)
 import type { CatalogModel } from "../../codex/catalog";
 import { accountBoundNativeOpenAiSlugsBySelector, catalogModelSlug, configuredNativeAliasSlugs, disabledNativeSlugs, invalidateCodexModelsCache, nativeModelRows, shouldIncludeAccountBoundNativeOpenAi, uniqueCatalogModelsForPublicList } from "../../codex/catalog";
 import { CatalogGatherBusyError } from "../../codex/catalog/provider-fetch";
-import { clearModelCache, getProviderLiveModelCount } from "../../codex/model-cache";
+import { clearModelCache, getProviderLiveModelCount, getStaleCached } from "../../codex/model-cache";
+import { antigravityFamilyDisabled, projectAntigravitySelectedModels } from "../../providers/antigravity-effort-families";
 import { NATIVE_OPENAI_MODELS } from "../../codex/catalog/native-models";
 
 import {
@@ -84,6 +95,8 @@ import {
   multiAgentGuidanceEnabled,
   providerBaseUrlConfigError,
   providerHeadersConfigError,
+  providerModelCostsConfigError,
+  sanitizeModelCostsForDisplay,
   saveConfigPreservingClaudeCode,
 } from "../../config";
 import {
@@ -97,13 +110,19 @@ import {
 } from "../../oauth";
 import { removeCredential } from "../../oauth/store";
 import { providerDestinationResolvedError } from "../../lib/destination-policy";
+import { redactSecretString } from "../../lib/redact";
+import { withModelCostRowReplacement } from "../../config/live-reconcile";
 import { enrichProviderFromCatalog, listKeyLoginProviders } from "../../oauth/key-providers";
 import { deriveProviderPresets } from "../../providers/derive";
 import { providerCodexAccountMode } from "../../providers/registry";
-import { encodedModelIdCollides, routedSlug, slugEquals } from "../../providers/slug-codec";
+import { encodedModelIdCollides, routedSlug, slugEquals, slugEquivalenceKey } from "../../providers/slug-codec";
 import { knownModelIdsForProvider } from "../../router";
-import { effectiveModelAliases, MODEL_ALIAS_PATTERN } from "../../providers/default-aliases";
+import { effectiveModelAliases, MODEL_ALIAS_PATTERN, templateAliasPlan } from "../../providers/default-aliases";
+import { aliasTemplateError } from "../../providers/alias-template";
 import { isValidModelDiscoveryModelId } from "../../providers/model-discovery-limits";
+import { commitProviderPatch } from "./provider-patch-transaction";
+import { ConfigWritePublishedError } from "../../config/persist-unlocked";
+import type { CatalogDisposition } from "../../codex/convergence-types";
 import { comboPublicModelId } from "../../combos/types";
 import { COMBO_NAMESPACE, comboDisabledModelSelectors, comboModelId, preservesPhysicalComboProvider } from "../../combos";
 import { clearProviderQuotaCache, fetchProviderQuotaReports } from "../../providers/quota";
@@ -127,15 +146,15 @@ import {
   setDebugSettings,
   type DebugFlag,
 } from "../../lib/debug-settings";
-import type { OcxClaudeCodeConfig, OcxConfig, OcxCustomModel, OcxProviderConfig } from "../../types";
+import type { ModelCapabilities, OcxClaudeCodeConfig, OcxConfig, OcxCustomModel, OcxProviderConfig, ProviderCostOverlay } from "../../types";
 import { drainAndShutdown } from "../lifecycle";
 import { filterRequestLogs, getRequestLogEntries, type RequestLogEntry } from "../request-log";
 import { estimateComboCost, estimateRequestCost, normalizeCostTokens, tokensPerSecond } from "../../usage/cost";
 import type { PersistedUsageAttempt } from "../../usage/log";
 import { isAllowedRequestOrigin, jsonResponse, providerManagementConfigError, publicProviderBaseUrl, safeConfigDTO, corsHeaders } from "../auth-cors";
 import { applySystemEnvToggle } from "../system-env";
+import { ClientPathError } from "../../clients/client-path";
 import {
-  ClientPathError,
   EXPORT_CLIENTS,
   EXPORT_CLIENT_IDS,
   OPENCODE_PROVIDER_ID,
@@ -152,8 +171,8 @@ import type {
 
 import { isPlainRecord, parseDebugLogQuery, tokPerSecondResult, unavailableCostReason, costResult, requestLogDto, stripRegistryOnlyStaticHeaders, fetchAllModels } from "./shared";
 import type { MetricUnavailableReason, TokPerSecondResult, CostEstimateReason, CostResult, MetricSource } from "./shared";
-import type { ManagementContext } from "./context";
-import { listManagementModelRows, loadExportModels } from "./model-rows";
+import { managementInferencePort, type ManagementContext } from "./context";
+import { effectiveModelReasoningEfforts, inheritedModelReasoningEfforts, listManagementModelRows, loadExportModels, previewExportSnapshot } from "./model-rows";
 import { initialModelSelectionPending } from "../../providers/initial-model-selection";
 import { readManagementJsonBody, rethrowManagementBodyTooLarge } from "./body";
 import {
@@ -176,6 +195,33 @@ function summarizeExportedModels(client: ExportClientId, document: unknown): { m
   return EXPORT_CLIENTS[client].summarize(document);
 }
 
+/**
+ * What a recent arrival looks like in the picker (#8236), by the same rules the catalog applies:
+ * a disabled slug hides it, and a non-empty provider selection shows only what it names.
+ * `auto-disabled` means the `off` policy disabled it (or a row from before that was recorded),
+ * `disabled` that someone else did; `not-selected` that the selection leaves it out.
+ * `rows` is the provider's cached discovery, read passively: an Antigravity base inherits the
+ * disable of its known tiers and is selected through any of them, exactly as
+ * `filterCatalogVisibleModels` decides. Without cached rows those family rules have nothing to read.
+ */
+function arrivalState(
+  config: OcxConfig,
+  provider: string,
+  row: { id: string; disabledByPolicy?: boolean },
+  rows: readonly CatalogModel[],
+): "enabled" | "auto-disabled" | "disabled" | "not-selected" {
+  if ((config.disabledModels ?? []).some(slug => slugEquals(slug, provider, row.id))) {
+    return row.disabledByPolicy === false ? "disabled" : "auto-disabled";
+  }
+  const candidate = rows.find(model => model.provider === provider && model.id === row.id) ?? { provider, id: row.id };
+  if (antigravityFamilyDisabled(config, candidate, rows)) return "disabled";
+  const selected = config.providers[provider]?.selectedModels ?? [];
+  if (selected.length === 0) return "enabled";
+  const keys = new Set(projectAntigravitySelectedModels(provider, selected, rows)
+    .map(id => slugEquivalenceKey(routedSlug(provider, id))));
+  return keys.has(slugEquivalenceKey(routedSlug(provider, row.id))) ? "enabled" : "not-selected";
+}
+
 export async function handleModelRoutes(ctx: ManagementContext): Promise<Response | null> {
   const { req, url, config, deps, convergeCodexCatalog, syncClaudeAgentDefsBestEffort } = ctx;
   // A handler persists the exact config object passed in. Production defaults to
@@ -183,19 +229,26 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
   // bypass this seam with a dynamic config import — doing so replaced a user's
   // ~/.opencodex/config.json with the `existing-uuid` test fixture.
   const persistConfig = deps.saveConfigPreservingClaudeCode ?? saveConfigPreservingClaudeCode;
+  const convergeVisibleCatalogs = async () => {
+    const catalogRefresh = await convergeCodexCatalog();
+    const refresh = deps.refreshOwnedCatalogIntegrations
+      ?? (await import("../../integrations/catalog-refresh")).refreshOwnedCatalogIntegrations;
+    const clientIntegrations = await refresh({
+      config,
+      port: managementInferencePort(ctx),
+      models: () => loadExportModels(config),
+    });
+    return { catalogRefresh, clientIntegrations };
+  };
 
   if (url.pathname === "/api/model-discovery" && req.method === "GET") {
     const providers = Object.fromEntries(Object.entries(config.providers).map(([name, provider]) => [
       name, provider.newModelPolicy ?? "inherit",
     ]));
-    const recentArrivals = Object.fromEntries(Object.entries(config.modelDiscovery?.recentArrivals ?? {}).map(([name, rows]) => [
-      name,
-      rows.map(row => ({
-        ...row,
-        state: (config.disabledModels ?? []).some(slug => slugEquals(slug, name, row.id))
-          ? "auto-disabled" : "enabled",
-      })),
-    ]));
+    const recentArrivals = Object.fromEntries(Object.entries(config.modelDiscovery?.recentArrivals ?? {}).map(([name, rows]) => {
+      const cached = getStaleCached(name) ?? [];
+      return [name, rows.map(row => ({ ...row, state: arrivalState(config, name, row, cached) }))];
+    }));
     const baselineCounts = Object.fromEntries(Object.entries(config.modelDiscovery?.knownModels ?? {}).map(([name, baseline]) => [
       name, baseline.ids.length,
     ]));
@@ -207,7 +260,9 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
   if (url.pathname === "/api/model-discovery" && req.method === "PUT") {
     let body: { policy?: unknown; provider?: unknown };
     try { body = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
-    if (body.policy !== "on" && body.policy !== "off") return jsonResponse({ error: "policy must be on or off" }, 400);
+    if (body.policy !== "on" && body.policy !== "off" && body.policy !== "admit") {
+      return jsonResponse({ error: "policy must be on, off or admit" }, 400);
+    }
     const provider = typeof body.provider === "string" && body.provider.trim() ? body.provider.trim() : null;
     let baselineBootstrapped = false;
     if (provider) {
@@ -249,18 +304,20 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
 
   if (url.pathname === "/api/aliases" && req.method === "GET") {
     const providers: Record<string, string> = {};
-    const models: Record<string, Record<string, { alias: string; source: "user" | "builtin"; stale?: boolean }>> = {};
+    const models: Record<string, Record<string, { alias: string; source: "user" | "builtin" | "template"; stale?: boolean }>> = {};
     for (const [name, provider] of Object.entries(config.providers)) {
       if (provider.alias) providers[name] = provider.alias;
       const known = knownModelIdsForProvider(name, provider, config);
       const knownSet = new Set(known);
-      const rows: Record<string, { alias: string; source: "user" | "builtin"; stale?: boolean }> = {};
-      for (const [id, value] of effectiveModelAliases(config, provider, new Set([...known, ...Object.keys(provider.modelAliases ?? {})]))) {
+      const rows: Record<string, { alias: string; source: "user" | "builtin" | "template"; stale?: boolean }> = {};
+      for (const [id, value] of effectiveModelAliases(config, provider, new Set([...known, ...Object.keys(provider.modelAliases ?? {})]), name)) {
         rows[id] = { ...value, ...(!knownSet.has(id) ? { stale: true } : {}) };
       }
       if (Object.keys(rows).length) models[name] = rows;
     }
-    return jsonResponse({ providers, models, defaults: {
+    const templates = Object.fromEntries(Object.entries(config.providers)
+      .filter(([, provider]) => typeof provider.aliasTemplate === "string").map(([name, provider]) => [name, provider.aliasTemplate]));
+    return jsonResponse({ providers, models, templates, defaults: {
       global: config.defaultModelAliases ?? false,
       providers: Object.fromEntries(Object.entries(config.providers).filter(([, p]) => p.defaultAliases !== undefined).map(([n, p]) => [n, p.defaultAliases])),
     } });
@@ -274,8 +331,9 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
     // this guard the alias route matched `name = "keys"`, found no such provider, and returned
     // 404 for every key-pool rename.
     if (name === "keys") return null;
-    const provider = config.providers[name];
-    if (!provider) return jsonResponse({ error: `provider '${name}' not found` }, 404, req, config);
+    // Own keys only: `__proto__` or `constructor` would otherwise resolve to Object.prototype.
+    if (!hasOwnProvider(config.providers, name)) return jsonResponse({ error: `provider '${name}' not found` }, 404, req, config);
+    const provider = config.providers[name]!;
     let raw: unknown;
     try { raw = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
     if (!isPlainRecord(raw) || (raw.alias !== null && typeof raw.alias !== "string")) return jsonResponse({ error: "alias must be a string or null" }, 400, req, config);
@@ -293,12 +351,44 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
     return jsonResponse({ ok: true, provider: name, alias, catalogRefresh });
   }
 
+  // #7705: the opt-in template is stored as text and derived at resolution time; this route only
+  // validates, saves and previews it. The preview is the same plan routing uses, bounded.
+  const aliasTemplateMatch = url.pathname.match(/^\/api\/providers\/([^/]+)\/alias-template$/);
+  if (aliasTemplateMatch && req.method === "PUT") {
+    const name = decodeURIComponent(aliasTemplateMatch[1]!);
+    if (name === "keys") return null;
+    // Own keys only: `__proto__` or `constructor` would otherwise resolve to Object.prototype.
+    if (!hasOwnProvider(config.providers, name)) return jsonResponse({ error: `provider '${name}' not found` }, 404, req, config);
+    const provider = config.providers[name]!;
+    let raw: unknown;
+    try { raw = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
+    if (!isPlainRecord(raw) || (raw.template !== null && typeof raw.template !== "string")) {
+      return jsonResponse({ error: "template must be a string or null" }, 400, req, config);
+    }
+    const template = typeof raw.template === "string" ? raw.template.trim() : null;
+    const problem = template === null ? null : aliasTemplateError(template);
+    if (problem) return jsonResponse({ error: problem }, 400, req, config);
+    if (template) provider.aliasTemplate = template; else delete provider.aliasTemplate;
+    persistConfig(config);
+    const catalogRefresh = await convergeCodexCatalog();
+    if (!template) return jsonResponse({ ok: true, provider: name, template: null, catalogRefresh });
+    const known = knownModelIdsForProvider(name, provider, config);
+    const existing = effectiveModelAliases(config, { ...provider, aliasTemplate: undefined }, known, name);
+    const plan = templateAliasPlan(config, provider, name, known, existing);
+    return jsonResponse({
+      ok: true, provider: name, template,
+      preview: { generated: plan.accepted.size, skipped: plan.skipped.slice(0, 50), skippedTotal: plan.skipped.length },
+      catalogRefresh,
+    });
+  }
+
   const modelAliasMatch = url.pathname.match(/^\/api\/providers\/([^/]+)\/model-aliases$/);
   if (modelAliasMatch && req.method === "PUT") {
     const name = decodeURIComponent(modelAliasMatch[1]!);
     if (name === "keys") return null;
-    const provider = config.providers[name];
-    if (!provider) return jsonResponse({ error: `provider '${name}' not found` }, 404, req, config);
+    // Own keys only: `__proto__` or `constructor` would otherwise resolve to Object.prototype.
+    if (!hasOwnProvider(config.providers, name)) return jsonResponse({ error: `provider '${name}' not found` }, 404, req, config);
+    const provider = config.providers[name]!;
     let raw: unknown;
     try { raw = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
     if (!isPlainRecord(raw) || (raw.set !== undefined && !isPlainRecord(raw.set)) || (raw.remove !== undefined && !Array.isArray(raw.remove))) return jsonResponse({ error: "invalid model alias update" }, 400, req, config);
@@ -327,9 +417,9 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
     try { raw = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
     if (!isPlainRecord(raw) || typeof raw.enabled !== "boolean" || (raw.provider !== undefined && typeof raw.provider !== "string")) return jsonResponse({ error: "enabled must be boolean" }, 400, req, config);
     if (typeof raw.provider === "string") {
-      const provider = config.providers[raw.provider];
-      if (!provider) return jsonResponse({ error: `provider '${raw.provider}' not found` }, 404, req, config);
-      provider.defaultAliases = raw.enabled;
+      // Own keys only, as in the alias routes above.
+      if (!hasOwnProvider(config.providers, raw.provider)) return jsonResponse({ error: `provider '${raw.provider}' not found` }, 404, req, config);
+      config.providers[raw.provider]!.defaultAliases = raw.enabled;
     } else config.defaultModelAliases = raw.enabled;
     persistConfig(config);
     const catalogRefresh = await convergeCodexCatalog();
@@ -355,6 +445,71 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
 
   if (url.pathname === "/api/models" && req.method === "GET") {
     return jsonResponse(await listManagementModelRows(config));
+  }
+
+  const modelCostsMatch = url.pathname.match(/^\/api\/providers\/([^/]+)\/model-costs$/);
+  if (modelCostsMatch && (req.method === "GET" || req.method === "PUT")) {
+    let name: string;
+    try { name = decodeURIComponent(modelCostsMatch[1]!); } catch { return jsonResponse({ error: "invalid provider encoding" }, 400); }
+    if (!hasOwnProvider(config.providers, name)) {
+      return jsonResponse({ error: "provider not found" }, 404, req, config);
+    }
+    if (req.method === "GET") {
+      const provider = config.providers[name]!;
+      return jsonResponse({ provider: name, modelCosts: sanitizeModelCostsForDisplay(provider.modelCosts) ?? {} }, 200, req, config);
+    }
+    let body: unknown;
+    try { body = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
+    if (!isPlainRecord(body) || !isValidModelDiscoveryModelId(body.modelId)
+      || !Object.hasOwn(body, "cost")
+      || Object.keys(body).some(key => key !== "modelId" && key !== "cost")) {
+      return jsonResponse({ error: "only a valid modelId and cost object or null are allowed" }, 400, req, config);
+    }
+    const modelId = body.modelId;
+    if (redactSecretString(modelId) !== modelId) {
+      return jsonResponse({ error: "modelId cannot be displayed safely" }, 400, req, config);
+    }
+    const submitted = { [modelId]: body.cost };
+    const validationError = body.cost === null ? null : providerModelCostsConfigError(submitted);
+    if (validationError) return jsonResponse({ error: validationError }, 400, req, config);
+    // Copy validated rates and policy; never echo a secret-shaped model key that the
+    // shared display boundary suppresses. Model IDs remain exact, including slashes.
+    const cost = body.cost === null ? null : sanitizeModelCostsForDisplay(submitted)?.[modelId];
+    if (cost === undefined) return jsonResponse({ error: "modelId cannot be displayed safely" }, 400, req, config);
+
+    // Body parsing yields: a concurrent provider PATCH can replace the row or remove it.
+    // Resolve ownership again and keep the merge/save synchronous on the current row.
+    if (!hasOwnProvider(config.providers, name)) {
+      return jsonResponse({ error: "provider not found" }, 404, req, config);
+    }
+    const provider = config.providers[name]!;
+    const hadModelCosts = Object.hasOwn(provider, "modelCosts");
+    const previousModelCosts = provider.modelCosts;
+    const nextModelCosts = Object.assign(
+      Object.create(null) as Record<string, ProviderCostOverlay>,
+      structuredClone(previousModelCosts ?? {}),
+    );
+    if (cost === null) delete nextModelCosts[modelId];
+    else nextModelCosts[modelId] = structuredClone(cost);
+    const mergedError = providerModelCostsConfigError(nextModelCosts);
+    if (mergedError) return jsonResponse({ error: mergedError }, 400, req, config);
+    // Keep even an empty map until persistence reconciles individual model keys.
+    // Deleting the property would also delete prices another writer added on disk.
+    provider.modelCosts = nextModelCosts;
+    try {
+      // The persistence owner refreshes usage overlays after its atomic write.
+      // Price-only edits do not change routing or require catalog convergence.
+      withModelCostRowReplacement(config, name, modelId, cost, () => persistConfig(config));
+    } catch (error) {
+      // A published write is durable even if bookkeeping failed: recovery GET
+      // must not serve old prices or let a later save undo the committed policy.
+      if (!(error instanceof ConfigWritePublishedError)) {
+        if (hadModelCosts) provider.modelCosts = previousModelCosts;
+        else delete provider.modelCosts;
+      }
+      throw error;
+    }
+    return jsonResponse({ ok: true, provider: name, modelId, cost }, 200, req, config);
   }
 
   const displayNameMatch = url.pathname.match(/^\/api\/providers\/([^/]+)\/model-display-names$/);
@@ -447,6 +602,16 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
         config,
       );
     }
+    const namingOptions = url.searchParams.getAll("modelNames");
+    const modelNames = namingOptions[0];
+    if (namingOptions.length > 1 || (modelNames !== undefined
+      && (!isExportModelNames(modelNames) || !supportsAliasModelNames(requested)))) {
+      return jsonResponse({ error: "modelNames must be alias or routed and requires Hermes or Command Code", code: "invalid_model_names" }, 400, req, config);
+    }
+    const passive = url.searchParams.get("preview") === "1";
+    if (passive && !supportsAliasModelNames(requested)) {
+      return jsonResponse({ error: "passive export preview requires Hermes or Command Code", code: "invalid_export_preview" }, 400, req, config);
+    }
     const spec = EXPORT_CLIENTS[requested];
     // Resolved before the catalog load on purpose. A refused override is a
     // property of the request, not of the catalog: validating it afterwards
@@ -469,12 +634,23 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
       if (!(error instanceof ClientPathError)) throw error;
       return jsonResponse({ error: error.message }, 400, req, config);
     }
-    let models: ExportModel[];
+    if ((requested === "t3code" || requested === "raycast" || requested === "droid" || requested === "qoder" || requested === "qoder-cn" || requested === "workbuddy" || requested === "workbuddy-ai") && shouldInjectApiAuthHeader(config)) {
+      return jsonResponse({
+        error: `${requested === "t3code" ? "T3 Code" : requested === "droid" ? "Factory Droid" : requested.startsWith("qoder") ? "Qoder" : requested.startsWith("workbuddy") ? "WorkBuddy" : "Raycast"} export requires an unauthenticated loopback destination; this listener requires an admission header the client cannot supply.`,
+        reason: "non_loopback",
+      }, 400, req, config);
+    }
+    const baseUrl = opencodeProxyBaseUrl(managementInferencePort(ctx), config.hostname, config);
+    let models: readonly ExportModel[];
     try {
       // The ONE loader every export surface uses. It carries the visibility
       // filter with it, so this route and the integration routes cannot end up
       // telling a client about different models.
-      models = await loadExportModels(config);
+      if (passive) {
+        const snapshot = previewExportSnapshot(config);
+        if (snapshot === null) return jsonResponse({ error: "no current model roster is cached", code: "integration_preview_unavailable" }, 409, req, config);
+        models = snapshot.models;
+      } else models = await loadExportModels(config);
     } catch (error) {
       // A partial or empty `models` block reads as a valid config while offering nothing,
       // so a catalog failure is surfaced as unavailable rather than serialized. The
@@ -488,9 +664,10 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
       );
     }
     const built = buildClientConfigText(requested, {
-      baseUrl: opencodeProxyBaseUrl(Number(url.port) || config.port, config.hostname),
+      baseUrl,
       models,
       config,
+      ...(modelNames === undefined ? {} : { modelNames }),
     });
     const document = built.document;
     return jsonResponse({
@@ -518,8 +695,7 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
     const disabled = Array.isArray(body.models) ? body.models.filter((m): m is string => typeof m === "string") : [];
     config.disabledModels = disabled;
     persistConfig(config);
-    const catalogRefresh = await convergeCodexCatalog();
-    return jsonResponse({ ok: true, disabled, catalogRefresh });
+    return jsonResponse({ ok: true, disabled, ...await convergeVisibleCatalogs() });
   }
 
   // One user-facing visibility switch spans two persisted filters: a provider allowlist and the
@@ -566,7 +742,10 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
       }
       const id = value.id.trim();
       const native = value.native === true;
-      if (!id || (provider === "openai") !== native || (native && !supportedNative.has(id))) {
+      const configuredOpenAiCustom = provider === "openai" && !native && providerConfig
+        && (config.customModels ?? []).some(model => model.provider === provider && model.modelId === id);
+      if (!id || (native && (provider !== "openai" || !supportedNative.has(id)))
+        || (provider === "openai" && !native && !configuredOpenAiCustom)) {
         return jsonResponse({ error: "invalid model visibility target" }, 400);
       }
       const key = `${native ? "native" : "routed"}:${id}`;
@@ -641,12 +820,249 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
 
     config.disabledModels = disabled;
     persistConfig(config);
-    const catalogRefresh = await convergeCodexCatalog();
-    return jsonResponse({ ok: true, scope, provider, enabled: body.enabled, disabled, catalogRefresh });
+    return jsonResponse({ ok: true, scope, provider, enabled: body.enabled, disabled, ...await convergeVisibleCatalogs() });
   }
 
   if (url.pathname === "/api/custom-models" && req.method === "GET") {
     return jsonResponse(config.customModels ?? []);
+  }
+
+  /*
+   * Per-model overrides for a routed row, addressed by provider + upstream model id.
+   *
+   * Deliberately not a custom model. A custom model is a row the operator declares; this edits
+   * facts about a row that already exists, through the provider-level per-model maps the runtime
+   * already reads. Creating a custom model to change one field would replace the row's identity
+   * and its discovery provenance, which is the opposite of what an edit means.
+   *
+   * Every field is optional and `null` CLEARS the declaration rather than writing a default: that
+   * is what hands the fact back to the registry, the catalog and the provider, instead of pinning
+   * today's answer as an override that silently outlives the data it came from.
+   *
+   * Display name is not here on purpose. The row already has a dedicated editor for it
+   * (PUT /api/providers/{provider}/model-display-names) with its own provenance display; a second
+   * control writing the same key is two statements that can drift, and this endpoint's job is the
+   * capability axes nothing else edits.
+   */
+  if (url.pathname === "/api/model-settings" && req.method === "PUT") {
+    let parsedBody: unknown;
+    try { parsedBody = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
+    if (!isPlainRecord(parsedBody)) return jsonResponse({ error: "invalid model settings request" }, 400);
+    const body = parsedBody;
+    for (const key of Object.keys(body)) {
+      if (!["provider", "modelId", "contextWindow", "inputModalities", "responsesCustomTools", "reasoningEfforts", "defaultReasoningEffort"].includes(key)) {
+        return jsonResponse({ error: `unknown model settings field: ${key}` }, 400);
+      }
+    }
+    const provider = typeof body.provider === "string" ? body.provider.trim() : "";
+    const modelId = typeof body.modelId === "string" ? body.modelId : "";
+    if (!provider || !modelId) return jsonResponse({ error: "provider and modelId are required" }, 400);
+    if (!isValidModelDiscoveryModelId(modelId) || ["__proto__", "constructor", "prototype"].includes(modelId)) {
+      return jsonResponse({ error: "modelId must be an exact non-reserved model id" }, 400);
+    }
+    if (!isValidProviderName(provider) || !hasOwnProvider(config.providers, provider)) {
+      return jsonResponse({ error: "unknown model settings provider" }, 400);
+    }
+    // "openai" is the native passthrough lane and "combo" is a synthetic row: neither is a
+    // provider whose per-model maps the runtime consults for these facts.
+    if (provider === "openai" || provider === "combo") {
+      return jsonResponse({ error: "model settings are only available for routed providers" }, 400);
+    }
+
+    const providerConfig = { ...config.providers[provider] };
+    const storedLadder = providerConfig.modelReasoningEfforts?.[modelId];
+
+    let contextWindow: number | null | undefined;
+    if (body.contextWindow !== undefined) {
+      if (body.contextWindow === null) contextWindow = null;
+      else if (typeof body.contextWindow === "number" && Number.isSafeInteger(body.contextWindow) && body.contextWindow > 0) {
+        contextWindow = body.contextWindow;
+      } else return jsonResponse({ error: "contextWindow must be a positive safe integer or null" }, 400);
+    }
+    let modalities: DeclaredInputModality[] | null | undefined;
+    if (body.inputModalities !== undefined) {
+      if (body.inputModalities === null) modalities = null;
+      else {
+        const parsed = readInputModalities(body.inputModalities);
+        if (parsed.error) return jsonResponse({ error: parsed.error }, 400);
+        // An empty array means "cleared", exactly like null: a model that accepts no modality at
+        // all is not a state this surface can express, and storing [] would advertise text-only
+        // through a value the catalog then has to special-case.
+        // Deduplicated before the unchanged check and before the write: `["text","text"]` against
+        // a stored `["text","image"]` passes a length test and an every-member test, so the
+        // operator's edit would be dropped as a no-op; when it did differ, the duplicates would be
+        // persisted as submitted.
+        const unique = parsed.values ? [...new Set(parsed.values)] : [];
+        modalities = unique.length > 0 ? unique : null;
+      }
+    }
+    let responsesCustomTools: boolean | null | undefined;
+    if (body.responsesCustomTools !== undefined) {
+      if (body.responsesCustomTools === null || typeof body.responsesCustomTools === "boolean") {
+        responsesCustomTools = body.responsesCustomTools;
+      } else return jsonResponse({ error: "responsesCustomTools must be a boolean or null" }, 400);
+    }
+    let ladder: string[] | null | undefined;
+    if (body.reasoningEfforts !== undefined) {
+      if (body.reasoningEfforts === null) ladder = null;
+      else {
+        const parsed = readReasoningEfforts(body.reasoningEfforts);
+        if (parsed.error) return jsonResponse({ error: parsed.error }, 400);
+        ladder = parsed.values ?? [];
+      }
+    }
+    /*
+     * Validated against the ladder this write leaves behind, not the one that happens to be stored:
+     * a caller replacing both in one request must not be rejected for the value it is replacing, and
+     * a default-only request must be judged against the ladder the model actually resolves — which
+     * may be the provider-level, registry, native or catalog one, not only a per-model entry.
+     * `inheritedModelReasoningEfforts` is what the clear case leaves behind: it removes the model's
+     * entry from a copy before resolving, so it answers the post-write state.
+     */
+    const resultingLadder = ladder === undefined
+      ? (Array.isArray(storedLadder) ? storedLadder : effectiveModelReasoningEfforts(config, provider, modelId))
+      : (ladder ?? inheritedModelReasoningEfforts(config, provider, modelId));
+    const defaultEffort = readDefaultReasoningEffort(body.defaultReasoningEffort, resultingLadder);
+    if (defaultEffort.error) return jsonResponse({ error: defaultEffort.error }, 400);
+
+    let changed = false;
+    const writePerModel = (
+      key: "modelContextWindows" | "modelReasoningEfforts" | "modelDefaultReasoningEfforts",
+      value: unknown,
+    ) => {
+      if (value === undefined) return;
+      const bag = providerConfig as unknown as Record<string, unknown>;
+      const record: Record<string, unknown> = Object.assign(Object.create(null), (bag[key] as Record<string, unknown> | undefined) ?? {});
+      const present = Object.prototype.hasOwnProperty.call(record, modelId);
+      if (value === null) {
+        if (!present) return;
+        delete record[modelId];
+        changed = true;
+      } else {
+        if (present && JSON.stringify(record[modelId]) === JSON.stringify(value)) return;
+        record[modelId] = value;
+        changed = true;
+      }
+      // An emptied map is removed rather than left as {}. The maps are optional config fields, and
+      // an empty one is indistinguishable from a configured-but-blank state to every reader.
+      if (Object.keys(record).length === 0) delete bag[key];
+      else bag[key] = record;
+    };
+    writePerModel("modelContextWindows", contextWindow);
+    writePerModel("modelReasoningEfforts", ladder);
+    if (body.defaultReasoningEffort !== undefined) {
+      writePerModel("modelDefaultReasoningEfforts", defaultEffort.value === undefined ? null : defaultEffort.value);
+    } else if (ladder !== undefined) {
+      /*
+       * A ladder write can strand a stored default that the model can no longer select, and the
+       * catalog would then publish a default outside its own ladder. The caller said nothing about
+       * the default, so only one that cannot survive is cleared. With `ladder === null` the override
+       * is gone and the ladder to test against is the inherited one — read from the config after the
+       * write, which no longer carries the removed entry.
+       */
+      const storedDefault = providerConfig.modelDefaultReasoningEfforts?.[modelId];
+      const nextConfig = { ...config, providers: { ...config.providers, [provider]: providerConfig } };
+      const effectiveLadder = ladder ?? effectiveModelReasoningEfforts(nextConfig, provider, modelId);
+      if (typeof storedDefault === "string" && !(effectiveLadder ?? []).includes(storedDefault)) {
+        writePerModel("modelDefaultReasoningEfforts", null);
+      }
+    }
+    if (modalities !== undefined || responsesCustomTools !== undefined) {
+      const capabilities = Object.assign(Object.create(null), providerConfig.modelCapabilities ?? {}) as NonNullable<typeof providerConfig.modelCapabilities>;
+      const row = { ...(capabilities[modelId] ?? {}) };
+      let capabilitiesChanged = false;
+      if (modalities !== undefined) {
+        const declared = Array.isArray(row.inputModalities) ? [...row.inputModalities] : undefined;
+        const unchanged = modalities === null
+          ? declared === undefined
+          : declared !== undefined
+            && declared.length === modalities.length
+            && modalities.every(modality => declared.includes(modality));
+        if (!unchanged) {
+          changed = true;
+          capabilitiesChanged = true;
+          if (modalities === null) delete row.inputModalities;
+          else row.inputModalities = modalities;
+        }
+      }
+      if (responsesCustomTools !== undefined) {
+        const next = responsesCustomTools === null ? undefined : responsesCustomTools;
+        if (row.responsesCustomTools !== next) {
+          changed = true;
+          capabilitiesChanged = true;
+          if (next === undefined) delete row.responsesCustomTools;
+          else row.responsesCustomTools = next;
+        }
+      }
+      if (capabilitiesChanged) {
+        if (Object.keys(row).length === 0) delete capabilities[modelId];
+        else capabilities[modelId] = row;
+        if (Object.keys(capabilities).length === 0) delete providerConfig.modelCapabilities;
+        else providerConfig.modelCapabilities = capabilities;
+      }
+      /*
+       * The legacy `modelInputModalities` record is the fallback `declaredModelInputModalities` and the
+       * router read once the capability entry is gone. A clear that left its exact entry behind would
+       * report "restored" while the old declaration stayed in force. Only the exact key is removed: a
+       * family or case-folded key covers other models too, and stays a provider-level declaration.
+       */
+      const legacy = providerConfig.modelInputModalities;
+      if (modalities === null && legacy && Object.hasOwn(legacy, modelId)) {
+        const next: Record<string, string[]> = Object.assign(Object.create(null), legacy);
+        delete next[modelId];
+        changed = true;
+        if (Object.keys(next).length === 0) delete providerConfig.modelInputModalities;
+        else providerConfig.modelInputModalities = next;
+      }
+    }
+
+    const hasOverrides = [providerConfig.modelContextWindows, providerConfig.modelReasoningEfforts,
+      providerConfig.modelDefaultReasoningEfforts, providerConfig.modelInputModalities]
+      .some(map => map !== undefined && Object.hasOwn(map, modelId))
+      || providerConfig.modelCapabilities?.[modelId]?.inputModalities !== undefined;
+    const hasCapabilityOverrides = hasOverrides
+      || providerConfig.modelCapabilities?.[modelId]?.responsesCustomTools !== undefined;
+    const state = {
+      ok: true as const,
+      provider,
+      modelId,
+      hasOverrides: hasCapabilityOverrides,
+      contextWindow: providerConfig.modelContextWindows?.[modelId] ?? null,
+      inputModalities: providerConfig.modelCapabilities?.[modelId]?.inputModalities ?? null,
+      responsesCustomTools: providerConfig.modelCapabilities?.[modelId]?.responsesCustomTools ?? null,
+      reasoningEfforts: providerConfig.modelReasoningEfforts?.[modelId] ?? null,
+      defaultReasoningEffort: providerConfig.modelDefaultReasoningEfforts?.[modelId] ?? null,
+    };
+    // A no-op can still retain stored declarations; `hasOverrides` reports that independently.
+    if (!changed) return jsonResponse({ ...state, changed: false, saved: false,
+      catalogRefresh: { status: "skipped", reason: "not-requested", retryable: false } });
+    let publicationError = false;
+    try {
+      commitProviderPatch(config, () => { config.providers[provider] = providerConfig; }, persistConfig);
+    } catch (error) {
+      if (!(error instanceof ConfigWritePublishedError)) {
+        return jsonResponse({ error: "model settings could not be saved" }, 500);
+      }
+      publicationError = true;
+    }
+    /*
+     * Drop this provider's live `/models` cache before converging.
+     *
+     * The gather bakes the resolved hints into the rows it caches, and on a cache hit it re-applies
+     * the config through `clampObservedModelLimits`, where a configured window may only LOWER the
+     * observed one. A raised or cleared override would therefore keep reading back the previous
+     * answer for the whole TTL, and a cleared modality or ladder would keep the baked one. Clearing
+     * the entry is what makes the save visible on the next read, the same reason
+     * `PUT /api/provider-context-caps` clears it per affected provider.
+     */
+    clearModelCache(provider);
+    let catalogRefresh: CatalogDisposition;
+    if (publicationError) catalogRefresh = { status: "skipped", reason: "not-requested", retryable: true };
+    else {
+      try { catalogRefresh = await convergeCodexCatalog(); }
+      catch { catalogRefresh = { status: "failed", reason: "internal", phase: "gather", retryable: true, partialWrite: false }; }
+    }
+    return jsonResponse({ ...state, changed: true, saved: true, catalogRefresh });
   }
 
   if (url.pathname === "/api/custom-models" && req.method === "POST") {
@@ -852,7 +1268,7 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
       delete target.selectedModels;
       delete target.modelPreset;
       persistConfig(config);
-      return jsonResponse({ ok: true, provider, mode, selected: [], catalogRefresh: await convergeCodexCatalog() });
+      return jsonResponse({ ok: true, provider, mode, selected: [], ...await convergeVisibleCatalogs() });
     }
     if (mode === "custom") {
       // Keep whatever is selected; only the marker changes, so a user can pin their edits
@@ -897,7 +1313,7 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
       mode: "preset",
       appliedVersion: preset.version,
       selected: presetIds,
-      catalogRefresh: await convergeCodexCatalog(),
+      ...await convergeVisibleCatalogs(),
     });
   }
   if (url.pathname === "/api/selected-models" && req.method === "PUT") {
@@ -921,8 +1337,7 @@ export async function handleModelRoutes(ctx: ManagementContext): Promise<Respons
     // re-materialize over it afterwards.
     markModelPresetDiverged(config.providers[provider]);
     persistConfig(config);
-    const catalogRefresh = await convergeCodexCatalog();
-    return jsonResponse({ ok: true, provider, selected: models, catalogRefresh });
+    return jsonResponse({ ok: true, provider, selected: models, ...await convergeVisibleCatalogs() });
   }
   return null;
 }

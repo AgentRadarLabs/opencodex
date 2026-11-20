@@ -1,3 +1,4 @@
+import { rememberProxyIncomplete, carryProxyIncompleteContext } from "../lib/client-error-body";
 import type { TranslatorBudget } from "../lib/translator-budget";
 import type { ResponsesTerminalRepairPolicy } from "../providers/registry";
 import { nextSseBlock, sseDataPayload } from "./sse-payload-rewrite";
@@ -80,6 +81,7 @@ export function relayResponsesSseWithTerminalRepair(
   policy: ResponsesTerminalRepairPolicy,
   budget: TranslatorBudget,
   scheduler: ResponsesTerminalRepairScheduler = systemScheduler,
+  proxyErrorContext: object = {},
 ): ReadableStream<Uint8Array> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -91,6 +93,7 @@ export function relayResponsesSseWithTerminalRepair(
   let maxSequence = -1;
   let buffer = "";
   let bufferBytes = 0;
+  let pendingLineFeed = false;
   let timer: unknown;
   let timerGeneration = 0;
   let realTerminalSeen = false;
@@ -190,6 +193,7 @@ export function relayResponsesSseWithTerminalRepair(
         ? { incomplete_details: { reason: "missing_terminal_event" } }
         : {}),
     };
+    if (kind === "incomplete") rememberProxyIncomplete(proxyErrorContext, "missing_terminal_event");
     const type = `response.${kind}`;
     return encoder.encode(`event: ${type}\ndata: ${JSON.stringify({
       type,
@@ -284,6 +288,7 @@ export function relayResponsesSseWithTerminalRepair(
     let emitted = false;
     while ((next = nextSseBlock(buffer))) {
       replaceBuffer(next.rest);
+      pendingLineFeed = next.delimiter.endsWith("\r") && buffer.length === 0;
       const kind = inspectPayload(sseDataPayload(next.block));
       if (kind === "done" && !realTerminalSeen) {
         emitSynthetic(completeCandidate() ? "completed" : "incomplete", controller);
@@ -327,9 +332,20 @@ export function relayResponsesSseWithTerminalRepair(
           controller.close();
           return;
         }
-        appendBuffer(decoder.decode(value, { stream: true }));
+        let fragment = decoder.decode(value, { stream: true });
+        let continuedDelimiter = false;
+        if (pendingLineFeed && fragment.length > 0) {
+          pendingLineFeed = false;
+          if (fragment.startsWith("\n")) {
+            // This byte completes an already-forwarded CR delimiter, not a new EOF suffix.
+            controller.enqueue(encoder.encode("\n"));
+            fragment = fragment.slice(1);
+            continuedDelimiter = true;
+          }
+        }
+        appendBuffer(fragment);
         const result = emitBlocks(controller);
-        if (result.closed || result.emitted) return;
+        if (result.closed || result.emitted || continuedDelimiter) return;
       }
     } catch (error) {
       if (disposed) return;
@@ -338,7 +354,7 @@ export function relayResponsesSseWithTerminalRepair(
     }
   };
 
-  return new ReadableStream<Uint8Array>({
+  return carryProxyIncompleteContext(proxyErrorContext, new ReadableStream<Uint8Array>({
     start(controller) {
       controllerRef = controller;
       if (upstream.signal.aborted) {
@@ -359,5 +375,5 @@ export function relayResponsesSseWithTerminalRepair(
       upstream.abort(reason);
       return reader.cancel(reason);
     },
-  });
+  }));
 }

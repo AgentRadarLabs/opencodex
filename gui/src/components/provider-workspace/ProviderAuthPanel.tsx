@@ -1,14 +1,20 @@
+import { anthropicSubscriptionLabel } from "../../../../src/providers/anthropic-subscription";
+import { anthropicInstanceRowShapeMatches, isAnthropicInstanceId } from "../../../../src/providers/anthropic-instance-id";
 /**
  * ProviderAuthPanel — OAuth accounts, API-key pool, and forward-auth
  * embedding for the workspace Settings tab (WP091). Consumes WP040+WP060
  * handlers via props-down; no internal auth machinery.
  */
-import { useEffect, useRef, useState } from "react";
-import { useT } from "../../i18n/shared";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useT, useI18n } from "../../i18n/shared";
+import { formatAccountPauseTooltip } from "../../account-pause-display";
 import { IconLock, IconRefresh, IconTrash } from "../../icons";
 import type { WorkspaceItem } from "../../provider-workspace/catalog";
 import { oauthAccountDisplayLabel, providerAuthSurface } from "../../provider-workspace/auth";
+import { oauthCredentialSlot } from "../../../../src/oauth/credential-siblings";
+import { oauthLabel } from "../../pages/providers-shared";
 import { displayAccountId } from "../../lib/privacy";
+import AccountAutoSwitchControl from "../AccountAutoSwitchControl";
 import {
   formatOAuthHealthLabel,
   formatOAuthHealthSummary,
@@ -21,28 +27,46 @@ import AnthropicAccountPoolSettings from "./AnthropicAccountPoolSettings";
 import { LoginHint as LoginHintView } from "../login-url-block";
 import { OpenBrowserPrefToggle } from "../open-browser-pref-toggle";
 import ProviderAccountQuota from "./ProviderAccountQuota";
+import { GrokCouponBadge, GrokResetCouponModal } from "./GrokResetCoupons";
+import { AnthropicGrantBadge, AnthropicResetGrantModal } from "./AnthropicResetGrants";
 import type { CodexAccountPoolController } from "../../hooks/useCodexAccountPool";
+import { useGrokResetCoupons } from "../../hooks/useGrokResetCoupons";
+import { useAnthropicResetGrants } from "../../hooks/useAnthropicResetGrants";
 import { Switch } from "../../ui";
+import { kiroSkipReasonKey } from "../../kiro-device-login-helpers";
+import { isApiTargetCaptureCurrent, targetFetch, type ApiTargetCapture } from "../../api";
+import { useRenderTargetCapture } from "../../use-render-target-capture";
+import KiroDeviceLoginDialog from "../KiroDeviceLoginDialog";
+import OAuthTosWarningModal from "../OAuthTosWarningModal";
+import { oauthRiskAcknowledgementBody } from "../../oauth-tos-risk";
 import type {
   AccountLoadState,
   OAuthAccountRow,
   ApiKeyRow,
   LoginHint,
   ProviderAuthHandlers,
-  ProviderUpdatePatch,
-  ProviderUpdateResult,
+  ProviderUpdateCallback,
 } from "./types";
 
 const COCKPIT_IMPORT_MAX_BYTES = 256 * 1024;
 const EMPTY_OAUTH_ACCOUNTS: OAuthAccountRow[] = [];
 const EMPTY_API_KEYS: ApiKeyRow[] = [];
 
+/**
+ * One predicate for "this row cannot spend a coupon right now". The read set and
+ * the badge must agree: a row fetched here and hidden there is a billing RPC
+ * spent on a 401.
+ */
+function accountShowsReauth(account: OAuthAccountRow): boolean {
+  return Boolean(account.needsReauth) || oauthHealthShowsReauth(account.health?.status);
+}
+
 function XaiChatOptInControl({
   initialState,
   onUpdateProvider,
 }: {
   initialState: NonNullable<WorkspaceItem["xaiResponsesOptInState"]>;
-  onUpdateProvider?: (name: string, patch: ProviderUpdatePatch) => Promise<ProviderUpdateResult>;
+  onUpdateProvider?: ProviderUpdateCallback;
 }) {
   const t = useT();
   const [state, setState] = useState(initialState);
@@ -163,33 +187,53 @@ function safeCockpitImportResult(value: unknown): CockpitImportResult | null {
 }
 
 export default function ProviderAuthPanel({
-  item, apiBase, oauth, accounts = EMPTY_OAUTH_ACCOUNTS, keys = EMPTY_API_KEYS, accountLoadState = "ready",
-  switchingAccountId = null, busy = false, loginHint, authHandlers, onCodexActiveNeedsReauthChange,
+  item, apiBase, targetKey, oauth, accounts = EMPTY_OAUTH_ACCOUNTS, keys = EMPTY_API_KEYS, accountLoadState = "ready",
+  switchingAccountId = null, pausingAccountId = null, busy = false, loginHint, loginCapture, authHandlers, onCodexActiveNeedsReauthChange,
   codexController, onUpdateProvider,
 }: {
   item: WorkspaceItem;
   apiBase: string;
+  /** Logical dashboard target; the panel's rows and actions belong to it. */
+  targetKey?: string;
   oauth?: { loggedIn: boolean; email?: string; error?: string };
   accounts?: OAuthAccountRow[];
   keys?: ApiKeyRow[];
   accountLoadState?: AccountLoadState;
   switchingAccountId?: string | null;
+  pausingAccountId?: string | null;
   busy?: boolean;
   loginHint?: LoginHint | null;
+  loginCapture?: ApiTargetCapture;
   authHandlers?: ProviderAuthHandlers;
   onCodexActiveNeedsReauthChange?: (needs: boolean) => void;
-  onUpdateProvider?: (name: string, patch: ProviderUpdatePatch) => Promise<ProviderUpdateResult>;
+  onUpdateProvider?: ProviderUpdateCallback;
   /** Shared Codex account state owned by Providers (WP3). */
   codexController?: CodexAccountPoolController;
 }) {
   const t = useT();
+  // The panel's render owns the target for its own import action.
+  const renderCapture = useRenderTargetCapture(apiBase, targetKey);
+  const { locale } = useI18n();
   const [addingKey, setAddingKey] = useState(false);
+  const [kiroChooser, setKiroChooser] = useState<{ addAccount: boolean } | null>(null);
+  const kiroLoginTriggerRef = useRef<HTMLButtonElement>(null);
+  const kiroAddTriggerRef = useRef<HTMLButtonElement>(null);
+  const openLogin = (addAccount: boolean) => {
+    if (item.name === "kiro") setKiroChooser({ addAccount });
+    else void authHandlers?.onLogin(item.name, addAccount);
+  };
   const [newKey, setNewKey] = useState("");
   const [keyBusy, setKeyBusy] = useState(false);
   const [importBusy, setImportBusy] = useState(false);
   const [importStatus, setImportStatus] = useState<"idle" | "invalid" | "failed" | "complete">("idle");
   const [importResult, setImportResult] = useState<CockpitImportResult | null>(null);
   const importFileRef = useRef<HTMLInputElement>(null);
+  // An imported Antigravity credential carries the same Google account-ban risk as a login, so
+  // the import goes through the same warning dialog. The acknowledgement is never armed ahead of
+  // a pick: every chosen file, whether through the button or the input reached directly, is held
+  // here and imported only from that file's own Continue. Nothing can carry an earlier acceptance
+  // over to a later selection, whatever the engine does with the picker's cancel and focus events.
+  const [importWarning, setImportWarning] = useState<{ file: File } | null>(null);
   const [manualCode, setManualCode] = useState("");
   const [manualCodeBusy, setManualCodeBusy] = useState(false);
   const [manualCodeMsg, setManualCodeMsg] = useState("");
@@ -207,6 +251,38 @@ export default function ProviderAuthPanel({
   }, [connectionIdentity]);
 
   const onRefreshQuota = authHandlers?.onRefreshQuota;
+  const surface = providerAuthSurface({ ...item, hasApiKey: item.hasApiKey || keys.length > 0 });
+  const isOauth = surface === "oauth-accounts";
+  const isKeyAuth = surface === "api-keys";
+  // Grok reset coupons live behind a billing RPC rather than the quota payload,
+  // so the xAI rows read them once per roster instead of riding the quota probe.
+  // The gate names the OAuth surface here rather than relying on the roster
+  // loader three files away to leave `accounts` empty for key-auth xAI.
+  const grokCouponsEnabled = isOauth && item.name === "xai" && accounts.length > 0;
+  const grokAccountIds = useMemo(
+    () => (grokCouponsEnabled
+      ? accounts.filter(account => !accountShowsReauth(account)).map(account => account.id)
+      : []),
+    [grokCouponsEnabled, accounts],
+  );
+  const grokCoupons = useGrokResetCoupons({ apiBase, accountIds: grokAccountIds, enabled: grokCouponsEnabled });
+  const [couponAccount, setCouponAccount] = useState<OAuthAccountRow | null>(null);
+  // Claude usage resets ride a separate usage read, like the Grok coupons above.
+  const isAnthropicPool = isAnthropicInstanceId(item.name) && anthropicInstanceRowShapeMatches(item.name, item);
+  const claudeGrantsEnabled = isOauth && isAnthropicPool && accounts.length > 0;
+  const claudeAccountIds = useMemo(
+    () => (claudeGrantsEnabled ? accounts.filter(account => !accountShowsReauth(account)).map(account => account.id) : []),
+    [claudeGrantsEnabled, accounts],
+  );
+  const claudeGrants = useAnthropicResetGrants({ apiBase, provider: isAnthropicInstanceId(item.name) ? item.name : "anthropic", accountIds: claudeAccountIds, enabled: claudeGrantsEnabled });
+  // The open reset dialog belongs to the pool it was opened in. Switching server or pool
+  // hides it during render rather than resetting it from an effect.
+  const grantScope = `${apiBase}\0${item.name}`;
+  const [grantSelection, setGrantSelection] = useState<{ scope: string; account: OAuthAccountRow } | null>(null);
+  const grantAccount = grantSelection?.scope === grantScope ? grantSelection.account : null;
+  const setGrantAccount = (account: OAuthAccountRow | null) => {
+    setGrantSelection(account ? { scope: grantScope, account } : null);
+  };
   const refreshQuota = async () => {
     if (!onRefreshQuota || refreshingQuota) return;
     const generation = ++quotaRefreshGeneration.current;
@@ -222,10 +298,6 @@ export default function ProviderAuthPanel({
     }
   };
 
-  const surface = providerAuthSurface({ ...item, hasApiKey: item.hasApiKey || keys.length > 0 });
-  const isOauth = surface === "oauth-accounts";
-  const isKeyAuth = surface === "api-keys";
-
   if (surface === "codex-accounts") {
     return (
       <section className="pwi-section pwi-auth-section" aria-label={t("pws.availableAccounts")}>
@@ -233,6 +305,7 @@ export default function ProviderAuthPanel({
         <div className="pwi-auth-body">
           <CodexAccountPool
             apiBase={apiBase}
+            targetKey={targetKey}
             embedded
             controller={codexController}
             onActiveNeedsReauthChange={onCodexActiveNeedsReauthChange}
@@ -244,25 +317,39 @@ export default function ProviderAuthPanel({
 
   if (!surface || !authHandlers) return null;
 
-  const hintForThis = loginHint?.provider === item.name ? loginHint : null;
+  // A shared-login row (Kimi (Responses)) signs in through its owner, so its flow is keyed by the owner.
+  const loginOwner = oauthCredentialSlot(item.name);
+  const hintForThis = loginHint?.provider === loginOwner ? loginHint : null;
   // Paste fallback for when the browser cannot reach the loopback callback
   // (remote dashboard, SSH, blocked localhost). A rejected paste reports why and
   // leaves the flow running, so the user can correct it and try again.
   const submitManualCode = async () => {
     const input = manualCode.trim();
     if (!input || manualCodeBusy) return;
+    if (!loginCapture) {
+      setManualCodeOk(false);
+      setManualCodeMsg(t("prov.targetChanged"));
+      return;
+    }
     setManualCodeBusy(true);
     setManualCodeMsg("");
     try {
-      const res = await fetch(`${apiBase}/api/oauth/login/code`, {
+      const res = await targetFetch(loginCapture, `${apiBase}/api/oauth/login/code`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider: item.name, input }),
+        body: JSON.stringify({ provider: loginOwner, input }),
       });
+      if (!isApiTargetCaptureCurrent(loginCapture)) {
+        setManualCodeOk(false);
+        setManualCodeMsg(t("prov.targetChanged"));
+        return;
+      }
       if (!res.ok) {
         const data = await res.json().catch(() => ({})) as { error?: string };
         setManualCodeOk(false);
-        setManualCodeMsg(t("prov.pasteFail", { error: data.error || res.statusText }));
+        setManualCodeMsg(data.error === "target_changed"
+          ? t("prov.targetChanged")
+          : t("prov.pasteFail", { error: data.error || res.statusText }));
         return;
       }
       setManualCode("");
@@ -275,7 +362,8 @@ export default function ProviderAuthPanel({
       setManualCodeBusy(false);
     }
   };
-  const loggedIn = accounts.length > 0 || oauth?.loggedIn === true;
+  const loggedIn = (accountLoadState === "ready" && accounts.length > 0) || oauth?.loggedIn === true;
+  const canLogout = loggedIn || (accountLoadState === "error" && oauth?.loggedIn !== false);
   const activeReauthAccount = accounts.find(a => a.active && a.needsReauth);
   const activeNeedsReauth = Boolean(activeReauthAccount);
   const quotaRows = isOauth ? accounts : keys;
@@ -294,11 +382,16 @@ export default function ProviderAuthPanel({
     }
   };
 
-  const importCockpitFile = async (file: File | undefined) => {
+  const importCockpitFile = async (file: File | undefined, acknowledged: boolean) => {
     if (!file || importBusy) return;
+    if (!acknowledged) {
+      setImportWarning({ file });
+      return;
+    }
     setImportBusy(true);
     setImportStatus("idle");
     setImportResult(null);
+    const capture = renderCapture;
     try {
       if (!file.name.toLowerCase().endsWith(".json") || file.size > COCKPIT_IMPORT_MAX_BYTES) {
         setImportStatus("invalid");
@@ -311,10 +404,10 @@ export default function ProviderAuthPanel({
         setImportStatus("invalid");
         return;
       }
-      const response = await fetch(`${apiBase}/api/oauth/accounts/import`, {
+      const response = await targetFetch(capture, `${apiBase}/api/oauth/accounts/import`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider: "google-antigravity", format: "cockpit-tools", document }),
+        body: JSON.stringify({ provider: "google-antigravity", format: "cockpit-tools", document, ...oauthRiskAcknowledgementBody("google-antigravity", acknowledged) }),
       });
       if (!response.ok) {
         setImportStatus("failed");
@@ -384,8 +477,15 @@ export default function ProviderAuthPanel({
         )}
         {isOauth && (
           <>
-            {item.name === "anthropic" && (
-              <AnthropicAccountPoolSettings apiBase={apiBase} accountCount={accounts.length} />
+            {isAnthropicPool && (
+              <AnthropicAccountPoolSettings
+                key={`${apiBase}:${item.name}`}
+                apiBase={apiBase}
+                targetKey={targetKey}
+                provider={isAnthropicInstanceId(item.name) ? item.name : "anthropic"}
+                accountCount={accounts.length}
+                onThresholdChange={threshold => { void authHandlers?.onAccountPoolThreshold?.(item.name, threshold); }}
+              />
             )}
             {item.name === "google-antigravity" && (
               <div className="pwi-auth-add-key">
@@ -402,13 +502,28 @@ export default function ProviderAuthPanel({
                     className="sr-only"
                     aria-describedby="cockpit-import-description cockpit-import-status"
                     disabled={importBusy}
-                    onChange={event => { void importCockpitFile(event.currentTarget.files?.[0]); }}
+                    onChange={event => { void importCockpitFile(event.currentTarget.files?.[0], false); }}
                   />
                 </div>
                 <button type="button" className="btn btn-ghost btn-sm" disabled={importBusy}
                   onClick={() => importFileRef.current?.click()}>
                   {importBusy ? t("pws.cockpitImporting") : t("pws.cockpitImportChooseFile")}
                 </button>
+                {importWarning && (
+                  <OAuthTosWarningModal
+                    providerId="google-antigravity"
+                    providerLabel="Google Antigravity"
+                    onCancel={() => {
+                      setImportWarning(null);
+                      if (importFileRef.current) importFileRef.current.value = "";
+                    }}
+                    onContinue={() => {
+                      const pending = importWarning;
+                      setImportWarning(null);
+                      void importCockpitFile(pending.file, true);
+                    }}
+                  />
+                )}
                 <div id="cockpit-import-status" role="status" aria-live="polite">
                   {importStatus === "invalid" && t("pws.cockpitImportInvalid")}
                   {importStatus === "failed" && t("pws.cockpitImportFailed")}
@@ -425,8 +540,8 @@ export default function ProviderAuthPanel({
               <span className={`pwi-auth-dot ${activeNeedsReauth ? "pwi-auth-dot--warn" : loggedIn ? "pwi-auth-dot--ok" : "pwi-auth-dot--off"}`} aria-hidden="true" />
               <span className="pwi-auth-status-text">
                 {loggedIn
-                  ? (accounts.length > 0 ? t("pws.loggedInTitle") : (oauth?.email ?? t("pws.loggedInTitle")))
-                  : (oauth?.error || t("pws.notLoggedInTitle"))}
+                  ? t("pws.loggedInTitle")
+                  : (oauth?.error || (oauth?.loggedIn === false ? t("pws.notLoggedInTitle") : t("startup.unverified")))}
               </span>
               <span className="pwi-auth-actions">
                 {activeReauthAccount && (
@@ -434,10 +549,10 @@ export default function ProviderAuthPanel({
                     {t("pws.reauthenticate")}
                   </button>
                 )}
-                {loggedIn ? (
+                {canLogout ? (
                   <button type="button" className="btn btn-ghost btn-sm" onClick={() => void authHandlers.onLogout(item.name)}>{t("prov.logout")}</button>
                 ) : (
-                  <button type="button" className="btn btn-primary btn-sm" disabled={busy} onClick={() => void authHandlers.onLogin(item.name, false)}>
+                  <button ref={item.name === "kiro" ? kiroLoginTriggerRef : undefined} type="button" className="btn btn-primary btn-sm" disabled={busy || (item.name === "kiro" && Boolean(kiroChooser))} onClick={() => openLogin(false)}>
                     {busy ? <span className="pwi-spin-inline" aria-hidden="true" /> : <IconLock style={{ width: 13, height: 13 }} aria-hidden="true" />}
                     {busy ? t("prov.waitingBrowser") : t("prov.login")}
                   </button>
@@ -455,6 +570,7 @@ export default function ProviderAuthPanel({
                       url: hintForThis.url,
                       deviceCode: hintForThis.deviceCode,
                       instructions: hintForThis.instructions,
+                      browserLaunch: hintForThis.browserLaunch,
                     }}
                     paste={{
                       value: manualCode,
@@ -466,11 +582,19 @@ export default function ProviderAuthPanel({
                     }}
                   />
                   {authHandlers.onCancelLogin && (
-                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => void authHandlers.onCancelLogin?.(item.name)}>
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => void authHandlers.onCancelLogin?.(loginOwner)}>
                       {t("common.cancel")}
                     </button>
                   )}
                 </div>
+              </div>
+            )}
+            {authHandlers.pendingAffinityResets?.[item.name] && (
+              <div className="pwi-auth-state pwi-auth-state--error" role="alert">
+                <span>{t("prov.affinityResetPending")}</span>
+                {authHandlers.onRetryAffinityReset && <button type="button" className="btn btn-ghost btn-sm"
+                  disabled={Boolean(switchingAccountId || pausingAccountId)}
+                  onClick={() => void authHandlers.onRetryAffinityReset?.(item.name)}>{t("common.retry")}</button>}
               </div>
             )}
             {accountLoadState === "loading" && accounts.length === 0 && (
@@ -489,52 +613,88 @@ export default function ProviderAuthPanel({
                 )}
               </div>
             )}
+            {accounts.length > 0 && oauthCredentialSlot(item.name) !== item.name && (
+              // A shared-login row (Kimi (Responses)) lists its owner's accounts: every control below acts on them.
+              <div className="pwi-auth-state" role="note">
+                {t("pws.sharedAccountsNote", { provider: oauthLabel(oauthCredentialSlot(item.name)) })}
+              </div>
+            )}
             {accounts.length > 0 && (
               <ul className="pwi-auth-list">
                 {accounts.map(account => {
                   const label = oauthAccountDisplayLabel(accounts, account, t);
+                  const planLabel = isAnthropicPool ? anthropicSubscriptionLabel(account.plan) : item.name === "google-antigravity" ? account.plan : undefined;
                   const switching = switchingAccountId === account.id;
+                  const pausing = pausingAccountId === account.id;
                   const healthStatus = account.health?.status;
-                  const showReauth = Boolean(account.needsReauth) || oauthHealthShowsReauth(healthStatus);
+                  const showReauth = accountShowsReauth(account);
                   const inCooldown = oauthHealthIsCooldown(healthStatus);
                   const maskedId = displayAccountId(account.id);
                   const healthLabel = formatOAuthHealthLabel(t, account.health);
-                  const healthSummary = formatOAuthHealthSummary(t, item.name, account.id, account.health);
+                  const healthSummary = isAnthropicPool ? null : formatOAuthHealthSummary(t, item.name, account.id, account.health);
                   return (
                   <li key={account.id} className={`pwi-auth-acct${account.active ? " pwi-auth-acct--active" : ""}`}>
                     <div className={`pwi-auth-row${account.active ? " pwi-auth-row--active" : ""}`}>
                     <button type="button" className="pwi-auth-row-main"
-                      onClick={() => { if (!account.active && !showReauth && !inCooldown && !switchingAccountId) void authHandlers.onSwitchAccount(item.name, account); }}
+                      onClick={() => { if (!account.active && !account.paused && !showReauth && !inCooldown && !switchingAccountId && !pausingAccountId) void authHandlers.onSwitchAccount(item.name, account); }}
                       aria-current={account.active ? "true" : undefined}
-                      aria-label={`${label}${account.active ? ` — ${t("pws.accountCurrent")}` : ""}`}
-                      disabled={Boolean(showReauth || inCooldown || (switchingAccountId && !switching))}>
-                      <span className={`pwi-auth-dot ${showReauth ? "pwi-auth-dot--warn" : account.active ? "pwi-auth-dot--ok" : "pwi-auth-dot--off"}`} aria-hidden="true" />
+                      aria-label={`${label}${planLabel ? ` — ${planLabel}` : ""}${account.active ? ` — ${t("pws.accountCurrent")}` : ""}`}
+                      disabled={Boolean(account.paused || showReauth || inCooldown || switchingAccountId || pausingAccountId)}>
+                      <span className={`pwi-auth-dot ${showReauth ? "pwi-auth-dot--warn" : account.active && !account.paused ? "pwi-auth-dot--ok" : "pwi-auth-dot--off"}`} aria-hidden="true" />
                       <span className="pwi-auth-row-copy">
-                        <span className="pwi-auth-row-label">{label}</span>
-                        <span className="pwi-auth-row-secondary">{[account.email, `${t("prov.accountId")}: ${maskedId}`].filter(Boolean).join(" · ")}</span>
+                        <span className="pwi-auth-row-heading"><span className="pwi-auth-row-label">{label}</span>{planLabel && <span className="badge badge-green">{planLabel}</span>}</span>
+                        {!isAnthropicPool && <span className="pwi-auth-row-secondary">{`${t("prov.accountId")}: ${maskedId}`}</span>}
                         {healthSummary && (
                           <span className="pwi-auth-row-secondary faint">{healthSummary}</span>
                         )}
                         {inCooldown && (
                           <span className="pwi-auth-row-secondary faint">{t("pws.healthCooldownHint")}</span>
                         )}
+                        {account.paused && (
+                          <span className="pwi-auth-row-secondary faint">{t("pws.accountPausedHint")}</span>
+                        )}
                       </span>
                       {healthLabel && (
                         <span className={oauthHealthBadgeClass(healthStatus)}>{healthLabel}</span>
                       )}
                       {showReauth && !healthLabel && <span className="badge badge-amber">{t("pws.reauth")}</span>}
-                      {account.active && <span className="badge badge-primary">{t("prov.accountActive")}</span>}
+                      {kiroSkipReasonKey(account, item.name) && <span className="badge badge-amber">{t(kiroSkipReasonKey(account, item.name)!)}</span>}
+                      {account.paused && <span className="badge badge-muted" title={account.pauseDetails ? formatAccountPauseTooltip(t, locale, account.pauseDetails) : undefined}>{t("codexAuth.paused")}</span>}
+                      {account.active && !account.paused && <span className="badge badge-primary">{t("prov.accountActive")}</span>}
                       {switching && <span className="badge badge-muted">{t("pws.accountSwitching")}</span>}
                     </button>
+                    {typeof account.paused === "boolean" && authHandlers.onPauseAccount && (
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-sm"
+                        aria-label={`${t(account.paused ? "codexAuth.resume" : "codexAuth.pause")} — ${label}`}
+                        title={account.paused ? t("pws.accountPausedHint") : undefined}
+                        aria-busy={pausing}
+                        disabled={busy || Boolean(switchingAccountId) || Boolean(pausingAccountId)}
+                        onClick={() => void authHandlers.onPauseAccount(item.name, account, !account.paused)}
+                      >
+                        {t(account.paused ? "codexAuth.resume" : "codexAuth.pause")}
+                      </button>
+                    )}
                     {showReauth && (
                       <button
                         type="button"
                         className="btn btn-ghost btn-sm"
-                        disabled={busy || Boolean(switchingAccountId)}
+                        disabled={busy || Boolean(switchingAccountId) || Boolean(pausingAccountId)}
                         onClick={() => void authHandlers.onReauth(item.name, account.id)}
                       >
                         {t("pws.reauthenticate")}
                       </button>
+                    )}
+                    {grokCouponsEnabled && !showReauth && (
+                      <GrokCouponBadge
+                        entry={grokCoupons.entries[account.id]}
+                        t={t}
+                        onClick={() => setCouponAccount(account)}
+                      />
+                    )}
+                    {claudeGrantsEnabled && !showReauth && (
+                      <AnthropicGrantBadge entry={claudeGrants.entries[account.id]} t={t} onClick={() => setGrantAccount(account)} />
                     )}
                     <button type="button" className="btn btn-ghost btn-sm"
                       onClick={() => void authHandlers.onEditAlias(item.name, "oauth", account.id, account.alias)}>
@@ -543,27 +703,57 @@ export default function ProviderAuthPanel({
                     <button type="button" className="btn btn-ghost btn-sm pwi-auth-row-remove"
                       aria-label={`${t("common.remove")} — ${label}`}
                       title={`${t("common.remove")} — ${label}`}
-                      disabled={Boolean(switchingAccountId)}
+                      disabled={Boolean(switchingAccountId) || Boolean(pausingAccountId)}
                       onClick={() => void authHandlers.onRemoveAccount(item.name, account)}>
                       <IconTrash style={{ width: 13, height: 13 }} aria-hidden="true" />
                     </button>
                     </div>
                     <div className="pwi-auth-acct-quota">
+                      {isAnthropicPool && account.autoSwitchThresholdOverride !== undefined
+                        && account.autoSwitchThreshold !== undefined && authHandlers.onAccountThreshold && (
+                        <AccountAutoSwitchControl
+                          accountLabel={label} inputId={`anthropic-threshold-${account.id}`}
+                          globalThreshold={account.autoSwitchThreshold} override={account.autoSwitchThresholdOverride}
+                          hintText={t("pws.anthropicAccountThresholdHint")}
+                          disabled={busy || Boolean(switchingAccountId) || Boolean(pausingAccountId)}
+                          onChange={threshold => authHandlers.onAccountThreshold!(item.name, account, threshold)}
+                        />
+                      )}
                       <ProviderAccountQuota quotaMode={account.quotaMode} quota={account.quota}
-                        quotaUnavailable={account.quotaUnavailable} quotaPending={account.quotaPending} />
+                        quotaUnavailable={account.quotaUnavailable} quotaPending={account.quotaPending} quotaFailure={account.quotaFailure}
+                        quotaReadAt={account.quotaReadAt} />
                     </div>
                   </li>
                   );
                 })}
               </ul>
             )}
+            {couponAccount && (
+              <GrokResetCouponModal
+                accountId={couponAccount.id}
+                accountLabel={oauthAccountDisplayLabel(accounts, couponAccount, t)}
+                entry={grokCoupons.entries[couponAccount.id]}
+                controller={grokCoupons}
+                onClose={() => setCouponAccount(null)}
+              />
+            )}
+            {grantAccount && (
+              <AnthropicResetGrantModal
+                key={`${apiBase}:${item.name}:${grantAccount.id}`}
+                accountId={grantAccount.id}
+                accountLabel={oauthAccountDisplayLabel(accounts, grantAccount, t)}
+                entry={claudeGrants.entries[grantAccount.id]}
+                controller={claudeGrants}
+                onClose={() => setGrantAccount(null)}
+              />
+            )}
             {accountLoadState === "ready" && loggedIn && accounts.length === 0 && (
               <div className="pwi-auth-state pwi-auth-state--empty">{t("pws.noAccounts")}</div>
             )}
             {loggedIn && (
               <div className="pwi-auth-actions">
-                <button type="button" className="btn btn-ghost btn-sm"
-                  onClick={() => void authHandlers.onLogin(item.name, true)} disabled={busy || Boolean(switchingAccountId)}>
+                <button ref={item.name === "kiro" ? kiroAddTriggerRef : undefined} type="button" className="btn btn-ghost btn-sm"
+                  onClick={() => openLogin(true)} disabled={busy || Boolean(switchingAccountId) || (item.name === "kiro" && Boolean(kiroChooser))}>
                   {t("pws.addAccount")}
                 </button>
                 {canRefreshQuota && (
@@ -587,30 +777,57 @@ export default function ProviderAuthPanel({
             )}
           </>
         )}
+        {item.name === "kiro" && kiroChooser && (
+          <KiroDeviceLoginDialog apiBase={apiBase} targetKey={targetKey} triggerRef={kiroChooser.addAccount ? kiroAddTriggerRef : kiroLoginTriggerRef}
+            addAccount={kiroChooser.addAccount} busy={busy} onClose={() => setKiroChooser(null)}
+            onCli={addAccount => { void authHandlers.onLogin(item.name, addAccount); }}
+            onSettled={authHandlers.onNativeLoginSettled} />
+        )}
 
         {isKeyAuth && (
           <>
             {keys.length > 0 && (
               <ul className="pwi-auth-list">
-                {keys.map(entry => (
-                  <li key={entry.id} className={`pwi-auth-acct${entry.active ? " pwi-auth-acct--active" : ""}`}>
-                    <div className={`pwi-auth-row${entry.active ? " pwi-auth-row--active" : ""}`}>
+                {keys.map(entry => {
+                  const switching = switchingAccountId === entry.id;
+                  const pausing = pausingAccountId === entry.id;
+                  return (
+                  <li key={entry.id} className={`pwi-auth-acct${entry.active && !entry.disabled ? " pwi-auth-acct--active" : ""}`}>
+                    <div className={`pwi-auth-row${entry.active && !entry.disabled ? " pwi-auth-row--active" : ""}`}>
                     <button type="button" className="pwi-auth-row-main"
                       onClick={() => void authHandlers.onSwitchApiKey(item.name, entry)}
-                      disabled={entry.active}>
-                      <span className={`pwi-auth-dot ${entry.active ? "pwi-auth-dot--ok" : "pwi-auth-dot--off"}`} aria-hidden="true" />
+                      aria-current={entry.active && !entry.disabled ? "true" : undefined}
+                      disabled={(entry.active && !entry.disabled) || busy || Boolean(switchingAccountId) || Boolean(pausingAccountId)} aria-label={entry.disabled ? `${t("pws.resumeAndActivateKey")} — ${entry.label ?? entry.masked}` : undefined}>
+                      <span className={`pwi-auth-dot ${entry.active && !entry.disabled ? "pwi-auth-dot--ok" : "pwi-auth-dot--off"}`} aria-hidden="true" />
                       <span className="pwi-auth-row-copy">
                         <span className="pwi-auth-row-label">{entry.label ?? entry.masked}</span>
                         {entry.label && <code className="pwi-auth-row-secondary">{entry.masked} · {t("prov.accountId")}: {entry.id}</code>}
+                        {entry.disabled && (
+                          <span className="pwi-auth-row-secondary faint">{t("pws.accountPausedHint")}</span>
+                        )}
                       </span>
-                      {entry.active && <span className="badge badge-primary">{t("prov.accountActive")}</span>}
+                      {entry.disabled && <span className="badge badge-muted" title={entry.pauseDetails ? formatAccountPauseTooltip(t, locale, entry.pauseDetails) : undefined}>{t("codexAuth.paused")} · {t("codexAuth.resume")}</span>}
+                      {entry.active && !entry.disabled && <span className="badge badge-primary">{t("prov.accountActive")}</span>}
+                      {switching && <span className="badge badge-muted">{t("pws.accountSwitching")}</span>}
                     </button>
+                    {authHandlers.onPauseApiKey && (
+                      <button type="button" className="btn btn-ghost btn-sm"
+                        aria-label={`${t(entry.disabled ? "codexAuth.resume" : "codexAuth.pause")} — ${entry.label ?? entry.masked}`}
+                        title={entry.disabled ? t("pws.accountPausedHint") : undefined}
+                        aria-busy={pausing}
+                        disabled={busy || Boolean(switchingAccountId) || Boolean(pausingAccountId)}
+                        onClick={() => void authHandlers.onPauseApiKey!(item.name, entry, !entry.disabled)}>
+                        {t(entry.disabled ? "codexAuth.resume" : "codexAuth.pause")}
+                      </button>
+                    )}
                     <button type="button" className="btn btn-ghost btn-sm"
+                      disabled={busy || Boolean(switchingAccountId) || Boolean(pausingAccountId)}
                       onClick={() => void authHandlers.onEditAlias(item.name, "api-key", entry.id, entry.label)}>
                       {t("prov.editAlias")}
                     </button>
                     <button type="button" className="btn btn-ghost btn-sm pwi-auth-row-remove"
                       aria-label={`${t("common.remove")} — ${entry.label ?? entry.masked}`}
+                      disabled={busy || Boolean(switchingAccountId) || Boolean(pausingAccountId)}
                       title={`${t("common.remove")} — ${entry.label ?? entry.masked}`}
                       onClick={() => void authHandlers.onRemoveApiKey(item.name, entry)}>
                       <IconTrash style={{ width: 13, height: 13 }} aria-hidden="true" />
@@ -618,10 +835,11 @@ export default function ProviderAuthPanel({
                     </div>
                     <div className="pwi-auth-acct-quota">
                       <ProviderAccountQuota quotaMode={entry.quotaMode} quota={entry.quota}
-                        quotaUnavailable={entry.quotaUnavailable} quotaPending={entry.quotaPending} />
+                        quotaUnavailable={entry.quotaUnavailable} quotaPending={entry.quotaPending} quotaFailure={entry.quotaFailure}
+                        quotaReadAt={entry.quotaReadAt} />
                     </div>
                   </li>
-                ))}
+                );})}
               </ul>
             )}
             {addingKey ? (

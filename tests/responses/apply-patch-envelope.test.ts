@@ -4,6 +4,8 @@ import {
   mayBecomePatchEnvelope,
   normalizeApplyPatchDelimiters,
   repairFreeformToolInput,
+  stableCanonicalPatchPrefix,
+  unwrapFreeformToolInput,
 } from "../../src/responses/apply-patch-envelope";
 import { compileCodeModeHelperInput, resolveCodeModeHelperName } from "../../src/responses/code-mode-helper-compat";
 
@@ -22,6 +24,48 @@ const CANONICAL_PATCH = `*** Begin Patch
 *** End Patch`;
 
 describe("apply_patch envelope repair", () => {
+  test.each([
+    ["exec", 'text("nested wrapper");'],
+    ["apply_patch", CANONICAL_PATCH],
+  ])("unwraps one extra canonical string body for %s", (tool, body) => {
+    const nested = JSON.stringify({ input: body });
+    const args = JSON.stringify({ input: nested });
+    expect(repairFreeformToolInput(args, tool)).toBe(body);
+    expect(repairFreeformToolInput(args, tool, "functions")).toBe(body);
+    expect(repairFreeformToolInput(body, tool)).toBe(body);
+    expect(repairFreeformToolInput(nested, tool)).toBe(body);
+    // A third layer is deliberately left in place.
+    expect(repairFreeformToolInput(JSON.stringify({ input: args }), tool)).toBe(nested);
+    expect(repairFreeformToolInput(args, tool, "mcp")).toBe(nested);
+    expect(repairFreeformToolInput(args, "render_diagram")).toBe(nested);
+  });
+
+  test("the reported exec body parses only after the extra wrapper is removed", () => {
+    const body = 'text("nested wrapper");';
+    const nested = JSON.stringify({ input: body });
+    expect(() => new Function("text", nested)).toThrow(SyntaxError);
+    const values: string[] = [];
+    new Function("text", repairFreeformToolInput(JSON.stringify({ input: nested }), "exec"))(
+      (value: string) => values.push(value),
+    );
+    expect(values).toEqual(["nested wrapper"]);
+  });
+
+  test.each(["exec", "apply_patch"])("preserves noncanonical nested %s bodies", tool => {
+    for (const nested of [
+      '{"input":"text(1)","extra":true}',
+      '{"input":42}', '{"input":null}', '{"input":{}}',
+      '{"code":"text(1)"}', '["text(1)"]', '{"input":"incomplete',
+    ]) {
+      expect(repairFreeformToolInput(JSON.stringify({ input: nested }), tool)).toBe(nested);
+    }
+    for (const input of [null, 42, true, {}, []]) {
+      const args = JSON.stringify({ input });
+      expect(repairFreeformToolInput(args, tool)).toBe(args);
+    }
+    expect(unwrapFreeformToolInput(undefined, tool)).toBe("");
+  });
+
   test("repairs only the outer lines of a complete top-level apply_patch payload", () => {
     expect(repairFreeformToolInput(DECORATED_PATCH, "apply_patch")).toBe(CANONICAL_PATCH);
     expect(normalizeApplyPatchDelimiters(DECORATED_PATCH)).toBe(CANONICAL_PATCH);
@@ -37,10 +81,51 @@ describe("apply_patch envelope repair", () => {
     expect(repairFreeformToolInput(JSON.stringify({ input: DECORATED_PATCH }), "apply_patch")).toBe(CANONICAL_PATCH);
   });
 
+  test("recovers one recognized fallback field for exec or apply_patch", () => {
+    expect(repairFreeformToolInput(JSON.stringify({ code: "const x = 1;" }), "exec")).toBe("const x = 1;");
+    expect(repairFreeformToolInput(JSON.stringify({ script: "const x = 2;" }), "exec")).toBe("const x = 2;");
+    expect(repairFreeformToolInput(JSON.stringify({ command: "await tools.exec_command({ cmd: 'pwd' });" }), "exec"))
+      .toBe("await tools.exec_command({ cmd: 'pwd' });");
+    expect(repairFreeformToolInput(JSON.stringify({ patch: DECORATED_PATCH }), "apply_patch")).toBe(CANONICAL_PATCH);
+  });
+
+  test("keeps fallback recovery fail-closed when the body is ambiguous", () => {
+    const ambiguous = JSON.stringify({ code: "const chosen = 'code';", command: "const chosen = 'command';" });
+    const arbitrary = JSON.stringify({ payload: "const chosen = 'payload';" });
+    expect(repairFreeformToolInput(ambiguous, "exec")).toBe(ambiguous);
+    expect(repairFreeformToolInput(arbitrary, "exec")).toBe(arbitrary);
+    expect(repairFreeformToolInput(JSON.stringify({ code: "const x = 1;" }), "render_diagram"))
+      .toBe(JSON.stringify({ code: "const x = 1;" }));
+  });
+
+  test("keeps explicit input authoritative over fallback fields", () => {
+    expect(repairFreeformToolInput(
+      JSON.stringify({ input: "const chosen = 'input';", code: "const chosen = 'code';" }),
+      "exec",
+    )).toBe("const chosen = 'input';");
+    const invalidInput = JSON.stringify({ input: 42, code: "const chosen = 'code';" });
+    expect(repairFreeformToolInput(invalidInput, "exec")).toBe(invalidInput);
+  });
+
+  test("strips only a complete outer fence for executable freeform tools", () => {
+    expect(repairFreeformToolInput("```js\nconst y = 3;\n```", "exec")).toBe("const y = 3;");
+    expect(repairFreeformToolInput("```js example.ts\nconst y = 3;\n```", "exec")).toBe("const y = 3;");
+    expect(repairFreeformToolInput("```diff\n" + DECORATED_PATCH + "\n```", "apply_patch")).toBe(CANONICAL_PATCH);
+
+    const internalFence = "const md = `\n```js\nlet z = 1;\n```\n`;";
+    expect(repairFreeformToolInput(internalFence, "exec")).toBe(internalFence);
+    const nonExecutableFence = "```md\n# diagram source\n```";
+    expect(repairFreeformToolInput(nonExecutableFence, "render_diagram")).toBe(nonExecutableFence);
+  });
+
   test("repairs only bare and reserved-functions apply_patch grammars", () => {
     const wrapped = JSON.stringify({ input: DECORATED_PATCH });
     expect(repairFreeformToolInput(wrapped, "apply_patch", "functions")).toBe(CANONICAL_PATCH);
     expect(repairFreeformToolInput(wrapped, "apply_patch", "mcp")).toBe(DECORATED_PATCH);
+    const foreignFallback = JSON.stringify({ patch: DECORATED_PATCH });
+    expect(repairFreeformToolInput(foreignFallback, "apply_patch", "mcp")).toBe(foreignFallback);
+    const foreignFence = "```diff\n" + DECORATED_PATCH + "\n```";
+    expect(repairFreeformToolInput(foreignFence, "apply_patch", "mcp")).toBe(foreignFence);
   });
 
   test("keeps exec JavaScript strings, comments, templates, and regexes byte-identical", () => {
@@ -134,6 +219,12 @@ describe("raw exec patch envelope recognition", () => {
     expect(source).not.toContain("*** Begin Patch ***");
   });
 
+  test("recognizes a double-wrapped patch submitted as exec", () => {
+    const args = JSON.stringify({ input: JSON.stringify({ input: DECORATED_PATCH }) });
+    expect(resolveCodeModeHelperName(undefined, "exec", args, undefined, CODE_MODE)).toBe("apply_patch");
+    expect(compileCodeModeHelperInput(args, "apply_patch", "exec")).toContain(JSON.stringify(CANONICAL_PATCH));
+  });
+
   test("refuses JavaScript that merely mentions an envelope", () => {
     const cases = [
       "const sample = \"tools.apply_patch({ input: patchText })\";",
@@ -190,5 +281,22 @@ describe("raw exec patch envelope recognition", () => {
     for (const partial of ["", "const x = 1;", "await tools.exec_command({"]) {
       expect(mayBecomePatchEnvelope(partial)).toBe(false);
     }
+  });
+
+  test("exposes only completion-stable bytes from canonically opened patches", () => {
+    expect(stableCanonicalPatchPrefix("*** Begin Pat")).toBe("");
+    expect(stableCanonicalPatchPrefix("*** Begin Patch ***\nbody")).toBeNull();
+    expect(stableCanonicalPatchPrefix("```diff\n*** Begin Patch\n")).toBeNull();
+    expect(stableCanonicalPatchPrefix("*** Begin Patch\nbody")).toBe("*** Begin Patch\nbody");
+    expect(stableCanonicalPatchPrefix("*** Begin Patch\r\nbody\r\n*** End Patch\r\n"))
+      .toBe("*** Begin Patch\r\nbody\r\n*** End Patch\r\n");
+    expect(stableCanonicalPatchPrefix("*** Begin Patch\nbody\n*** End Patch **"))
+      .toBe("*** Begin Patch\nbody\n*** End Patch");
+    expect(stableCanonicalPatchPrefix("*** Begin Patch\nbody\n*** End Patch ***\n"))
+      .toBe("*** Begin Patch\nbody\n*** End Patch");
+    expect(stableCanonicalPatchPrefix("*** Begin Patch\nbody\n*** End Patch ***\ninterior"))
+      .toBe("*** Begin Patch\nbody\n*** End Patch ***\ninterior");
+    const longLfOnlyLine = `*** Begin Patch\n${"x".repeat(200_000)}`;
+    expect(stableCanonicalPatchPrefix(longLfOnlyLine)).toBe(longLfOnlyLine);
   });
 });

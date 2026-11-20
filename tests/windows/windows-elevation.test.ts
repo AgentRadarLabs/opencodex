@@ -13,6 +13,7 @@ import {
   isWindowsSchtasksCreateAccessDenied,
   resolveTrustedWindowsIcaclsExe,
   resolveTrustedWindowsPowerShellExe,
+  resolveTrustedWindowsRegExe,
   resolveTrustedWindowsSchtasksExe,
   schtasksOperationFromArgs,
   setTrustedWindowsElevationExecutablesForTests,
@@ -39,7 +40,7 @@ describe("windows elevation helpers", () => {
     expect(isWindowsAccessDeniedError(error)).toBe(true);
   });
 
-  test("formats schtasks create access-denied errors with marker and UAC guidance", () => {
+  test("formats schtasks create access-denied errors with marker and non-elevation guidance", () => {
     const error = Object.assign(new Error("Command failed"), {
       stderr: "FEHLER: Zugriff verweigert\r\n",
       stdout: "",
@@ -55,7 +56,10 @@ describe("windows elevation helpers", () => {
     ]);
     expect(message).toContain("Windows access denied while running Task Scheduler.");
     expect(message).toContain("schtasks /create /tn opencodex-proxy /xml task.xml /f");
-    expect(message).toContain("UAC prompt");
+    // #4425: the scoped task definition registers without elevation, so the diagnostic
+    // must not send the user to approve a UAC prompt as the fix.
+    expect(message).toContain("normally registers without elevation");
+    expect(message).not.toContain("Approve the Windows UAC prompt");
     expect(message).toContain(WINDOWS_SCHTASKS_CREATE_ACCESS_DENIED_MARKER);
     expect(isWindowsSchtasksCreateAccessDenied(message)).toBe(true);
   });
@@ -217,6 +221,7 @@ describe("windows elevation helpers", () => {
     mkdirSync(join(trustedSystem32, "WindowsPowerShell", "v1.0"), { recursive: true });
     writeFileSync(join(trustedSystem32, "schtasks.exe"), "");
     writeFileSync(join(trustedSystem32, "icacls.exe"), "");
+    writeFileSync(join(trustedSystem32, "reg.exe"), "");
     writeFileSync(join(trustedSystem32, "WindowsPowerShell", "v1.0", "powershell.exe"), "");
 
     const evilRoot = mkdtempSync(join(tmpdir(), "ocx-evil-sys-"));
@@ -224,6 +229,7 @@ describe("windows elevation helpers", () => {
     mkdirSync(join(evilSystem32, "WindowsPowerShell", "v1.0"), { recursive: true });
     writeFileSync(join(evilSystem32, "schtasks.exe"), "evil");
     writeFileSync(join(evilSystem32, "icacls.exe"), "evil");
+    writeFileSync(join(evilSystem32, "reg.exe"), "evil");
     writeFileSync(join(evilSystem32, "WindowsPowerShell", "v1.0", "powershell.exe"), "evil");
 
     const previousSystemRoot = process.env.SystemRoot;
@@ -235,6 +241,7 @@ describe("windows elevation helpers", () => {
       setTrustedWindowsSystemDirectoryResolverForTests(() => trustedSystem32);
 
       const powershell = resolveTrustedWindowsPowerShellExe();
+      expect(resolveTrustedWindowsRegExe()).toBe(join(trustedSystem32, "reg.exe"));
       const schtasks = resolveTrustedWindowsSchtasksExe();
       const icacls = resolveTrustedWindowsIcaclsExe();
       expect(powershell.toLowerCase().includes("ocx-evil-sys")).toBe(false);

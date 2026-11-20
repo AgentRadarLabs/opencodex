@@ -32,7 +32,7 @@ on your behalf.
 
 ## Automated gates
 
-Three deterministic checks run before human review, and each failure message
+Deterministic checks run before human review, and each failure message
 tells you exactly what to change:
 
 - **PR quality (`enforce-target`).** Pull requests must target `dev` and carry
@@ -51,8 +51,8 @@ tells you exactly what to change:
   self-waive the screenshot requirement.
   Contributor PRs (authors without repository push permission) open in draft
   and stay there until a four-box review-readiness checklist in the
-  description is complete: local CI green, the branch on the latest `dev`
-  commit, all correct Codex and CodeRabbit findings fixed, and the
+  description is complete: required local validation passed with its scope
+  documented, the branch on the latest `dev` commit, all correct Codex and CodeRabbit findings fixed, and the
   ready-for-review confirmation. Once every box is ticked the check marks the
   PR ready for review and notifies the maintainers listed in `MAINTAINERS.md`
   (excluding the author). The gate's status and "what to do" live in a single
@@ -67,8 +67,9 @@ tells you exactly what to change:
   can check itself: the branch must be on the latest `dev` commit or at most
   10 commits behind it, and every Codex and CodeRabbit review thread authored
   by a review bot on the current head must be resolved (unresolved threads
-  from other authors do not block). The local-CI box is an author attestation
-  only — fork contributors cannot start repository CI; a maintainer has to —
+  from other authors do not block). The local-validation box follows the [test-scope policy](/contributing/#build-and-test-commands):
+  run the full suite by default; when it is too costly, run focused regressions
+  and document the exception. It is an author attestation only — fork contributors cannot start repository CI; a maintainer has to —
   so the gate never disproves it; a new push still resets every box. CodeRabbit
   findings that fall outside the diff range and are reported only in a review
   body on the current head add to the unresolved count while a bot review
@@ -89,14 +90,9 @@ tells you exactly what to change:
   lockfile changed without its manifest each need an explicit approval label.
   A comment-only change to a source file is not a behavior change and owes no
   test.
-- **Cross-platform CI.** The suite runs sharded on Linux and in full on macOS for
-  every pull request. Windows runs at the shipping boundary — on promotion to
-  `main` or `preview` — so a slow or flaky Windows runner cannot decide when your
-  pull request turns green.
-  This runs for **every** pull request, whatever its base branch — including a
-  stacked child whose base is another open PR's head. The `paths:` filter, not
-  the base branch, decides whether the jobs run at all: a PR touching only docs
-  or `devlog/` queues nothing.
+- **Cross-platform CI.** Pull requests run scoped Linux checks. Full Linux, macOS and Windows
+  coverage is a manual `lane=all` dispatch on `dev` after a batch of merges; a green PR is not
+  full-platform release evidence. Docs changes receive a scoped build gate.
 
 - **Type label.** The `label` check derives `bug` / `enhancement` /
   `documentation` / `chore` from your PR title. A title without a recognisable
@@ -113,7 +109,7 @@ right; say why when it is wrong. It does not block a merge.
 `enforce-target` and `label` use trusted default-branch automation. The PR gate
 runs on `pull_request_target` and on CodeRabbit `status` events, both loaded
 from the repository default branch; the write-capable behavior therefore
-changes only after the gate revision is promoted to `main`. The cross-platform
+changes only after the gate revision reaches the repository default branch. The cross-platform
 CI workflow runs on `pull_request` and takes effect as soon as it is on the
 branch being targeted.
 
@@ -131,3 +127,14 @@ A PR that stalls with unresolved review feedback may be closed, with the reason
 stated plainly. Closure is not a verdict on the contributor: reopen it once the
 stated reason is resolved, or replace it with a clean one. Ask if the reason is
 not clear.
+
+## Updating an older readiness checklist
+
+If the gate reports that your checklist still uses the retired local-CI wording, it preserves
+your description and asks you to update the first item. Change that item to the wording in
+the bot notice, clear all four boxes and save. Wait for the bot to acknowledge the cleared
+checklist, validate the displayed head, then tick all four boxes and save again. Changing
+only the wording while leaving four ticks does not count as a new attestation. A push or
+retarget invalidates the checkpoint. The gate stays red and the PR stays draft until this
+sequence and the ordinary quality checks complete. If your save shares the checkpoint's
+timestamp, make another body edit and save later; editing only the title does not count.

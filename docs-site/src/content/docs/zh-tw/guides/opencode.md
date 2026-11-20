@@ -82,9 +82,11 @@ Loopback 範例：
 
 非 loopback 範例：
 
+這是遠端用戶端的手動設定範例。請先設定 TLS 前端，再使用其 HTTPS URL；OpenCodex 本身不終止 TLS，`ocx opencode` 也不會自動探索該 URL。即使在區域網路中，明文 HTTP 也會在傳輸時暴露准入憑證。另一種方式是讓代理繫結回環位址，並使用本機 SSH 通道。請參閱[資料監聽器的 TLS](/zh-tw/guides/remote-hub/#giving-the-data-listener-tls)。
+
 ```json
 "options": {
-  "baseURL": "http://192.168.1.10:10100/v1",
+  "baseURL": "https://proxy.example.com/v1",
   "headers": {
     "x-opencodex-api-key": "{env:OPENCODEX_OPENCODE_API_KEY}"
   }
@@ -101,7 +103,7 @@ Loopback 範例：
 
 只有在目錄回報具權威性的 context window 時，才會寫入 `limit.context`；若沒有，會省略整個 `limit` 區塊，opencode 沿用自己的預設值。
 
-opencode 的 schema 會拒絕只有 `context`、沒有 `output` 的 `limit` 區塊，而目錄又沒有具權威性的 per-model output 欄位，因此會一併發出 `output` 預算 `32000`，並向下 clamp 到 context window，避免小 context 模型出現 `output > context`。這個數字是為了滿足 schema——並非宣稱任何特定模型的真實上限。
+輸出上限使用目錄或產生的中繼資料中已知的模型上限，僅在未知時回退到 `32000`。輸出上限始終不超過 context window；已知低於 `32000` 的上限也會保留。
 
 `opencodex` provider 區塊每次啟動都會重新產生，因此在裡面做的 per-model 調整不會保留。請把自訂項目放在你自己的 provider 鍵底下。
 

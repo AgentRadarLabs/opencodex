@@ -28,15 +28,18 @@ when a maintainer steps down.
 
 ## Review and merge policy
 
-- Pull requests target `dev`. It is the only integration line, and promotion to
-  `main` happens only from `dev`. The target-branch check accepts `dev` alone.
-- The **`enforce-target`** CI check rejects pull requests whose head
-  ancestry sits on the **`main`** tip while far behind **`dev`**, and rejects
-  empty, thin, or malformed descriptions; PRs whose title or description
-  mentions `gui` must include a screenshot of the UI change in the description.
+- Pull requests target `dev`, the only development and integration line. The
+  target-branch check accepts `dev` alone.
+- The **`enforce-target`** CI check rejects pull requests whose base is not
+  **`dev`** (stacked children excepted), and rejects empty, thin, or malformed
+  descriptions; PRs that change files under `gui/`
+  must include a screenshot of the UI change in the description. Drag the image
+  into the description instead of committing it to the PR branch; command-line
+  uploads use the `pr-assets` branch and a commit-SHA link.
   Contributor PRs (authors without repository push permission) open in draft
   and stay there until a four-box review-readiness checklist in the
-  description is complete: local CI green, branch on the latest `dev` commit,
+  description is complete: required local validation passed with its scope documented,
+  branch on the latest `dev` commit,
   all correct Codex and CodeRabbit findings fixed, and the ready-for-review
   confirmation. When all four boxes are ticked the gate marks the PR ready and
   notifies the maintainers listed in `MAINTAINERS.md` (excluding the author).
@@ -47,16 +50,36 @@ when a maintainer steps down.
   Before a completion is accepted, the gate verifies the checklist claims
   it can check itself: the branch must be on the latest `dev` commit or at
   most 10 commits behind it, and Codex/CodeRabbit findings must be resolved.
-  The local-CI box is an author attestation only — fork contributors cannot
-  start repository CI; a maintainer has to — so the gate never disproves it;
+  The local-validation box follows the full-suite default and documented resource
+  exception in [AGENTS.md](./AGENTS.md#commands); focused regression tests remain
+  mandatory under that exception. It is an author attestation only — fork
+  contributors cannot start repository CI; a maintainer has to — so the gate
+  never disproves it;
   a new push still resets every box. A disproved claim unticks the matching
   box and keeps the PR a draft.
-  Authors with repository push permission skip the ancestry heuristic only. As
-  with the approval requirement above, this part is enforced by convention;
-  the ruleset does not check ancestry (see the note under the change log).
-- A pull request requires approval from at least one maintainer and successful required CI checks
-  before merge.
-- Authors do not approve their own pull requests.
+  As with the approval requirement above, the wrong-base rule is enforced by CI
+  rather than by the ruleset.
+- Pull requests require successful required CI checks before merge. Contributor pull requests
+  normally require approval from at least one maintainer other than the author.
+- **Batched merges.** A pull request's own CI is the fast lane by default: `gates` plus
+  `test changed` (the tests Bun's import graph reaches from the diff), not the four full
+  Ubuntu shards. The shards still run on a pull request that carries the `ci:full` label at
+  push time or touches the CI/test harness, fixtures, toolchain or dependency set
+  (`scripts/ci/select-test-lane.sh`). Add `ci:full` before pushing when a change reaches shared
+  contracts in ways an import graph cannot see (subprocesses, files read as data, generated
+  output). Merge green pull requests one at a time; after roughly every five merges, run
+  `gh workflow run ci.yml --ref dev` (the default `lane=all`). If that run is red, stop merging,
+  fix `dev` from the batch it covers, and resume once it is green. A complete successful
+  dispatch is also the cross-platform evidence for the exact commit it tests.
+- A current maintainer with GitHub `maintain` or `admin` access may explicitly integrate a pull
+  request into `dev` without another maintainer's approval, including their own pull request.
+  Record that choice and the exact-head verification in the pull-request description or comment.
+  This is maintainer integration, not a self-approval or an independent review. Outstanding
+  maintainer change requests must still be resolved or explicitly withdrawn. Technical review,
+  attribution, documentation and security-review duties remain in force.
+- The maintainer-integration exception applies only to `dev`. It does not grant contributor
+  authors approval authority or permit direct pushes, force-pushes or branch deletion. Authors do
+  not submit approving reviews of their own work.
 - Authentication, credential handling, GitHub Actions, release automation, dependency installation,
   and other security-boundary changes require explicit security review.
 - A new or promoted provider preset is a credential-destination change. Before merge it needs the
@@ -70,31 +93,22 @@ when a maintainer steps down.
   canonical registry entry.
 - Security-sensitive and release-related changes should be reviewed by both maintainers when
   practical.
-- Direct pushes are reserved for maintainer-owned integration work, urgent repairs, or incident
-  recovery. The same CI and documentation requirements still apply.
-- Promotion from `dev` to `main` and npm releases is maintainer-controlled.
-- **Opening a release starts by moving `dev`'s version line forward.** Before cutting
-  a release, `dev` must already outrank the version being released; `release.yml`
-  asserts this and refuses to publish otherwise. Dispatch
-  `.github/workflows/dev-version-bump.yml` with the intended version, merge the pull
-  request it opens, then promote and release. When `dev` already outranks the target
-  — a preview cut, or a stable hotfix below `dev`'s line — no move is needed and the
-  workflow reports `changed=false`.
-
-  Opening a preview for the next core ends the current patch line. After
-  `vX.Y.0-preview.*` is tagged, a fix ships as part of `X.Y.0`, not as
-  `X.(Y-1).(Z+1)`. The release helper refuses such a bump rather than producing a
-  version the repository would reject. This is a deliberate policy restriction, not
-  a claim that lower stable patches were historically unused.
-
-  Done after the publish, as this repository did for ten releases (`32529c2b2`,
-  `e4a85d134`, `076ad3036`, `befcac3e1`, then #3045, #3076, #3127, #3265, #3354,
-  #3434), it leaves `dev` and every open pull request carrying a failure contributors
-  cannot fix from their own diff. The pull request itself does not go away — `Protect
-  dev` requires a reviewed merge. If the pre-move is missed and publication somehow
-  succeeds, dispatch `dev-version-bump.yml` from the default branch with the released
-  version and `mode=repair`, then merge the repair pull request. Design:
-  `devlog/_plan/260904_release_version_line/`.
+- Integration uses pull requests, including urgent maintainer repairs. The PR-only ruleset
+  bypass does not authorize direct pushes; incident changes to branch protection require a
+  separate owner decision.
+- npm releases are maintainer-controlled. Preview and stable releases use an eligible
+  `dev` commit with successful full manual cross-platform CI; the workflow stamps the
+  release version into build checkouts instead of committing a pre-release version bump
+  or promoting a branch. Releases share one concurrency group and preserve the global
+  version ordering. The `main` and `preview` branches were deleted after the
+  single-branch model was in place; released history remains reachable through
+  tags, and neither branch is a release target.
+- Publication remains disabled until the coordinator completes the cutover checks,
+  including the reviewed legacy lineage baseline, npm trusted-publisher configuration,
+  default branch and rulesets, Pages settings, and a hosted dry-run. The variable
+  `OCX_DEV_RELEASE_PUBLISH_ENABLED` must equal `true` for a real publication; missing
+  or other values keep the hold in place. A hosted release dry-run uses the trusted
+  `dev` workflow and does not publish.
 
 ## The retired `dev2-go` line
 
@@ -128,6 +142,19 @@ Adding or removing a maintainer requires:
 3. updates to this file and [`.github/CODEOWNERS`](./.github/CODEOWNERS).
 
 ### Change log
+
+- 2026-09-06 — The owner authorized explicit maintainer integration into `dev` without a second
+  maintainer approval. Both current maintainers have `admin` access. The dev-only PR bypass
+  includes GitHub's `admin` and `maintain` roles; `write` access alone is insufficient. Contributor
+  review remained the default; the former `main`/`preview` branches were later retired. The optional
+  `scripts/ci/assert-mergeable-review.sh --maintainer-integration <pr-number> [repo]` path checks
+  the authenticated actor against the trusted `dev` roster and live repository permissions,
+  preserves outstanding maintainer objections, and binds its result to the current head and base.
+  The helper emits a validation snapshot, not a ready-to-run privileged merge command: head
+  matching does not pin a PR's base, which may change after inspection. Revalidate the current
+  actor and `dev` base before a separately authorized merge. The helper is not proof of CI or
+  security review and not a barrier against an administrator bypassing it. Repository settings
+  remain authoritative for actual permissions.
 
 - 2026-08-19 — [@Wibias](https://github.com/Wibias) stepped down as a maintainer
   and is now a contributor. This follows his own decision to stop developing
@@ -168,20 +195,19 @@ Adding or removing a maintainer requires:
   this addition does not widen the review surface for them.
 
   Code-owner approval and the maintainer-approval requirement above are both
-  enforced, not conventions. `dev`, `main`, and `preview` each carry an active
-  repository ruleset — the classic `/branches/{branch}/protection` endpoint
-  returns 404 for them, which is why this file long described the repository as
-  unprotected. `Protect dev` (id 20763889) requires a pull request with one
+  enforced, not conventions. `dev` carries an active repository ruleset; the
+  classic `/branches/{branch}/protection` endpoint can return 404 for rulesets,
+  which is why this file long described the repository as unprotected.
+  `Protect dev` (id 20763889) requires a pull request with one
   approving review, code-owner review, and extra approval for unattributed
   changes, and it blocks deletion and non-fast-forward pushes. Allowed merge
   methods are merge and squash; rebase merges are off.
 
-  The one carve-out is that the `maintain`/`admin` repository role holds a
-  `pull_request` bypass, so an owner can merge without the approval the rules
-  otherwise require. That is a bypass, not an exemption: "Authors do not approve
-  their own pull requests" above still governs, and an owner who uses the bypass
-  should record it on the pull request rather than leave it to be inferred from
-  a merge timestamp. Widening the security boundary is a separate decision.
+  At that time, the actual PR bypass covered `admin`; the earlier wording that
+  included `maintain` was inaccurate. The 2026-09-06 policy above adds the explicit
+  maintainer-integration exception for `dev` and the corresponding `maintain` role.
+  Both roles bypass through pull requests only. Force-push and deletion protections
+  remain in place, and the integrating maintainer records the decision and evidence.
 
 ## Security reports
 

@@ -8,12 +8,14 @@ import { clearGenericFailoverHealth } from "../../src/oauth/generic-account-fail
 import * as accountFailover from "../../src/oauth/generic-account-failover";
 import * as oauth from "../../src/oauth";
 import { stampOAuthAccountLabel } from "../../src/providers/label";
+import { formatAnthropicProviderForLog } from "../../src/oauth/anthropic-routing";
 import { isCodexUsageAccountLogLabel, isCodexPoolAccountLogLabel } from "../../src/usage/log";
 import type { PersistedUsageEntry } from "../../src/usage/log";
 import { summarizeUsage } from "../../src/usage/summary";
 import type { RequestLogContext } from "../../src/server/request-log";
 import { handleResponses } from "../../src/server/responses";
 import type { OcxConfig } from "../../src/types";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 
 /**
@@ -66,9 +68,13 @@ async function withHome<T>(run: (home: string) => Promise<T>): Promise<T> {
   const prevCodex = process.env.CODEX_HOME;
   process.env.OPENCODEX_HOME = home;
   process.env.CODEX_HOME = home;
+  // Take the writer lease after this helper installs its home so direct handler dispatch can open the spend journal.
+  const releaseSpendHome = acquireOwnedSpendHome();
   try {
     return await run(home);
   } finally {
+    // Release before restoring or removing the home to prevent Windows removal failures and POSIX unlinked databases.
+    releaseSpendHome();
     globalThis.fetch = originalFetch;
     removeTreeWithRetry(home);
     if (prevOpencodex === undefined) delete process.env.OPENCODEX_HOME;
@@ -135,6 +141,28 @@ describe("stampOAuthAccountLabel", () => {
       const ctx: { accountLogLabel?: string } = {};
       stampOAuthAccountLabel(ctx, name, oauth, "acct-1");
       expect(ctx.accountLogLabel).toBeUndefined();
+    }
+  });
+
+  test("on an AgentRadar gateway, stamps anthropic with the same p-digest its account-qualified provider carries", () => {
+    // The hosted ledger needs the serving account on every Anthropic row, including the plain
+    // active-account path that never rewrites the provider; it must join the
+    // `anthropic-p<hex6>` rows of the same account. Self-hosted installs keep the skip above.
+    const prior = process.env.OPENCODEX_AGENTRADAR;
+    process.env.OPENCODEX_AGENTRADAR = "1";
+    try {
+      for (const name of ["anthropic", "anthropic2"]) {
+        const ctx: { accountLogLabel?: string } = {};
+        stampOAuthAccountLabel(ctx, name, oauth, "acct-1");
+        expect(ctx.accountLogLabel).toMatch(/^p[a-f0-9]{6}$/);
+        expect(formatAnthropicProviderForLog(name, "acct-1")).toBe(`${name}-${ctx.accountLogLabel}`);
+      }
+      const ctx: { accountLogLabel?: string } = {};
+      stampOAuthAccountLabel(ctx, "openai", oauth, "acct-1");
+      expect(ctx.accountLogLabel).toBeUndefined();
+    } finally {
+      if (prior === undefined) delete process.env.OPENCODEX_AGENTRADAR;
+      else process.env.OPENCODEX_AGENTRADAR = prior;
     }
   });
 
@@ -258,7 +286,7 @@ describe("Responses per-account attribution for non-Codex OAuth", () => {
     });
   });
 
-  test.each([[1, 1], [5, 4]])("native Responses with %i accounts stays within %i sends on repeated 429", async (accounts, expectedSends) => {
+  test.each([[1, 1], [5, 5]])("native Responses with %i accounts visits each once on repeated 429 (%i sends)", async (accounts, expectedSends) => {
     await withHome(async () => {
       clearGenericFailoverHealth();
       for (let index = 0; index < accounts; index++) {

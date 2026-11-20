@@ -10,6 +10,11 @@ import type { CursorEffortTable } from "../integrations/cursor-effort-table";
  * Completions, Responses and Anthropic Messages, streams, and accepts tool calls, so those are
  * constants; context length and vision come from catalog data when known and are omitted
  * otherwise, matching Cursor's optional-field schema.
+ *
+ * Top-level capacity metrics (`context_window`, `context_length`, `max_output_tokens`) are
+ * mirrored directly on each model row for external client discovery (e.g. pi-ai, DSH,
+ * LibreChat) that inspects flat properties rather than Cursor's nested `capabilities.*` shape.
+ * A row that gains a nested capacity value must gain the top-level mirror in the same change.
  */
 
 /**
@@ -105,6 +110,10 @@ export function predictCursorEffort(
 }
 
 export interface ModelCapabilityInput {
+  supportsReasoning?: boolean;
+  supportsThinkingToggle?: boolean;
+  supportsReasoningEffort?: boolean;
+  defaultThinkingEnabled?: boolean;
   reasoningEfforts?: readonly string[];
   contextWindow?: number;
   /**
@@ -128,10 +137,26 @@ export interface ModelCapabilityFields {
     input_modalities?: string[];
     supports_tool_use: true;
     supports_streaming: true;
-    supports_reasoning: boolean;
+    supports_reasoning?: boolean;
+    supports_thinking_toggle?: boolean;
+    supports_reasoning_effort?: boolean;
+    default_thinking_enabled?: boolean;
     supports_vision?: boolean;
     reasoning_effort?: string[];
   };
+  /**
+   * Mirrored top-level context window for external/legacy client discovery (e.g. pi-ai, DSH)
+   * that reads top-level context_window / context_length instead of nested capabilities.
+   */
+  context_window?: number;
+  /**
+   * Top-level context length alias matching capabilities.context_length for clients expecting context_length.
+   */
+  context_length?: number;
+  /**
+   * Mirrored top-level max output token limit for external/legacy client discovery.
+   */
+  max_output_tokens?: number;
   /**
    * Cursor reads the long-context threshold from `pricing.overrides[].min_prompt_tokens`. That
    * key sits outside its validated capability schema, so it is the one place a threshold can
@@ -148,11 +173,20 @@ function positiveInt(value: unknown): number | undefined {
 }
 
 export function modelCapabilityFields(input: ModelCapabilityInput): ModelCapabilityFields {
-  const efforts = (input.reasoningEfforts ?? []).filter(effort => typeof effort === "string" && effort.length > 0);
+  const efforts = input.supportsReasoning === false || input.supportsReasoningEffort === false ? []
+    : (input.reasoningEfforts ?? []).filter(effort => typeof effort === "string" && effort.length > 0);
+  // Legacy discovery used an explicit empty ladder to withhold Cursor reasoning controls.
+  // Independent capability declarations replace that compatibility inference per axis.
+  const legacyEmptyLadder = input.reasoningEfforts?.length === 0
+    && input.supportsThinkingToggle === undefined && input.supportsReasoningEffort === undefined;
+  const supportsReasoning = input.supportsReasoning
+    ?? (input.supportsThinkingToggle === true || input.supportsReasoningEffort === true || efforts.length > 0
+      ? true : legacyEmptyLadder ? false : undefined);
   const contextLength = positiveInt(input.contextWindow);
   const longContextLength = positiveInt(input.longContextWindow);
   const maxOutputTokens = positiveInt(input.maxOutputTokens);
   const hasLongTier = contextLength !== undefined && longContextLength !== undefined && longContextLength > contextLength;
+  const effectiveContextLength = hasLongTier ? longContextLength : contextLength;
   const modalities = Array.isArray(input.inputModalities)
     ? input.inputModalities.filter(modality => typeof modality === "string" && modality.length > 0)
     : undefined;
@@ -160,9 +194,7 @@ export function modelCapabilityFields(input: ModelCapabilityInput): ModelCapabil
   return {
     api_types: [...OPENCODEX_MODEL_API_TYPES],
     capabilities: {
-      ...(hasLongTier
-        ? { context_length: longContextLength }
-        : contextLength !== undefined ? { context_length: contextLength } : {}),
+      ...(effectiveContextLength !== undefined ? { context_length: effectiveContextLength } : {}),
       ...(maxOutputTokens !== undefined ? { max_output_tokens: maxOutputTokens } : {}),
       // Once a gateway advertises api_types, Cursor keeps only rows whose output_modalities
       // include "text"; omitting the key drops the row from the extended catalog.
@@ -170,10 +202,17 @@ export function modelCapabilityFields(input: ModelCapabilityInput): ModelCapabil
       ...(modalities !== undefined && modalities.length > 0 ? { input_modalities: [...modalities] } : {}),
       supports_tool_use: true,
       supports_streaming: true,
-      supports_reasoning: efforts.length > 0,
+      ...(supportsReasoning !== undefined ? { supports_reasoning: supportsReasoning } : {}),
+      ...(input.supportsThinkingToggle !== undefined ? { supports_thinking_toggle: input.supportsThinkingToggle } : {}),
+      ...(input.supportsReasoningEffort !== undefined ? { supports_reasoning_effort: input.supportsReasoningEffort } : {}),
+      ...(input.defaultThinkingEnabled !== undefined ? { default_thinking_enabled: input.defaultThinkingEnabled } : {}),
       ...(supportsVision !== undefined ? { supports_vision: supportsVision } : {}),
       ...(efforts.length > 0 ? { reasoning_effort: [...efforts] } : {}),
     },
+    ...(effectiveContextLength !== undefined
+      ? { context_window: effectiveContextLength, context_length: effectiveContextLength }
+      : {}),
+    ...(maxOutputTokens !== undefined ? { max_output_tokens: maxOutputTokens } : {}),
     ...(hasLongTier ? { pricing: { overrides: [{ min_prompt_tokens: contextLength }] } } : {}),
   };
 }

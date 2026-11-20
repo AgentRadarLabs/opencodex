@@ -3,10 +3,12 @@ import { buildWinswXml, ensureWinswBinary, parseWinswStatus, probeScmRegistratio
 import { parseServiceArgs, serviceInstallArgs, serviceReinstallArgs } from "../../src/service";
 import { loadServiceTokenFromFile } from "../../src/lib/service-secrets";
 import { getConfigDir } from "../../src/config";
-import { mkdtempSync, readFileSync, writeFileSync} from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { isSupervisedServiceChild } from "../../src/service/service-child-ownership";
 
 const entry = { bun: "C:\\OpenCodex\\bun.exe", bunRuntimeSource: "bundled" as const, cli: "C:\\Open Codex\\cli & co\\index.ts" };
 
@@ -46,6 +48,15 @@ describe("winsw xml", () => {
     const xml = buildWinswXml(entry, env);
 
     expect(xml).toContain('<env name="OCX_SERVICE" value="1"/>');
+    expect(xml).toContain('<env name="OCX_SERVICE_MANAGED" value="1"/>');
+    expect(isSupervisedServiceChild({
+      OCX_SERVICE: winswEnvValue(xml, "OCX_SERVICE") ?? undefined,
+      OCX_SERVICE_MANAGED: winswEnvValue(xml, "OCX_SERVICE_MANAGED") ?? undefined,
+    }, {
+      platform: "win32",
+      parentPid: () => { throw new Error("parent inspection must not run"); },
+      processCommandLine: () => { throw new Error("parent inspection must not run"); },
+    })).toBe(true);
     expect(xml).toContain('<env name="OCX_API_TOKEN_FILE"');
     expect(xml).toContain('<env name="PATH" value="C:\\bin;C:\\tools &amp; more"/>');
     expect(winswEnvValue(xml, "CODEX_SQLITE_HOME")).toBe("C:\\Users\\jun\\.codex-sqlite");
@@ -90,6 +101,34 @@ describe("winsw xml", () => {
     expect(xml).toContain('<log mode="roll-by-size">');
     expect(xml).toContain(`<id>${WINSW_SERVICE_ID}</id>`);
   });
+  test("uses the canonical default Codex home when ~/.codex is a junction", () => {
+    const root = mkdtempSync(join(tmpdir(), "ocx-winsw-junction-"));
+    const physical = join(root, "physical-codex-home");
+    const alias = join(root, ".codex");
+    try {
+      mkdirSync(physical, { recursive: true });
+      // Directory symlinks are junctions on Windows and the same realpath case on POSIX.
+      symlinkSync(physical, alias, process.platform === "win32" ? "junction" : "dir");
+      const expected = realpathSync(physical);
+      const source = [
+        `const { buildWinswXml } = await import(${JSON.stringify(new URL("../../src/lib/winsw.ts", import.meta.url).href)});`,
+        // Run with HOME set before Bun starts so its homedir resolver targets only this fixture.
+        // Remove the test preload's explicit CODEX_HOME pin to exercise the default resolver.
+        "delete process.env.CODEX_HOME;",
+        `process.stdout.write(buildWinswXml(${JSON.stringify(entry)}, process.env, 10100));`,
+      ].join("\n");
+      const xml = execFileSync(process.execPath, ["-e", source], {
+        cwd: process.cwd(),
+        env: { ...process.env, HOME: root, USERPROFILE: root, CODEX_HOME: "" },
+        encoding: "utf8",
+      });
+      expect(winswEnvValue(xml, "CODEX_HOME")).toBe(expected);
+      expect(winswEnvValue(xml, "CODEX_HOME")).not.toBe(alias);
+    } finally {
+      removeTreeWithRetry(root);
+    }
+  });
+
   test("honors OCX_BAKE_PORT when building WinSW arguments", () => {
     const xml = buildWinswXml(entry, { ...env, OCX_BAKE_PORT: "14444" });
     expect(xml).toContain("start --port 14444");
@@ -228,15 +267,17 @@ describe("winsw install flow", () => {
 
 describe("service backend CLI parsing", () => {
   test("install --native selects the native backend", () => {
-    expect(parseServiceArgs(["install", "--native"])).toEqual({ sub: "install", backend: "native", invalid: [] });
+    expect(parseServiceArgs(["install", "--native"])).toEqual({ sub: "install", backend: "native", invalid: [], json: false });
   });
 
   test("bare service defaults to install with no backend override", () => {
-    expect(parseServiceArgs([])).toEqual({ sub: "install", backend: null, invalid: [] });
+    expect(parseServiceArgs([])).toEqual({ sub: "install", backend: null, invalid: [], json: false });
   });
 
-  test("restart aliases the existing no-admin repair path", () => {
-    expect(parseServiceArgs(["restart"])).toEqual({ sub: "repair", backend: null, invalid: [] });
+  test("restart is its own verb: parsed like repair, no backend flag, no admin path", () => {
+    // `restart` used to alias `repair`; since repair became a no-op on a healthy launchd job,
+    // `restart` carries its own verb so the darwin path can kickstart the unchanged job.
+    expect(parseServiceArgs(["restart"])).toEqual({ sub: "restart", backend: null, invalid: [], json: false });
   });
 
   test("--scheduler and unknown flags are recognized separately", () => {

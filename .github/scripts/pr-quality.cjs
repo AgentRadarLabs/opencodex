@@ -6,10 +6,12 @@ const {
   isPlaceholderOnlyValue,
   hasSubstantialStructuredContent,
 } = require(path.join(__dirname, "issue-quality.cjs"));
+// The readiness wording is derived from the threshold the gate enforces, so the
+// sentence in the box and the number it promises cannot drift apart (#4443).
+const { READINESS_LATEST_DEV_BEHIND_MAX } = require(
+  path.join(__dirname, "pr-quality-state.cjs")
+);
 
-const ANCESTRY_BEHIND_THRESHOLD = 20;
-/** Cap on ahead_by vs main so stale `dev` forks (many commits ahead of main) are not flagged. */
-const ANCESTRY_AHEAD_MAIN_MAX = 5;
 const MIN_SECTION_LEN = 40;
 const MIN_RICH_SECTIONS = 2;
 const UNSTRUCTURED_MIN_LEN = 120;
@@ -20,13 +22,43 @@ const REVIEW_READINESS_START = "<!-- pr-quality-readiness-checklist:start -->";
 const REVIEW_READINESS_END = "<!-- pr-quality-readiness-checklist:end -->";
 
 /**
+ * The latest-dev box, worded as the condition the gate actually enforces.
+ *
+ * `readinessClaimViolations` clears this claim while the head is at most
+ * `READINESS_LATEST_DEV_BEHIND_MAX` commits behind the base — but the box used
+ * to read "I pushed my PR to the latest dev commit", which asks for the exact
+ * tip. On a fast-moving `dev` that gap is a treadmill: an author who reads the
+ * box literally resyncs for unrelated commits, every resync moves the head,
+ * head-drift resets all four boxes, and the previous exact-head CI evidence is
+ * invalidated — without reducing merge risk, because the gate was already
+ * satisfied (#4443).
+ *
+ * Deriving the sentence from the constant is the point: the wording and the
+ * threshold cannot drift apart again, and raising or lowering the tolerance
+ * rewords the box in the same commit.
+ *
+ * Rewording is safe for open pull requests. `extractReviewReadiness` matches on
+ * box count and checked state, never on item text, and
+ * `appendReviewReadinessSection` is idempotent — a body that already carries the
+ * marker pair is returned untouched. Existing checklists keep their wording and
+ * their ticks; only newly appended ones use this sentence.
+ */
+function latestDevReadinessItem() {
+  return (
+    "I pushed my PR to a recent dev commit " +
+    `(at most ${READINESS_LATEST_DEV_BEHIND_MAX} behind; ` +
+    "a maintainer may still ask for the exact tip before merge)."
+  );
+}
+
+/**
  * The four self-attestation boxes a non-maintainer author must tick before the
  * gate lifts the draft. The final box is intentionally set off by a blank line
  * so the "ready" claim reads as the closing confirmation, not a fourth task.
  */
 const REVIEW_READINESS_ITEMS = [
-  "All CI tests are green on my local testing.",
-  "I pushed my PR to the latest dev commit.",
+  "Required local validation passed; commands, results, and any full-suite exception are documented.",
+  latestDevReadinessItem(),
   "I resolved all correct Codex and CodeRabbit findings.",
   "My PR is ready for review.",
 ];
@@ -70,20 +102,6 @@ const MARKDOWN_REFERENCE_IMAGE_RE = /!\[([^\]]*)\]\[([^\]]*)\]/g;
 const MARKDOWN_REFERENCE_DEF_RE = /^\s*\[([^\]]+)\]:\s*\S+/gm;
 /** Embedded HTML image with a renderable `src` (`<img ... src="...">`). */
 const HTML_IMAGE_RE = /<img\b[^>]*\bsrc\s*=\s*(?:"[^"]+"|'[^']+'|[^\s>"']+)[^>]*>/i;
-
-function isWrongAncestry({
-  behindMain,
-  behindBase,
-  aheadMain = 0,
-  threshold = ANCESTRY_BEHIND_THRESHOLD,
-  aheadMainMax = ANCESTRY_AHEAD_MAIN_MAX,
-}) {
-  return (
-    behindMain === 0 &&
-    behindBase >= threshold &&
-    aheadMain <= aheadMainMax
-  );
-}
 
 function authorHasPushPermission(permission) {
   return permission === "admin" || permission === "maintain" || permission === "write";
@@ -374,6 +392,24 @@ function appendReviewReadinessSection(body) {
   return `${body.trimEnd()}\n\n${section}\n`;
 }
 
+/** Read only the first label in a structurally valid managed four-box section. */
+function firstReviewReadinessItem(body) {
+  const readiness = extractReviewReadiness(body);
+  if (!readiness.present || readiness.total !== REVIEW_READINESS_ITEMS.length) return null;
+  const start = body.indexOf(REVIEW_READINESS_START) + REVIEW_READINESS_START.length;
+  const end = body.indexOf(REVIEW_READINESS_END);
+  return /^[ \t]*[-*][ \t]+\[[ xX]\][ \t]+([^\r\n]*?)[ \t]*\r?$/m
+    .exec(body.slice(start, end))?.[1] ?? null;
+}
+
+function reviewReadinessMigrationRequired(body) {
+  return firstReviewReadinessItem(body) === "All CI tests are green on my local testing.";
+}
+
+function reviewReadinessUsesCurrentPolicy(body) {
+  return firstReviewReadinessItem(body) === REVIEW_READINESS_ITEMS[0];
+}
+
 /**
  * Remove the bot-managed readiness section from a body. Used so the bot's own
  * checklist never counts as author-written description substance, and so a
@@ -475,12 +511,6 @@ function collectPrQualityFailures({
   allowedBases,
   title = "",
   body,
-  behindMain,
-  behindBase,
-  aheadMain = 0,
-  authorPermission,
-  permissionLookupFailed = false,
-  ancestryLookupFailed = false,
   /** True when baseRef is another open PR's head (stacked child). */
   stackedBase = false,
   /** Issue comments; a maintainer comment waives the GUI-screenshot gate. */
@@ -497,21 +527,6 @@ function collectPrQualityFailures({
   const wrongBase = !allowedBases.includes(baseRef) && !stackedBase;
   if (wrongBase) {
     failures.push({ code: "wrong_base" });
-  } else {
-    // Permission lookup fails closed (still evaluate ancestry). Compare API
-    // failures skip ancestry — zeros would falsely pass the #644 heuristic.
-    // Stacked children skip ancestry against the integration base; their parent
-    // PR is the temporary target.
-    const skipAncestry =
-      stackedBase ||
-      ancestryLookupFailed ||
-      (!permissionLookupFailed && authorHasPushPermission(authorPermission));
-    if (
-      !skipAncestry &&
-      isWrongAncestry({ behindMain, behindBase, aheadMain })
-    ) {
-      failures.push({ code: "wrong_ancestry" });
-    }
   }
 
   const desc = assessPrDescription(body);
@@ -534,12 +549,9 @@ function collectPrQualityFailures({
 }
 
 module.exports = {
-  ANCESTRY_BEHIND_THRESHOLD,
-  ANCESTRY_AHEAD_MAIN_MAX,
   REVIEW_READINESS_ITEMS,
   REVIEW_READINESS_START,
   REVIEW_READINESS_END,
-  isWrongAncestry,
   authorHasPushPermission,
   assessPrDescription,
   guiPathsChanged,
@@ -550,6 +562,8 @@ module.exports = {
   buildReviewReadinessSection,
   extractReviewReadiness,
   appendReviewReadinessSection,
+  reviewReadinessMigrationRequired,
+  reviewReadinessUsesCurrentPolicy,
   stripReviewReadinessSection,
   REVIEW_READINESS_CLAIM_INDEX,
   uncheckReviewReadinessBoxes,

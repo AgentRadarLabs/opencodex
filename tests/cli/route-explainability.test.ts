@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -118,6 +118,27 @@ describe("route explainability (RI-09)", () => {
   test("unknown request ids return 404", async () => {
     const response = await apiGet("/api/request-history/missing/route-decision", config());
     expect(response.status).toBe(404);
+  });
+
+  test("the account decision and its cause are part of the route explanation (#4546)", async () => {
+    // An operator asking why a request is on this account should not have to compare account
+    // labels across rows, which is how the original incident had to be diagnosed.
+    appendUsageEntry({
+      ...tracedEntry("explain-affinity"),
+      affinity: "rebound",
+      affinityReason: "quota_refusal",
+    });
+    const response = await apiGet("/api/request-history/explain-affinity/route-decision", config());
+    expect(response.status).toBe(200);
+    const body = await response.json() as { affinity?: { move?: string; reason?: string | null } };
+    expect(body.affinity).toEqual({ move: "rebound", reason: "quota_refusal" });
+  });
+
+  test("a row with no account decision explains with a null affinity block", async () => {
+    appendUsageEntry(tracedEntry("explain-no-affinity"));
+    const response = await apiGet("/api/request-history/explain-no-affinity/route-decision", config());
+    const body = await response.json() as { affinity?: unknown };
+    expect(body.affinity).toBeNull();
   });
 
   test("pre-trace rows explain with null routeDecision and their attempts", async () => {
@@ -292,6 +313,29 @@ describe("route explainability (RI-09)", () => {
     expect(code).toBe(0);
     expect(calls).toHaveLength(1);
     expect(calls[0]!.path).toBe("/api/request-history/id%20with%20spaces/route-decision");
+  });
+
+  test("CLI logs explain text output keeps line breaks and still escapes values", async () => {
+    const { handleObserveCommand } = await import("../../src/cli/observe");
+    // U+009B (C1 CSI) survives JSON.stringify, so only the terminal-safety pass can escape it.
+    const payload = { requestId: "explain-text", summary: { finalModel: "m1\u009b31m" } };
+    const output = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const code = await handleObserveCommand(["logs", "explain", "explain-text"], {
+        baseUrl: "http://cli.test",
+        fetchImpl: async () => new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      });
+      expect(code).toBe(0);
+      const lines = output.mock.calls.map(call => String(call[0]));
+      expect(lines).toEqual(JSON.stringify(payload, null, 2).replace("\u009b", "\\u009b").split("\n"));
+      expect(lines.join("\n")).not.toContain("\\x0a");
+      expect(lines.join("\n")).not.toContain("\u009b");
+    } finally {
+      output.mockRestore();
+    }
   });
 
   test("CLI logs explain rejects missing request ids", async () => {

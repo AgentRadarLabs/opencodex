@@ -22,14 +22,25 @@ export {
 export {
   advanceComboAfterFailure,
   clearComboSelectionState,
+  comboExclusion,
+  comboExclusionReasons,
+  comboTargetUnavailableCause,
+  comboTargetSkipTrigger,
+  comboUnavailableDiagnostics,
   NoAvailableComboTargetsError,
   noteComboFailure,
   noteComboSuccess,
   pickComboTarget,
   pickComboTargetWithWait,
+  quotaInactiveReason,
+  settleComboReprobeSuccess,
+  snapshotComboQuotaCooldowns,
   tryPickComboModel,
   UnknownComboError,
+  type ComboExclusion,
   type ComboPick,
+  type ComboUnavailableDiagnostics,
+  type QuotaInactiveReason,
 } from "./resolve";
 export {
   clearComboTargetCooldowns,
@@ -54,3 +65,33 @@ export {
   resetComboEffortWarningStateForTests,
 } from "./request";
 export { earliestQuotaResetAt, quotaResetRemainingMs } from "./reset-window";
+export {
+  buildJevRouteQuestion,
+  buildJevState,
+  JEV_API_URL,
+  JEV_MODEL,
+  JEV_PROVIDER_ID,
+  jevDecisionBackendFor,
+  jevDecisionTimeoutMs,
+  jevRouteOptions,
+  parseJevDecision,
+  resolveJevDecision,
+  type JevCandidate,
+  type JevDecision,
+  type JevDecisionBackend,
+  type JevRouteOptionDescriptor,
+  type ResolveJevDecisionOptions,
+} from "./jev";
+export {
+  buildJevModelPrompt,
+  JEV_MODEL_INSTRUCTIONS,
+  JEV_MODEL_MAX_OPTIONS,
+  JEV_MODEL_MAX_RESPONSE_TEXT_CHARS,
+  JevModelInvokeError,
+  parseJevModelChoice,
+  resolveJevModelDecision,
+  type JevModelInvoke,
+  type JevModelInvokeRequest,
+  type JevModelInvokeResult,
+} from "./jev-model-backend";
+export { resolveJevComboDecision, type ResolveJevComboDecisionOptions } from "./jev-dispatch";

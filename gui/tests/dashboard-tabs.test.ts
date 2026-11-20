@@ -19,6 +19,13 @@ test("Dashboard sub-hashes are registered routes, not invalid suffixes", () => {
   }
 });
 
+test("Usage companion deep link stays on its own view", () => {
+  expect(readPageFromHash("usage/companion")).toBe("usage");
+  expect(hashBelongsToPage("usage/companion", "usage")).toBe(true);
+  expect(resolveAppHashChange("usage/companion")).toEqual({ page: "usage", replaceTo: null });
+  expect(resolveAppHashChange("usage/unknown").replaceTo).toBe("usage");
+});
+
 test("bare #dashboard stays the Overview route", () => {
   expect(readPageFromHash("dashboard")).toBe("dashboard");
   expect(hashBelongsToPage("dashboard", "dashboard")).toBe(true);
@@ -42,13 +49,17 @@ test("registering Dashboard tabs does not disturb the Logs or Providers contract
   expect(hashBelongsToPage("logs/debug", "dashboard")).toBe(false);
 });
 
-test("Codex Set sits directly after Dashboard in the sidebar", async () => {
+test("Home leads the sidebar and the old dashboard is its own fine-tuning row", async () => {
   const app = await Bun.file(new URL("../src/App.tsx", import.meta.url)).text();
-  const nav = app.slice(app.indexOf("const NAV"), app.indexOf("];", app.indexOf("const NAV")));
-  const order = [...nav.matchAll(/id: "([a-z-]+)"/g)].map((m) => m[1]);
-  expect(order[0]).toBe("dashboard");
-  expect(order[1]).toBe("codex-set");
-  // Order only — no divider markup was introduced (Q3).
+  const { NAV_GROUPS, groupForPage } = await import("../src/nav-groups");
+  const order = NAV_GROUPS.map((group) => group.id);
+  expect(order[0]).toBe("home");
+  // The dashboard's sidecar, memory and compaction controls are fine-tuning in v2, but they
+  // keep a row of their own rather than sitting behind the All settings hub.
+  const proxy = groupForPage("dashboard");
+  expect(proxy?.id).toBe("proxy");
+  expect(proxy?.tier).toBe("advanced");
+  // Tiers are headings, not divider rules.
   expect(app).not.toContain("nav-divider");
 });
 

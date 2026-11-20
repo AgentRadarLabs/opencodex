@@ -8,12 +8,30 @@
  *
  * Design of record: devlog/_fin/260802_client_toggle_api/021 §3.
  */
-import { ClientPathError, EXPORT_CLIENTS, opencodeProxyBaseUrl, type ExportModel, type ManagedContribution } from "../clients/config-export";
+import { createClineIO } from "./cline-io";
+import { parseClineDocument } from "./cline-document";
+import { ClientPathError, EXPORT_CLIENTS, opencodeProxyBaseUrl, droidDefaultsFromOwnedRows, type ExportModel, type ManagedContribution } from "../clients/config-export";
+import { qoderLegacyCatalogCollision } from "../clients/config-export/qoder";
+import { resolveModelNames, type ExportModelNames } from "../clients/config-export/model-names";
+import { namedExportContext } from "../clients/config-export/alias-selectors";
+import type { ConfigFormat } from "../clients/config-export";
 import type { OcxConfig } from "../types";
 import { PARSE_FAILED, loadTarget, parseConfig, type IntegrationIO } from "./config-io";
 import { SNAPSHOT_RETENTION } from "./journal";
+import {
+  AmbiguousSelectorError,
+  InvalidSelectorError,
+  UnrepresentableSelectorError,
+  parseSegment,
+  readPath,
+  selectIndex,
+  type PathSegment,
+} from "./merge";
 import { canonicalContribution, fingerprint, semanticContribution, type OwnershipRecord } from "./ownership";
 import {
+  droidNormalizedContributionMatchesRecord,
+  droidNormalizedFileMatchesRecord,
+  isHermesAffinityUpgrade,
   protectedContributionFingerprint,
   refreshablePathsOf,
   semanticProtectedContributionFingerprint,
@@ -21,10 +39,16 @@ import {
 } from "./ownership-policy";
 import {
   INTEGRATION_CLIENTS,
+  boundIntegrationConfigPath,
+  assertDroidPathsUnambiguous,
+  assertDroidRecordedSettingsUnambiguous,
   resolveIntegrationPaths,
+  type ResolvedIntegrationPaths,
   unresolvedPathHintFor,
   type IntegrationClientId,
 } from "./registry";
+import { resolveIntegrationTarget, type IneffectiveWriteReason, type IntegrationTarget } from "./target";
+import { inspectKiloCandidates } from "./kilo-candidates";
 import { createIntegrationStateStore, type IntegrationStateStore } from "./store";
 
 export type IntegrationState = "absent" | "current" | "stale" | "conflict" | "unsafe";
@@ -35,6 +59,8 @@ export type StateReason =
   | "unowned-key"
   /** A container we would have to write through holds a non-object value. */
   | "blocked-container"
+  | "ambiguous-selector"
+  | "candidate-conflict"
   /** A path selector we cannot resolve, e.g. a relative OPENCLAW_CONFIG_PATH. */
   | "unresolvable-path";
 
@@ -46,25 +72,76 @@ export interface IntegrationStatus {
   appliedAt?: string;
   lastOpId?: string;
   reason?: StateReason;
+  /** Other Kilo global candidates defining provider.opencodex. */
+  conflictPaths?: string[];
+  /** Kilo candidate that could not be inspected; may differ from the owned target. */
+  candidateFailurePath?: string;
+  /**
+   * The store this client reads instead of `configPath`.
+   *
+   * Present only when the integration is NOT writing that store: either our
+   * block is still in the config file, or the store is not a document whose
+   * shape has been observed. Where the store is written, `configPath` names it
+   * and there is nothing to report beside the state.
+   *
+   * Orthogonal to `state`, which answers "what is on disk, and did we put it
+   * there?" — and answers it correctly here: the block can be byte-for-byte
+   * current in a file the client stopped opening. That pair is not a
+   * contradiction, it is the whole of #5348, so the surface that reports
+   * `current` has to be able to report this beside it.
+   */
+  supersededBy?: string;
+  /** Why `supersededBy` is not written; present exactly when it is. */
+  supersededReason?: IneffectiveWriteReason;
+  /**
+   * `missing-store` only: the document that recreates the store. A surface that localizes the
+   * remedy needs the content to name, not the writer's English sentence.
+   */
+  missingStoreDocument?: string;
   /** Snapshot files retained for this client; -1 when they cannot be inspected. */
   snapshotCount: number;
   /** Pruning is behind, so older (possibly credential-bearing) snapshots remain. */
   retentionDegraded: boolean;
 }
 
-export function readPath(doc: unknown, path: readonly string[]): unknown {
-  let cursor: unknown = doc;
-  for (const key of path) {
-    if (typeof cursor !== "object" || cursor === null || Array.isArray(cursor)) return undefined;
-    cursor = (cursor as Record<string, unknown>)[key];
-    if (cursor === undefined) return undefined;
-  }
-  return cursor;
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+
+function assertNever(segment: never): never {
+  throw new Error(`unknown path segment ${JSON.stringify(segment)}`);
+}
+
+/**
+ * The path reader lives with the path grammar, in `merge`, and is re-exported
+ * here because the classifier was its original home and every caller imports
+ * it from this module. One implementation is the point: a reader that resolved
+ * a selector differently from the writer would report one element as ours and
+ * then rewrite another.
+ */
+export { readPath };
 
 /** Does the document carry any fragment we would write? */
 export function hasOurFragments(doc: unknown, contribution: ManagedContribution): boolean {
   return contribution.fragments.some(fragment => readPath(doc, fragment.path) !== undefined);
+}
+
+/**
+ * A hand-written Qoder legacy row for one of our models makes Qoder reject the
+ * provider we would add. Rows a record still names are ours for refresh to
+ * drop. Overwrite cannot resolve this either, because the row is not on a path
+ * we write, so the writer and planner ask the same question before overwriting.
+ */
+export function qoderLegacyCatalogConflict(
+  parsed: unknown,
+  record: OwnershipRecord | null,
+  contribution: ManagedContribution | null,
+): boolean {
+  if (contribution?.clientId !== "qoder" && contribution?.clientId !== "qoder-cn") return false;
+  const owned = new Set((record?.fragmentPaths ?? [])
+    .filter(path => Array.isArray(path) && path.every(key => typeof key === "string"))
+    .map(path => readPath(parsed, path)));
+  return qoderLegacyCatalogCollision(parsed, contribution, owned);
 }
 
 /**
@@ -82,10 +159,35 @@ export function blockedContainerPath(
   doc: unknown,
   contribution: ManagedContribution,
 ): readonly string[] | null {
+  /*
+   * What a segment needs the value it walks through to BE: a record for a key,
+   * an array for a selector. `typeof null === "object"`, so null is excluded
+   * by both checks rather than walking straight into the dereference below.
+   */
+  const holds = (segment: PathSegment, value: unknown): boolean => {
+    switch (segment.kind) {
+      case "key":
+        return isPlainRecord(value);
+      case "select":
+        return Array.isArray(value);
+      default:
+        return assertNever(segment);
+    }
+  };
+  const step = (segment: PathSegment, value: unknown): unknown => {
+    switch (segment.kind) {
+      case "key":
+        return (value as Record<string, unknown>)[segment.key];
+      case "select":
+        return (value as readonly unknown[])[selectIndex(value as readonly unknown[], segment.criteria)];
+      default:
+        return assertNever(segment);
+    }
+  };
   for (const fragment of contribution.fragments) {
     let cursor: unknown = doc;
     for (let depth = 0; depth < fragment.path.length - 1; depth += 1) {
-      const key = fragment.path[depth]!;
+      const segment = parseSegment(fragment.path[depth]!);
       /*
        * ONLY `undefined` means absent. A missing file parses as `{}`, so an
        * absent prefix reads `undefined` — but a parsed `null` is a value the
@@ -94,14 +196,10 @@ export function blockedContainerPath(
        * "successful" apply.
        */
       if (cursor === undefined) break;
-      // `typeof null === "object"`, so null has to be named explicitly or it
-      // walks straight into the dereference below.
-      if (cursor === null || typeof cursor !== "object" || Array.isArray(cursor)) {
-        return fragment.path.slice(0, depth);
-      }
-      const next = (cursor as Record<string, unknown>)[key];
+      if (!holds(segment, cursor)) return fragment.path.slice(0, depth);
+      const next = step(segment, cursor);
       if (next === undefined) break;
-      if (typeof next !== "object" || next === null || Array.isArray(next)) {
+      if (!holds(parseSegment(fragment.path[depth + 1]!), next)) {
         return fragment.path.slice(0, depth + 1);
       }
       cursor = next;
@@ -142,6 +240,18 @@ function recordedContribution(
   };
 }
 
+function observedContributionMatchesRecord(
+  observed: ManagedContribution,
+  record: OwnershipRecord,
+): boolean {
+  if (fingerprint(canonicalContribution(observed)) === record.blockFingerprint) return true;
+  if (
+    typeof record.semanticBlockFingerprint === "string"
+    && fingerprint(semanticContribution(observed)) === record.semanticBlockFingerprint
+  ) return true;
+  return droidNormalizedContributionMatchesRecord(observed, record);
+}
+
 /**
  * Prove that every protected field still matches what OpenCodex wrote.
  *
@@ -157,13 +267,8 @@ function recordedBlockIsOwned(
 ): boolean {
   const observed = recordedContribution(doc, record);
   if (!observed) return false;
-  if (fingerprint(canonicalContribution(observed)) === record.blockFingerprint) return true;
-
+  if (observedContributionMatchesRecord(observed, record)) return true;
   const observedSemanticFingerprint = fingerprint(semanticContribution(observed));
-  if (
-    typeof record.semanticBlockFingerprint === "string"
-    && observedSemanticFingerprint === record.semanticBlockFingerprint
-  ) return true;
 
   const desiredFingerprint = fingerprint(canonicalContribution(desired));
   if (
@@ -230,6 +335,20 @@ export function classifyIntegration(input: {
    */
   configPath?: string;
   clientId?: IntegrationClientId;
+  /**
+   * Text format of the file being classified, which is not always the client's
+   * config format: a client that moved its providers keeps a second document
+   * whose format is declared with the store. Only the comment-capability of the
+   * format is read here, and reading the wrong one would decide a sibling edit
+   * the wrong way.
+   */
+  format?: ConfigFormat;
+  /**
+   * Whether the file being classified is patched in place, which makes a
+   * sibling edit harmless. Like `format`, it belongs to the target; omitted, the
+   * client's config-file declaration answers.
+   */
+  sourcePreservingYaml?: boolean;
 }): { state: IntegrationState; reason?: StateReason } {
   if (input.fileText !== null && !input.fileIsRegular) {
     return { state: "unsafe", reason: "not-regular-file" };
@@ -239,10 +358,41 @@ export function classifyIntegration(input: {
    * Checked BEFORE `absent`: our leaf is missing in exactly this case, so the
    * absent branch would authorize an apply that replaces the user's value.
    */
-  if (blockedContainerPath(input.parsed, input.contribution)) {
-    return { state: "unsafe", reason: "blocked-container" };
+  try {
+    if (blockedContainerPath(input.parsed, input.contribution)) {
+      return { state: "unsafe", reason: "blocked-container" };
+    }
+    // Check every selector before presence/fingerprint short-circuits, including
+    // paths an older ownership record may remove during refresh or disable.
+    const paths = [
+      ...input.contribution.fragments.map(fragment => fragment.path),
+      ...(input.record?.fragmentPaths ?? []),
+    ];
+    for (const path of paths) {
+      if (Array.isArray(path) && path.every(key => typeof key === "string")) {
+        readPath(input.parsed, path);
+      }
+    }
+  } catch (error) {
+    if (error instanceof AmbiguousSelectorError) {
+      return { state: "unsafe", reason: "ambiguous-selector" };
+    }
+    if (error instanceof InvalidSelectorError) {
+      return { state: "unsafe", reason: "unparseable" };
+    }
+    throw error;
   }
-  if (!hasOurFragments(input.parsed, input.contribution)) return { state: "absent" };
+  // Before `absent`: none of our paths is occupied, yet Qoder would reject the provider.
+  if (qoderLegacyCatalogConflict(input.parsed, input.record, input.contribution)) {
+    return { state: "conflict", reason: "unowned-key" };
+  }
+  // A catalog can shrink to zero while the record still owns earlier rows.
+  // Presence for disable must include those recorded paths, independent of the
+  // current export roster; the ownership fingerprint is checked below.
+  if (!hasOurFragments(input.parsed, input.contribution)
+    && !(input.record?.fragmentPaths.some(path => readPath(input.parsed, path) !== undefined))) {
+    return { state: "absent" };
+  }
 
   /*
    * Fragments the desired contribution carries beyond the paths this record names. Both
@@ -300,15 +450,20 @@ export function classifyIntegration(input: {
    * conflict no matter what the rest of the file looks like, so the sibling-
    * edit exemption below can never mask it.
    */
-  if (!recordedBlockIsOwned(input.parsed, input.record, input.contribution)) {
+  if (!recordedBlockIsOwned(input.parsed, input.record, input.contribution)
+    && !isHermesAffinityUpgrade(input.parsed, input.record, input.contribution)) {
     return { state: "conflict", reason: "foreign-edit" };
   }
-  if (!INTEGRATION_CLIENTS[clientId].sourcePreservingYaml
-    && fingerprint(input.fileText ?? "") !== input.record.fileFingerprint) {
+  if (!(input.sourcePreservingYaml ?? INTEGRATION_CLIENTS[clientId].sourcePreservingYaml !== undefined)
+    && fingerprint(input.fileText ?? "") !== input.record.fileFingerprint
+    && !droidNormalizedFileMatchesRecord(input.parsed, input.record)) {
     /*
-     * The file changed since we wrote it, but every fragment we own is still
-     * byte-for-byte what we put there — a sibling edit, not tampering. Apply
-     * rewrites the WHOLE document, so for comment-capable formats (yaml,
+     * The file changed since we wrote it. Every fragment we own is still
+     * byte-for-byte what we put there, so this is a sibling edit rather than
+     * tampering. Known Droid row normalization is accepted before this branch
+     * only when removing its two client fields reproduces the recorded file.
+     * Other drift reaches this branch. Apply rewrites the WHOLE document, so
+     * for comment-capable formats (yaml,
      * json5, toml) it would drop comments the user wrote next to us: fail
      * closed there. Strict JSON cannot carry comments — a commented file
      * never reaches this branch because parsing already failed — so the only
@@ -322,7 +477,7 @@ export function classifyIntegration(input: {
      * stands and re-owns the file. This also lets disable proceed on a
      * drifted file — removal still touches only the recorded fragment paths.
      */
-    if (EXPORT_CLIENTS[clientId].format !== "json") {
+    if ((input.format ?? EXPORT_CLIENTS[clientId].format) !== "json") {
       return { state: "conflict", reason: "foreign-edit" };
     }
     return { state: "stale" };
@@ -343,22 +498,28 @@ export function classifyIntegration(input: {
 }
 
 export interface IntegrationStateInput {
+  modelNames?: ExportModelNames;
   clientId: IntegrationClientId;
   models: readonly ExportModel[];
   config: OcxConfig;
   port: number;
+  droidReasoningDefaults?: Record<string, string>;
   env?: NodeJS.ProcessEnv;
   home?: string;
   /** The whole integration state store, bound to one root. */
   store?: IntegrationStateStore;
   io?: IntegrationIO;
+  /** Internal explicit profile target; never accepted as a caller-provided path. */
+  resolvedPaths?: ResolvedIntegrationPaths;
 }
 
 export function exportContextOf(input: {
   models: readonly ExportModel[];
   config: OcxConfig;
   port: number;
-}): { baseUrl: string; models: readonly ExportModel[]; config: OcxConfig } {
+  droidReasoningDefaults?: Record<string, string>;
+  document?: unknown;
+}): { baseUrl: string; models: readonly ExportModel[]; config: OcxConfig; droidReasoningDefaults?: Record<string, string>; document?: unknown } {
   return {
     /*
      * Composed through the SAME helper `ocx export` uses. Interpolating the
@@ -372,7 +533,42 @@ export function exportContextOf(input: {
     baseUrl: opencodeProxyBaseUrl(input.port, input.config.hostname, input.config),
     models: input.models,
     config: input.config,
+    ...(input.droidReasoningDefaults === undefined ? {} : { droidReasoningDefaults: input.droidReasoningDefaults }),
+    // Forwarded only when the caller parsed a target: a client that resolves
+    // between two document roots (Command Code) needs the bytes on disk.
+    ...(input.document === undefined ? {} : { document: input.document }),
   };
+}
+
+export function buildIntegrationContribution(
+  input: IntegrationStateInput,
+  effective: IntegrationTarget,
+  parsed: unknown,
+  record: OwnershipRecord | null,
+): ManagedContribution {
+  // The parsed target travels with the context: a client whose reader picks
+  // between two document roots (Command Code) must see the bytes on disk, and
+  // routing it through this one builder keeps classify, plan and write agreeing.
+  const context = exportContextOf({ ...input, document: parsed });
+  const mode = resolveModelNames(input.clientId, input.modelNames,
+    record?.configPath === effective.configPath ? record.modelNames : undefined);
+  context.models = namedExportContext(input.clientId, { ...context, modelNames: mode }).models;
+  if (input.clientId === "droid" && input.droidReasoningDefaults === undefined && record?.configPath === effective.configPath) {
+    const inherited = recordedDroidContributionMatches(parsed, record)
+      ? droidDefaultsFromOwnedRows(context, parsed, record.fragmentPaths)
+      : {};
+    if (Object.keys(inherited).length > 0) context.droidReasoningDefaults = inherited;
+  }
+  return effective.buildContribution(context);
+}
+
+function recordedDroidContributionMatches(document: unknown, record: OwnershipRecord): boolean {
+  try {
+    const observed = recordedContribution(document, record);
+    return observed !== null && observedContributionMatchesRecord(observed, record);
+  } catch {
+    return false;
+  }
 }
 
 let retriedThisProcess = false;
@@ -416,9 +612,8 @@ function retentionOf(
 export function readIntegrationState(input: IntegrationStateInput): IntegrationStatus {
   const store = input.store ?? createIntegrationStateStore();
   retryPendingPrunesOnce(store);
-  const io = input.io ?? store.io();
+  let io = input.io ?? store.io();
   const spec = INTEGRATION_CLIENTS[input.clientId];
-  const exportSpec = EXPORT_CLIENTS[input.clientId];
   const retention = retentionOf(input.clientId, store);
   /*
    * Resolution can refuse — a relative OPENCLAW_* selector names a file whose
@@ -426,14 +621,29 @@ export function readIntegrationState(input: IntegrationStateInput): IntegrationS
    * every client for its state, so letting that escape would answer 500 for
    * the whole Integrations page because one client is misconfigured.
    */
-  let configPath: string;
   let installed: boolean;
+  let effective: IntegrationTarget;
+  let record: OwnershipRecord | null = null;
   try {
     // One resolution for both, so a client whose paths come from mutable state
     // cannot report one account's install beside another account's config path.
-    const paths = resolveIntegrationPaths(input.clientId, input.env, input.home);
-    configPath = paths.configPath;
+    const paths = resolveStatePaths(input, io);
     installed = io.statKind(paths.detectDir) === "dir";
+    if (input.clientId === "cline") io = createClineIO(io, paths.configPath, store);
+    /*
+     * The record is one of the inputs the target is chosen from, so it is read
+     * here rather than after the file. The status this function reports is about
+     * whichever file the next mutation would act on; reading a different one
+     * would let the badge and the switch disagree.
+     */
+    record = store.readRecords()[input.clientId] ?? null;
+    const recordedPath = boundIntegrationConfigPath({
+      clientId: input.clientId, record, resolvedPath: paths.configPath,
+      statKind: io.statKind, env: input.env, home: input.home,
+    });
+    effective = resolveIntegrationTarget({
+      clientId: input.clientId, configPath: recordedPath, io, record, env: input.env, home: input.home, resolvedPaths: paths,
+    });
   } catch (error) {
     if (!(error instanceof ClientPathError)) throw error;
     /*
@@ -447,6 +657,10 @@ export function readIntegrationState(input: IntegrationStateInput): IntegrationS
      * yet. A client that can name where its config would go gets `installed:
      * false` and that location, which reads as "not installed" in the UI.
      */
+    if (input.clientId === "zcode" && record) return {
+      clientId: input.clientId, state: "unsafe", installed: false, configPath: record.configPath,
+      reason: "unresolvable-path", appliedAt: record.appliedAt, lastOpId: record.opId, ...retention,
+    };
     const hint = unresolvedPathHintFor(input.clientId, input.env, input.home);
     return {
       clientId: input.clientId,
@@ -458,30 +672,78 @@ export function readIntegrationState(input: IntegrationStateInput): IntegrationS
     };
   }
 
-  const target = loadTarget(io, configPath);
-  if (!target.ok) {
+  const configPath = effective.configPath;
+  if (effective.pathError) return {
+    clientId: input.clientId, state: "unsafe", installed, configPath,
+    reason: "unresolvable-path",
+    ...(record?.configPath === configPath ? { appliedAt: record.appliedAt, lastOpId: record.opId } : {}),
+    ...retention,
+  };
+  if (input.clientId === "kilo") {
+    const candidates = inspectKiloCandidates({ io, selectedPath: configPath, env: input.env, home: input.home });
+    if (candidates.kind !== "ok") return {
+      clientId: input.clientId,
+      state: candidates.kind === "conflict" ? "conflict" : "unsafe",
+      installed,
+      configPath,
+      reason: candidates.kind === "conflict" ? "candidate-conflict" : candidates.why,
+      ...(candidates.kind === "conflict" ? { conflictPaths: candidates.paths } : {}),
+      ...(candidates.kind === "unsafe" ? { candidateFailurePath: candidates.path } : {}),
+      ...(record && record.configPath === configPath ? { appliedAt: record.appliedAt, lastOpId: record.opId } : {}),
+      ...retention,
+    };
+  }
+  const loaded = loadTarget(io, configPath);
+  if (!loaded.ok) {
     return {
       clientId: input.clientId,
       state: "unsafe",
       installed,
       configPath,
-      reason: target.why === "read-failed" ? "unparseable" : "not-regular-file",
+      reason: loaded.why === "read-failed" ? "unparseable" : "not-regular-file",
       ...retention,
     };
   }
 
-  const parsed = parseConfig(target.before, exportSpec.format);
-  const contribution = exportSpec.buildContribution(exportContextOf(input));
-  const record = store.readRecords()[input.clientId] ?? null;
+  const parsed = input.clientId === "cline"
+    ? parseClineDocument(loaded.before)
+    : parseConfig(loaded.before, effective.format, EXPORT_CLIENTS[input.clientId].jsonc ? { jsonc: true } : undefined);
+  let contribution: ManagedContribution;
+  try {
+    contribution = buildIntegrationContribution(input, effective, parsed, record);
+  } catch (error) {
+    // One catalog row can make this client's ownership unaddressable. Keep its
+    // refusal visible without hiding every other client in a collection read.
+    if (!(error instanceof UnrepresentableSelectorError)) throw error;
+    return { clientId: input.clientId, state: "unsafe", installed, configPath,
+      reason: "unresolvable-path",
+      ...(record?.configPath === configPath ? { appliedAt: record.appliedAt, lastOpId: record.opId } : {}),
+      ...retention };
+  }
+  if (input.clientId === "droid" && input.models.length > 0 && contribution.fragments.length === 0
+    && (!record || record.configPath !== configPath)) {
+    return { clientId: input.clientId, state: "unsafe", installed, configPath,
+      reason: "unresolvable-path", ...retention };
+  }
   const { state, reason } = classifyIntegration({
-    fileText: target.before,
+    fileText: loaded.before,
     fileIsRegular: true,
     parsed,
     record,
     contribution,
     configPath,
     clientId: input.clientId,
+    format: effective.format,
+    sourcePreservingYaml: effective.sourcePreservingYaml !== null,
   });
+  if (input.clientId === "droid" && record && (state === "current" || state === "stale")) {
+    try { assertDroidRecordedSettingsUnambiguous(spec.detectDir(input.env, input.home), parsed, record); }
+    catch (error) {
+      if (!(error instanceof ClientPathError)) throw error;
+      return { clientId: input.clientId, state: "unsafe", installed, configPath,
+        reason: "unresolvable-path", ...retention };
+    }
+  }
 
   return {
     clientId: input.clientId,
@@ -489,7 +751,49 @@ export function readIntegrationState(input: IntegrationStateInput): IntegrationS
     installed,
     configPath,
     ...(reason ? { reason } : {}),
+    /*
+     * Only when the client reads a DIFFERENT file than the one this status is
+     * about. A store we are writing needs no notice; the path already names it.
+     */
+    ...(effective.ineffective && effective.ineffective.store !== configPath
+      ? {
+          supersededBy: effective.ineffective.store,
+          supersededReason: effective.ineffective.why,
+          ...(effective.ineffective.emptyDocument === undefined ? {} : { missingStoreDocument: effective.ineffective.emptyDocument }),
+        }
+      : {}),
     ...(record ? { appliedAt: record.appliedAt, lastOpId: record.opId } : {}),
     ...retention,
   };
+}
+
+function resolveStatePaths(input: IntegrationStateInput, io: IntegrationIO): ResolvedIntegrationPaths {
+  const context = exportContextOf(input);
+  const paths = input.clientId === "zcode" || !input.resolvedPaths
+    ? resolveIntegrationPaths(input.clientId, input.env, input.home, context, io) : input.resolvedPaths;
+  if (input.clientId === "droid" && input.resolvedPaths) assertDroidPathsUnambiguous(paths.detectDir, context);
+  return paths;
+}
+
+export function readOwnedDroidReasoningDefaults(input: IntegrationStateInput): Record<string, string> {
+  if (input.clientId !== "droid") return {};
+  const store = input.store ?? createIntegrationStateStore();
+  const io = input.io ?? store.io();
+  try {
+    const paths = resolveStatePaths(input, io);
+    const record = store.readRecords().droid;
+    if (!record || record.clientId !== "droid" || record.configPath !== paths.configPath) return {};
+    const effective = resolveIntegrationTarget({
+      clientId: "droid", configPath: paths.configPath, io, record, env: input.env, home: input.home,
+    });
+    const loaded = loadTarget(io, effective.configPath);
+    if (!loaded.ok) return {};
+    const parsed = parseConfig(loaded.before, "json");
+    if (parsed === PARSE_FAILED) return {};
+    if (!recordedDroidContributionMatches(parsed, record)) return {};
+    return droidDefaultsFromOwnedRows(exportContextOf(input), parsed, record.fragmentPaths);
+  } catch (error) {
+    if (error instanceof ClientPathError) return {};
+    throw error;
+  }
 }

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
+  claudeSessionUserId,
   conversationIdFromClaudeCacheKey,
   conversationIdFromClaudeMetadata,
   conversationIdFromResponsesRequest,
@@ -9,6 +10,7 @@ import {
   reasoningReplayConversationIdFromResponsesRequest,
   sessionIdHeaderFromRequest,
   summarizeConversationLogs,
+  unwrapLogConversationQuery,
 } from "../../src/server/request-log-conversation";
 import {
   filterRequestLogs,
@@ -60,6 +62,50 @@ describe("matchesLogConversationId", () => {
     expect(matchesLogConversationId(stored, "other")).toBe(false);
     expect(matchesLogConversationId(undefined, raw)).toBe(false);
   });
+
+  test("unwraps a pasted codex://threads deep link to the bare thread id", () => {
+    const threadId = "019f6482-67d5-77c2-a643-02daddaa7115";
+    const stored = digest32(threadId);
+    expect(matchesLogConversationId(stored, `codex://threads/${threadId}`)).toBe(true);
+    expect(matchesLogConversationId(stored, `  CODEX://THREADS/${threadId}/  `)).toBe(true);
+    expect(matchesLogConversationId(threadId, `codex://threads/${threadId}`)).toBe(true);
+    expect(matchesLogConversationId(stored, "codex://threads/other-thread")).toBe(false);
+    expect(matchesLogConversationId(stored, "codex://other/x")).toBe(false);
+    expect(matchesLogConversationId(stored, "codex://threads/")).toBe(false);
+  });
+
+  test("unwraps codex://threads links carrying query or fragment metadata", () => {
+    const threadId = "019f6482-67d5-77c2-a643-02daddaa7115";
+    const stored = digest32(threadId);
+    for (const paste of [
+      `codex://threads/${threadId}?hostId=durable`,
+      `codex://threads/${threadId}?hostId=remote-control%3Aexample-environment`,
+      `codex://threads/${threadId}/?hostId=durable&view=full`,
+      `codex://threads/${threadId}#section`,
+    ]) {
+      expect(matchesLogConversationId(stored, paste)).toBe(true);
+      expect(matchesLogConversationId(threadId, paste)).toBe(true);
+    }
+  });
+
+  test("a literal codex://threads session id stays findable by its whole-string digest", () => {
+    const uri = "codex://threads/019f6482-67d5-77c2-a643-02daddaa7115";
+    const stored = digest32(uri);
+    expect(matchesLogConversationId(stored, uri)).toBe(true);
+    const withHost = `${uri}?hostId=durable`;
+    expect(matchesLogConversationId(digest32(withHost), withHost)).toBe(true);
+    expect(matchesLogConversationId(stored, withHost)).toBe(false);
+    expect(matchesLogConversationId(stored, "codex://threads/other-thread")).toBe(false);
+  });
+
+  test("rejects malformed or oversized codex://threads pastes without backtracking", () => {
+    const stored = digest32("019f6482-67d5-77c2-a643-02daddaa7115");
+    const slashFlood = `codex://threads/${"/".repeat(4000)}\u2028x`;
+    expect(unwrapLogConversationQuery(slashFlood)).toBe(slashFlood.trim());
+    expect(matchesLogConversationId(stored, slashFlood)).toBe(false);
+    expect(matchesLogConversationId(stored, "codex://threads/id/extra")).toBe(false);
+    expect(matchesLogConversationId(stored, `codex://threads/${"a".repeat(600)}`)).toBe(false);
+  });
 });
 
 describe("sessionIdHeaderFromRequest", () => {
@@ -95,6 +141,62 @@ describe("conversationIdFromResponsesRequest", () => {
   });
 });
 
+test("Hermes identity is a log-only fallback that any native id replaces", async () => {
+  const { assignNativeLogConversationId, fillHermesLogConversationFallback } =
+    await import("../../src/server/request-log-conversation");
+  const rawId = "hermes-responses-fixture";
+  const headers = new Headers({ "x-hermes-conversation-id": rawId });
+  const slot: { conversationId?: string; conversationIdIsHermesFallback?: boolean } = {};
+  fillHermesLogConversationFallback(slot, headers);
+  expect(slot).toEqual({ conversationId: digest32(rawId), conversationIdIsHermesFallback: true });
+  // A Cursor conversation created mid-turn is a late native id; it must still replace Hermes.
+  assignNativeLogConversationId(slot, digest32("cursor-late-conversation"));
+  expect(slot).toEqual({ conversationId: digest32("cursor-late-conversation") });
+  // Once native, neither a second native id nor the Hermes header overwrites it.
+  assignNativeLogConversationId(slot, digest32("other-native"));
+  fillHermesLogConversationFallback(slot, headers);
+  expect(slot).toEqual({ conversationId: digest32("cursor-late-conversation") });
+});
+
+test("a caller-owned log id (routed Claude) is never replaced", async () => {
+  const { assignNativeLogConversationId, fillHermesLogConversationFallback } =
+    await import("../../src/server/request-log-conversation");
+  const slot: { conversationId?: string; conversationIdIsHermesFallback?: boolean } = {
+    conversationId: digest32("claude-metadata-user"),
+  };
+  assignNativeLogConversationId(slot, digest32("cursor-late-conversation"));
+  fillHermesLogConversationFallback(slot, new Headers({ "x-hermes-conversation-id": "hermes" }));
+  expect(slot).toEqual({ conversationId: digest32("claude-metadata-user") });
+});
+
+test("Responses: empty session header does not suppress valid thread-id over Hermes fallback", async () => {
+  const { nativeLogConversationIdFromHeaders, conversationIdFromResponsesRequest, sessionIdHeaderFromRequest } =
+    await import("../../src/server/request-log-conversation");
+  const rawThreadId = "native-thread-valid";
+  const headers = new Headers({
+    "session_id": "",
+    "thread-id": rawThreadId,
+    "x-hermes-conversation-id": "hermes-responses-fallback",
+  });
+
+  const resolvedConversationId = conversationIdFromResponsesRequest({
+    sessionIdHeader: sessionIdHeaderFromRequest(headers),
+    threadIdHeader: headers.get("thread-id"),
+  });
+  expect(resolvedConversationId).toBeUndefined();
+  expect(resolvedConversationId ?? nativeLogConversationIdFromHeaders(headers)).toBe(digest32(rawThreadId));
+});
+
+test("Chat: empty session_id does not mask valid session-id over Hermes fallback", async () => {
+  const { nativeLogConversationIdFromHeaders } = await import("../../src/server/request-log-conversation");
+  const rawSessionId = "native-session-valid";
+  const headers = new Headers({
+    "session_id": "",
+    "session-id": rawSessionId,
+    "x-hermes-conversation-id": "hermes-chat-fallback",
+  });
+  expect(nativeLogConversationIdFromHeaders(headers)).toBe(digest32(rawSessionId));
+});
 describe("reasoningReplayConversationIdFromResponsesRequest", () => {
   test("keeps the raw identity instead of the hashed log id", () => {
     expect(reasoningReplayConversationIdFromResponsesRequest({
@@ -105,11 +207,18 @@ describe("reasoningReplayConversationIdFromResponsesRequest", () => {
     })).not.toBe(digest32("session"));
   });
 
-  test("prefers parent thread, then thread-id, then cursor, then session_id", () => {
+  test("prefers the request's own thread-id, then the parent thread, then cursor, then session_id", () => {
+    // A child agent carries both headers. Its own thread-id must own its replay record, or the
+    // child's route overwrites the parent's serving provenance and the parent loses its
+    // replayed thinking signatures on the next turn (#8632).
     expect(reasoningReplayConversationIdFromResponsesRequest({
       clientThreadId: "parent-thread",
       threadIdHeader: "thread",
       cursorConversationId: "cursor",
+      sessionIdHeader: "session",
+    })).toBe("thread");
+    expect(reasoningReplayConversationIdFromResponsesRequest({
+      clientThreadId: "parent-thread",
       sessionIdHeader: "session",
     })).toBe("parent-thread");
     expect(reasoningReplayConversationIdFromResponsesRequest({
@@ -146,6 +255,26 @@ describe("conversationIdFromClaudeMetadata", () => {
     expect(conversationIdFromClaudeMetadata({})).toBeUndefined();
     expect(conversationIdFromClaudeCacheKey("system", "system-hash")).toBeUndefined();
     expect(conversationIdFromClaudeCacheKey("metadata", digest32("session-user"))).toBe(digest32("session-user"));
+  });
+
+  test("a Claude Code turn token (tk) keeps one conversation, and so one pooled account", () => {
+    const session = JSON.stringify({ device_id: "d", account_uuid: "a", session_id: "s" });
+    const turn = (tk: string) => JSON.stringify({ device_id: "d", account_uuid: "a", session_id: "s", tk });
+    expect(conversationIdFromClaudeMetadata({ user_id: turn("turn-1") })).toBe(digest32(session));
+    expect(conversationIdFromClaudeMetadata({ user_id: turn("turn-2") })).toBe(digest32(session));
+    // Anything else keys on its raw string, as before.
+    for (const raw of ['{"tk":"only"}', '{ "session_id": "s" }', '["tk"]', "not json"]) {
+      expect(conversationIdFromClaudeMetadata({ user_id: raw })).toBe(digest32(raw));
+    }
+    // Logs search with any turn's user_id finds the session; older raw-keyed rows still match.
+    expect(matchesLogConversationId(digest32(session), turn("turn-3"))).toBe(true);
+    expect(matchesLogConversationId(digest32(turn("turn-3")), turn("turn-3"))).toBe(true);
+    // An oversized id is never persisted, but its cache key still drops tk.
+    const huge = JSON.stringify({ session_id: "s", tk: "t", pad: "x".repeat(5000) });
+    expect(conversationIdFromClaudeMetadata({ user_id: huge })).toBeUndefined();
+    expect(JSON.parse(claudeSessionUserId(huge))).not.toHaveProperty("tk");
+    // An oversized tk alone does not cost the session its identity (it also gates routing).
+    expect(conversationIdFromClaudeMetadata({ user_id: turn("t".repeat(5000)) })).toBe(digest32(session));
   });
 });
 
@@ -190,6 +319,22 @@ describe("request log conversation persistence / filter", () => {
       .toEqual(["a"]);
     expect(filterRequestLogs(logs, new URLSearchParams(`conversation=${digest32("conv-2")}`)).map(e => e.requestId))
       .toEqual(["b"]);
+  });
+
+  test("filterRequestLogs unwraps a pasted codex://threads link", () => {
+    const threadId = "019f6482-67d5-77c2-a643-02daddaa7115";
+    const logs = [
+      log({ requestId: "a", conversationId: digest32(threadId) }),
+      log({ requestId: "b", conversationId: digest32("conv-2") }),
+    ];
+    const params = new URLSearchParams(`conversationId=${encodeURIComponent(`codex://threads/${threadId}`)}`);
+    expect(filterRequestLogs(logs, params).map(e => e.requestId)).toEqual(["a"]);
+    for (const hostId of ["durable", "remote-control%3Aexample-environment"]) {
+      const withHost = new URLSearchParams(
+        `conversationId=${encodeURIComponent(`codex://threads/${threadId}?hostId=${hostId}`)}`,
+      );
+      expect(filterRequestLogs(logs, withHost).map(e => e.requestId)).toEqual(["a"]);
+    }
   });
 
   test("hydrated usage rows keep conversationId", () => {

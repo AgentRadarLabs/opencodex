@@ -44,8 +44,13 @@ const COST_VENDOR_BUNDLES = [
   "zai", "mistral", "cerebras", "azure-openai", "amazon-bedrock", "xiaomi",
 ];
 
+// Capability-only bundles may describe a transport/backend that is not a public provider preset.
+// The canonical ChatGPT Codex forward route has modality differences from the public OpenAI API
+// (for example retired Spark is text-only there), so keep that evidence distinct.
+const CAPABILITY_ONLY_BUNDLES = ["openai-codex"];
+
 const allowedProviders = Array.from(
-  new Set([...Object.values(PROVIDER_ALIASES), ...COST_VENDOR_BUNDLES]),
+  new Set([...Object.values(PROVIDER_ALIASES), ...COST_VENDOR_BUNDLES, ...CAPABILITY_ONLY_BUNDLES]),
 ).sort();
 
 // Models the upstream catalogue lists but the provider rejects at request time. Issue #82:
@@ -128,7 +133,7 @@ lines.push("");
 lines.push("// Cross-provider model-level price fallback (260720 WP5): a model follows its");
 lines.push("// official vendor price regardless of the serving provider. Exact modelId match in");
 lines.push("// priority-ordered vendor bundles; first nonzero cost wins.");
-lines.push("const COST_VENDOR_PRIORITY = " + JSON.stringify(COST_VENDOR_BUNDLES) + ";");
+lines.push("export const COST_VENDOR_PRIORITY = " + JSON.stringify(COST_VENDOR_BUNDLES) + ";");
 lines.push("export function findVendorCostByModelId(modelId: string): { provider: string; cost: { input: number; output: number; cacheRead: number; cacheWrite: number } } | undefined {");
 lines.push("  for (const provider of COST_VENDOR_PRIORITY) {");
 lines.push("    const row = DATA[provider]?.find(r => r[0] === modelId);");

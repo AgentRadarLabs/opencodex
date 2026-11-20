@@ -1,34 +1,14 @@
 import { isCyberPolicyCode, isCyberPolicyMessage } from "../lib/errors";
+import { sseDataPayload } from "./sse-payload-rewrite";
 
 export const MAX_CLIENT_SSE_FRAME_BYTES = 4 * 1024 * 1024;
 
-/**
- * Classify the bytes at `index` as an SSE block delimiter.
- *
- * Returns the delimiter length in bytes, `0` when `index` does not start a
- * delimiter, and `undefined` when more bytes are required to decide.
- */
-export function sseDelimiterLengthAt(
-  index: number,
-  length: number,
-  byteAt: (index: number) => number,
-  endOfStream = false,
-): number | undefined {
-  const first = byteAt(index);
-  if (first !== 10 && first !== 13) return 0;
-  const firstLength = first === 13
-    && index + 1 < length
-    && byteAt(index + 1) === 10
-    ? 2
-    : 1;
-  const secondIndex = index + firstLength;
-  if (secondIndex >= length) return undefined;
-  const second = byteAt(secondIndex);
-  if (second === 10) return firstLength + 1;
-  if (second !== 13) return 0;
-  if (secondIndex + 1 >= length) return endOfStream ? firstLength + 1 : undefined;
-  return firstLength + (byteAt(secondIndex + 1) === 10 ? 2 : 1);
-}
+export const EMPTY_BYTES = new Uint8Array(0);
+
+// Intern every legal pair; a split CRLF may leave a framing-only LF continuation.
+const DELIMITERS = new Map([
+  "\n", "\n\n", "\n\r", "\n\r\n", "\r\r", "\r\r\n", "\r\n\n", "\r\n\r", "\r\n\r\n",
+].map(text => [text, Uint8Array.from(text, char => char.charCodeAt(0))]));
 
 export class SseFrameTooLargeError extends Error {
   readonly maxBytes: number;
@@ -53,12 +33,43 @@ export class SseFrameCountLimitError extends Error {
 export type BoundedSseFrame = {
   block: Uint8Array;
   delimiter: Uint8Array;
+  /** A late LF extending a previously returned CR; no new event. */
+  continuation?: true;
 };
 
-export type BoundedSseFinish = {
-  frames: BoundedSseFrame[];
-  tail: Uint8Array;
-};
+/**
+ * Classify the bytes at `index` as an SSE block delimiter.
+ *
+ * Returns the delimiter length in bytes, `0` when `index` does not start a
+ * delimiter, and `undefined` when more bytes are required to decide.
+ */
+export function sseDelimiterLengthAt(
+  index: number,
+  length: number,
+  byteAt: (index: number) => number,
+): number | undefined {
+  const first = byteAt(index);
+  if (first !== 10 && first !== 13) return 0;
+  let next = index + 1;
+  if (next >= length) return undefined;
+  if (first === 13 && byteAt(next) === 10) next += 1;
+  if (next >= length) return undefined;
+  const second = byteAt(next);
+  if (second !== 10 && second !== 13) return 0;
+  next += 1;
+  if (second === 13 && next < length && byteAt(next) === 10) next += 1;
+  return next - index;
+}
+
+function delimiterBytesAt(
+  index: number,
+  delimiterLength: number,
+  byteAt: (index: number) => number,
+): Uint8Array {
+  let text = "";
+  for (let offset = 0; offset < delimiterLength; offset++) text += String.fromCharCode(byteAt(index + offset));
+  return DELIMITERS.get(text)!;
+}
 
 function copyRange(
   start: number,
@@ -85,14 +96,8 @@ function copyRange(
  * cost on ordinary framing.
  */
 function isResponsesTerminalFrame(block: Uint8Array): boolean {
-  const data: string[] = [];
-  for (const line of new TextDecoder().decode(block).split(/\r\n|\r|\n/)) {
-    if (!line.startsWith("data:")) continue;
-    const value = line.slice(5);
-    data.push(value.startsWith(" ") ? value.slice(1) : value);
-  }
-  if (data.length === 0) return false;
-  const payload = data.join("\n");
+  const payload = sseDataPayload(new TextDecoder().decode(block));
+  if (payload === null) return false;
   if (payload === "[DONE]") return false;
   try {
     const parsed = JSON.parse(payload) as {
@@ -142,10 +147,11 @@ function isResponsesTerminalFrame(block: Uint8Array): boolean {
 export class BoundedSseFrameBuffer {
   private readonly maxFrameBytes: number;
   private readonly maxFramesPerFeed: number;
-  private delimiterTail: Uint8Array = new Uint8Array(0);
-  private candidate: Uint8Array = new Uint8Array(0);
+  private delimiterTail: Uint8Array = EMPTY_BYTES;
+  private candidate: Uint8Array = EMPTY_BYTES;
   private candidateBytes = 0;
   private disposed = false;
+  private pendingLineFeed = false;
 
   constructor(maxFrameBytes = MAX_CLIENT_SSE_FRAME_BYTES) {
     if (!Number.isSafeInteger(maxFrameBytes) || maxFrameBytes <= 0) {
@@ -159,9 +165,10 @@ export class BoundedSseFrameBuffer {
   }
 
   private clear(): void {
-    this.delimiterTail = new Uint8Array(0);
-    this.candidate = new Uint8Array(0);
+    this.delimiterTail = EMPTY_BYTES;
+    this.candidate = EMPTY_BYTES;
     this.candidateBytes = 0;
+    this.pendingLineFeed = false;
   }
 
   private ensureCapacity(requiredBytes: number): void {
@@ -196,12 +203,12 @@ export class BoundedSseFrameBuffer {
   }
 
   private takeCandidate(): Uint8Array {
-    if (this.candidateBytes === 0) return new Uint8Array(0);
+    if (this.candidateBytes === 0) return EMPTY_BYTES;
     const block = this.candidate.slice(0, this.candidateBytes);
     // Release the working allocation after each complete frame. This avoids
     // retaining a rare multi-MiB frame allocation for the rest of a long-lived
     // stream; normal small-frame allocation remains bounded by feed's frame cap.
-    this.candidate = new Uint8Array(0);
+    this.candidate = EMPTY_BYTES;
     this.candidateBytes = 0;
     return block;
   }
@@ -211,8 +218,9 @@ export class BoundedSseFrameBuffer {
     if (chunk.byteLength === 0) return [];
 
     const frames: BoundedSseFrame[] = [];
+    let completedFrames = 0;
     const previousTail = this.delimiterTail;
-    this.delimiterTail = new Uint8Array(0);
+    this.delimiterTail = EMPTY_BYTES;
     const tailLength = previousTail.byteLength;
     const totalLength = tailLength + chunk.byteLength;
     const byteAt = (index: number): number => index < tailLength
@@ -230,27 +238,30 @@ export class BoundedSseFrameBuffer {
 
     try {
       let index = 0;
-      let retainedThrough = 0;
+      if (this.pendingLineFeed && byteAt(0) === 10) {
+        // The prior event was already dispatched on CR. Preserve its later LF without
+        // charging it to the next event or letting it pair with another line ending.
+        frames.push({ block: EMPTY_BYTES, delimiter: DELIMITERS.get("\n")!, continuation: true });
+        index = 1;
+      }
+      this.pendingLineFeed = false;
+      let retainedThrough = index;
       while (index < totalLength) {
         const delimiterLength = sseDelimiterLengthAt(index, totalLength, byteAt);
         if (delimiterLength === undefined) break;
         if (delimiterLength > 0) {
-          if (frames.length >= this.maxFramesPerFeed) {
+          if (completedFrames >= this.maxFramesPerFeed) {
             this.clear();
             this.disposed = true;
             throw new SseFrameCountLimitError(this.maxFramesPerFeed);
           }
           retainRange(retainedThrough, index);
           const block = this.takeCandidate();
-          const delimiter = copyRange(
-            index,
-            index + delimiterLength,
-            tailLength,
-            previousTail,
-            chunk,
-          );
+          const delimiter = delimiterBytesAt(index, delimiterLength, byteAt);
           frames.push({ block, delimiter });
+          completedFrames += 1;
           index += delimiterLength;
+          this.pendingLineFeed = index === totalLength && byteAt(index - 1) === 13;
           retainedThrough = index;
           continue;
         }
@@ -277,36 +288,22 @@ export class BoundedSseFrameBuffer {
     }
   }
 
-  /** Resolve any final delimiter and release all retained state. */
-  finishFrames(): BoundedSseFinish {
-    if (this.disposed) return { frames: [], tail: new Uint8Array(0) };
+  /** Bytes retained for an unfinished frame, including a possible delimiter prefix. */
+  get pendingBytes(): number {
+    return this.candidateBytes + this.delimiterTail.byteLength;
+  }
+
+  /** Return the final unterminated block bytes and release all retained state. */
+  finish(): Uint8Array {
+    if (this.disposed) return EMPTY_BYTES;
     try {
-      const delimiter = this.delimiterTail;
-      this.delimiterTail = new Uint8Array(0);
-      const delimiterLength = delimiter.byteLength > 0
-        ? sseDelimiterLengthAt(0, delimiter.byteLength, index => delimiter[index]!, true)
-        : 0;
-      if (delimiter.byteLength > 0 && delimiterLength === delimiter.byteLength) {
-        return {
-          frames: [{ block: this.takeCandidate(), delimiter }],
-          tail: new Uint8Array(0),
-        };
-      }
-      this.retain(delimiter);
-      return { frames: [], tail: this.takeCandidate() };
+      this.retain(this.delimiterTail);
+      this.delimiterTail = EMPTY_BYTES;
+      return this.takeCandidate();
     } finally {
       this.clear();
       this.disposed = true;
     }
-  }
-
-  /** Return final bytes in wire order and release all retained state. */
-  finish(): Uint8Array {
-    const { frames, tail } = this.finishFrames();
-    return joinSseFrameBytes([
-      ...frames.flatMap(frame => [frame.block, frame.delimiter]),
-      tail,
-    ]);
   }
 
   dispose(): void {
@@ -319,7 +316,7 @@ export class BoundedSseFrameBuffer {
 export function joinSseFrameBytes(parts: readonly Uint8Array[]): Uint8Array {
   let byteLength = 0;
   for (const part of parts) byteLength += part.byteLength;
-  if (byteLength === 0) return new Uint8Array(0);
+  if (byteLength === 0) return EMPTY_BYTES;
   if (parts.length === 1 && parts[0]!.byteLength === byteLength) return parts[0]!;
   const joined = new Uint8Array(byteLength);
   let offset = 0;

@@ -22,6 +22,30 @@ function poolReport(current: unknown = { weeklyPercent: 70, updatedAt: observedA
 }
 const render = (node: ReactNode) => renderToStaticMarkup(<LanguageProvider>{node}</LanguageProvider>);
 
+test("Mistral budget windows display unknown without a false zero", () => {
+  const report = { quota: { updatedAt: observedAt, unknownBudgetWindows: [
+    { label: "API budget (EDU)", resetAt: Date.UTC(2026, 11, 1) },
+    { label: "Vibe budget (EDU)", resetAt: Date.UTC(2026, 11, 1) },
+  ] } };
+  const markup = render(<ProviderCurrentQuota report={report} />);
+  expect(markup).toContain("API budget (EDU)");
+  expect(markup).toContain("Vibe budget (EDU)");
+  expect(markup).toContain("Quota unknown");
+  expect(markup).not.toContain("0% used");
+});
+
+test("Mistral measured budgets use the existing quota renderer", () => {
+  const report = { quota: { updatedAt: observedAt, customWindows: [
+    { label: "API budget", displayLabel: "API budget (EUR 2.50 of EUR 20.00 used; EDU)", percent: 12.5, resetAt: Date.UTC(2026, 11, 1) },
+    { label: "Vibe budget", displayLabel: "Vibe budget (EUR 0.20 of EUR 10.00 used; EDU)", percent: 2, resetAt: Date.UTC(2026, 11, 1) },
+  ] } };
+  const markup = render(<ProviderCurrentQuota report={report} />);
+  expect(markup).toContain("API budget (EUR 2.50 of EUR 20.00 used; EDU)");
+  expect(markup).toContain("Vibe budget (EUR 0.20 of EUR 10.00 used; EDU)");
+  expect(markup).toContain("13% used");
+  expect(markup).toContain("2% used");
+});
+
 test("current quota projection uses the account measurement and timestamp, never the aggregate", () => {
   const projected = currentAccountQuotaReport(poolReport());
   expect(accountQuotaFromReport(projected)?.weeklyPercent).toBe(70);
@@ -99,4 +123,20 @@ test("unsupported, passive unobserved, explicit loading and failed last-good are
   expect(failed).toContain('data-quota-state="unavailable"');
   expect(failed).toContain("12% used");
   expect(failed).toContain("Quota updated");
+});
+
+
+test("safe account failure categories reach both current and all-account quota views", () => {
+  const quota = { weeklyPercent: 12, updatedAt: observedAt };
+  const reading = { quotaMode: "probe" as const, quota, quotaUnavailable: true, quotaFailure: "dns_failed" as const };
+  for (const view of [<ProviderAccountQuota {...reading} />, <ProviderCurrentQuota reading={reading} />]) {
+    const markup = render(view);
+    expect(markup).toContain("The quota hostname could not be resolved.");
+    expect(markup).toContain("12% used");
+  }
+  const unknown = render(<ProviderAccountQuota {...reading} quotaFailure={"private-error" as never} />);
+  expect(unknown).not.toContain("private-error");
+  expect(unknown).not.toContain("hostname");
+  const recovered = render(<ProviderAccountQuota {...reading} quotaUnavailable={false} />);
+  expect(recovered).not.toContain("hostname");
 });

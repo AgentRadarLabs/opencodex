@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { cmdAccount, classifyAccount, formatAccountTable, type AccountDeps } from "../../src/cli/account";
 import type { AccountStdin } from "../../src/cli/account-api";
+import { projectCodexQuotaRefreshOutcome } from "../../src/codex/quota-refresh-outcome";
 import { printSubcommandUsage } from "../../src/cli/help";
 import {
   DEFAULT_ACCOUNT_PRIORITY,
@@ -136,11 +137,12 @@ function json(body: unknown, status = 200): Response {
 
 async function mockManagementApi(req: Request): Promise<Response> {
   const url = new URL(req.url);
-  const body = req.method === "PUT" || req.method === "POST" ? await req.json() : undefined;
+  const body = req.method === "PUT" || req.method === "POST" ? await req.json().catch(() => undefined) : undefined;
   requests.push({ method: req.method, path: url.pathname, search: url.search, body });
 
-  if (req.method === "GET" && url.pathname === "/api/codex-auth/accounts") {
-    if (url.searchParams.get("refresh") === "1" && codexRefreshFailure) {
+  if ((req.method === "GET" && url.pathname === "/api/codex-auth/accounts")
+    || (req.method === "POST" && url.pathname === "/api/codex-auth/accounts/refresh")) {
+    if ((url.searchParams.get("refresh") === "1" || req.method === "POST") && codexRefreshFailure) {
       return json({ error: codexRefreshFailure.error }, codexRefreshFailure.status);
     }
     if (lastDeletedType === "codex" && postDeleteReadFailure) {
@@ -375,7 +377,7 @@ async function mockManagementApi(req: Request): Promise<Response> {
 }
 
 function defaultDeps(): AccountDeps {
-  return { baseUrl, loadConfigImpl: fixtureConfig };
+  return { baseUrl, loadConfigImpl: fixtureConfig, antigravityRisk: { agentDriven: () => false, promptVisible: () => true } };
 }
 
 function stdinFrom(value: string, isTTY = false): AccountStdin {
@@ -490,8 +492,9 @@ describe("account login --device", () => {
   test("is rejected for providers that have no device flow", async () => {
     const result = await run(["login", "anthropic", "--device", "--no-wait"]);
 
-    expect(result.code).not.toBe(0);
-    expect(result.output).toContain("--device is not supported for provider 'anthropic'");
+    expect(result.code).toBe(2);
+    expect(result.output).toContain("--device is not supported for this provider");
+    expect(requests).toHaveLength(0);
   });
 
   test("is accepted as a no-op for providers that are already device flows", async () => {
@@ -584,6 +587,151 @@ afterEach(() => {
 });
 
 describe("ocx account CLI (issue #180 matrix)", () => {
+  test("OAuth quota diagnostics use a closed code in human and JSON output", async () => {
+    oauthAccounts = [{ id: "acct_1", quotaUnavailable: true, quotaFailure: "dns_failed" }];
+    const human = await run(["list", "anthropic", "--quota"]);
+    expect(human.code).toBe(0);
+    expect(human.stdout).toContain("unavailable (dns_failed)");
+    const machine = await run(["list", "anthropic", "--quota", "--json"]);
+    expect(JSON.parse(machine.stdout).accounts[0].quotaFailure).toBe("dns_failed");
+    oauthAccounts = [{ id: "acct_1", quotaUnavailable: true, quotaFailure: RAW_SENTINEL }];
+    const unknown = await run(["list", "anthropic", "--quota", "--json"]);
+    expect(unknown.stdout).not.toContain(RAW_SENTINEL);
+    expect(JSON.parse(unknown.stdout).accounts[0]).not.toHaveProperty("quotaFailure");
+  });
+
+  test("plan exclusions survive the API projection and use the policy plan", async () => {
+    codexAccounts = [{ id: "policy", plan: "plus", selectionExcludedReason: "plan_excluded", selectionExcludedPlan: "free", paused: false }];
+    const human = await run(["list", "openai"]);
+    expect(human.code).toBe(0);
+    expect(human.stdout).toContain("not-auto-selected(plan=free)");
+    const machine = await run(["list", "openai", "--json"]);
+    expect(JSON.parse(machine.stdout).accounts[0]).toMatchObject({ selectionExcludedReason: "plan_excluded", selectionExcludedPlan: "free" });
+    codexAccounts = [{ id: "policy", plan: "plus", selectionExcludedReason: "unrecognized", selectionExcludedPlan: "free" }];
+    expect((await run(["list", "openai"])).stdout).not.toContain("not-auto-selected");
+    expect(JSON.parse((await run(["list", "openai", "--json"])).stdout).accounts[0]).not.toHaveProperty("selectionExcludedReason");
+  });
+
+  test.each(["estimated", "insufficient-evidence"] as const)("human and JSON history preserve capacity status %s", async status => {
+    const capacity = status === "estimated" ? { status, estimates: [{ window: "weekly", estimatedTokens: 10000, sampleCount: 2, confidence: "low" }] }
+      : { status, reason: "ledger_truncated", estimates: [] };
+    const deps: AccountDeps = { baseUrl: "http://127.0.0.1:10100", fetchImpl: (async () => Response.json({ observations: [{
+      observedAt: 1_800_000_000_000, source: "wham", windows: [{ family: "account", window: "weekly", usedPercent: 20 }],
+    }], capacity })) as typeof fetch };
+    const human = await run(["history", "openai", "pool-a"], deps);
+    expect(human.code).toBe(0);
+    expect(human.stdout).toContain(status === "estimated" ? "~10000 reported tokens / 100%\t2 samples" : "insufficient evidence (ledger_truncated)");
+    const json = await run(["history", "openai", "pool-a", "--json"], deps);
+    expect(JSON.parse(json.stdout).capacity).toEqual(capacity);
+  });
+
+  test("human quota history renders populated rows and safely handles oversized reset dates", async () => {
+    const result = await run(["history", "openai", "pool-a"], { baseUrl: "http://127.0.0.1:10100", fetchImpl: (async () => Response.json({
+      observations: [{ observedAt: 1_800_000_000_000, source: "wham", windows: [
+        { family: "account", window: "weekly", usedPercent: 20, resetAtMs: 1e20 },
+      ] }],
+    })) as typeof fetch });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("2027-01-15T08:00:00.000Z\twham\taccount/weekly\t20%\tunknown");
+  });
+
+  test("history reads one cached endpoint and rejects invalid arguments before I/O", async () => {
+    let calls = 0;
+    const deps: AccountDeps = { baseUrl: "http://127.0.0.1:10100", fetchImpl: (async input => {
+      calls++;
+      expect(String(input)).toBe("http://127.0.0.1:10100/api/codex-auth/quota/history?accountId=pool-a&limit=2");
+      return Response.json({ accountId: "pool-a", observations: [], retention: { maxObservations: 200, maxAgeDays: 30 }, truncated: false });
+    }) as typeof fetch };
+    const result = await run(["history", "openai", "pool-a", "--limit", "2", "--json"], deps);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).observations).toEqual([]);
+    for (const args of [["anthropic", "pool-a"], ["openai", "__main__"], ["openai", "pool-a", "--limit", "201"], ["openai", "pool-a", "--unknown"]]) {
+      expect((await run(["history", ...args], deps)).code).toBe(1);
+    }
+    expect(calls).toBe(1);
+  });
+
+  test.each([100, 12])("pending validation stays visible at %s percent usage without exposing raw health details", async weeklyPercent => {
+    codexAccounts = [{ id: "pending", email: "p***@example.test", quota: { weeklyPercent },
+      health: { status: "warning", reason: "validation_pending", message: RAW_SENTINEL } }];
+    for (const command of [["list", "openai"], ["refresh", "openai"]]) {
+      const human = await run(command);
+      expect(human.code).toBe(0);
+      expect(human.stdout).toContain("validation-pending");
+      expect(human.output).not.toContain(RAW_SENTINEL);
+      const machine = await run([...command, "--json"]);
+      expect(JSON.parse(machine.stdout).accounts[0].validationPending).toBe(true);
+      expect(machine.output).not.toContain(RAW_SENTINEL);
+    }
+    codexAccounts = [{ id: "pending", quota: { weeklyPercent: 12 }, health: { status: "healthy" } }];
+    const recovered = await run(["refresh", "openai", "--json"]);
+    expect(JSON.parse(recovered.stdout).accounts[0]).not.toHaveProperty("validationPending");
+    expect((await run(["refresh", "openai"])).stdout).not.toContain("validation-pending");
+  });
+
+  test("main quota diagnostics survive opt-in JSON without copying upstream data", async () => {
+    codexAccounts = [{ id: "__main__", isMain: true, quota: null,
+      quotaRefresh: { status: "http_error", httpStatus: 503, message: RAW_SENTINEL } }];
+    const result = await run(["list", "openai", "--quota", "--refresh", "--json"]);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).accounts[0].quotaRefresh).toEqual({ status: "http_error", httpStatus: 503 });
+    expect(result.output).not.toContain(RAW_SENTINEL);
+    const ordinary = await run(["list", "openai", "--json"]);
+    expect(JSON.parse(ordinary.stdout).accounts[0]).not.toHaveProperty("quotaRefresh");
+  });
+
+  test.each([
+    { status: "private-status-canary" },
+    { status: "http_error", httpStatus: "503" },
+    { status: "http_error", httpStatus: 999 },
+    { status: "http_error", httpStatus: 503.5 },
+    null,
+  ])("invalid quota diagnostic is omitted: %j", async quotaRefresh => {
+    codexAccounts = [{ id: "__main__", isMain: true, quota: null, quotaRefresh }];
+    const result = await run(["list", "openai", "--quota", "--json"]);
+    expect(JSON.parse(result.stdout).accounts[0]).not.toHaveProperty("quotaRefresh");
+    expect(result.output).not.toContain("canary");
+  });
+
+  test.each(["ok", "not_reported", "timeout", "network_error", "invalid_response", "internal_error"])(
+    "quota JSON reconstructs %s without extra fields", async status => {
+      codexAccounts = [{ id: "__main__", isMain: true, quota: null,
+        quotaRefresh: { status, httpStatus: 503, accountId: RAW_SENTINEL, nested: { token: RAW_SENTINEL } } }];
+      const result = await run(["list", "openai", "--quota", "--json"]);
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout).accounts[0].quotaRefresh).toEqual({ status });
+      expect(result.output).not.toContain(RAW_SENTINEL);
+    },
+  );
+
+  test.each([
+    { value: undefined },
+    { value: null },
+    { value: [] },
+    { value: "private-diagnostic-canary" },
+    { value: 0 },
+    { value: true },
+    { value: {} },
+    { value: { status: "private-status-canary" } },
+    { value: { status: "http_error" } },
+    { value: { status: "http_error", httpStatus: NaN } },
+    { value: { status: "http_error", httpStatus: Infinity } },
+    { value: { status: "http_error", httpStatus: 99 } },
+    { value: { status: "http_error", httpStatus: 600 } },
+    { value: { status: "http_error", httpStatus: 403.5 } },
+    { value: { status: "http_error", httpStatus: "403" } },
+  ])("diagnostic projector rejects invalid values: %j", ({ value }) => {
+    expect(projectCodexQuotaRefreshOutcome(value)).toBeUndefined();
+  });
+
+  test.each([100, 599])("diagnostic projector bounds HTTP status %s and strips extra fields", httpStatus => {
+    const source = { status: "http_error", httpStatus, token: RAW_SENTINEL };
+    const projected = projectCodexQuotaRefreshOutcome(source);
+    expect(projected).toEqual({ status: "http_error", httpStatus });
+    expect(projected).not.toBe(source);
+    expect(JSON.stringify(projected)).not.toContain(RAW_SENTINEL);
+  });
+
   test("1: list renders all three account families, main alias, and padded columns", async () => {
     const result = await run(["list"]);
 
@@ -843,7 +991,7 @@ describe("ocx account CLI (issue #180 matrix)", () => {
 
     expect(human.code).toBe(0);
     expect(requests.some(request =>
-      request.path === "/api/codex-auth/accounts" && request.search === "?refresh=1"
+      request.path === "/api/codex-auth/accounts/refresh" && request.method === "POST"
     )).toBe(true);
     expect(human.stdout).toContain("weekly 42%");
     expect(human.stdout).toContain("monthly 17%");
@@ -942,13 +1090,13 @@ describe("ocx account CLI (issue #180 matrix)", () => {
     });
   });
 
-  test("21: auto-switch rejects wrong providers, invalid thresholds and missing providers", async () => {
-    const wrongProvider = await run(["auto-switch", "anthropic", "on"]);
+  test("21: auto-switch rejects missing Anthropic account selectors, invalid thresholds and missing providers", async () => {
+    const missingAnthropicAccount = await run(["auto-switch", "anthropic", "on"]);
     const invalidThreshold = await run(["auto-switch", "openai", "threshold", "101"]);
     const missingProvider = await run(["auto-switch"]);
 
-    expect(wrongProvider.code).toBe(1);
-    expect(wrongProvider.stderr).toContain("auto-switch only applies to the openai Codex account pool or a generic OAuth provider pool");
+    expect(missingAnthropicAccount.code).toBe(2);
+    expect(missingAnthropicAccount.stderr).toContain("--account <id>");
     expect(invalidThreshold.code).toBe(1);
     expect(invalidThreshold.stderr).toContain("integer 0-100");
     expect(missingProvider.code).toBe(1);
@@ -1777,9 +1925,9 @@ describe("ocx account CLI (issue #180 matrix)", () => {
     const sleepSpy = spyOn(Bun, "sleep").mockImplementation(async () => {});
     try {
       const result = await run(["login", "anthropic"]);
-
-      expect(result.code).toBe(2);
-      expect(result.stderr).toContain("provider entry was not written");
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("Management operation did not return a usable outcome");
+      expect(result.output).not.toContain("provider entry was not written");
       expect(result.stdout).not.toContain("Logged in to anthropic");
     } finally {
       sleepSpy.mockRestore();
@@ -1792,7 +1940,7 @@ describe("ocx account CLI (issue #180 matrix)", () => {
 
     const beforeInline = requests.length;
     const inline = await run([
-      "import", "google-antigravity", "--format", "cockpit-tools", document,
+      "import", "google-antigravity", "--accept-antigravity-risk", "--format", "cockpit-tools", document,
     ]);
     expect(inline.code).toBe(1);
     expect(requests).toHaveLength(beforeInline);
@@ -1806,7 +1954,7 @@ describe("ocx account CLI (issue #180 matrix)", () => {
     expect(unsupported.stderr).not.toContain("source_read_failed");
 
     const stdin = await run([
-      "import", "google-antigravity", "--format", "cockpit-tools", "--stdin", "--json",
+      "import", "google-antigravity", "--accept-antigravity-risk", "--format", "cockpit-tools", "--stdin", "--json",
     ], { ...defaultDeps(), stdinImpl: stdinFrom(document) });
     expect(stdin.code).toBe(0);
     expect(JSON.parse(stdin.stdout)).toEqual({
@@ -1824,7 +1972,7 @@ describe("ocx account CLI (issue #180 matrix)", () => {
       body: {
         provider: "google-antigravity",
         format: "cockpit-tools",
-        document: [{ email: "user@example.com", refresh_token: canary }],
+        document: [{ email: "user@example.com", refresh_token: canary }], acknowledgeAntigravityRisk: true,
       },
     });
 
@@ -1833,7 +1981,7 @@ describe("ocx account CLI (issue #180 matrix)", () => {
     writeFileSync(path, document);
     try {
       const file = await run([
-        "import", "google-antigravity", "--format", "cockpit-tools", "--file", path,
+        "import", "google-antigravity", "--accept-antigravity-risk", "--format", "cockpit-tools", "--file", path,
       ]);
       expect(file.code).toBe(0);
       expect(file.stdout).toContain("1 imported, 0 updated, 0 failed");
@@ -1844,7 +1992,7 @@ describe("ocx account CLI (issue #180 matrix)", () => {
 
     const beforeOversized = requests.length;
     const oversized = await run([
-      "import", "google-antigravity", "--format", "cockpit-tools", "--stdin",
+      "import", "google-antigravity", "--accept-antigravity-risk", "--format", "cockpit-tools", "--stdin",
     ], { ...defaultDeps(), stdinImpl: stdinFrom("x".repeat(ACCOUNT_IMPORT_MAX_BYTES + 1)) });
     expect(oversized.code).toBe(1);
     expect(oversized.stderr).toContain("invalid_document");
@@ -1855,7 +2003,7 @@ describe("ocx account CLI (issue #180 matrix)", () => {
     const canary = "options-before-provider-canary-DO-NOT-LEAK";
     const document = '[{"email":"user@example.com","refresh_token":"safe-fixture-token"}]';
     const ordered = await run([
-      "import", "--json", "--format", "cockpit-tools", "--stdin", "google-antigravity",
+      "import", "--json", "--accept-antigravity-risk", "--format", "cockpit-tools", "--stdin", "google-antigravity",
     ], { ...defaultDeps(), stdinImpl: stdinFrom(document) });
     expect(ordered.code).toBe(0);
     expect(JSON.parse(ordered.stdout).importedCount).toBe(1);
@@ -1866,7 +2014,7 @@ describe("ocx account CLI (issue #180 matrix)", () => {
 
     const beforeExtra = requests.length;
     const extra = await run([
-      "import", "--format", "cockpit-tools", "--stdin", "google-antigravity", canary,
+      "import", "--accept-antigravity-risk", "--format", "cockpit-tools", "--stdin", "google-antigravity", canary,
     ], { ...defaultDeps(), stdinImpl: stdinFrom(document) });
     expect(extra.code).toBe(1);
     expect(requests).toHaveLength(beforeExtra);
@@ -1878,19 +2026,19 @@ describe("ocx account CLI (issue #180 matrix)", () => {
     const document = '[{"email":"user@example.com","refresh_token":"safe-fixture-token"}]';
     const sourceCases: Array<{ args: string[]; deps?: AccountDeps; expected?: string }> = [
       {
-        args: ["import", "google-antigravity", "--format", "cockpit-tools", "--stdin", "--file", `/not-read-${canary}.json`],
+        args: ["import", "google-antigravity", "--accept-antigravity-risk", "--format", "cockpit-tools", "--stdin", "--file", `/not-read-${canary}.json`],
         deps: { ...defaultDeps(), stdinImpl: stdinFrom(document) },
       },
-      { args: ["import", "google-antigravity", "--format", "cockpit-tools"] },
-      { args: ["import", "google-antigravity", "--format", "cockpit-tools", "--file"] },
-      { args: ["import", "google-antigravity", "--format", "cockpit-tools", "--file", ""] },
+      { args: ["import", "google-antigravity", "--accept-antigravity-risk", "--format", "cockpit-tools"] },
+      { args: ["import", "google-antigravity", "--accept-antigravity-risk", "--format", "cockpit-tools", "--file"] },
+      { args: ["import", "google-antigravity", "--accept-antigravity-risk", "--format", "cockpit-tools", "--file", ""] },
       {
-        args: ["import", "google-antigravity", "--format", "cockpit-tools", "--stdin"],
+        args: ["import", "google-antigravity", "--accept-antigravity-risk", "--format", "cockpit-tools", "--stdin"],
         deps: { ...defaultDeps(), stdinImpl: stdinFrom(document, true) },
         expected: "stdin_required",
       },
       {
-        args: ["import", "google-antigravity", "--format", "cockpit-tools", "--stdin"],
+        args: ["import", "google-antigravity", "--accept-antigravity-risk", "--format", "cockpit-tools", "--stdin"],
         deps: { ...defaultDeps(), stdinImpl: stdinFrom("x".repeat(ACCOUNT_IMPORT_MAX_BYTES + 1)) },
         expected: "invalid_document",
       },
@@ -1909,7 +2057,7 @@ describe("ocx account CLI (issue #180 matrix)", () => {
     silent.isTTY = false;
     const beforeSilent = requests.length;
     const timedOut = await run([
-      "import", "google-antigravity", "--format", "cockpit-tools", "--stdin",
+      "import", "google-antigravity", "--accept-antigravity-risk", "--format", "cockpit-tools", "--stdin",
     ], { ...defaultDeps(), stdinImpl: silent, stdinTimeoutMs: 5 });
     expect(timedOut.code).toBe(1);
     expect(timedOut.stderr).toContain("stdin_timeout");
@@ -1931,7 +2079,7 @@ describe("ocx account CLI (issue #180 matrix)", () => {
     }) as typeof fetch;
 
     const result = await run([
-      "import", "google-antigravity", "--format", "cockpit-tools", "--stdin",
+      "import", "google-antigravity", "--accept-antigravity-risk", "--format", "cockpit-tools", "--stdin",
     ], {
       ...defaultDeps(),
       fetchImpl,
@@ -1958,7 +2106,7 @@ describe("ocx account CLI (issue #180 matrix)", () => {
     }) as typeof fetch;
 
     const result = await run([
-      "import", "google-antigravity", "--format", "cockpit-tools", "--stdin", "--json",
+      "import", "google-antigravity", "--accept-antigravity-risk", "--format", "cockpit-tools", "--stdin", "--json",
     ], {
       ...defaultDeps(),
       fetchImpl,
@@ -2002,7 +2150,7 @@ describe("ocx account CLI (issue #180 matrix)", () => {
     for (const malformed of malformedResults) {
       importResultOverride = malformed;
       const result = await run([
-        "import", "google-antigravity", "--format", "cockpit-tools", "--stdin", "--json",
+        "import", "google-antigravity", "--accept-antigravity-risk", "--format", "cockpit-tools", "--stdin", "--json",
       ], {
         ...defaultDeps(),
         stdinImpl: stdinFrom('[{"email":"user@example.com","refresh_token":"safe-fixture-token"}]'),
@@ -2010,7 +2158,7 @@ describe("ocx account CLI (issue #180 matrix)", () => {
 
       expect(result.code).toBe(1);
       expect(result.stdout).toBe("");
-      expect(result.stderr).toBe("Error: invalid_response");
+      expect(result.stderr).toBe((await import("../../src/oauth/antigravity-risk")).ANTIGRAVITY_RISK_WARNING + "\nError: invalid_response");
       expect(result.output).not.toContain(canary);
     }
   });
@@ -2029,20 +2177,39 @@ describe("ocx account CLI (issue #180 matrix)", () => {
       ],
     };
     const result = await run([
-      "import", "google-antigravity", "--format", "cockpit-tools", "--stdin",
+      "import", "google-antigravity", "--accept-antigravity-risk", "--format", "cockpit-tools", "--stdin",
     ], {
       ...defaultDeps(),
       stdinImpl: stdinFrom('[{"email":"user@example.com","refresh_token":"safe-fixture-token"}]'),
     });
 
     expect(result.code).toBe(1);
-    expect(result.stderr).toBe("");
+    expect(result.stderr).toBe((await import("../../src/oauth/antigravity-risk")).ANTIGRAVITY_RISK_WARNING);
     expect(result.stdout).toContain("1 imported, 0 updated, 1 failed, 1 unsupported");
     expect(result.stdout).toContain("#2 failed (credential_rejected)");
     expect(result.stdout).toContain("#3 unsupported (unsupported_format)");
   });
 
-  test("pending Codex login keeps success and prints generic recovery guidance", async () => {
+  test("quota-pending login reports registration and recovery instead of ready model guidance", async () => {
+    codexLoginStatus = { status: "done", validationPending: true };
+    const sleepSpy = spyOn(Bun, "sleep").mockImplementation(async () => {});
+    try {
+      const human = await run(["login", "openai"]);
+      expect(human.code).toBe(1);
+      expect(human.stdout).toContain("validation pending (routing disabled)");
+      expect(human.stdout).toContain("ocx gui");
+      expect(human.stdout).not.toContain("Logged in");
+      expect(human.stdout).not.toContain("ocx models");
+      const machine = await run(["login", "openai", "--json"]);
+      expect(machine.code).toBe(1);
+      expect(JSON.parse(machine.stdout)).toMatchObject({ validationPending: true, recoveryCommand: "ocx gui" });
+      expect(JSON.parse(machine.stdout)).not.toHaveProperty("modelSelection");
+    } finally {
+      sleepSpy.mockRestore();
+    }
+  });
+
+  test("pending Codex login preserves registration and returns incomplete status", async () => {
     codexLoginStatus = {
       status: "done",
       catalogRefreshPending: true,
@@ -2051,8 +2218,7 @@ describe("ocx account CLI (issue #180 matrix)", () => {
     const sleepSpy = spyOn(Bun, "sleep").mockImplementation(async () => {});
     try {
       const result = await run(["login", "openai"]);
-
-      expect(result.code).toBe(0);
+      expect(result.code).toBe(1);
       expect(result.stdout).toContain("Logged in.");
       expect(result.stderr).toContain("ocx sync");
       expect(result.output).not.toContain("private-login-detail");
@@ -2066,10 +2232,9 @@ describe("ocx account CLI (issue #180 matrix)", () => {
     const sleepSpy = spyOn(Bun, "sleep").mockImplementation(async () => {});
     try {
       const result = await run(["login", "openai", "--json"]);
-
-      expect(result.code).toBe(0);
+      expect(result.code).toBe(1);
       expect(JSON.parse(result.stdout)).toEqual({
-        status: "done",
+        status: "done", flowId: "flow-mock",
         catalogRefreshPending: true,
         modelSelection: {
           provider: "openai", afterLogin: false, requiresRunningProxy: true,

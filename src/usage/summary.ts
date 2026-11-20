@@ -1,23 +1,20 @@
 import { baseProviderLabel } from "../providers/label";
 import { canonicalAntigravityUsageModel } from "../providers/antigravity-models";
 import { usageDisplayTotalTokens } from "./totals";
+import { usageApp, type UsageApp, type UsageAppSummary } from "./app-breakdown";
+import { isLegacyCodexUsage, matchesUsageSource, snapshotConfiguredKeyIds, type UsageSourceFilter } from "./source-filter";
+import type { UsageTimeWindow } from "./time-range";
 import { isUnresolvedRequestedModel, usageModelPriceOptions } from "./model-identity";
 import {
+  classifyCacheTelemetryProvenance,
   isCodexUsageAccountLogLabel,
   normalizeServerToolUsage,
   physicalUsageAttempts,
+  type CacheTelemetryProvenance,
   type PersistedUsageEntry,
   type UsageStatus,
 } from "./log";
-import {
-  type AttemptCostEstimate,
-  type CostEstimate,
-  estimateAttemptCost,
-  estimateRequestCost,
-  normalizeCostTokens,
-  serviceTierContext,
-  type ServiceTierContext,
-} from "./cost";
+import { type AttemptCostEstimate, type CostEstimate, estimateAttemptCost, estimateRequestCost, isMeasuredStatus, normalizeCostTokens, serviceTierContext, type ServiceTierContext, tokensPerSecond } from "./cost";
 
 /**
  * Canonical range members. The warm-up loop in the management usage route
@@ -58,6 +55,40 @@ export interface UsageSummaryTotals {
   unpricedRequests: number;
   /** Requests whose usage itself is missing/unsupported, so no cost can be computed. */
   unmeteredRequests: number;
+  /**
+   * Physical upstream sends aggregated per logical request (#4546, devlog 040 slice D): attempts
+   * and combo children summed on the row, then summed over rows. `attemptCount` answers how many
+   * attempts were recorded, which is a smaller number — retry layers re-send inside one attempt.
+   *
+   * These are optional because the management read-failure fallback emits a zeroed summary of its
+   * own; absence means "not computed", never zero.
+   */
+  sends?: number;
+  /** Sends whose attempt reached a terminal status. */
+  settledSends?: number;
+  /** Sends charged with no terminal outcome behind them. Never folded into `settledSends`. */
+  unresolvedSends?: number;
+  /** Rows that carried a spend record, i.e. logical requests with send accounting. */
+  spendRequests?: number;
+  /** Input tokens whose row carried OBSERVED cache detail; the only honest hit-rate denominator. */
+  cacheObservedInputTokens?: number;
+  cacheObservedRequests?: number;
+  /** Rows whose cache detail is a wire-compatibility zero: present, and proof of nothing. */
+  cacheSynthesizedRequests?: number;
+  /** Rows with no cache detail at all. Not a miss, and not a zero. */
+  cacheUnknownRequests?: number;
+  /**
+   * Aggregated output throughput (#6309): output tokens and wall-clock milliseconds summed over
+   * the attempts whose usage was measured, plus how many attempts qualified. The rate is the
+   * token sum over the duration sum — a time-weighted average, not a mean of per-request rates —
+   * so one fast tiny request cannot outweigh many slow large ones. Attempts without both a
+   * positive token count and a positive duration contribute nothing.
+   */
+  throughputOutputTokens?: number;
+  throughputDurationMs?: number;
+  throughputSamples?: number;
+  /** Derived at finalize time: throughputOutputTokens / throughputDurationMs * 1000. */
+  throughputTokensPerSec?: number;
 }
 
 export interface UsageDay {
@@ -66,7 +97,7 @@ export interface UsageDay {
   measuredRequests: number;
   reportedRequests: number;
   totalTokens: number;
-  /** Display-time estimated cost for this local day from fully priced requests. */
+  /** Display-time estimated cost for this local day, summed from its model rows. */
   estimatedCostUsd: number;
   models: UsageDayModel[];
 }
@@ -84,6 +115,8 @@ export interface UsageDayModel {
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
   cacheHitRate?: number | null;
+  /** Denominator behind `cacheHitRate`: input tokens whose cache detail was observed. */
+  cacheObservedInputTokens?: number;
   estimatedCostUsd?: number;
 }
 
@@ -101,10 +134,16 @@ export interface UsageModel {
   totalTokens: number;
   inputTokens: number;
   outputTokens: number;
+  /** Aggregate output throughput for this row (#6309): summed measured tokens over summed duration. */
+  throughputTokensPerSec?: number;
+  /** Attempts behind the throughput aggregate; absent when nothing was measured. */
+  throughputSamples?: number;
   cachedInputTokens?: number;
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
   cacheHitRate?: number | null;
+  /** Denominator behind `cacheHitRate`; below `inputTokens` whenever some rows never measured cache. */
+  cacheObservedInputTokens?: number;
   priceCoverageRatio?: number;
   pricedRequests?: number;
   unpricedRequests?: number;
@@ -122,10 +161,18 @@ export interface UsageProvider {
   totalTokens: number;
   inputTokens?: number;
   outputTokens?: number;
+  /**
+   * Aggregate output throughput for this row (#6309): summed measured output tokens over summed
+   * wall-clock duration. Undefined when no attempt in the row reported both.
+   */
+  throughputTokensPerSec?: number;
+  throughputSamples?: number;
   cachedInputTokens?: number;
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
   cacheHitRate?: number | null;
+  /** Denominator behind `cacheHitRate`; below `inputTokens` whenever some rows never measured cache. */
+  cacheObservedInputTokens?: number;
   priceCoverageRatio?: number;
   pricedRequests?: number;
   unpricedRequests?: number;
@@ -159,12 +206,26 @@ export interface UsageSummary {
   range: UsageRange;
   surface: UsageSurface;
   since: number | null;
+  customWindow?: true;
+  until?: number;
   generatedAt: number;
   summary: UsageSummaryTotals;
   days: UsageDay[];
   models: UsageModel[];
   providers: UsageProvider[];
+  apps: UsageAppSummary[];
   accounts: UsageAccount[];
+  sourceFilter?: UsageSourceFilter;
+  legacyUnclassifiedRequests?: number;
+}
+
+export interface UsageSummaryFilterInput {
+  provider?: string | null;
+  model?: string | null;
+  apiKeyId?: string | null;
+  sourceFilter?: UsageSourceFilter;
+  /** Internal snapshot, never a client-supplied list or part of the response echo. */
+  configuredApiKeyIds?: readonly string[];
 }
 
 /**
@@ -205,23 +266,41 @@ export function cacheTokensFromUsage(usage?: PersistedUsageEntry["usage"]): {
   const hasCacheTelemetry = typeof usage.cachedInputTokens === "number"
     || typeof usage.cacheReadInputTokens === "number"
     || typeof usage.cacheCreationInputTokens === "number";
-  if (!hasCacheTelemetry) return { read: undefined, creation: undefined, hasCacheTelemetry: false };
-  const normalized = normalizeCostTokens(usage);
+  // The pricing reader's canonical-first decomposition: an implicit read is not reduced by writes,
+  // and contradictory telemetry (read + write above input under every reading) stays unavailable.
+  const normalized = hasCacheTelemetry ? normalizeCostTokens(usage) : null;
   if (!normalized) return { read: undefined, creation: undefined, hasCacheTelemetry: false };
-  return {
-    read: normalized.cacheRead,
-    creation: normalized.cacheWrite,
-    hasCacheTelemetry: true,
-  };
+  return { read: normalized.cacheRead, creation: normalized.cacheWrite, hasCacheTelemetry: true };
+}
+
+/**
+ * Cache tokens plus the provenance that says whether they may be averaged.
+ *
+ * A persisted `cacheProvenance` wins; a row written before the field existed is reconstructed
+ * from its own shape, which reproduces the previous reading exactly (telemetry present is
+ * observed, absent is unknown) so historical rows do not change meaning. Only `observed` reaches
+ * a hit-rate denominator: a synthesized zero was emitted for wire compatibility and an unknown
+ * was never measured, and averaging either as a zero is how a cold pool reports a warm cache.
+ */
+export function cacheObservationFromUsage(
+  usage: PersistedUsageEntry["usage"],
+  provenance: CacheTelemetryProvenance | undefined,
+): { read: number | undefined; creation: number | undefined; provenance: CacheTelemetryProvenance } {
+  const { read, creation, hasCacheTelemetry } = cacheTokensFromUsage(usage);
+  // A row cannot have observed what it does not carry, so a stored label never opens the
+  // denominator for a record with no cache fields in it.
+  if (!usage || !hasCacheTelemetry) return { read, creation, provenance: "unknown" };
+  return { read, creation, provenance: provenance ?? classifyCacheTelemetryProvenance(usage) };
 }
 
 export function calculateCacheHitRate(
   cacheObserved: boolean,
-  inputTokens: number,
+  /** Observed input tokens only. Passing the row's whole input total averages unknowns as zeros. */
+  observedInputTokens: number,
   cacheReadTokens: number,
 ): number | null {
-  if (!cacheObserved || inputTokens <= 0) return null;
-  return Math.max(0, Math.min(1, cacheReadTokens / inputTokens));
+  if (!cacheObserved || observedInputTokens <= 0) return null;
+  return Math.max(0, Math.min(1, cacheReadTokens / observedInputTokens));
 }
 
 export function computeEntryCost(entry: PersistedUsageEntry): EntryCostInfo {
@@ -230,17 +309,18 @@ export function computeEntryCost(entry: PersistedUsageEntry): EntryCostInfo {
     const attemptEstimates = entry.attempts.map(attempt =>
       estimateAttemptCost({ ...attempt, ...usageModelPriceOptions(entry, attempt) }, undefined, tier)
     );
-    const isPriced = attemptEstimates.length > 0
-      && attemptEstimates.every(estimate => estimate !== null);
-    return {
-      tier,
-      estimate: null,
-      attemptEstimates,
-      costTotal: isPriced
-        ? attemptEstimates.reduce((total, estimate) => total + estimate!.cost.total, 0)
-        : 0,
-      isPriced,
-    };
+    let costTotal = 0;
+    let isPriced = false;
+    for (const est of attemptEstimates) {
+      if (est) {
+        costTotal += est.cost.total;
+        isPriced = true;
+      }
+    }
+    // An unmeasured leg that may have generated billed tokens leaves the total unknown, not short.
+    const unknownCost = entry.attempts.some((attempt, index) =>
+      !attemptEstimates[index] && (!attempt.usage || !isMeasuredStatus(attempt.usageStatus)) && !spentNothing(attempt));
+    return { tier, estimate: null, attemptEstimates, costTotal, isPriced: isPriced && !unknownCost };
   }
   const estimate = estimateRequestCost({
     ...usageModelPriceOptions(entry, entry),
@@ -314,6 +394,25 @@ function dayCountForAllRange(oldest: number | null, now: number): number {
   return Math.min(MAX_USAGE_DAY_BUCKETS, Math.max(1, days));
 }
 
+function customWindowDates(window: UsageTimeWindow): string[] {
+  const start = startOfLocalDay(window.since);
+  const date = new Date(startOfLocalDay(window.until));
+  const dates: string[] = [];
+  while (date.getTime() >= start && dates.length < MAX_USAGE_DAY_BUCKETS) {
+    dates.push(localDateKey(date.getTime()));
+    const previous = date.getTime();
+    date.setDate(date.getDate() - 1);
+    date.setHours(0, 0, 0, 0);
+    // A skipped civil day can normalize back to this same midnight (Apia, 2011).
+    // Move through the preceding instant to find the prior existing local day.
+    if (date.getTime() >= previous) {
+      date.setTime(previous - 1);
+      date.setHours(0, 0, 0, 0);
+    }
+  }
+  return dates.reverse();
+}
+
 function blankTotals(): UsageSummaryTotals {
   return {
     requests: 0,
@@ -335,14 +434,18 @@ function blankTotals(): UsageSummaryTotals {
     pricedRequests: 0,
     unpricedRequests: 0,
     unmeteredRequests: 0,
+    sends: 0,
+    settledSends: 0,
+    unresolvedSends: 0,
+    spendRequests: 0,
+    cacheObservedInputTokens: 0,
+    cacheObservedRequests: 0,
+    cacheSynthesizedRequests: 0,
+    cacheUnknownRequests: 0,
   };
 }
 
-function isMeasuredStatus(status: UsageStatus): boolean {
-  return status === "reported" || status === "estimated";
-}
-
-interface UsageAttribution {
+export interface UsageAttribution {
   requestId: string;
   provider: string;
   model: string;
@@ -352,6 +455,10 @@ interface UsageAttribution {
   usageStatus: UsageStatus;
   usage?: PersistedUsageEntry["usage"];
   totalTokens?: number;
+  /** Wall-clock duration of the attempt, or of the row when it has no attempts. */
+  durationMs?: number;
+  /** Attempt provenance when the row has one, else the entry's; never assumed observed. */
+  cacheProvenance?: CacheTelemetryProvenance;
 }
 
 
@@ -384,7 +491,10 @@ function usageModelKey(providerKey: string, model: string): string {
   return `${providerKey}\0${model}`;
 }
 
-function usageAttributions(entry: PersistedUsageEntry): UsageAttribution[] {
+export function usageAttributions(entry: PersistedUsageEntry): UsageAttribution[] {
+  // `=== undefined`, not `!length`: after `normalizePhysicalEntry` an EMPTY list means no attempt
+  // reached upstream and the row's own totals were stripped, so falling back to the row would
+  // invent a request out of stale parent usage. Absent attempts is the older, different case.
   if (entry.attempts === undefined) {
     return [{
       requestId: entry.requestId,
@@ -395,18 +505,28 @@ function usageAttributions(entry: PersistedUsageEntry): UsageAttribution[] {
       usageStatus: entry.usageStatus,
       ...(entry.usage ? { usage: entry.usage } : {}),
       ...(entry.totalTokens !== undefined ? { totalTokens: entry.totalTokens } : {}),
+      durationMs: entry.durationMs,
+      ...(entry.cacheProvenance ? { cacheProvenance: entry.cacheProvenance } : {}),
     }];
   }
-  return entry.attempts.map(attempt => ({
-    requestId: entry.requestId,
-    provider: attempt.provider,
-    ...usageModelIdentity(attempt.provider, attempt.model),
-    ...(isUnresolvedRequestedModel(entry, attempt) ? { hasUnresolvedRequestedModel: true as const } : {}),
-    ...(attempt.accountLogLabel ? { accountLogLabel: attempt.accountLogLabel } : {}),
-    usageStatus: attempt.usageStatus,
-    ...(attempt.usage ? { usage: attempt.usage } : {}),
-    ...(attempt.totalTokens !== undefined ? { totalTokens: attempt.totalTokens } : {}),
-  }));
+  return entry.attempts.map(attempt => {
+    // An attempt's own provenance wins; the row's is the fallback for a child written before
+    // attempt-level provenance existed. A child carrying no cache fields still resolves to
+    // unknown in cacheObservationFromUsage, so it cannot inherit a sibling's observation.
+    const cacheProvenance = attempt.cacheProvenance ?? entry.cacheProvenance;
+    return {
+      requestId: entry.requestId,
+      provider: attempt.provider,
+      ...usageModelIdentity(attempt.provider, attempt.model),
+      ...(isUnresolvedRequestedModel(entry, attempt) ? { hasUnresolvedRequestedModel: true as const } : {}),
+      ...(attempt.accountLogLabel ? { accountLogLabel: attempt.accountLogLabel } : {}),
+      usageStatus: attempt.usageStatus,
+      ...(attempt.usage ? { usage: attempt.usage } : {}),
+      ...(attempt.totalTokens !== undefined ? { totalTokens: attempt.totalTokens } : {}),
+      durationMs: attempt.durationMs,
+      ...(cacheProvenance ? { cacheProvenance } : {}),
+    };
+  });
 }
 
 export function projectedComboUsage(
@@ -417,6 +537,8 @@ export function projectedComboUsage(
   let cachedInputTokens = 0;
   let cacheReadInputTokens = 0;
   let cacheCreationInputTokens = 0;
+  let cacheCreation1hInputTokens = 0;
+  let hasCacheWrite1h = false;
   let reasoningOutputTokens = 0;
   let hasUsage = false;
   let hasCacheTelemetry = false;
@@ -430,6 +552,14 @@ export function projectedComboUsage(
   for (const attempt of attempts) {
     if (attempt.usage) {
       hasUsage = true;
+      // A context checkpoint is absolute, so the latest wins; server-tool counters add.
+      if (typeof attempt.usage.contextTotalTokens === "number"
+        && Number.isFinite(attempt.usage.contextTotalTokens) && attempt.usage.contextTotalTokens >= 0) {
+        contextTotalTokens = attempt.usage.contextTotalTokens;
+      }
+      for (const [name, value] of Object.entries(normalizeServerToolUsage(attempt.usage.anthropicServerToolUse) ?? {})) {
+        anthropicServerToolUse[name] = (anthropicServerToolUse[name] ?? 0) + value;
+      }
       inputTokens += attempt.usage.inputTokens;
       outputTokens += attempt.usage.outputTokens;
       const cache = cacheTokensFromUsage(attempt.usage);
@@ -439,21 +569,15 @@ export function projectedComboUsage(
         cacheReadInputTokens += cache.read;
       }
       if (typeof cache.creation === "number") cacheCreationInputTokens += cache.creation;
+      if (typeof attempt.usage.cacheCreation1hInputTokens === "number") {
+        hasCacheWrite1h = true;
+        cacheCreation1hInputTokens += attempt.usage.cacheCreation1hInputTokens;
+      }
       if (typeof attempt.usage.reasoningOutputTokens === "number") {
         hasReasoningTelemetry = true;
         reasoningOutputTokens += attempt.usage.reasoningOutputTokens;
       }
       if (attempt.usage.estimated === true) estimated = true;
-      if (typeof attempt.usage.contextTotalTokens === "number"
-        && Number.isFinite(attempt.usage.contextTotalTokens)
-        && attempt.usage.contextTotalTokens >= 0) {
-        contextTotalTokens = attempt.usage.contextTotalTokens;
-      }
-      for (const [name, value] of Object.entries(
-        normalizeServerToolUsage(attempt.usage.anthropicServerToolUse) ?? {},
-      )) {
-        anthropicServerToolUse[name] = (anthropicServerToolUse[name] ?? 0) + value;
-      }
     }
     const attemptTotal = usageDisplayTotalTokens(attempt.usage, attempt.totalTokens);
     if (attemptTotal !== undefined) {
@@ -470,6 +594,7 @@ export function projectedComboUsage(
       outputTokens,
       ...(contextTotalTokens !== undefined ? { contextTotalTokens } : {}),
       ...(hasCacheTelemetry ? { cachedInputTokens, cacheReadInputTokens, cacheCreationInputTokens } : {}),
+      ...(hasCacheWrite1h ? { cacheCreation1hInputTokens } : {}),
       ...(hasReasoningTelemetry ? { reasoningOutputTokens } : {}),
       ...(boundedServerToolUse ? { anthropicServerToolUse: boundedServerToolUse } : {}),
       ...(estimated ? { estimated: true } : {}),
@@ -494,6 +619,7 @@ function addTokens(
   totals: UsageSummaryTotals,
   entry: Pick<PersistedUsageEntry, "usage" | "totalTokens">,
 ): void {
+  // A stored total without usage detail is still tokens spent.
   totals.totalTokens += usageDisplayTotalTokens(entry.usage, entry.totalTokens) ?? 0;
   if (!entry.usage) return;
   totals.inputTokens += entry.usage.inputTokens;
@@ -507,8 +633,69 @@ function addTokens(
   if (typeof entry.usage.reasoningOutputTokens === "number") totals.reasoningOutputTokens += entry.usage.reasoningOutputTokens;
 }
 
+/**
+ * Fold one row's send accounting into the window totals.
+ *
+ * The row already aggregated its attempts and combo children, so this is a sum over logical
+ * requests. Rows written before the spend record existed contribute nothing rather than a zero:
+ * a request whose sends were never counted is not a request that sent nothing.
+ */
+function addSpendTotals(
+  totals: UsageSummaryTotals,
+  entry: Pick<PersistedUsageEntry, "spend">,
+): void {
+  const spend = entry.spend;
+  if (!spend) return;
+  totals.sends = (totals.sends ?? 0) + spend.sends;
+  totals.settledSends = (totals.settledSends ?? 0) + spend.settled;
+  totals.unresolvedSends = (totals.unresolvedSends ?? 0) + spend.unresolved;
+  totals.spendRequests = (totals.spendRequests ?? 0) + 1;
+}
+
+/** Keep the three cache provenances countable, and let only observed input tokens be averaged. */
+function addCacheProvenanceTotals(
+  totals: UsageSummaryTotals,
+  entry: Pick<PersistedUsageEntry, "usage" | "cacheProvenance">,
+): void {
+  const { provenance } = cacheObservationFromUsage(entry.usage, entry.cacheProvenance);
+  if (provenance === "observed") {
+    totals.cacheObservedRequests = (totals.cacheObservedRequests ?? 0) + 1;
+    totals.cacheObservedInputTokens = (totals.cacheObservedInputTokens ?? 0) + (entry.usage?.inputTokens ?? 0);
+    return;
+  }
+  if (provenance === "synthesized") {
+    totals.cacheSynthesizedRequests = (totals.cacheSynthesizedRequests ?? 0) + 1;
+    return;
+  }
+  totals.cacheUnknownRequests = (totals.cacheUnknownRequests ?? 0) + 1;
+}
+
 function finalizeCoverage(totals: UsageSummaryTotals): void {
   totals.coverageRatio = totals.requests === 0 ? 0 : totals.measuredRequests / totals.requests;
+}
+
+/**
+ * Aggregate output throughput inputs (#6309) into the window totals. A measured attempt
+ * contributes its output tokens and duration only when both are positive, so a zero-token
+ * or zero-duration row cannot deflate or inflate the rate. Without attempts, the row-level
+ * usage and duration describe the request directly.
+ */
+function addThroughputTotals(totals: UsageSummaryTotals, entry: PersistedUsageEntry): void {
+  const samples = entry.attempts?.length
+    ? entry.attempts
+    : [{ usage: entry.usage, durationMs: entry.durationMs }];
+  for (const sample of samples) {
+    if (!sample.usage || tokensPerSecond(sample.usage.outputTokens, sample.durationMs) === null) continue;
+    totals.throughputOutputTokens = (totals.throughputOutputTokens ?? 0) + sample.usage.outputTokens;
+    totals.throughputDurationMs = (totals.throughputDurationMs ?? 0) + sample.durationMs;
+    totals.throughputSamples = (totals.throughputSamples ?? 0) + 1;
+  }
+}
+
+/** Fold the raw throughput sums into the rate the dashboard and API expose. */
+function finalizeThroughput(totals: UsageSummaryTotals): void {
+  if ((totals.throughputDurationMs ?? 0) <= 0) return;
+  totals.throughputTokensPerSec = tokensPerSecond(totals.throughputOutputTokens ?? 0, totals.throughputDurationMs!) ?? undefined;
 }
 
 function addEstimatedCost(
@@ -516,8 +703,12 @@ function addEstimatedCost(
   entry: Pick<PersistedUsageEntry, "usageStatus" | "usage" | "attempts">,
   costInfo: EntryCostInfo,
 ): void {
-  if (entry.usageStatus === "unreported" || entry.usageStatus === "unsupported"
-    || (!entry.usage && !entry.attempts?.length)) {
+  // A row of attempts reads `unreported` when any leg lacks usage. Once one leg is measured the row
+  // is metered and the attempt-level pricing decides, matching the model and provider breakdowns.
+  const measuredAttempt = entry.attempts?.some(attempt => attempt.usage && isMeasuredStatus(attempt.usageStatus));
+  if (!measuredAttempt
+    && (entry.usageStatus === "unreported" || entry.usageStatus === "unsupported"
+      || (!entry.usage && !entry.attempts?.length))) {
     totals.unmeteredRequests += 1;
     return;
   }
@@ -568,6 +759,11 @@ interface UsageModelAccumulator {
   cacheReadInputTokens: number;
   cacheCreationInputTokens: number;
   cacheObserved: boolean;
+  /** Input tokens from attributions with OBSERVED cache detail; the hit-rate denominator. */
+  cacheObservedInputTokens: number;
+  throughputOutputTokens: number;
+  throughputDurationMs: number;
+  throughputSamples: number;
   estimatedCostUsd?: number;
   requestCounts: UsageRequestCounts;
   requestFacts?: Map<number, number>;
@@ -600,7 +796,9 @@ interface UsagePartition {
   dayStart: number;
   surface: UsagePartitionSurface;
   oldestTimestamp: number | null;
+  legacyUnclassifiedRequests: number;
   totals: UsageSummaryTotals;
+  apps: Map<UsageApp, UsageSummaryTotals>;
   models: Map<string, UsageModelAccumulator>;
   providers?: Map<string, UsageModelAccumulator>;
   accounts: Map<string, UsageAccountAccumulator>;
@@ -617,12 +815,22 @@ interface NormalizedUsageFilter {
   provider: string | null;
   model: string | null;
   apiKeyId: string | null;
+  sourceFilter?: UsageSourceFilter;
+  configuredApiKeyIds?: readonly string[];
+  configuredApiKeyIdSet?: ReadonlySet<string>;
 }
 
 export interface UsageSummaryAccumulator {
   add(entry: PersistedUsageEntry): void;
   /** Return a mutation-independent snapshot that may continue accepting rows. */
   clone(): UsageSummaryAccumulator;
+  /**
+   * Widen the reported ledger span with rows this accumulator was never fed.
+   *
+   * A filtered query backed by a candidate index only reads the rows that match, so the span
+   * it would derive from those rows is narrower than the ledger it describes.
+   */
+  noteLedgerSpan(start: number | null, end: number | null): void;
   summarize(
     range: UsageRange,
     now: number,
@@ -640,21 +848,16 @@ function requestStatusFact(status: UsageStatus): number {
   return REQUEST_UNREPORTED;
 }
 
-function statusFromRequestFacts(facts: number): UsageStatus {
-  const statuses = facts & REQUEST_STATUS_MASK;
-  if (statuses === REQUEST_UNSUPPORTED) return "unsupported";
-  if ((statuses & (REQUEST_UNREPORTED | REQUEST_UNSUPPORTED)) !== 0) return "unreported";
-  if ((statuses & REQUEST_ESTIMATED) !== 0) return "estimated";
-  return (statuses & REQUEST_REPORTED) !== 0 ? "reported" : "unreported";
-}
-
+/**
+ * The row as its real upstream sends: locally answered, unsent and duplicate-ordinal attempts are
+ * dropped, legacy root usage with no per-attempt usage lands on the final physical attempt, and the
+ * row's totals and status are recomputed from those attempts. Rows without `attempts` are unchanged.
+ */
 export function normalizePhysicalEntry(entry: PersistedUsageEntry): PersistedUsageEntry {
   if (entry.attempts === undefined) return entry;
   const attempts = physicalUsageAttempts(entry.attempts).map(attempt => ({ ...attempt }));
-  if (attempts.length > 0
-    && entry.usage
-    && !attempts.some(attempt => attempt.usage !== undefined)) {
-    const finalAttempt = attempts[attempts.length - 1]!;
+  const finalAttempt = attempts.at(-1);
+  if (finalAttempt && entry.usage && !attempts.some(attempt => attempt.usage !== undefined)) {
     finalAttempt.usage = entry.usage;
     finalAttempt.usageStatus = entry.usageStatus;
     if (entry.totalTokens !== undefined) finalAttempt.totalTokens = entry.totalTokens;
@@ -663,11 +866,23 @@ export function normalizePhysicalEntry(entry: PersistedUsageEntry): PersistedUsa
   return {
     ...rest,
     attempts,
-    usageStatus: statusFromRequestFacts(
-      attempts.reduce((facts, attempt) => facts | requestStatusFact(attempt.usageStatus), 0),
-    ),
+    usageStatus: statusFromRequestFacts(attempts.reduce((facts, attempt) => facts | requestStatusFact(attempt.usageStatus), 0)),
     ...projectedComboUsage(attempts),
   };
+}
+
+function statusFromRequestFacts(facts: number): UsageStatus {
+  const statuses = facts & REQUEST_STATUS_MASK;
+  if (statuses === REQUEST_UNSUPPORTED) return "unsupported";
+  if ((statuses & (REQUEST_UNREPORTED | REQUEST_UNSUPPORTED)) !== 0) return "unreported";
+  if ((statuses & REQUEST_ESTIMATED) !== 0) return "estimated";
+  return (statuses & REQUEST_REPORTED) !== 0 ? "reported" : "unreported";
+}
+
+/** A usage-less local or unsent attempt cannot make a request's usage unknown. */
+function attemptStatusFact(attempt: NonNullable<PersistedUsageEntry["attempts"]>[number]): number {
+  return attempt.usage || (attempt.sendCount !== 0 && attempt.locallyAnswered !== true)
+    ? requestStatusFact(attempt.usageStatus) : 0;
 }
 
 function blankRequestCounts(): UsageRequestCounts {
@@ -681,14 +896,30 @@ function blankRequestCounts(): UsageRequestCounts {
   };
 }
 
+/**
+ * A usage-less attempt that provably cost nothing: it never reached upstream, or upstream refused it
+ * with an HTTP error before any output (providers do not bill a pre-generation 429/401/5xx). One
+ * whose stream began, aborted, or ended without a status may have generated billed tokens, so it
+ * stays an unknown cost. A request made only of such zeros carries neither fact and counts unpriced.
+ */
+function spentNothing(attempt: NonNullable<PersistedUsageEntry["attempts"]>[number] | undefined): boolean {
+  if (!attempt || attempt.usage) return false;
+  if (attempt.sendCount === 0 || attempt.locallyAnswered === true) return true;
+  // A 499 is the client hanging up on a send upstream may already be generating for.
+  return attempt.status >= 400 && attempt.status !== 499
+    && attempt.streamAborted !== true && attempt.firstOutputMs === undefined;
+}
+
 function bumpRequestCounts(counts: UsageRequestCounts, facts: number, amount = 1): void {
   counts.requests += amount;
   const status = statusFromRequestFacts(facts);
   if (isMeasuredStatus(status)) counts.measuredRequests += amount;
   if (status === "reported") counts.reportedRequests += amount;
   else if (status === "estimated") counts.estimatedRequests += amount;
-  if ((facts & REQUEST_UNPRICED) !== 0) counts.unpricedRequests += amount;
-  else if ((facts & REQUEST_PRICED) !== 0) counts.pricedRequests += amount;
+  // Unpriced dominates: one unpriceable part makes the request's cost unknown, and counting it
+  // on both sides overstated price coverage.
+  if ((facts & REQUEST_PRICED) !== 0 && (facts & REQUEST_UNPRICED) === 0) counts.pricedRequests += amount;
+  else counts.unpricedRequests += amount;
 }
 
 function mergeRequestCounts(target: UsageRequestCounts, source: UsageRequestCounts): void {
@@ -732,6 +963,23 @@ function mergeTotals(target: UsageSummaryTotals, source: UsageSummaryTotals): vo
   target.pricedRequests += source.pricedRequests;
   target.unpricedRequests += source.unpricedRequests;
   target.unmeteredRequests += source.unmeteredRequests;
+  target.sends = mergeOptionalTotal(target.sends, source.sends);
+  target.settledSends = mergeOptionalTotal(target.settledSends, source.settledSends);
+  target.unresolvedSends = mergeOptionalTotal(target.unresolvedSends, source.unresolvedSends);
+  target.spendRequests = mergeOptionalTotal(target.spendRequests, source.spendRequests);
+  target.cacheObservedInputTokens = mergeOptionalTotal(target.cacheObservedInputTokens, source.cacheObservedInputTokens);
+  target.cacheObservedRequests = mergeOptionalTotal(target.cacheObservedRequests, source.cacheObservedRequests);
+  target.cacheSynthesizedRequests = mergeOptionalTotal(target.cacheSynthesizedRequests, source.cacheSynthesizedRequests);
+  target.cacheUnknownRequests = mergeOptionalTotal(target.cacheUnknownRequests, source.cacheUnknownRequests);
+  target.throughputOutputTokens = mergeOptionalTotal(target.throughputOutputTokens, source.throughputOutputTokens);
+  target.throughputDurationMs = mergeOptionalTotal(target.throughputDurationMs, source.throughputDurationMs);
+  target.throughputSamples = mergeOptionalTotal(target.throughputSamples, source.throughputSamples);
+}
+
+/** Sum an optional total. Absent on one side means "not computed there", so it contributes nothing. */
+function mergeOptionalTotal(target: number | undefined, source: number | undefined): number | undefined {
+  if (target === undefined && source === undefined) return undefined;
+  return (target ?? 0) + (source ?? 0);
 }
 
 function blankModelAccumulator(
@@ -754,6 +1002,10 @@ function blankModelAccumulator(
     cacheReadInputTokens: 0,
     cacheCreationInputTokens: 0,
     cacheObserved: false,
+    cacheObservedInputTokens: 0,
+    throughputOutputTokens: 0,
+    throughputDurationMs: 0,
+    throughputSamples: 0,
     requestCounts: blankRequestCounts(),
     ...(mode === "exact" ? { requestFacts: new Map() } : {}),
   };
@@ -781,6 +1033,10 @@ function mergeModelAccumulator(target: UsageModelAccumulator, source: UsageModel
   target.cacheReadInputTokens += source.cacheReadInputTokens;
   target.cacheCreationInputTokens += source.cacheCreationInputTokens;
   target.cacheObserved ||= source.cacheObserved;
+  target.cacheObservedInputTokens += source.cacheObservedInputTokens;
+  target.throughputOutputTokens += source.throughputOutputTokens;
+  target.throughputDurationMs += source.throughputDurationMs;
+  target.throughputSamples += source.throughputSamples;
   if (source.estimatedCostUsd !== undefined) {
     target.estimatedCostUsd = (target.estimatedCostUsd ?? 0) + source.estimatedCostUsd;
   }
@@ -874,6 +1130,7 @@ function projectedEntryForFilter(
   filter: NormalizedUsageFilter,
 ): { entry: PersistedUsageEntry; comboOverlap: boolean } | null {
   if (filter.apiKeyId !== null && entry.apiKeyId !== filter.apiKeyId) return null;
+  if (filter.sourceFilter && !matchesUsageSource(entry, filter.sourceFilter, filter.configuredApiKeyIdSet)) return null;
   if (entry.attempts === undefined) {
     const identity = usageModelIdentity(entry.provider, entry.model, entry.resolvedModel);
     return filterMatchesAttribution(filter, entry.provider, identity.model)
@@ -885,9 +1142,19 @@ function projectedEntryForFilter(
     return filterMatchesAttribution(filter, attempt.provider, identity.model);
   });
   if (attempts.length === 0) return null;
-  const { usage: _parentUsage, totalTokens: _parentTotalTokens, ...withoutParentUsage } = entry;
+  const projectedStatus = attempts.length !== entry.attempts.length;
+  const { usage: _parentUsage, totalTokens: _parentTotalTokens, spend: parentSpend, ...withoutParentUsage } = entry;
   return {
-    entry: { ...withoutParentUsage, attempts, ...projectedComboUsage(attempts) },
+    entry: {
+      ...withoutParentUsage,
+      // The spend record counts the whole logical request. A projection that dropped a combo
+      // child no longer describes it, so the record is dropped with the child rather than
+      // reporting a full-request send count against a partial row.
+      ...(parentSpend && attempts.length === entry.attempts.length ? { spend: parentSpend } : {}),
+      attempts,
+      ...(projectedStatus ? { usageStatus: statusFromRequestFacts(attempts.reduce((facts, attempt) => facts | attemptStatusFact(attempt), 0)) } : {}),
+      ...projectedComboUsage(attempts),
+    },
     comboOverlap: entry.attempts.length > 1,
   };
 }
@@ -947,7 +1214,8 @@ function buildDayModels(
     outputTokens: model.outputTokens,
     cacheReadInputTokens: model.cacheReadInputTokens,
     cacheCreationInputTokens: model.cacheCreationInputTokens,
-    cacheHitRate: calculateCacheHitRate(model.cacheObserved, model.inputTokens, model.cacheReadInputTokens),
+    cacheHitRate: calculateCacheHitRate(model.cacheObserved, model.cacheObservedInputTokens, model.cacheReadInputTokens),
+    cacheObservedInputTokens: model.cacheObservedInputTokens,
     ...(model.estimatedCostUsd !== undefined ? { estimatedCostUsd: model.estimatedCostUsd } : {}),
   }));
 }
@@ -976,10 +1244,17 @@ function buildUsageModels(
       totalTokens: model.summaryTotalTokens,
       inputTokens: model.inputTokens,
       outputTokens: model.outputTokens,
+      ...(model.throughputDurationMs > 0
+        ? {
+            throughputTokensPerSec: tokensPerSecond(model.throughputOutputTokens, model.throughputDurationMs) ?? undefined,
+            throughputSamples: model.throughputSamples,
+          }
+        : {}),
       cachedInputTokens: model.cacheReadInputTokens,
       cacheReadInputTokens: model.cacheReadInputTokens,
       cacheCreationInputTokens: model.cacheCreationInputTokens,
-      cacheHitRate: calculateCacheHitRate(model.cacheObserved, model.inputTokens, model.cacheReadInputTokens),
+      cacheHitRate: calculateCacheHitRate(model.cacheObserved, model.cacheObservedInputTokens, model.cacheReadInputTokens),
+      cacheObservedInputTokens: model.cacheObservedInputTokens,
       priceCoverageRatio: requests > 0 ? counts.pricedRequests / requests : 0,
       pricedRequests: counts.pricedRequests,
       unpricedRequests: counts.unpricedRequests,
@@ -1014,10 +1289,17 @@ function buildUsageProviders(
         totalTokens: provider.summaryTotalTokens,
         inputTokens: provider.inputTokens,
         outputTokens: provider.outputTokens,
+        ...(provider.throughputDurationMs > 0
+          ? {
+              throughputTokensPerSec: tokensPerSecond(provider.throughputOutputTokens, provider.throughputDurationMs) ?? undefined,
+              throughputSamples: provider.throughputSamples,
+            }
+          : {}),
         cachedInputTokens: provider.cacheReadInputTokens,
         cacheReadInputTokens: provider.cacheReadInputTokens,
         cacheCreationInputTokens: provider.cacheCreationInputTokens,
-        cacheHitRate: calculateCacheHitRate(provider.cacheObserved, provider.inputTokens, provider.cacheReadInputTokens),
+        cacheHitRate: calculateCacheHitRate(provider.cacheObserved, provider.cacheObservedInputTokens, provider.cacheReadInputTokens),
+        cacheObservedInputTokens: provider.cacheObservedInputTokens,
         priceCoverageRatio: requests > 0 ? counts.pricedRequests / requests : 0,
         pricedRequests: counts.pricedRequests,
         unpricedRequests: counts.unpricedRequests,
@@ -1069,6 +1351,7 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
   private readonly requestIds: Map<string, number> | null;
   private readonly filter: NormalizedUsageFilter | null;
   private readonly mode: UsageAccumulatorMode;
+  private readonly window: UsageTimeWindow | undefined;
   private nextRequestId = 0;
   private nextOrdinal = 0;
   private snapshotStart: number | null = null;
@@ -1077,21 +1360,44 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
   private estimatedRetainedBytes = ESTIMATED_ACCUMULATOR_BASE_BYTES;
 
   constructor(options?: {
-    filter?: { provider?: string | null; model?: string | null; apiKeyId?: string | null };
+    filter?: UsageSummaryFilterInput;
     mode?: UsageAccumulatorMode;
+    window?: UsageTimeWindow;
   }) {
     const provider = normalizeFilterValue(options?.filter?.provider);
     const model = normalizeFilterValue(options?.filter?.model);
     const apiKeyId = normalizeExactFilterValue(options?.filter?.apiKeyId);
-    this.filter = provider === null && model === null && apiKeyId === null
+    const inputSource = options?.filter?.sourceFilter;
+    const sourceFilter = inputSource ? { client: inputSource.client, device: { ...inputSource.device } } : undefined;
+    const configuredApiKeyIds = options?.filter?.configuredApiKeyIds
+      ? snapshotConfiguredKeyIds(options.filter.configuredApiKeyIds) : undefined;
+    if (sourceFilter?.device.kind === "unconfigured" && !configuredApiKeyIds) {
+      throw new Error("configured key snapshot required");
+    }
+    this.filter = provider === null && model === null && apiKeyId === null && !sourceFilter
       ? null
-      : { provider, model, apiKeyId };
+      : { provider, model, apiKeyId, ...(sourceFilter ? { sourceFilter } : {}),
+        ...(configuredApiKeyIds ? { configuredApiKeyIds, configuredApiKeyIdSet: new Set(configuredApiKeyIds) } : {}) };
     this.mode = options?.mode ?? "exact";
+    this.window = options?.window ? Object.freeze({ ...options.window }) : undefined;
     this.requestIds = this.mode === "exact" ? new Map() : null;
+    if (configuredApiKeyIds) {
+      // Account conservatively for the array, set, and serialized retained cache identity.
+      this.estimatedRetainedBytes += configuredApiKeyIds.reduce((bytes, id) => bytes + 128 + id.length * 8, 0);
+    }
   }
 
   get snapshotWindow(): { start: number | null; end: number | null } {
     return { start: this.snapshotStart, end: this.snapshotEnd };
+  }
+
+  noteLedgerSpan(start: number | null, end: number | null): void {
+    if (start !== null && Number.isFinite(start)) {
+      this.snapshotStart = this.snapshotStart === null ? start : Math.min(this.snapshotStart, start);
+    }
+    if (end !== null && Number.isFinite(end)) {
+      this.snapshotEnd = this.snapshotEnd === null ? end : Math.max(this.snapshotEnd, end);
+    }
   }
 
   get estimatedBytes(): number {
@@ -1102,6 +1408,7 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
     const cloned = new StreamingUsageSummaryAccumulator({
       ...(this.filter ? { filter: this.filter } : {}),
       mode: this.mode,
+      window: this.window,
     });
     cloned.nextRequestId = this.nextRequestId;
     cloned.nextOrdinal = this.nextOrdinal;
@@ -1127,6 +1434,7 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
       cloned.partitions.set(key, {
         ...partition,
         totals: { ...partition.totals },
+        apps: new Map([...partition.apps].map(([client, totals]) => [client, { ...totals }])),
         models,
         ...(providers ? { providers } : {}),
         accounts,
@@ -1160,7 +1468,9 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
         dayStart,
         surface,
         oldestTimestamp: null,
+        legacyUnclassifiedRequests: 0,
         totals: blankTotals(),
+        apps: new Map(),
         models: new Map(),
         ...(this.mode === "row-unique" ? { providers: new Map() } : {}),
         accounts: new Map(),
@@ -1188,8 +1498,22 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
     if (attribution.usage) {
       breakdown.inputTokens += attribution.usage.inputTokens;
       breakdown.outputTokens += attribution.usage.outputTokens;
-      const { read, creation, hasCacheTelemetry } = cacheTokensFromUsage(attribution.usage);
-      breakdown.cacheObserved ||= hasCacheTelemetry;
+      if (tokensPerSecond(attribution.usage.outputTokens, attribution.durationMs ?? 0) !== null) {
+        breakdown.throughputOutputTokens += attribution.usage.outputTokens;
+        breakdown.throughputDurationMs += attribution.durationMs!;
+        breakdown.throughputSamples += 1;
+      }
+      const { read, creation, provenance } = cacheObservationFromUsage(
+        attribution.usage,
+        attribution.cacheProvenance,
+      );
+      // Only an observation opens the denominator. A synthesized zero and an unreported detail
+      // both contribute their tokens to inputTokens and nothing to the cache average, which is
+      // the difference between "no cache reads measured" and "no cache reads happened".
+      if (provenance === "observed") {
+        breakdown.cacheObserved = true;
+        breakdown.cacheObservedInputTokens += attribution.usage.inputTokens;
+      }
       if (typeof read === "number") breakdown.cacheReadInputTokens += read;
       if (typeof creation === "number") breakdown.cacheCreationInputTokens += creation;
     }
@@ -1321,7 +1645,7 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
     return label;
   }
 
-  add(sourceEntry: PersistedUsageEntry): void {
+  private noteSnapshot(sourceEntry: PersistedUsageEntry): void {
     if (Number.isFinite(sourceEntry.timestamp)) {
       this.snapshotStart = this.snapshotStart === null
         ? sourceEntry.timestamp
@@ -1330,19 +1654,38 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
         ? sourceEntry.timestamp
         : Math.max(this.snapshotEnd, sourceEntry.timestamp);
     }
-    const normalizedEntry = normalizePhysicalEntry(sourceEntry);
-    const projected = this.filter
-      ? projectedEntryForFilter(normalizedEntry, this.filter)
-      : { entry: normalizedEntry, comboOverlap: false };
+  }
+
+  add(sourceEntry: PersistedUsageEntry): void {
+    if (!this.filter?.sourceFilter) this.noteSnapshot(sourceEntry);
+    if (this.window && (!Number.isFinite(sourceEntry.timestamp)
+      || sourceEntry.timestamp < this.window.since || sourceEntry.timestamp > this.window.until)) return;
+    const physicalEntry = normalizePhysicalEntry(sourceEntry);
+    const projected = this.filter ? projectedEntryForFilter(physicalEntry, this.filter) : { entry: physicalEntry, comboOverlap: false };
     if (!projected) return;
+    if (this.filter?.sourceFilter) this.noteSnapshot(sourceEntry);
     this.comboOverlap ||= projected.comboOverlap;
     const entry = projected.entry;
     const partition = this.partitionFor(entry);
+    if (this.filter?.sourceFilter && isLegacyCodexUsage(entry)) partition.legacyUnclassifiedRequests += 1;
     const costInfo = computeEntryCost(entry);
     bumpStatus(partition.totals, entry.usageStatus);
     partition.totals.attemptCount += entry.attempts?.length ?? 1;
     addTokens(partition.totals, entry);
+    addSpendTotals(partition.totals, entry);
+    addCacheProvenanceTotals(partition.totals, entry);
+    addThroughputTotals(partition.totals, entry);
     addEstimatedCost(partition.totals, entry, costInfo);
+    const client = usageApp(entry.client);
+    let app = partition.apps.get(client);
+    if (!app) {
+      app = blankTotals();
+      partition.apps.set(client, app);
+      this.estimatedRetainedBytes += ESTIMATED_BREAKDOWN_BYTES;
+    }
+    bumpStatus(app, entry.usageStatus);
+    addTokens(app, entry);
+    addEstimatedCost(app, entry, costInfo);
 
     const requestKey = this.mode === "exact" ? this.requestKey(entry.requestId) : null;
     const attributions = usageAttributions(entry);
@@ -1355,8 +1698,8 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
         ? costInfo.attemptEstimates?.[index] ?? null
         : costInfo.estimate;
       const ordinal = this.nextOrdinal++;
-      const facts = requestStatusFact(attribution.usageStatus)
-        | (estimate ? REQUEST_PRICED : REQUEST_UNPRICED);
+      const facts = (entry.attempts?.length ? attemptStatusFact(entry.attempts[index]!) : requestStatusFact(attribution.usageStatus))
+        | (estimate ? REQUEST_PRICED : spentNothing(entry.attempts?.[index]) ? 0 : REQUEST_UNPRICED);
       const modelKey = this.addModelAttribution(partition, attribution, estimate, ordinal);
       modelFacts.set(modelKey, (modelFacts.get(modelKey) ?? 0) | facts);
       if (this.mode === "row-unique") {
@@ -1397,19 +1740,29 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
     now: number,
     surface: UsageSurface = "all",
   ): UsageSummary & { filter?: UsageFilterEcho } {
-    const { since, days: fixedDays } = rangeWindow(range, now);
+    const preset = rangeWindow(range, now);
+    const since = this.window?.since ?? preset.since;
+    const fixedDays = preset.days;
     const totals = blankTotals();
     const models = new Map<string, UsageModelAccumulator>();
     const providers = new Map<string, UsageModelAccumulator>();
+    const apps = new Map<UsageApp, UsageSummaryTotals>();
     const accounts = new Map<string, UsageAccountAccumulator>();
     const dayAccumulators = new Map<string, UsageDayAccumulator>();
     const modelOverlaps: UsageModelOverlap[] = [];
     let oldestTimestamp: number | null = null;
+    let legacyUnclassifiedRequests = 0;
 
     for (const partition of this.partitions.values()) {
       if (!usageSurfaceMatches(partition.surface, surface)) continue;
-      if (since !== null && partition.dayStart < since) continue;
+      if (!this.window && since !== null && partition.dayStart < since) continue;
+      legacyUnclassifiedRequests += partition.legacyUnclassifiedRequests;
       mergeTotals(totals, partition.totals);
+      for (const [client, app] of partition.apps) {
+        const combined = apps.get(client) ?? blankTotals();
+        mergeTotals(combined, app);
+        apps.set(client, combined);
+      }
       mergeModelMaps(models, partition.models);
       if (partition.providers) mergeModelMaps(providers, partition.providers);
       modelOverlaps.push(...partition.modelOverlaps.values());
@@ -1433,28 +1786,36 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
       day.modelOverlaps.push(...partition.modelOverlaps.values());
     }
     finalizeCoverage(totals);
+    finalizeThroughput(totals);
 
-    const dayCount = range === "all" ? dayCountForAllRange(oldestTimestamp, now) : fixedDays;
-    const startOfToday = startOfLocalDay(now);
+    const customDates = this.window ? new Set(customWindowDates(this.window)) : null;
+    const dayCount = customDates?.size ?? (range === "all" ? dayCountForAllRange(oldestTimestamp, now) : fixedDays);
+    const startOfToday = startOfLocalDay(this.window?.until ?? now);
     const firstVisibleDay = new Date(startOfToday);
     firstVisibleDay.setDate(firstVisibleDay.getDate() - dayCount + 1);
     const firstVisibleDate = localDateKey(firstVisibleDay.getTime());
     const lastVisibleDate = localDateKey(startOfToday);
-    for (let offset = dayCount - 1; offset >= 0; offset--) {
+    const visibleDates = customDates ?? new Set<string>();
+    for (let offset = dayCount - 1; !customDates && offset >= 0; offset--) {
       const date = new Date(startOfToday);
       date.setDate(date.getDate() - offset);
-      const key = localDateKey(date.getTime());
+      visibleDates.add(localDateKey(date.getTime()));
+    }
+    for (const key of visibleDates) {
       if (!dayAccumulators.has(key)) {
         dayAccumulators.set(key, { totals: blankTotals(), models: new Map(), modelOverlaps: [] });
       }
     }
-    const days = [...dayAccumulators]
+    const visibleDays = customDates
+      ? [...customDates].map(date => [date, dayAccumulators.get(date)!] as const)
+      : [...dayAccumulators]
       // All-history totals, models, providers, and accounts still cover every
       // retained row. Only the chart buckets are bounded so one malformed or
       // ancient timestamp cannot synthesize an enormous JSON response.
       .filter(([date]) => range !== "all"
         || (date >= firstVisibleDate && date <= lastVisibleDate))
-      .sort(([a], [b]) => a.localeCompare(b))
+      .sort(([a], [b]) => a.localeCompare(b));
+    const days = visibleDays
       .map(([date, day]): UsageDay => ({
         date,
         requests: day.totals.requests,
@@ -1469,12 +1830,18 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
       range,
       surface,
       since,
+      ...(this.window ? { customWindow: true as const, until: this.window.until } : {}),
       generatedAt: now,
       summary: totals,
       days,
       models: buildUsageModels(models, totals.totalTokens, modelOverlaps),
       providers: buildUsageProviders(this.mode === "row-unique" ? providers : models, totals.totalTokens),
+      apps: [...apps].map(([client, app]) => ({ client, requests: app.requests, measuredRequests: app.measuredRequests,
+        totalTokens: app.totalTokens, ...(app.pricedRequests ? { estimatedCostUsd: app.estimatedCostUsd } : {}), pricedRequests: app.pricedRequests,
+        unpricedRequests: app.unpricedRequests + app.unmeteredRequests, shareRatio: totals.totalTokens === 0 ? 0 : Math.min(1, app.totalTokens / totals.totalTokens) })),
       accounts: buildUsageAccounts(accounts),
+      ...(this.filter?.sourceFilter ? { sourceFilter: { client: this.filter.sourceFilter.client,
+        device: { ...this.filter.sourceFilter.device } }, legacyUnclassifiedRequests } : {}),
     };
     if (!this.filter) return summary;
     const matches = (provider: string, model: string): boolean =>
@@ -1504,8 +1871,9 @@ class StreamingUsageSummaryAccumulator implements UsageSummaryAccumulator {
 }
 
 export function createUsageSummaryAccumulator(options?: {
-  filter?: { provider?: string | null; model?: string | null; apiKeyId?: string | null };
+  filter?: UsageSummaryFilterInput;
   mode?: UsageAccumulatorMode;
+  window?: UsageTimeWindow;
 }): UsageSummaryAccumulator {
   return new StreamingUsageSummaryAccumulator(options);
 }
@@ -1551,14 +1919,19 @@ function normalizeExactFilterValue(input: string | null | undefined): string | n
  */
 export function projectUsageSummary<T extends UsageSummary>(
   summary: T,
-  filter: { provider?: string | null; model?: string | null; apiKeyId?: string | null },
+  filter: UsageSummaryFilterInput,
   entries?: PersistedUsageEntry[],
 ): T & { filter?: UsageFilterEcho } {
   const provider = normalizeFilterValue(filter.provider);
   const model = normalizeFilterValue(filter.model);
   const apiKeyId = normalizeExactFilterValue(filter.apiKeyId);
-  if (provider === null && model === null && apiKeyId === null) return summary;
-  const accumulator = createUsageSummaryAccumulator({ filter: { provider, model, apiKeyId } });
+  if (provider === null && model === null && apiKeyId === null && !filter.sourceFilter) return summary;
+  const accumulator = createUsageSummaryAccumulator({
+    filter: { provider, model, apiKeyId, ...(filter.sourceFilter ? { sourceFilter: filter.sourceFilter } : {}),
+      ...(filter.configuredApiKeyIds ? { configuredApiKeyIds: filter.configuredApiKeyIds } : {}) },
+    ...(summary.customWindow && summary.since !== null && summary.until !== undefined
+      ? { window: { since: summary.since, until: summary.until } } : {}),
+  });
   for (const entry of entries ?? []) accumulator.add(entry);
   const projected = accumulator.summarize(summary.range, summary.generatedAt, summary.surface);
   return {
@@ -1567,7 +1940,9 @@ export function projectUsageSummary<T extends UsageSummary>(
     days: projected.days,
     models: projected.models,
     providers: projected.providers,
+    apps: projected.apps,
     accounts: projected.accounts,
+    ...(projected.sourceFilter ? { sourceFilter: projected.sourceFilter, legacyUnclassifiedRequests: projected.legacyUnclassifiedRequests } : {}),
     filter: projected.filter,
   };
 }

@@ -26,6 +26,7 @@
 import { withHistoryWriteSerialization } from "./history-lock";
 import { loadConfig } from "../config";
 import { shouldSyncCodexOnStart } from "./desired-state";
+import { stopRestoreWriteGuard, type RestoreOwnershipRefusal } from "../client/restore-ownership";
 import {
   writeHistoryProviderTransition,
   writeLegacyOpenaiHistoryRecovery,
@@ -33,6 +34,7 @@ import {
 } from "./internal/history-writer";
 import {
   snapshotCodexHistoryNoop,
+  adoptHistoryDbBusyTimeout,
   type CodexHistoryFailureReason,
   type CodexHistoryVerifiedNoopProof,
 } from "./history-provider";
@@ -62,6 +64,13 @@ export interface HistoryWorkerRunMessage {
   readonly canonicalBackupPath: string;
   /** When set, prove this transition's desired direction while H is held. */
   readonly expectedDesiredEnabled?: boolean;
+  /** Stop restoration must revalidate connection ownership inside H, under C. */
+  readonly guardStopOwnership?: boolean;
+  /**
+   * The parent realm's `state_5.sqlite` busy timeout. A Worker cannot observe a parent that
+   * resolved a different window, for the same reason the homes below are explicit.
+   */
+  readonly busyTimeoutMs?: number;
   /** Env snapshot: a Worker may not observe parent mutations on every platform. */
   readonly env?: { readonly CODEX_HOME?: string; readonly OPENCODEX_HOME?: string };
 }
@@ -75,6 +84,7 @@ export type HistoryWorkerResult =
       readonly reason: "busy" | "database" | "unsafe-path" | "desired_disabled" | "desired_enabled" }
   | { readonly type: "error"; readonly requestId: string; readonly jobId: string;
       readonly message: string; readonly reason?: CodexHistoryFailureReason;
+      readonly restoreBoundary?: RestoreOwnershipRefusal;
       /** Specific integrity condition, so a non-retryable one can be named as such. */
       readonly integrityCode?: string;
       readonly rows?: number; readonly files?: number };
@@ -107,7 +117,13 @@ export function isHistoryWorkerRunMessage(data: unknown): data is HistoryWorkerR
     && nonEmpty(message.canonicalCodexHome)
     && nonEmpty(message.canonicalStateDbPath)
     && nonEmpty(message.canonicalBackupPath)
-    && (message.expectedDesiredEnabled === undefined || typeof message.expectedDesiredEnabled === "boolean");
+    && (message.expectedDesiredEnabled === undefined || typeof message.expectedDesiredEnabled === "boolean")
+    && (message.guardStopOwnership === undefined
+      || (message.guardStopOwnership === true && message.operation === "restore-openai"))
+    && (message.busyTimeoutMs === undefined
+      || (typeof message.busyTimeoutMs === "number"
+        && Number.isFinite(message.busyTimeoutMs)
+        && message.busyTimeoutMs >= 0));
 }
 
 /**
@@ -149,7 +165,16 @@ export function runHistoryUnitUnderLock(
       // manifest-backed original metadata. The provider is derived from the operation,
       // never from a caller; only recover-legacy-openai force-labels bare routed rows.
       const provider = operation === "apply-opencodex" ? "opencodex" : "openai";
-      return writeHistoryProviderTransition(permit, target, provider);
+      const guard = message.guardStopOwnership ? stopRestoreWriteGuard() : undefined;
+      try {
+        // H is already held. The provider takes C only for synchronous attempts, so
+        // there is no C -> H edge and no C lease spans the parent's Worker await.
+        return writeHistoryProviderTransition(permit, target, provider, guard?.run);
+      } catch (error) {
+        const boundary = guard?.boundary();
+        if (boundary && boundary !== "restore") return { restoreBoundary: boundary };
+        throw error;
+      }
     },
   );
 
@@ -157,6 +182,10 @@ export function runHistoryUnitUnderLock(
     return { type: "blocked", requestId, jobId, reason: acquired.reason };
   }
   const result = acquired.value;
+  if ("restoreBoundary" in result) {
+    return { type: "error", requestId, jobId, message: `stop_restore_${result.restoreBoundary}`,
+      restoreBoundary: result.restoreBoundary };
+  }
   if ("desiredStateChanged" in result) {
     return {
       type: "blocked",
@@ -207,6 +236,9 @@ if (typeof self !== "undefined" && typeof (self as { onmessage?: unknown }) === 
     try {
       if (message.env?.CODEX_HOME) process.env.CODEX_HOME = message.env.CODEX_HOME;
       if (message.env?.OPENCODEX_HOME) process.env.OPENCODEX_HOME = message.env.OPENCODEX_HOME;
+      // Before any DB open: the timeout has to be in force for the first `openStateDb`, not
+      // after the writer has already waited out this realm's default.
+      if (message.busyTimeoutMs !== undefined) adoptHistoryDbBusyTimeout(message.busyTimeoutMs);
       self.postMessage(runHistoryUnitUnderLock(message));
     } catch (error) {
       self.postMessage({

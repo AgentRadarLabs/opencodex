@@ -39,14 +39,23 @@ import type {
   OpencodeProviderBlocks,
   OpencodeV2ProviderBlock,
 } from "../clients/config-export";
-import { visibleNativeSlugs } from "../codex/catalog";
+import type { EffectiveModelExportMetadata } from "../clients/config-export/contracts";
+import { resolveExportReasoningAxes } from "../clients/config-export/reasoning-metadata";
+import { filterCatalogVisibleModels, visibleNativeSlugs } from "../codex/catalog";
 import { commandInvocation } from "../lib/win-exec";
+import { configuredAdminToken, opencodeCatalogToken } from "../lib/admin-secrets";
+import { localManagementOrigin } from "../lib/local-destinations";
+import { directLocalHttpFetch } from "../server/direct-local-http";
 import { loadServiceTokenFromFile, serviceApiTokenFilePath } from "../lib/service-secrets";
 import { providerCodexAccountMode } from "../providers/registry";
 import { findLiveProxy, probeHostname, type LiveProxy } from "../server/proxy-liveness";
 import type { OcxConfig } from "../types";
 import { withProcessRuntimeProvenance } from "../lib/bun-runtime";
 import { selfLaunchArgv } from "../lib/self-launch-argv";
+import { withoutSiblingMarker } from "../codex/sibling-start";
+import { parseJsonc } from "../lib/jsonc";
+import { withoutSupervisorMarkers } from "../lib/supervisor-markers";
+export { parseJsonc };
 
 /**
  * The provider-block serializer, its constants, and the config-path helpers now live in
@@ -84,6 +93,11 @@ export interface OpencodeRoutedModel {
   displayName?: string;
   /** Declared effort ladder; exported as opencode model variants when present. */
   reasoningEfforts?: readonly string[];
+  supportsReasoning?: boolean;
+  supportsThinkingToggle?: boolean;
+  supportsReasoningEffort?: boolean;
+  defaultThinkingEnabled?: boolean;
+  defaultReasoningEffort?: string;
 }
 
 /** Row shape from authenticated GET /api/models on the running proxy. */
@@ -98,10 +112,35 @@ export interface OpencodeProxyModelRow {
   displayName?: string;
   displayNameSource?: "operator" | "provider" | "fallback";
   contextWindow?: number;
+  /** Authoritative output limit (CatalogModel.maxOutputTokens); optional. */
+  maxOutputTokens?: number;
+  /** Authoritative input ceiling (CatalogModel.maxInputTokens); optional. */
+  maxInputTokens?: number;
+  /**
+   * Derived on the hub from known evidence; absent means unknown, never a negative. An
+   * explicit `false` from the hub is evidence too and is carried through unchanged.
+   */
+  supportsTools?: boolean;
+  supportsReasoning?: boolean;
+  supportsReasoningSummaries?: boolean;
+  /** Declared input modalities from `/api/models`; carried into opencode model capabilities. */
+  inputModalities?: string[];
   /** Declared effort ladder from `/api/models`; carried into opencode model variants. */
   reasoningEfforts?: string[];
+  supportsThinkingToggle?: boolean;
+  supportsReasoningEffort?: boolean;
+  defaultThinkingEnabled?: boolean;
   /** Declared default effort from `/api/models`. */
   defaultReasoningEffort?: string;
+  /**
+   * Effective export metadata `/api/models` attaches to every row it produces. Custom row
+   * fields are the operator's stored overrides, so this object is the authoritative
+   * projection a client consumes; routed and native rows carry their declared default in it
+   * because the row-level default is the picker's preference order. When present, an absent
+   * field inside means "no declared value" — never "fall back to the row" — and every field
+   * below still works for rows without it (older hubs, hand-built rows).
+   */
+  exportMetadata?: EffectiveModelExportMetadata;
 }
 
 const PROJECT_CONFIG_FILENAMES = ["opencode.json", "opencode.jsonc"] as const;
@@ -114,89 +153,6 @@ export const OPENCODE_CONFIG_CONTENT_ENV = "OPENCODE_CONFIG_CONTENT";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/**
- * Strip `//` and block comments outside string literals. Escape-aware so a quote inside
- * an escaped sequence cannot flip string state and expose config text to the stripper.
- */
-function stripJsonComments(text: string): string {
-  let out = "";
-  let inString = false;
-  let inLine = false;
-  let inBlock = false;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i]!;
-    const next = text[i + 1];
-    if (inLine) {
-      if (ch === "\n") {
-        inLine = false;
-        out += ch;
-      }
-      continue;
-    }
-    if (inBlock) {
-      // Newlines are preserved so JSON.parse error positions stay meaningful.
-      if (ch === "\n") out += ch;
-      else if (ch === "*" && next === "/") { inBlock = false; i++; }
-      continue;
-    }
-    if (inString) {
-      out += ch;
-      if (ch === "\\") {
-        const escaped = text[i + 1];
-        if (escaped !== undefined) { out += escaped; i++; }
-        continue;
-      }
-      if (ch === "\"") inString = false;
-      continue;
-    }
-    if (ch === "\"") { inString = true; out += ch; continue; }
-    if (ch === "/" && next === "/") { inLine = true; i++; continue; }
-    if (ch === "/" && next === "*") { inBlock = true; i++; continue; }
-    out += ch;
-  }
-  return out;
-}
-
-/** Drop commas that sit directly before `}` or `]`, ignoring string contents. */
-function stripTrailingCommas(text: string): string {
-  let out = "";
-  let inString = false;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i]!;
-    if (inString) {
-      out += ch;
-      if (ch === "\\") {
-        const escaped = text[i + 1];
-        if (escaped !== undefined) { out += escaped; i++; }
-        continue;
-      }
-      if (ch === "\"") inString = false;
-      continue;
-    }
-    if (ch === "\"") { inString = true; out += ch; continue; }
-    if (ch === ",") {
-      let j = i + 1;
-      while (j < text.length && /\s/.test(text[j]!)) j++;
-      if (text[j] === "}" || text[j] === "]") continue;
-    }
-    out += ch;
-  }
-  return out;
-}
-
-/**
- * opencode documents opencode.json as JSONC, so a valid user config may carry comments
- * or trailing commas. Strict JSON.parse runs first and untouched — the tolerant path is
- * only attempted when that throws, keeping well-formed configs away from the stripper.
- */
-export function parseJsonc(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return JSON.parse(stripTrailingCommas(stripJsonComments(text)));
-  }
 }
 
 /** Model key as the proxy routes it: `provider/id` for routed models, bare slug for native OpenAI entries. */
@@ -234,9 +190,14 @@ function opencodeLaunchCatalog(
       id: model.id,
       contextWindow: model.contextWindow,
       displayName: model.displayName,
-      ...(model.reasoningEfforts && model.reasoningEfforts.length > 0
+      ...(model.reasoningEfforts !== undefined
         ? { reasoningEfforts: [...model.reasoningEfforts] }
         : {}),
+      ...(model.supportsReasoning !== undefined ? { supportsReasoning: model.supportsReasoning } : {}),
+      ...(model.supportsThinkingToggle !== undefined ? { supportsThinkingToggle: model.supportsThinkingToggle } : {}),
+      ...(model.supportsReasoningEffort !== undefined ? { supportsReasoningEffort: model.supportsReasoningEffort } : {}),
+      ...(model.defaultThinkingEnabled !== undefined ? { defaultThinkingEnabled: model.defaultThinkingEnabled } : {}),
+      ...(model.defaultReasoningEffort !== undefined ? { defaultReasoningEffort: model.defaultReasoningEffort } : {}),
     })),
   ];
 }
@@ -304,17 +265,38 @@ function opencodeBlocks(
 /** Default deadline for authenticated GET /api/models during `ocx opencode` launch. */
 export const OPENCODE_PROXY_MODELS_TIMEOUT_MS = 8_000;
 
+function opencodeManagementOrigin(live: LiveProxy, override?: string): string {
+  if (!override && (!Number.isInteger(live.port) || live.port < 1 || live.port > 65535)) {
+    throw new Error("The local management port is invalid.");
+  }
+  let url: URL;
+  try { url = new URL(override ?? `http://${probeHostname(live.hostname)}:${live.port}`); }
+  catch { throw new Error("The local management address is invalid."); }
+  if (url.protocol !== "http:" || url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
+    throw new Error("The catalog requires a local HTTP management origin without credentials or a path.");
+  }
+  const host = url.hostname.toLowerCase();
+  if (["localhost", "localhost.", "127.0.0.1", "0.0.0.0", "[::]"].includes(host)) url.hostname = "127.0.0.1";
+  else if (host !== "[::1]") {
+    throw new Error("The catalog requires a loopback management listener. On a hub, enable hub.managementIngress.");
+  }
+  const port = Number(url.port || 80);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("The local management port is invalid.");
+  return url.origin;
+}
+
 /** Fetch the live model catalog from a running proxy's management API. */
 export async function fetchOpencodeProxyModels(
   live: LiveProxy,
-  apiKey: string,
-  deps: { fetchImpl?: typeof fetch; timeoutMs?: number } = {},
+  managementToken: string,
+  deps: { fetchImpl?: typeof fetch; timeoutMs?: number; managementOrigin?: string } = {},
 ): Promise<OpencodeProxyModelRow[]> {
-  const baseUrl = `http://${probeHostname(live.hostname)}:${live.port}`;
-  const fetchImpl = deps.fetchImpl ?? fetch;
+  const baseUrl = opencodeManagementOrigin(live, deps.managementOrigin);
+  const fetchImpl = deps.fetchImpl ?? directLocalHttpFetch;
   const headers = new Headers({ Accept: "application/json" });
-  const token = apiKey.trim();
-  if (token) headers.set("X-OpenCodex-API-Key", token);
+  const token = managementToken.trim();
+  if (!token) throw new Error("No local admin token is available for the model catalog.");
+  headers.set("X-OpenCodex-API-Key", token);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), deps.timeoutMs ?? OPENCODE_PROXY_MODELS_TIMEOUT_MS);
   const abortIfTimedOut = (): Promise<never> => new Promise((_, reject) => {
@@ -335,10 +317,16 @@ export async function fetchOpencodeProxyModels(
     response = await Promise.race([
       fetchImpl(`${baseUrl}/api/models`, {
         headers,
+        redirect: "error",
+        cache: "no-store",
         signal: controller.signal,
       }),
       abortIfTimedOut(),
     ]);
+    if (response.status >= 300 && response.status < 400) {
+      void response.body?.cancel().catch(() => {});
+      throw new Error("Management catalog redirects are refused.");
+    }
     text = await Promise.race([response.text(), abortIfTimedOut()]);
   } catch (error) {
     const timedOut = error instanceof Error && error.name === "AbortError";
@@ -370,34 +358,65 @@ export async function fetchOpencodeProxyModels(
 /**
  * Visible OpenCode catalog entries from proxy /api/models rows. Disabled rows are omitted;
  * native rows are omitted in Codex Direct mode.
+ *
+ * Custom rows carry their effective projection in `exportMetadata`; when it is present it
+ * wins over the row's own fields, which for a custom row are the operator's stored overrides
+ * rather than the resolved capabilities. Routed/native projections also distinguish declared
+ * defaults from picker preferences; older hubs without the field retain their row values. The empty-vs-undefined ladder distinction
+ * survives: a row declaring `reasoningEfforts: []` exports `[]`, not an absent key.
  */
 export function opencodeCatalogFromProxyRows(
   rows: readonly OpencodeProxyModelRow[],
   config: OcxConfig,
 ): OpencodeCatalogModel[] {
   const omitNative = providerCodexAccountMode("openai", config.providers?.openai) === "direct";
+  const routedRows = rows.filter((row): row is OpencodeProxyModelRow & { provider: string; id: string } =>
+    row.native !== true && typeof row.provider === "string" && typeof row.id === "string");
+  const visibleRouted = new Set<OpencodeProxyModelRow>(filterCatalogVisibleModels(routedRows, config));
   const seen = new Set<string>();
   const catalog: OpencodeCatalogModel[] = [];
   for (const row of rows) {
     const namespaced = row.namespaced?.trim();
     if (!namespaced || row.disabled === true) continue;
     if (omitNative && row.native === true) continue;
+    if (row.native !== true && typeof row.provider === "string" && typeof row.id === "string"
+      && !visibleRouted.has(row)) continue;
     if (seen.has(namespaced)) continue;
     seen.add(namespaced);
+    const effective = row.exportMetadata;
+    const maxTokens = effective?.maxTokens ?? row.maxOutputTokens;
+    const maxInputTokens = effective?.maxInputTokens ?? row.maxInputTokens;
+    const inputModalities = effective?.inputModalities ?? row.inputModalities;
+    const { supportsThinkingToggle, supportsReasoningEffort, defaultThinkingEnabled,
+      reasoningEfforts, defaultReasoningEffort } = resolveExportReasoningAxes(effective, row);
+    const supportsTools = effective?.supportsTools ?? row.supportsTools;
+    const supportsReasoning = effective?.supportsReasoning ?? row.supportsReasoning;
+    const supportsReasoningSummaries = effective?.supportsReasoningSummaries ?? row.supportsReasoningSummaries;
     catalog.push({
       namespaced,
       native: row.native === true,
       provider: row.provider,
       id: row.id,
-      contextWindow: row.contextWindow,
+      contextWindow: effective?.contextWindow ?? row.contextWindow,
+      ...(typeof maxTokens === "number" ? { maxTokens } : {}),
+      ...(typeof maxInputTokens === "number" ? { maxInputTokens } : {}),
       displayName: row.displayNameSource === "fallback" ? undefined : row.displayName,
+      ...(Array.isArray(inputModalities) && inputModalities.length > 0
+        ? { inputModalities: [...inputModalities] }
+        : {}),
       ...(typeof row.fastRowAvailable === "boolean" ? { fastRowAvailable: row.fastRowAvailable } : {}),
-      ...(Array.isArray(row.reasoningEfforts) && row.reasoningEfforts.length > 0
-        ? { reasoningEfforts: [...row.reasoningEfforts] }
+      // `[]` is a declaration, not an absence: an explicit no-rungs ladder stays empty here.
+      ...(Array.isArray(reasoningEfforts) ? { reasoningEfforts: [...reasoningEfforts] } : {}),
+      ...(typeof supportsThinkingToggle === "boolean" ? { supportsThinkingToggle } : {}),
+      ...(typeof supportsReasoningEffort === "boolean" ? { supportsReasoningEffort } : {}),
+      ...(typeof defaultThinkingEnabled === "boolean" ? { defaultThinkingEnabled } : {}),
+      ...(typeof defaultReasoningEffort === "string" && defaultReasoningEffort.length > 0
+        ? { defaultReasoningEffort }
         : {}),
-      ...(typeof row.defaultReasoningEffort === "string" && row.defaultReasoningEffort.length > 0
-        ? { defaultReasoningEffort: row.defaultReasoningEffort }
-        : {}),
+      // An explicit false survives the hop; only derivation is true-or-nothing.
+      ...(typeof supportsTools === "boolean" ? { supportsTools } : {}),
+      ...(typeof supportsReasoning === "boolean" ? { supportsReasoning } : {}),
+      ...(typeof supportsReasoningSummaries === "boolean" ? { supportsReasoningSummaries } : {}),
     });
   }
   return catalog;
@@ -414,7 +433,7 @@ export function isOpencodeRuntimeConfigError(
 
 /**
  * Merge inherited `OPENCODE_CONFIG_CONTENT` and override only our own blocks:
- * `provider.opencodex` (V1) and `providers.opencodex` (V2, the one carrying variants).
+ * `provider.opencodex` (V1 maps) and `providers.opencodex` (native V2 arrays).
  * When no inline layer is present, emit the minimal runtime object for this launcher.
  */
 export function mergeOpencodeRuntimeConfig(
@@ -557,7 +576,8 @@ export function opencodeProxyStartEnv(base: OpencodeLaunchEnv = process.env): Op
   const withTokenFile = base.OPENCODEX_API_AUTH_TOKEN?.trim()
     ? base
     : serviceTokenLookupEnv(base);
-  return { ...withTokenFile, OCX_SERVICE: "1" };
+  // A shell a supervised runtime handed to a tool carries its supervisor's markers; this proxy is not its.
+  return withoutSupervisorMarkers({ ...withTokenFile, OCX_SERVICE: "1" });
 }
 
 /**
@@ -574,7 +594,7 @@ export function buildOpencodeEnv(
   const runtimeConfig = mergeOpencodeRuntimeConfig(base[OPENCODE_CONFIG_CONTENT_ENV], blocks);
   if (isOpencodeRuntimeConfigError(runtimeConfig)) return runtimeConfig;
   return {
-    ...base,
+    ...Object.fromEntries(Object.entries(base).filter(([name]) => name.toUpperCase() !== "OPENCODEX_ADMIN_AUTH_TOKEN")),
     [OPENCODE_CONFIG_CONTENT_ENV]: serializeOpencodeRuntimeConfig(runtimeConfig),
     [OPENCODE_API_KEY_ENV]: apiKey,
   };
@@ -601,7 +621,8 @@ async function ensureProxyForOpencode(config: OcxConfig): Promise<LiveProxy | nu
     detached: true,
     stdio: "ignore",
     windowsHide: true,
-    env: withProcessRuntimeProvenance(opencodeProxyStartEnv(process.env) as NodeJS.ProcessEnv),
+    // An ordinary owner: a stray sibling marker would otherwise mark it before any probe.
+    env: withProcessRuntimeProvenance(opencodeProxyStartEnv(withoutSiblingMarker(process.env)) as NodeJS.ProcessEnv),
   });
   // Without a listener an 'error' (bad argv[1], EMFILE, AV denial) throws synchronously
   // and kills this process; the health poll below already reports the failure properly.
@@ -632,22 +653,28 @@ export function opencodeNotFoundHint(
 }
 
 export async function cmdOpencode(args: string[]): Promise<number> {
-  const config = loadConfig();
-  const live = await ensureProxyForOpencode(config);
+  const startupConfig = loadConfig();
+  const live = await ensureProxyForOpencode(startupConfig);
   if (!live) {
     console.error("❌ Proxy did not become healthy after starting.");
     return 1;
   }
 
-  const apiKey = opencodeApiKey(config);
+  const apiKey = opencodeApiKey(startupConfig);
   let proxyModels: OpencodeProxyModelRow[];
   try {
-    proxyModels = await fetchOpencodeProxyModels(live, apiKey);
+    const managementToken = configuredAdminToken();
+    if (!managementToken) throw new Error("No local admin token is available; check the running proxy's home.");
+    proxyModels = await fetchOpencodeProxyModels(live, opencodeCatalogToken(managementToken), {
+      managementOrigin: localManagementOrigin({ ...startupConfig, hostname: live.hostname }, live.port),
+    });
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     console.error(`❌ Could not fetch the model catalog from the proxy: ${reason}`);
     return 1;
   }
+  // /api/models may have completed and persisted initial provider selection.
+  const config = loadConfig();
   const catalog = opencodeCatalogFromProxyRows(proxyModels, config);
   const blocks = buildOpencodeProviderBlocksFromCatalog(live.port, catalog, live.hostname, config);
   const baseUrl = blocks.v1.options.baseURL;

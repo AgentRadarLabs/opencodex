@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
   DEFAULT_LOG_FILTER_STATE,
   extractLogFilterOptions,
   filterLogs,
   hasActiveLogFilters,
 } from "../src/pages/logs-filter";
+import { hashLogConversationQuery, unwrapLogConversationQuery } from "../src/log-conversation-id";
 
 const NOW = 2_000_000_000_000;
 const logs = [
@@ -46,16 +48,31 @@ describe("rich Logs filtering", () => {
     expect(filterLogs(logs, DEFAULT_LOG_FILTER_STATE, NOW)).toEqual(logs);
   });
 
-  test("matches requested, resolved, and attempted models by substring", () => {
+  test("matches complete requested, resolved, and attempted model identities", () => {
     const attemptOnly = [{
       id: "attempt-only",
       model: "requested-model",
       attempts: [{ model: "fallback-only" }],
     }];
-    expect(filterLogs(logs, { ...DEFAULT_LOG_FILTER_STATE, model: "reliable" }, NOW).map(row => row.id)).toEqual(["claude"]);
-    expect(filterLogs(logs, { ...DEFAULT_LOG_FILTER_STATE, model: "SONNET-4.6" }, NOW).map(row => row.id)).toEqual(["claude"]);
-    expect(filterLogs(logs, { ...DEFAULT_LOG_FILTER_STATE, model: "terra" }, NOW).map(row => row.id)).toEqual(["codex"]);
+    expect(filterLogs(logs, { ...DEFAULT_LOG_FILTER_STATE, model: "claude-sonnet-4.6" }, NOW).map(row => row.id)).toEqual(["claude"]);
+    expect(filterLogs(logs, { ...DEFAULT_LOG_FILTER_STATE, model: "GPT-5.6-TERRA" }, NOW).map(row => row.id)).toEqual(["codex"]);
+    expect(filterLogs(logs, { ...DEFAULT_LOG_FILTER_STATE, model: "reliable" }, NOW).map(row => row.id)).toEqual([]);
     expect(filterLogs(attemptOnly, { ...DEFAULT_LOG_FILTER_STATE, model: "fallback-only" }, NOW).map(row => row.id)).toEqual(["attempt-only"]);
+  });
+
+  test("offers and matches an upstream served model distinct from the routed model", () => {
+    const rows = [
+      { id: "rerouted", model: "requested", resolvedModel: "routed", servedModel: "UPSTREAM/model-v2" },
+      { id: "routed-only", model: "requested", resolvedModel: "routed" },
+    ];
+    expect(extractLogFilterOptions(rows).models).toEqual(["UPSTREAM/model-v2", "requested", "routed"]);
+    expect(filterLogs(rows, { ...DEFAULT_LOG_FILTER_STATE, model: "upstream/model-v2" }, NOW).map(row => row.id))
+      .toEqual(["rerouted"]);
+  });
+
+  test("does not treat a stale or partial model selection as a substring query", () => {
+    expect(filterLogs(logs, { ...DEFAULT_LOG_FILTER_STATE, model: "terra" }, NOW)).toEqual([]);
+    expect(filterLogs(logs, { ...DEFAULT_LOG_FILTER_STATE, model: "gpt-5.6-terra-old" }, NOW)).toEqual([]);
   });
 
   test("matches the selected provider on the row or any attempt", () => {
@@ -63,10 +80,9 @@ describe("rich Logs filtering", () => {
     expect(filterLogs(logs, { ...DEFAULT_LOG_FILTER_STATE, provider: "anthropic" }, NOW).map(row => row.id)).toEqual(["claude"]);
   });
 
-  test("composes surface, status, interception, and conversation filters", () => {
+  test("composes status, interception, and conversation filters", () => {
     expect(filterLogs(logs, {
       ...DEFAULT_LOG_FILTER_STATE,
-      surface: "claude",
       status: "success",
       conversationId: "conv-123",
     }, NOW).map(row => row.id)).toEqual(["claude"]);
@@ -75,6 +91,15 @@ describe("rich Logs filtering", () => {
       status: "success",
       interceptedOnly: true,
     }, NOW).map(row => row.id)).toEqual(["helper"]);
+  });
+
+  test("ignores obsolete surface selections rather than hiding rows without a visible control", () => {
+    for (const surface of ["claude", "codex", "grok", "invalid"]) {
+      const obsolete = { ...DEFAULT_LOG_FILTER_STATE, surface };
+      expect(filterLogs(logs, obsolete, NOW)).toEqual(logs);
+      expect(hasActiveLogFilters(obsolete)).toBe(false);
+    }
+    expect(DEFAULT_LOG_FILTER_STATE).not.toHaveProperty("surface");
   });
 
   test("accepts only finite integer HTTP statuses in status buckets", () => {
@@ -137,5 +162,109 @@ describe("rich Logs filtering", () => {
     expect(hasActiveLogFilters({ ...DEFAULT_LOG_FILTER_STATE, status: "errors" })).toBe(true);
     expect(hasActiveLogFilters({ ...DEFAULT_LOG_FILTER_STATE, minTokPerSec: 1 })).toBe(true);
     expect(hasActiveLogFilters({ ...DEFAULT_LOG_FILTER_STATE, conversationId: "  conv  " })).toBe(true);
+  });
+});
+
+test.each([
+  ["15m", 15 * 60_000], ["1h", 60 * 60_000], ["24h", 24 * 60 * 60_000],
+] as const)("relative window %s includes its lower boundary and expires it as time advances", (timeWindow, duration) => {
+  const rows = [
+    { id: "before", timestamp: NOW - duration - 1 },
+    { id: "boundary", timestamp: NOW - duration },
+    { id: "inside", timestamp: NOW - duration + 1 },
+    { id: "invalid", timestamp: Number.NaN },
+  ];
+  const filters = { ...DEFAULT_LOG_FILTER_STATE, timeWindow };
+  expect(filterLogs(rows, filters, NOW).map(row => row.id)).toEqual(["boundary", "inside"]);
+  expect(filterLogs(rows, filters, NOW + 1).map(row => row.id)).toEqual(["inside"]);
+});
+
+test("speed buckets separate values immediately below and at both boundaries", () => {
+  const rows = [14.99, 15, 49.99, 50].map(value => ({
+    id: String(value), displayMetrics: { tokPerSecond: { kind: "value" as const, value } },
+  }));
+  expect(filterLogs(rows, { ...DEFAULT_LOG_FILTER_STATE, maxTokPerSec: 15 }).map(row => row.id)).toEqual(["14.99"]);
+  expect(filterLogs(rows, { ...DEFAULT_LOG_FILTER_STATE, minTokPerSec: 15, maxTokPerSec: 50 }).map(row => row.id))
+    .toEqual(["15", "49.99"]);
+  expect(filterLogs(rows, { ...DEFAULT_LOG_FILTER_STATE, minTokPerSec: 50 }).map(row => row.id)).toEqual(["50"]);
+});
+
+test("exact model choices distinguish prefix siblings and compose with a provider on another attempt", () => {
+  const rows = [
+    { id: "exact", model: "model-a", provider: "openai" },
+    { id: "sibling", model: "model-a-plus", provider: "openai" },
+    { id: "resolved", model: "requested", resolvedModel: " MODEL-A ", provider: "openai" },
+    { id: "attempt", attempts: [{ model: "model-a", provider: "first" }, { model: "other", provider: "openai" }] },
+  ];
+  expect(filterLogs(rows, { ...DEFAULT_LOG_FILTER_STATE, model: "model-a", provider: "openai" }).map(row => row.id))
+    .toEqual(["exact", "resolved", "attempt"]);
+});
+
+const digest32 = (raw: string) => createHash("sha256").update(raw).digest("hex").slice(0, 32);
+const CODEX_THREAD_ID = "019f6482-67d5-77c2-a643-02daddaa7115";
+
+test("a pasted Claude Code user_id finds its session despite the per-turn tk", async () => {
+  const session = JSON.stringify({ device_id: "d", session_id: "s" });
+  const turn = JSON.stringify({ device_id: "d", session_id: "s", tk: "turn-3" });
+  const rows = [{ id: "session", conversationId: digest32(session) }, { id: "old", conversationId: digest32(turn) }];
+  const queryHash = await hashLogConversationQuery(turn);
+  expect(filterLogs(rows, { ...DEFAULT_LOG_FILTER_STATE, conversationId: turn, conversationQueryHash: queryHash }, NOW)
+    .map(row => row.id)).toEqual(["session", "old"]);
+});
+
+describe("codex://threads paste in the conversation filter", () => {
+  test("unwraps the deep link to the bare thread id and hashes the unwrapped value", async () => {
+    expect(unwrapLogConversationQuery(`codex://threads/${CODEX_THREAD_ID}`)).toBe(CODEX_THREAD_ID);
+    expect(unwrapLogConversationQuery(`  CODEX://THREADS/${CODEX_THREAD_ID}/  `)).toBe(CODEX_THREAD_ID);
+    expect(unwrapLogConversationQuery(CODEX_THREAD_ID)).toBe(CODEX_THREAD_ID);
+    expect(unwrapLogConversationQuery("codex://other/x")).toBe("codex://other/x");
+    expect(unwrapLogConversationQuery("codex://threads/")).toBe("codex://threads/");
+    expect(unwrapLogConversationQuery(`codex://threads/${CODEX_THREAD_ID}?hostId=durable`)).toBe(CODEX_THREAD_ID);
+    expect(unwrapLogConversationQuery(`codex://threads/${CODEX_THREAD_ID}?hostId=remote-control%3Aexample-environment`)).toBe(CODEX_THREAD_ID);
+    expect(unwrapLogConversationQuery(`codex://threads/${CODEX_THREAD_ID}#frag`)).toBe(CODEX_THREAD_ID);
+    expect(await hashLogConversationQuery(`codex://threads/${CODEX_THREAD_ID}`))
+      .toEqual([digest32(CODEX_THREAD_ID), digest32(`codex://threads/${CODEX_THREAD_ID}`)]);
+    expect(await hashLogConversationQuery(`codex://threads/${CODEX_THREAD_ID}?hostId=durable`))
+      .toEqual([digest32(CODEX_THREAD_ID), digest32(`codex://threads/${CODEX_THREAD_ID}?hostId=durable`)]);
+    expect(await hashLogConversationQuery(CODEX_THREAD_ID)).toEqual([digest32(CODEX_THREAD_ID)]);
+  });
+
+  test("a literal codex://threads id a client sent still matches its whole-string digest", async () => {
+    const uri = `codex://threads/${CODEX_THREAD_ID}`;
+    const rows = [{ id: "literal", conversationId: digest32(uri) }];
+    const queryHash = await hashLogConversationQuery(uri);
+    expect(filterLogs(rows, { ...DEFAULT_LOG_FILTER_STATE, conversationId: uri, conversationQueryHash: queryHash }, NOW)
+      .map(row => row.id)).toEqual(["literal"]);
+  });
+
+  test("malformed or oversized pastes stay plain queries and never match", () => {
+    const slashFlood = `codex://threads/${"/".repeat(4000)}\u2028x`;
+    expect(unwrapLogConversationQuery(slashFlood)).toBe(slashFlood.trim());
+    expect(unwrapLogConversationQuery("codex://threads/id/extra")).toBe("codex://threads/id/extra");
+    const rows = [{ id: "hashed", conversationId: digest32(CODEX_THREAD_ID) }];
+    expect(filterLogs(rows, { ...DEFAULT_LOG_FILTER_STATE, conversationId: slashFlood }, NOW)).toEqual([]);
+    expect(filterLogs(rows, {
+      ...DEFAULT_LOG_FILTER_STATE,
+      conversationId: `codex://threads/${CODEX_THREAD_ID}?hostId=durable`,
+      conversationQueryHash: [digest32(CODEX_THREAD_ID)],
+    }, NOW).map(row => row.id)).toEqual(["hashed"]);
+  });
+
+  test("filterLogs matches a stored digest or raw id behind the pasted link", async () => {
+    const rows = [
+      { id: "hashed", conversationId: digest32(CODEX_THREAD_ID) },
+      { id: "raw", conversationId: "raw-thread" },
+      { id: "other", conversationId: digest32("other") },
+    ];
+    const queryHash = await hashLogConversationQuery(`codex://threads/${CODEX_THREAD_ID}`);
+    expect(filterLogs(rows, {
+      ...DEFAULT_LOG_FILTER_STATE,
+      conversationId: `codex://threads/${CODEX_THREAD_ID}`,
+      conversationQueryHash: queryHash,
+    }, NOW).map(row => row.id)).toEqual(["hashed"]);
+    expect(filterLogs(rows, {
+      ...DEFAULT_LOG_FILTER_STATE,
+      conversationId: "codex://threads/raw-thread",
+    }, NOW).map(row => row.id)).toEqual(["raw"]);
   });
 });

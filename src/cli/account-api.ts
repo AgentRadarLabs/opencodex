@@ -1,3 +1,6 @@
+import { configuredAnthropicInstance, isAnthropicOAuthInstance } from "../providers/anthropic-instance";
+import { parseQuotaFailureCode, parseQuotaUnknownReason, type QuotaFailureCode, type QuotaUnknownReason, type ProviderQuota, type AccountQuotaMode } from "../providers/quota-types";
+import { parseWeeklyWindowConflicts, type WeeklyWindowConflict } from "../codex/quota-window-conflict";
 /**
  * Data-access layer for `ocx account` (issue #180) — live-proxy HTTP client and
  * per-family account readers. Kept separate from account.ts (command handlers)
@@ -8,22 +11,59 @@ import { runningProxyUpdateHeaders } from "../oauth/login-cli";
 import { isPublicOAuthProvider } from "../oauth/index";
 import { getProviderRegistryEntry, providerCodexAccountMode } from "../providers/registry";
 import type { OcxConfig } from "../types";
+import { projectCodexQuotaRefreshOutcome, type CodexQuotaRefreshOutcome } from "../codex/quota-refresh-outcome";
 
+import { projectApiKeyQuotaRows } from "./account-key-quota";
+import { projectAccountHealth } from "./account-next-actions";
+import type { OAuthHealthLabel } from "../oauth/health";
+
+import { accountPauseDetailsSchema } from "../config/schema/account-auto-pause";
 export type AccountType = "codex" | "oauth" | "api-key";
 
 export interface AccountRow {
   provider: string;
   type: AccountType;
   id: string;
+  slotId?: string;
+  slotKind?: "native-main" | "pool";
+  upstreamAccountKey?: string;
   label?: string;
   email?: string;
-  plan?: string;
+  /**
+   * Subscription tier. `null` means this version looked and the provider did not report one;
+   * an absent key means the row's surface does not carry a tier at all (#3777).
+   */
+  plan?: string | null;
   masked?: string;
   active: boolean;
   needsReauth?: boolean;
+  /** Validated server health label and locally generated recovery guidance. */
+  health?: OAuthHealthLabel;
+  healthAction?: string;
+  /** Explicit paid-credit consent, reported only when supplied by the Codex API. */
+  creditsAfterLimit?: boolean;
+  needsReauthReason?: "verify_account";
+  autoSelectable?: boolean;
+  skipReason?: "paused" | "needs_reauth" | "suspended" | "cooldown" | "quota_exhausted";
+  selectionExcludedReason?: "plan_excluded";
+  selectionExcludedPlan?: string;
+  /** Registered credential that is still excluded from routing until validation completes. */
+  validationPending?: boolean;
   /** Codex pool selection order, higher used earlier. Absent where ordering does not apply. */
   priority?: number;
-  quota?: CodexQuotaDto | null;
+  /** Null means the account inherits the global usage-switch threshold. */
+  autoSwitchThresholdOverride?: number | null;
+  quota?: (CodexQuotaDto & Partial<ProviderQuota>) | null;
+  quotaMode?: AccountQuotaMode;
+  quotaRefresh?: CodexQuotaRefreshOutcome;
+  quotaUnavailable?: boolean;
+  quotaFailure?: QuotaFailureCode;
+  /** Live weekly windows a Codex pool account reported in contradiction (#8574). */
+  weeklyQuotaConflicts?: WeeklyWindowConflict[];
+  /** Why the balance is unknown (#8397); reasons this CLI does not know are dropped. */
+  quotaUnknownReason?: QuotaUnknownReason;
+  /** When the server last read this balance, success or failure (epoch ms). */
+  quotaReadAt?: number;
   /**
    * Whether the pool is holding this account out of rotation.
    *
@@ -32,6 +72,7 @@ export interface AccountRow {
    * human listing (#2703).
    */
   paused?: boolean;
+  pauseDetails?: import("../types/account-auto-pause").AccountPauseDetails;
 }
 
 export type ClassifyResult = { type: AccountType } | { error: string };
@@ -49,7 +90,11 @@ export interface StageLeaseClock {
   clearTimeout(timer: ReturnType<typeof setTimeout>): void;
 }
 
+import type { AntigravityRiskSeams } from "../oauth/antigravity-risk";
+
 export interface AccountDeps {
+  /** Test seams for the Google Antigravity acknowledgement (agent detection, prompt visibility). */
+  antigravityRisk?: AntigravityRiskSeams;
   /** Test injection: skip findLiveProxy and call the API at this base URL. */
   baseUrl?: string;
   fetchImpl?: typeof fetch;
@@ -82,6 +127,7 @@ export function classifyAccount(config: OcxConfig, name: string): ClassifyResult
   if (provider && !provider.authMode && (provider.apiKey || (provider.apiKeyPool?.length ?? 0) > 0)) {
     return { type: "api-key" };
   }
+  if (name === "anthropic2" && !configuredAnthropicInstance(config, name)) return { error: "Anthropic pool instance is not configured" };
   if (isPublicOAuthProvider(name)) return { type: "oauth" };
   if (provider) return { type: "api-key" };
   return { error: `unknown provider "${name}"` };
@@ -105,8 +151,9 @@ export async function apiJson(
   method: "GET" | "PUT" | "POST" | "DELETE",
   path: string,
   body?: unknown,
-  options: { signal?: AbortSignal } = {},
+  options: { signal?: AbortSignal; redirect?: RequestRedirect } = {},
 ): Promise<ApiResult> {
+  if (baseUrl === LINK_HOME_BASE) return linkHomeApiJson(deps, method, path);
   const fetchImpl = deps.fetchImpl ?? fetch;
   try {
     const res = await fetchImpl(`${baseUrl}${path}`, {
@@ -114,6 +161,7 @@ export async function apiJson(
       headers: runningProxyUpdateHeaders(),
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: options.signal,
+      ...(options.redirect ? { redirect: options.redirect } : {}),
     });
     const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
     return { status: res.status, json };
@@ -132,7 +180,71 @@ export async function resolveBaseUrl(deps: AccountDeps): Promise<string | null> 
   if (deps.baseUrl) return deps.baseUrl;
   const live = await findLiveProxy();
   if (!live) return null;
+  if (live.role === "client") {
+    const { readLinkChildContext } = await import("./link-child");
+    if (readLinkChildContext()) return LINK_HOME_BASE;
+  }
   return `http://${probeHostname(live.hostname)}:${live.port}`;
+}
+
+/**
+ * Remote Link Child (#6957): account reads come from the Home over the link, and every account
+ * change is refused with the Child refusal. The marker is never a URL and never reaches fetch.
+ */
+export const LINK_HOME_BASE = "ocx-link-home:";
+
+async function linkHomeApiJson(deps: AccountDeps, method: string, path: string): Promise<ApiResult> {
+  const { readLinkChildContext, linkChildReadable, linkChildRefusal, readLinkHomeJson } = await import("./link-child");
+  const link = readLinkChildContext();
+  if (!link) return { status: 503, json: { error: "The Remote Link connection changed while the command ran; retry." } };
+  const pathname = new URL(path, "http://cli.invalid").pathname;
+  if (!linkChildReadable(method, path)) {
+    return { status: 403, json: { error: linkChildRefusal(link, `${method} ${pathname}`) } };
+  }
+  try {
+    const { status, body } = await readLinkHomeJson(link, path, deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {});
+    return { status, json: (body && typeof body === "object" ? body : { error: String(body ?? "") }) as Record<string, unknown> };
+  } catch (error) {
+    return { status: 503, json: { error: error instanceof Error ? error.message : String(error) } };
+  }
+}
+
+/**
+ * The config account commands classify providers against. On a Remote Link Child the local
+ * providers are inactive, so the Home's `/api/providers` projection (presence flags only) takes
+ * their place. Anywhere else the local config is returned. When the Home cannot be read the
+ * result is an error: classifying against the inactive local providers would answer for the
+ * wrong machine.
+ */
+export async function accountClassificationConfig(
+  deps: AccountDeps,
+  local: OcxConfig,
+): Promise<{ config: OcxConfig } | { error: string }> {
+  if (deps.baseUrl) return { config: local };
+  const { readLinkChildContext, readLinkHomeJson } = await import("./link-child");
+  const link = readLinkChildContext();
+  if (!link) return { config: local };
+  const unavailable = (detail: string) => ({ error: `Could not read the provider list from ${link.homePhrase} over Remote Link (${link.linkId}): ${detail}.` });
+  try {
+    const { status, body } = await readLinkHomeJson(link, "/api/providers", deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {});
+    if (status !== 200) {
+      // Keep the Home's own sentence (for example the upgrade instruction an older Home yields).
+      const message = body && typeof body === "object" && typeof (body as { error?: unknown }).error === "string"
+        ? (body as { error: string }).error : null;
+      return unavailable(message ?? `the Home answered HTTP ${status}`);
+    }
+    if (!Array.isArray(body)) return unavailable("the Home returned an unreadable provider list");
+    const providers: Record<string, unknown> = {};
+    for (const row of body) {
+      if (!row || typeof row !== "object" || typeof (row as { name?: unknown }).name !== "string") continue;
+      const { name, hasApiKey, ...rest } = row as Record<string, unknown> & { name: string };
+      // A placeholder marks presence for classification; no credential value crosses the link.
+      providers[name] = { ...rest, ...(hasApiKey === true ? { apiKey: "home-credential" } : {}) };
+    }
+    return { config: { ...local, providers: providers as OcxConfig["providers"] } };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 export function proxyUnreachable(transportError?: string): number {
@@ -208,14 +320,21 @@ export interface CodexQuotaDto {
 
 export interface ProviderQuotaWindowDto {
   label: string;
+  displayLabel?: string;
   percent: number;
   resetAt?: number;
+  modelId?: string;
+  /** Share of the weekly limit a model family may use, when upstream reports it. */
+  weeklyAllowancePercent?: number;
 }
 
 export interface ProviderQuotaDto extends CodexQuotaDto {
   fiveHourPercent?: number;
   fiveHourResetAt?: number;
   customWindows?: ProviderQuotaWindowDto[];
+  /** Readings upstream reports as not in effect; shown, never routed on. */
+  displayWindows?: ProviderQuotaWindowDto[];
+  unknownBudgetWindows?: { label: string; resetAt?: number }[];
   updatedAt?: number;
 }
 
@@ -230,14 +349,26 @@ export interface ProviderQuotaReportDto {
 
 interface CodexAccountDto {
   id: string;
+  slotId?: string;
+  slotKind?: "native-main" | "pool";
+  upstreamAccountKey?: string;
   alias?: string;
   email?: string;
   plan?: string;
   isMain?: boolean;
   needsReauth?: boolean;
+  selectionExcludedReason?: "plan_excluded";
+  selectionExcludedPlan?: string;
+  weeklyQuotaConflicts?: unknown;
+  health?: { reason?: string };
+  healthLabel?: unknown;
+  creditsAfterLimit?: unknown;
   priority?: number;
+  autoSwitchThresholdOverride?: number | null;
   quota?: CodexQuotaDto | null;
+  quotaRefresh?: unknown;
   paused?: boolean;
+  pauseDetails?: import("../types/account-auto-pause").AccountPauseDetails;
 }
 
 function projectQuota(quota: CodexQuotaDto | null | undefined): CodexQuotaDto | null {
@@ -260,10 +391,12 @@ export async function fetchCodexRows(
   baseUrl: string,
   forceRefresh = false,
   includeQuota = forceRefresh,
+  options: { refreshAction?: boolean } = {},
 ): Promise<FamilyRows> {
-  const accountsPath = `/api/codex-auth/accounts${forceRefresh ? "?refresh=1" : ""}`;
+  const refreshAction = options.refreshAction === true;
+  const accountsPath = `/api/codex-auth/accounts${refreshAction ? "/refresh" : forceRefresh ? "?refresh=1" : ""}`;
   const [accountsRes, activeRes] = await Promise.all([
-    apiJson(deps, baseUrl, "GET", accountsPath),
+    apiJson(deps, baseUrl, refreshAction ? "POST" : "GET", accountsPath),
     apiJson(deps, baseUrl, "GET", "/api/codex-auth/active"),
   ]);
   if (accountsRes.status !== 0 && accountsRes.status !== 200) {
@@ -292,16 +425,42 @@ export async function fetchCodexRows(
     provider: "openai",
     type: "codex" as const,
     id: a.id,
+    slotId: a.id,
+    slotKind: a.id === "__main__" ? "native-main" as const : "pool" as const,
+    ...(a.slotId === a.id && typeof a.upstreamAccountKey === "string"
+      && /^uai1_[0-9a-f]{64}$/.test(a.upstreamAccountKey)
+      ? { upstreamAccountKey: a.upstreamAccountKey } : {}),
     label: a.alias ?? a.plan ?? a.email,
     email: a.email,
     plan: a.plan,
     active: a.id === activeId,
     needsReauth: a.needsReauth,
+    ...projectAccountHealth(a, "openai", a.id),
+    ...(typeof a.creditsAfterLimit === "boolean" ? { creditsAfterLimit: a.creditsAfterLimit } : {}),
+    ...(a.selectionExcludedReason === "plan_excluded" ? {
+      selectionExcludedReason: "plan_excluded" as const,
+      ...(typeof a.selectionExcludedPlan === "string" ? { selectionExcludedPlan: a.selectionExcludedPlan } : {}),
+    } : {}),
+    ...(a.health?.reason === "validation_pending" ? { validationPending: true } : {}),
     priority: typeof a.priority === "number" ? a.priority : 0,
+    autoSwitchThresholdOverride: typeof a.autoSwitchThresholdOverride === "number"
+      ? a.autoSwitchThresholdOverride
+      : null,
     paused: a.paused === true,
-    ...(includeQuota ? { quota: projectQuota(a.quota) } : {}),
+    // Unknown display details are dropped defensively; the pause state above is retained.
+    pauseDetails: accountPauseDetailsSchema.safeParse(a.pauseDetails).data,
+    ...(includeQuota ? {
+      quota: projectQuota(a.quota),
+      quotaRefresh: projectCodexQuotaRefreshOutcome(a.quotaRefresh),
+      ...weeklyQuotaConflictsField(a.weeklyQuotaConflicts),
+    } : {}),
   }));
   return { rows, activeId, autoSwitchThreshold, status: 200 };
+}
+
+function weeklyQuotaConflictsField(value: unknown): { weeklyQuotaConflicts?: WeeklyWindowConflict[] } {
+  const weeklyQuotaConflicts = parseWeeklyWindowConflicts(value);
+  return weeklyQuotaConflicts ? { weeklyQuotaConflicts } : {};
 }
 
 interface OAuthAccountDto {
@@ -310,8 +469,25 @@ interface OAuthAccountDto {
   email?: string;
   active?: boolean;
   needsReauth?: boolean;
+  healthLabel?: unknown;
+  /** Present only for providers that support operator pause (generic OAuth pools). */
+  paused?: boolean;
+  pauseDetails?: import("../types/account-auto-pause").AccountPauseDetails;
+  autoSwitchThresholdOverride?: number | null;
+  needsReauthReason?: "verify_account";
+  autoSelectable?: boolean;
+  skipReason?: unknown;
+  /** Always sent by the management route; explicitly `null` when the tier is unknown. */
+  plan?: string | null;
   quota?: CodexQuotaDto | null;
   quotaUnavailable?: boolean;
+  quotaFailure?: unknown;
+  quotaUnknownReason?: unknown;
+}
+
+function isKiroSkipReason(value: unknown): value is NonNullable<AccountRow["skipReason"]> {
+  return value === "paused" || value === "needs_reauth" || value === "suspended"
+    || value === "cooldown" || value === "quota_exhausted";
 }
 
 async function fetchOAuthRows(
@@ -340,25 +516,50 @@ async function fetchOAuthRows(
     email: a.email,
     active: a.active ?? a.id === activeId,
     needsReauth: a.needsReauth,
+    ...projectAccountHealth(a, name, a.id),
+    // Unknown display details are dropped defensively; paused remains authoritative.
+    ...(a.paused === true ? { paused: true, pauseDetails: accountPauseDetailsSchema.safeParse(a.pauseDetails).data } : {}),
+    ...(isAnthropicOAuthInstance(name) && Object.hasOwn(a, "autoSwitchThresholdOverride") ? { autoSwitchThresholdOverride: a.autoSwitchThresholdOverride } : {}),
+    ...(a.needsReauthReason === "verify_account" ? { needsReauthReason: a.needsReauthReason } : {}),
+    ...(name === "kiro" && typeof a.autoSelectable === "boolean"
+      ? { autoSelectable: a.autoSelectable } : {}),
+    ...(name === "kiro" && a.autoSelectable === false && isKiroSkipReason(a.skipReason)
+      ? { skipReason: a.skipReason } : {}),
+    // Forward the server's answer verbatim. An absent key means the proxy predates tier
+    // reporting while `null` means it checked and found no tier — collapsing either
+    // direction would destroy the one distinction this field exists to make.
+    ...(Object.hasOwn(a, "plan") ? { plan: a.plan } : {}),
     ...(a.quota !== undefined ? { quota: a.quota } : {}),
     ...(a.quotaUnavailable !== undefined ? { quotaUnavailable: a.quotaUnavailable } : {}),
+    ...(a.quotaUnavailable === true && parseQuotaFailureCode(a.quotaFailure)
+      ? { quotaFailure: parseQuotaFailureCode(a.quotaFailure) } : {}),
+    ...(parseQuotaUnknownReason(a.quotaUnknownReason) ? { quotaUnknownReason: parseQuotaUnknownReason(a.quotaUnknownReason) } : {}),
   }));
   return { rows, activeId, status: 200 };
 }
 
 interface ApiKeyDto {
+  disabled?: boolean;
+  pauseDetails?: import("../types/account-auto-pause").AccountPauseDetails;
   id: string;
   label?: string;
   masked?: string;
   active?: boolean;
 }
 
-async function fetchKeyRows(deps: AccountDeps, baseUrl: string, name: string): Promise<FamilyRows> {
-  const res = await apiJson(deps, baseUrl, "GET", `/api/providers/keys?name=${encodeURIComponent(name)}`);
+async function fetchKeyRows(deps: AccountDeps, baseUrl: string, name: string, quota?: { refresh?: boolean }): Promise<FamilyRows> {
+  const query = `?name=${encodeURIComponent(name)}${quota ? `&quota=1${quota.refresh ? "&refresh=1" : ""}` : ""}`;
+  const res = await apiJson(deps, baseUrl, "GET", `/api/providers/keys${query}`, undefined, quota ? { redirect: "error" } : {});
   if (res.status === 0) {
     return { rows: [], activeId: null, status: 0, networkDown: true, transportError: res.transportError };
   }
   if (res.status !== 200) return { rows: [], activeId: null, status: res.status, errorJson: res.json };
+  if (quota) {
+    try { return projectApiKeyQuotaRows(res.json, name); }
+    catch (error) {
+      return { rows: [], activeId: null, status: 200, errorJson: { error: error instanceof Error ? error.message : "Malformed API-key quota response." } };
+    }
+  }
   const activeId = typeof res.json.activeId === "string" ? res.json.activeId : null;
   const keys = Array.isArray(res.json.keys) ? res.json.keys as ApiKeyDto[] : [];
   const rows = keys.map(k => ({
@@ -368,6 +569,9 @@ async function fetchKeyRows(deps: AccountDeps, baseUrl: string, name: string): P
     label: k.label ?? k.masked,
     masked: k.masked,
     active: k.active ?? k.id === activeId,
+    paused: k.disabled === true,
+    // Unknown display details are dropped defensively; disabled still keeps the key paused.
+    pauseDetails: accountPauseDetailsSchema.safeParse(k.pauseDetails).data,
   }));
   return { rows, activeId, status: 200 };
 }
@@ -381,7 +585,7 @@ export function fetchRows(
 ): Promise<FamilyRows> {
   if (type === "codex") return fetchCodexRows(deps, baseUrl, Boolean(quota?.refresh), quota !== undefined);
   if (type === "oauth") return fetchOAuthRows(deps, baseUrl, name, quota);
-  return fetchKeyRows(deps, baseUrl, name);
+  return fetchKeyRows(deps, baseUrl, name, quota);
 }
 
 export async function fetchProviderQuotaReport(

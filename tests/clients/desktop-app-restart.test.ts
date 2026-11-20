@@ -1,6 +1,20 @@
-import { describe, expect, test } from "bun:test";
-import { restartCodexDesktopApp, type DesktopAppRestartIo } from "../../src/codex/desktop-app-restart";
+import { afterEach, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { listCodexDesktopShellPids, restartCodexDesktopApp, type DesktopAppRestartIo } from "../../src/codex/desktop-app-restart";
+import {
+  codexCliUpdateSelectionGate,
+  beginCodexCliSelectionParentWrite,
+  createWorkerCommitWindow, createCodexCliUpdateFence,
+} from "../../src/codex/cli-update-selection-gate";
+import { classifyDesktopPicker, readCodexCatalogBinding, readCodexDesktopPickerState } from "../../src/codex/desktop-app/picker-freshness";
+import type { DesktopAppAdapter, DesktopProcess } from "../../src/codex/desktop-app/types";
+import { windowsDesktopAppAdapter } from "../../src/codex/desktop-app/windows";
+import { handleDesktopAppRestart } from "../../src/cli/restart-scope";
 import { setTrustedWindowsElevationExecutablesForTests } from "../../src/lib/windows-elevation";
+import { removeTreeWithRetry } from "../helpers/remove-tree";
 
 /**
  * #2292: the desktop restart is the one path in the CLI that terminates a user's
@@ -24,7 +38,63 @@ function withTrustedExes<T>(run: () => T): T {
 
 interface Call { file: string; args: string[] }
 
+describe.skipIf(process.platform !== "win32")("Windows membership through the real PowerShell prefilter", () => {
+  for (const [label, root, executable] of [
+    ["forward-slash images under a backslash root", INSTALL, INSTALL.replaceAll("\\", "/") + "/ChatGPT.exe"],
+    ["backslash images under a forward-slash root", INSTALL.replaceAll("\\", "/"), INSTALL + "\\ChatGPT.exe"],
+  ] as const) {
+    test(label, () => {
+      const sibling = executable.replace(/([\\/])ChatGPT\.exe$/, "-evil$1ChatGPT.exe");
+      const psLiteral = (value: string) => "'" + value.replaceAll("'", "''") + "'";
+      const fixture = [
+        // These functions shadow the CIM cmdlets: the generated list-only script
+        // sees synthetic rows and never enumerates or controls real processes.
+        "function Get-CimInstance {",
+        "  param([string]$ClassName, [string]$Filter)",
+        "  if ($ClassName -cne 'Win32_Process' -or $Filter -cne \"Name='ChatGPT.exe'\") { throw 'Unexpected fixture query' }",
+        "  @(",
+        `    [pscustomobject]@{ ProcessId = 1000; ParentProcessId = 900; CreationDate = [datetime]'2026-09-15T00:00:00Z'; ExecutablePath = ${psLiteral(executable)} }`,
+        `    [pscustomobject]@{ ProcessId = 2000; ParentProcessId = 900; CreationDate = [datetime]'2026-09-15T00:00:00Z'; ExecutablePath = ${psLiteral(sibling)} }`,
+        "  )",
+        "}",
+        "function Invoke-CimMethod {",
+        "  param($InputObject, [string]$MethodName)",
+        "  if ($MethodName -cne 'GetOwner' -or $InputObject.ProcessId -notin @(1000, 2000)) { throw 'Unexpected fixture owner query' }",
+        "  [pscustomobject]@{ ReturnValue = 0; Domain = ''; User = ([Security.Principal.WindowsIdentity]::GetCurrent()).Name }",
+        "}",
+      ].join("\n");
+      let rawListing = "";
+      const listed = withTrustedExes(() => windowsDesktopAppAdapter.listProcesses((file, args) => {
+        expect(file).toBe(PS);
+        expect(args.slice(0, 3)).toEqual(["-NoProfile", "-NonInteractive", "-Command"]);
+        const script = args[3]!;
+        rawListing = execFileSync(file, [...args.slice(0, 3), fixture + "\n" + script], {
+          encoding: "utf8",
+          timeout: 10_000,
+          windowsHide: true,
+        });
+        return rawListing;
+      }, { id: AUMID.replace("!App", ""), root, relaunch: AUMID }));
+      // The real prefilter admits both lexical prefixes despite mixed slashes.
+      // The shared JS boundary check then removes the similarly named sibling.
+      expect(rawListing.trim().split(/\r?\n/).map(line => Number(line.split(" ")[0]))).toEqual([1000, 2000]);
+      expect(listed?.map(entry => ({ pid: entry.pid, executable: entry.executable }))).toEqual([
+        { pid: 1000, executable },
+      ]);
+    }, 15_000);
+  }
+});
+
 /** Scripted exec seam: discovery, then process list, then whatever the branch does. */
+/**
+ * A lock path this case owns. The restart takes a singleton lock, so a case using the
+ * real default path would fail with restart_in_flight after any interrupted run, and
+ * would write into a directory the tests do not own.
+ */
+function isolatedLock(): { lockPath: string } {
+  return { lockPath: join(mkdtempSync(join(tmpdir(), "ocx-desktop-restart-")), "lock") };
+}
+
 function scriptedIo(options: {
   discovery?: string;
   processes?: string;
@@ -34,22 +104,44 @@ function scriptedIo(options: {
   throwOn?: (file: string, args: readonly string[]) => boolean;
 }): DesktopAppRestartIo {
   const polls = new Map<number, number>();
+  // A process that has exited must also STOP BEING LISTED. Modelling exit only through
+  // isAlive made these doubles unable to express the defect measured on a real Windows
+  // host, where the ladder recorded a stop that never happened; the enumeration is the
+  // authoritative signal and the double has to behave like one.
+  const dead = new Set<number>();
   return {
     platform: "win32",
+    // A per-case lock path. The restart now takes a singleton lock, and without this
+    // the suite would contend on the developer's real ~/.opencodex lock - a leftover
+    // from an interrupted run would then fail every case with restart_in_flight, and a
+    // passing run would leave state behind in a directory the tests do not own.
+    lock: isolatedLock(),
     ancestryPids: () => options.ancestry ?? [4242],
     sleep: () => {},
     now: (() => { let t = 0; return () => (t += 500); })(),
     isAlive: pid => {
       const n = (polls.get(pid) ?? 0) + 1;
       polls.set(pid, n);
-      return options.aliveFor ? options.aliveFor(pid, n) : false;
+      const alive = options.aliveFor ? options.aliveFor(pid, n) : false;
+      if (!alive) dead.add(pid);
+      return alive;
     },
     execFile: (file, args) => {
       options.calls.push({ file, args: [...args] });
       if (options.throwOn?.(file, args)) throw new Error("exec failed");
       const joined = args.join(" ");
       if (joined.includes("Get-AppxPackage")) return options.discovery ?? "MISS";
-      if (joined.includes("Win32_Process")) return options.processes ?? "";
+      if (joined.includes("Win32_Process")) {
+        const listing = options.processes ?? "";
+        if (dead.size === 0) return listing;
+        return listing
+          .split("\n")
+          .filter(line => {
+            const pid = Number(line.trim().split(/\s+/)[0]);
+            return !Number.isSafeInteger(pid) || !dead.has(pid);
+          })
+          .join("\n");
+      }
       return "";
     },
   };
@@ -57,12 +149,100 @@ function scriptedIo(options: {
 
 const DISCOVERY = [AUMID.replace("!App", ""), INSTALL, AUMID].join("\n");
 
+// The guard follows the test preload's OCX_TEST_HOME_GUARD, as the home guard does, rather than
+// NODE_ENV: Bun's test runner keeps an inherited NODE_ENV, and a real `NODE_ENV=test ocx ...`
+// must still restart the app.
+describe("the test-runner guard follows the test preload, not NODE_ENV", () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalGuard = process.env.OCX_TEST_HOME_GUARD;
+  afterEach(() => {
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
+    if (originalGuard === undefined) delete process.env.OCX_TEST_HOME_GUARD;
+    else process.env.OCX_TEST_HOME_GUARD = originalGuard;
+  });
+
+  test("an armed test process is guarded even when NODE_ENV was inherited as something else", () => {
+    process.env.NODE_ENV = "development";
+    const result = restartCodexDesktopApp({ lock: isolatedLock(), platform: "win32" });
+    expect(result.reason).toBe("test_environment");
+  });
+
+  test("a process the test preload did not arm restarts as usual even with NODE_ENV=test", () => {
+    process.env.NODE_ENV = "test";
+    process.env.OCX_TEST_HOME_GUARD = "0";
+    // discover() answers without exec, so this never reaches the OS.
+    const adapter = { ...windowsDesktopAppAdapter, discover: () => null };
+    const result = restartCodexDesktopApp({ lock: isolatedLock(), platform: "win32", adapter });
+    expect(result.reason).toBe("package_discovery_failed");
+  });
+});
+
 describe("Codex desktop app restart (#2292)", () => {
-  test("is a no-op off Windows and never execs anything", () => {
+  test("an unreadable Windows root command line refuses before stop and leaves the restart lock reusable", () => {
     const calls: Call[] = [];
-    const result = restartCodexDesktopApp({ platform: "darwin", execFile: (f, a) => { calls.push({ file: f, args: [...a] }); return ""; } });
-    expect(result).toEqual({ attempted: false, stopped: [], surviving: [], relaunch: "skipped", reason: "windows_only" });
+    const io = scriptedIo({ discovery: DISCOVERY, processes: `1000 900 2026-01-01T00:00:00Z ${INSTALL}\\app\\ChatGPT.exe\t`, calls });
+    withTrustedExes(() => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        expect(restartCodexDesktopApp(io)).toEqual({ attempted: false, stopped: [], surviving: [], relaunch: "skipped", reason: "relaunch_context_failed" });
+      }
+    });
+    expect(calls.some(call => call.file === TASKKILL || /CloseMainWindow|Start-Process|OpenCodexPackageActivation/.test(call.args.join(" ")))).toBe(false);
+  });
+
+  test("a relaunch-context failure refuses before any process is signalled and releases the lock", () => {
+    const calls: Call[] = [];
+    const io = scriptedIo({ discovery: DISCOVERY, processes: `1000 900 2026-01-01T00:00:00Z ${INSTALL}\\app\\ChatGPT.exe`, calls });
+    io.adapter = { ...windowsDesktopAppAdapter, captureRelaunchContext: () => { throw new Error("conflicting context"); } };
+    withTrustedExes(() => {
+      const first = restartCodexDesktopApp(io), second = restartCodexDesktopApp(io);
+      expect(first).toEqual({ attempted: false, stopped: [], surviving: [], relaunch: "skipped", reason: "relaunch_context_failed" });
+      expect(second.reason).toBe("relaunch_context_failed");
+    });
+    expect(calls.some(call => call.file === TASKKILL || call.args.join(" ").includes("CloseMainWindow") || call.args.join(" ").includes("Start-Process"))).toBe(false);
+  });
+  // macOS and Linux are no longer no-ops: they have real adapters. What survives from the
+  // original assertion is that a platform with NO adapter still refuses without execing
+  // anything, which is the fail-closed property the old windows_only case was really
+  // protecting.
+  test("is a no-op on a platform with no adapter and never execs anything", () => {
+    const calls: Call[] = [];
+    const result = restartCodexDesktopApp({
+          lock: isolatedLock(),
+      platform: "freebsd",
+      execFile: (f, a) => { calls.push({ file: f, args: [...a] }); return ""; },
+    });
+    expect(result).toEqual({
+      attempted: false, stopped: [], surviving: [], relaunch: "skipped", reason: "unsupported_platform",
+    });
     expect(calls).toEqual([]);
+  });
+
+  // A test that reaches the restart without injecting an adapter or exec used to drive the real
+  // OS adapter: on a developer Mac `performCodexRestart` tests quit the user's ChatGPT (Codex)
+  // app and relaunched it through `/usr/bin/open` with the runner's sandbox HOME, logged out.
+  // win32 keeps the pre-fix run harmless off Windows (no PowerShell to discover anything with).
+  test("under the test runner, the real OS adapter is never used without an injected one", () => {
+    const result = restartCodexDesktopApp({ lock: isolatedLock(), platform: "win32" });
+    expect(result).toEqual({
+      attempted: false, stopped: [], surviving: [], relaunch: "skipped", reason: "test_environment",
+    });
+  });
+
+  // An injected adapter still execs through the platform default when no exec is injected, so
+  // only an injected exec proves the caller is simulating the OS.
+  test("an injected adapter without an injected exec still never reaches the OS", () => {
+    const result = restartCodexDesktopApp({ lock: isolatedLock(), platform: "win32", adapter: windowsDesktopAppAdapter });
+    expect(result.reason).toBe("test_environment");
+  });
+
+  // win32 keeps this call away from the OS on macOS and Linux even if the guard regressed.
+  test("the CLI says why nothing was restarted under the test runner", async () => {
+    const out: string[] = [];
+    const log = { log: (...a: unknown[]) => { out.push(a.join(" ")); }, error: (...a: unknown[]) => { out.push(a.join(" ")); } };
+    const result = await handleDesktopAppRestart(log, { platform: "win32", lock: isolatedLock() });
+    expect(result.reason).toBe("test_environment");
+    expect(out.join("\n")).toContain("OCX_TEST_HOME_GUARD");
   });
 
   test("fails closed when the package cannot be identified, killing nothing", () => {
@@ -96,6 +276,34 @@ describe("Codex desktop app restart (#2292)", () => {
     const launch = calls.find(c => c.args.join(" ").includes("Start-Process"));
     expect(launch?.args.join(" ")).toContain(AUMID);
   });
+
+
+  for (const [label, root, executable, isMember] of [
+    ["forward-slash executable under backslash root", INSTALL, INSTALL.replaceAll("\\", "/") + "/ChatGPT.exe", true],
+    ["backslash executable under forward-slash root", INSTALL.replaceAll("\\", "/"), INSTALL + "\\ChatGPT.exe", true],
+    ["forward-slash sibling outside backslash root", INSTALL, INSTALL.replaceAll("\\", "/") + "-evil/ChatGPT.exe", false],
+    ["backslash sibling outside forward-slash root", INSTALL.replaceAll("\\", "/"), INSTALL + "-evil\\ChatGPT.exe", false],
+  ] as const) {
+    test(label, () => {
+      const calls: Call[] = [];
+      const result = withTrustedExes(() => restartCodexDesktopApp(scriptedIo({
+        discovery: [AUMID.replace("!App", ""), root, AUMID].join("\n"),
+        processes: `1000 900 T0 ${executable}`,
+        calls,
+        aliveFor: (_pid, poll) => poll <= 2,
+      })));
+      if (isMember) {
+        expect(result).toEqual({ attempted: true, stopped: [1000], surviving: [], relaunch: "started" });
+        expect(calls.some(c => c.args.join(" ").includes("CloseMainWindow"))).toBe(true);
+      } else {
+        expect(result.reason).toBe("no_targets");
+        expect(result.attempted).toBe(false);
+        expect(calls.some(c => c.args.join(" ").includes("CloseMainWindow"))).toBe(false);
+        expect(calls.some(c => c.args.join(" ").includes("Start-Process"))).toBe(false);
+      }
+      expect(calls.some(c => c.file === TASKKILL)).toBe(false);
+    });
+  }
 
   test("forces only after the graceful window elapses", () => {
     const calls: Call[] = [];
@@ -179,6 +387,7 @@ describe("Codex desktop app restart (#2292)", () => {
   test("every probe is bounded by a timeout", () => {
     const seen: (number | undefined)[] = [];
     withTrustedExes(() => restartCodexDesktopApp({
+          lock: isolatedLock(),
       platform: "win32",
       ancestryPids: () => [4242],
       sleep: () => {},
@@ -238,6 +447,7 @@ describe("Codex desktop app restart — kill-authority guards (#2292)", () => {
   test("an unreadable ancestry chain fails closed instead of assuming we are outside it", () => {
     const calls: Call[] = [];
     const result = withTrustedExes(() => restartCodexDesktopApp({
+          lock: isolatedLock(),
       platform: "win32",
       sleep: () => {},
       isAlive: () => false,
@@ -261,6 +471,7 @@ describe("Codex desktop app restart — kill-authority guards (#2292)", () => {
     const calls: Call[] = [];
     const parents: Record<number, string> = { 900: "800", 800: "1000", 1000: "0" };
     const result = withTrustedExes(() => restartCodexDesktopApp({
+          lock: isolatedLock(),
       platform: "win32",
       sleep: () => {},
       isAlive: () => false,
@@ -324,3 +535,173 @@ describe("#2557 a failed probe is not an absent app", () => {
   });
 });
 
+describe("desktop picker freshness inputs (#4761)", () => {
+  const install = { id: "fixture", root: "/Applications/ChatGPT.app", relaunch: "fixture" };
+  const shellExe = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT";
+  const helperExe = "/Applications/ChatGPT.app/Contents/Frameworks/Helper";
+  function fixtureAdapter(listed: DesktopProcess[] | null, discovered = true): DesktopAppAdapter {
+    const refuse = () => { throw new Error("a read-only probe must not act"); };
+    return {
+      discover: () => discovered ? install : null,
+      listProcesses: () => listed,
+      isShell: entry => entry.executable === shellExe,
+      ancestryPids: () => [],
+      requestQuit: refuse,
+      forceStop: refuse,
+      captureRelaunchContext: refuse,
+      relaunch: refuse,
+    };
+  }
+  const exec = () => { throw new Error("the fixture adapter never execs"); };
+  const listed: DesktopProcess[] = [
+    { pid: 10, parentPid: 1, createdAt: "a", executable: shellExe },
+    { pid: 11, parentPid: 10, createdAt: "b", executable: helperExe },
+    { pid: 12, parentPid: 10, createdAt: "c", executable: shellExe },
+  ];
+
+  test("lists only root shells, and null when discovery or the probe fails", () => {
+    expect(listCodexDesktopShellPids({ adapter: fixtureAdapter(listed), execFile: exec })).toEqual([10]);
+    expect(listCodexDesktopShellPids({ adapter: fixtureAdapter([]), execFile: exec })).toEqual([]);
+    expect(listCodexDesktopShellPids({ adapter: fixtureAdapter(null), execFile: exec })).toBeNull();
+    expect(listCodexDesktopShellPids({ adapter: fixtureAdapter(listed, false), execFile: exec })).toBeNull();
+  });
+
+  test("does not mistake a newer shell for proof that it loaded the current binding", () => {
+    // The shell may have loaded catalog A before an earlier sync rebound config.toml to
+    // the already-existing catalog B. B's older mtime cannot distinguish that case.
+    expect(classifyDesktopPicker([2_000, 3_000], 1_000)).toBe("unknown");
+    expect(classifyDesktopPicker([2_000, 1_000], 1_000)).toBe("stale");
+    expect(classifyDesktopPicker([500], 1_000)).toBe("stale");
+    expect(classifyDesktopPicker([500, null], 1_000)).toBe("stale");
+    expect(classifyDesktopPicker([null, 500], 1_000)).toBe("stale");
+    expect(classifyDesktopPicker([1_000, null], 1_000)).toBe("stale");
+    expect(classifyDesktopPicker([null, null], 1_000)).toBe("unknown");
+    expect(classifyDesktopPicker([], 1_000)).toBe("not_running");
+    expect(classifyDesktopPicker([], null)).toBe("not_running");
+    expect(classifyDesktopPicker(null, 1_000)).toBe("unknown");
+    expect(classifyDesktopPicker([2_000, null], 1_000)).toBe("unknown");
+    expect(classifyDesktopPicker([null, 2_000], 1_000)).toBe("unknown");
+    expect(classifyDesktopPicker([2_000], null)).toBe("unknown");
+  });
+
+  test("reads shell start times and the bound catalog's mtime through its seams", () => {
+    const read = (binding: string | null, catalogMtimeMs: number | null, starts: Map<number, number | null>) => readCodexDesktopPickerState({
+      adapter: fixtureAdapter(listed), execFile: exec,
+      readStartMs: pids => { expect(pids).toEqual([10]); return starts; },
+      catalogBinding: () => binding,
+      catalogMtimeMs: path => { expect(path).toBe("/codex/opencodex-catalog.json"); return catalogMtimeMs; },
+    });
+    const bound = "/codex/opencodex-catalog.json";
+    expect(read(bound, 1_000, new Map([[10, 5_000]]))).toBe("unknown");
+    expect(read(bound, 9_000, new Map([[10, 5_000]]))).toBe("stale");
+    expect(read(bound, 1_000, new Map([[10, null]]))).toBe("unknown");
+    expect(read(bound, null, new Map([[10, 5_000]]))).toBe("unknown");
+    // No model_catalog_json: the shell shows Codex's own roster, which no local file dates.
+    expect(read(null, 1_000, new Map([[10, 5_000]]))).toBe("unknown");
+  });
+
+  test("the catalog binding is the configured model_catalog_json, never the default-path fallback", () => {
+    const home = mkdtempSync(join(tmpdir(), "ocx-picker-binding-"));
+    const previous = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = home;
+    try {
+      expect(readCodexCatalogBinding()).toBeNull();
+      writeFileSync(join(home, "config.toml"), 'model = "gpt-5.5"\n');
+      writeFileSync(join(home, "opencodex-catalog.json"), "{}\n");
+      expect(readCodexCatalogBinding()).toBeNull();
+      writeFileSync(join(home, "config.toml"), 'model_catalog_json = "opencodex-catalog.json"\n');
+      expect(readCodexCatalogBinding()).toBe(join(realpathSync.native(home), "opencodex-catalog.json"));
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previous;
+      removeTreeWithRetry(home);
+    }
+  });
+
+  test("an armed test process without an injected executor never probes the real app", () => {
+    const previous = process.env.OCX_TEST_HOME_GUARD;
+    process.env.OCX_TEST_HOME_GUARD = "1";
+    try {
+      expect(readCodexDesktopPickerState({ adapter: fixtureAdapter(listed) })).toBe("unknown");
+    } finally {
+      if (previous === undefined) delete process.env.OCX_TEST_HOME_GUARD;
+      else process.env.OCX_TEST_HOME_GUARD = previous;
+    }
+  });
+});
+
+describe("the cli-update selection gate covers the whole restart ladder", () => {
+  test("CLI commit window refuses the real desktop restart caller before quit, then releases it", () => {
+    const calls: Call[] = [];
+    const io = scriptedIo({
+      discovery: DISCOVERY,
+      processes: "1000 900 2026-08-22T10:00:00.000Z",
+      calls,
+    });
+    const window = createWorkerCommitWindow({
+      gate: codexCliUpdateSelectionGate(),
+      fence: createCodexCliUpdateFence(),
+    });
+    let held = false;
+    try {
+      held = window.tryEnter();
+      expect(held).toBe(true);
+      const denied = withTrustedExes(() => restartCodexDesktopApp(io));
+      expect(denied).toEqual({
+        attempted: false, stopped: [], surviving: [], relaunch: "skipped",
+        reason: "selection_mutation_busy",
+      });
+      expect(existsSync(io.lock!.lockPath!)).toBe(false);
+      expect(calls.some(call => call.file === TASKKILL ||
+        /CloseMainWindow|Start-Process|OpenCodexPackageActivation/.test(call.args.join(" ")))).toBe(false);
+
+      window.exit();
+      held = false;
+      calls.length = 0;
+      // Same caller/lock path, plus explicit absence checks: same-PID reentry alone
+      // would NOT prove lock release.
+      const allowed = withTrustedExes(() => restartCodexDesktopApp(io));
+      expect(allowed).toEqual({
+        attempted: true, stopped: [1000], surviving: [], relaunch: "started",
+      });
+      expect(calls.filter(call => call.args.join(" ").includes("CloseMainWindow"))).toHaveLength(1);
+      expect(calls.some(call => call.args.join(" ").includes("Start-Process"))).toBe(true);
+      expect(calls.some(call => call.file === TASKKILL)).toBe(false);
+
+      expect(existsSync(io.lock!.lockPath!)).toBe(false);
+      const parent = beginCodexCliSelectionParentWrite();
+      try { expect(parent.entered).toBe(true); }
+      finally { if (parent.entered) parent.exit(); }
+    } finally {
+      if (held) window.exit();
+      removeTreeWithRetry(dirname(io.lock!.lockPath!));
+    }
+  });
+
+  test("a lock-acquisition throw still releases the process-wide selection gate", () => {
+    // Regression for the gate-then-lock ordering: the lock's own mkdir/write
+    // can throw, and before the fix that throw sat outside the try/finally and
+    // left the shared gate held for the rest of the process. A lock path whose
+    // parent is a regular file makes that acquisition throw deterministically.
+    const dir = mkdtempSync(join(tmpdir(), "ocx-desktop-restart-gate-"));
+    try {
+      const blocker = join(dir, "not-a-directory");
+      writeFileSync(blocker, "fixture");
+      const calls: Call[] = [];
+      const io = scriptedIo({
+        discovery: DISCOVERY,
+        processes: "1000 900 2026-08-22T10:00:00.000Z",
+        calls,
+      });
+      io.lock = { lockPath: join(blocker, "lock") };
+      expect(() => withTrustedExes(() => restartCodexDesktopApp(io))).toThrow();
+      // No discovery/quit/relaunch ran, and the gate is free again.
+      expect(calls).toHaveLength(0);
+      const parent = beginCodexCliSelectionParentWrite();
+      try { expect(parent.entered).toBe(true); }
+      finally { if (parent.entered) parent.exit(); }
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+});

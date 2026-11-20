@@ -4,23 +4,27 @@
  * recover there: `anthropicAccountPool.enabled: false` declines PROACTIVE routing, not the
  * reactive retry that runs only after upstream has already refused the request.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ProviderAdapter } from "../../../src/adapters/base";
-import { clearAnthropicAccountPoolState } from "../../../src/oauth/anthropic-routing";
+import type { AdapterRequest, IncomingMeta, ProviderAdapter } from "../../../src/adapters/base";
+import type { AttemptRecoveryKind } from "../../../src/usage/log";
+import { clearAnthropicAccountPoolState, getAnthropicAccountHealthSnapshot } from "../../../src/oauth/anthropic-routing";
 import { clearGenericFailoverHealth } from "../../../src/oauth/generic-account-failover";
 import { getAccountSet, saveCredential, setActiveAccount } from "../../../src/oauth/store";
+import { clearAccountQuotaCache, getCachedProviderAccountQuota, resetProviderQuotaReconcileStateForTests } from "../../../src/providers/quota";
 import type { OcxConfig, OcxParsedRequest, OcxProviderConfig } from "../../../src/types";
-import type { AttemptRecoveryKind } from "../../../src/usage/log";
 import { removeTreeWithRetry } from "../../helpers/remove-tree";
+import { acquireOwnedSpendHome } from "../../helpers/owned-spend-home";
 
 const previousHome = process.env.OPENCODEX_HOME;
 let testHome = "";
+let releaseSpendHome: (() => void) | undefined;
 let handleResponses: typeof import("../../../src/server/responses")["handleResponses"];
 let observedKeys: string[] = [];
-let sidecarMode: false | "403" | "429" = false;
+let sidecarMode = false;
+let restoreModuleMocks: (() => void) | undefined;
 
 function fixtureAdapter(provider: OcxProviderConfig): ProviderAdapter {
   return {
@@ -40,7 +44,13 @@ function fixtureAdapter(provider: OcxProviderConfig): ProviderAdapter {
 }
 
 beforeAll(async () => {
-  const actualResolver = await import("../../../src/server/adapter-resolve");
+  // Capture values: Bun's module namespaces are live and mock.restore() only restores spies.
+  const actualResolver = { ...await import("../../../src/server/adapter-resolve") };
+  const actualWebSearch = { ...await import("../../../src/web-search") };
+  restoreModuleMocks = () => {
+    mock.module("../../../src/server/adapter-resolve", () => actualResolver);
+    mock.module("../../../src/web-search", () => actualWebSearch);
+  };
   const actualResolveAdapter = actualResolver.resolveAdapter;
   mock.module("../../../src/server/adapter-resolve", () => ({
     ...actualResolver,
@@ -67,30 +77,27 @@ beforeAll(async () => {
     runWithWebSearch: async (args: {
       parsed: OcxParsedRequest;
       adapter: ProviderAdapter;
-      onCredentialError?: (response: Response, signal: AbortSignal) => Promise<{
-        adapter: ProviderAdapter;
-        recoveryKind: AttemptRecoveryKind;
-      } | null>;
-      on429?: (retryAfter: string | null) => Promise<{
-        adapter: ProviderAdapter;
-        recoveryKind: AttemptRecoveryKind;
-      } | null>;
+      incomingMeta: IncomingMeta;
+      fetchForRequest: (request: AdapterRequest, parsed: OcxParsedRequest, adapter: ProviderAdapter) => typeof fetch;
+      on429?: (retryAfter: string | null, headers: Headers, parsed: OcxParsedRequest, response: Response) => Promise<
+        { adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind } | null
+      >;
     }) => {
-      const first = await args.adapter.buildRequest(args.parsed);
-      observedKeys.push(new Headers(first.headers).get("authorization") ?? "");
-      const rotated = sidecarMode === "403"
-        ? await args.onCredentialError?.(Response.json({
-            type: "error",
-            error: {
-              type: "oauth_org_not_allowed",
-              message: "Your organization has disabled Claude subscription access for Claude Code. Use an Anthropic API key instead, or ask your admin to enable access.",
-            },
-          }, { status: 403 }), new AbortController().signal)
-        : await args.on429?.("30");
-      if (!rotated) throw new Error(`Anthropic sidecar did not rotate after ${sidecarMode}`);
-      const second = await rotated.adapter.buildRequest(args.parsed);
-      observedKeys.push(new Headers(second.headers).get("authorization") ?? "");
-      return new Response("sidecar-ok", { status: 200 });
+      // This is a dispatch seam test. The real loop is covered in anthropic-quota-dispatch.
+      let adapter = args.adapter;
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const request = await adapter.buildRequest(args.parsed, args.incomingMeta);
+        const response = await args.fetchForRequest(request, args.parsed, adapter)(request.url, {
+          method: request.method, headers: request.headers, body: request.body,
+        });
+        if (response.ok) return response;
+        const rotated = await args.on429?.(response.headers.get("retry-after"), response.headers, args.parsed, response);
+        if (!rotated) return response;
+        await response.body?.cancel();
+        expect(rotated.recoveryKind).toBe(response.status === 403 ? "oauth-account-403" : "anthropic-oauth-429");
+        adapter = rotated.adapter;
+      }
+      throw new Error("Anthropic sidecar exceeded bounded fixture roster");
     },
   }));
 
@@ -104,12 +111,20 @@ beforeEach(() => {
   sidecarMode = false;
   clearAnthropicAccountPoolState();
   clearGenericFailoverHealth();
+  clearAccountQuotaCache();
+  resetProviderQuotaReconcileStateForTests();
+  releaseSpendHome = acquireOwnedSpendHome();
 });
 
 afterEach(() => {
-  sidecarMode = false;
+  // Released before the directory below is removed: an open lease inside a directory being
+  // deleted fails the removal on Windows and leaves an unlinked live database on POSIX.
+  releaseSpendHome?.();
+  releaseSpendHome = undefined;
   clearAnthropicAccountPoolState();
   clearGenericFailoverHealth();
+  clearAccountQuotaCache();
+  resetProviderQuotaReconcileStateForTests();
   removeTreeWithRetry(testHome);
 });
 
@@ -117,97 +132,231 @@ afterAll(() => {
   if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = previousHome;
   mock.restore();
+  restoreModuleMocks?.();
 });
 
+test.each([new Error("Synthetic rotation failure"), new DOMException("Synthetic cancellation", "AbortError")])(
+  "Anthropic sidecar refunds unused hop and rethrows %s", async error => {
+    sidecarMode = true;
+    for (let index = 0; index < 2; index++) await saveCredential("anthropic", {
+      access: `anthropic-access-${index}`, refresh: `anthropic-refresh-${index}`,
+      expires: Date.now() + 3_600_000, accountId: `anthropic-account-${index}`,
+    });
+    await setActiveAccount("anthropic", getAccountSet("anthropic")!.accounts[0]!.id);
+    const { createRequestExecutionBudget } = await import("../../../src/lib/request-execution-budget");
+    const sendBudget = createRequestExecutionBudget({ maxTotalModelSends: 2, baseSendAllowance: 1,
+      finalRecoveryAllowance: 1, maxAlternateTargetSends: 0, maxTargetTransitions: 0 });
+    const refusal = await import("../../../src/oauth/anthropic-account-refusal");
+    const rotation = spyOn(refusal, "rotateAnthropicAccountOnResponseForInstance").mockImplementation(async () => {
+      expect(sendBudget.used).toBe(2);
+      expect(sendBudget.reserveSpent).toBe(true);
+      throw error;
+    });
+    const config = {
+      port: 0, defaultProvider: "anthropic",
+      anthropicAccountPool: { enabled: false, strategy: "round-robin" },
+      providers: { anthropic: {
+        adapter: "test-anthropic-sidecar", baseUrl: "https://anthropic-sidecar.test/v1",
+        authMode: "oauth", models: ["model"],
+        fetch: (async (_input, init) => {
+          observedKeys.push(new Headers(init?.headers).get("authorization") ?? "");
+          return new Response("rate limited", { status: 429 });
+        }) as typeof fetch,
+      } },
+    } as unknown as OcxConfig;
+    try {
+      await expect(handleResponses(new Request("http://localhost/v1/responses", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "anthropic/model", input: "search", stream: true,
+          tools: [{ type: "web_search" }] }),
+      }), config, { model: "", provider: "" }, { sendBudget })).rejects.toBe(error);
+      expect(rotation).toHaveBeenCalledTimes(1);
+      expect(observedKeys).toEqual(["Bearer anthropic-access-0"]);
+      expect(sendBudget.used).toBe(1);
+      expect(sendBudget.reserveSpent).toBe(false);
+    } finally { rotation.mockRestore(); }
+  },
+);
+
+test.each([[2, false], [6, false], [8, false], [6, true]] as const)("Anthropic sidecar snapshots %i accounts, spent budget=%s", async (count, spent) => {
+  sidecarMode = true;
+  for (let index = 0; index < count; index += 1) {
+    await saveCredential("anthropic", {
+      access: `anthropic-access-${index}`,
+      refresh: `anthropic-refresh-${index}`,
+      expires: Date.now() + 3_600_000,
+      accountId: `anthropic-account-${index}`,
+    });
+  }
+  const ids = getAccountSet("anthropic")!.accounts.map(account => account.id);
+  await setActiveAccount("anthropic", ids[0]!);
+
+  const config = {
+    port: 0,
+    defaultProvider: "anthropic",
+    anthropicAccountPool: { enabled: false, strategy: "round-robin" },
+    providers: {
+      anthropic: {
+        adapter: "test-anthropic-sidecar",
+        baseUrl: "https://anthropic-sidecar.test/v1",
+        authMode: "oauth",
+        models: ["model"],
+        fetch: (async (_input, init) => {
+          observedKeys.push(new Headers(init?.headers).get("authorization") ?? "");
+          if (count === 8 || observedKeys.length < (count === 6 ? 5 : 2)) {
+            return new Response("rate limited", {
+              status: 429,
+              headers: {
+                "retry-after": "30",
+                "anthropic-ratelimit-unified-5h-status": "rejected",
+                "anthropic-ratelimit-unified-5h-utilization": "1",
+                "anthropic-ratelimit-unified-7d-utilization": "0.61",
+              },
+            });
+          }
+          expect(observedKeys).toHaveLength(count === 6 ? 5 : 2);
+          expect(getCachedProviderAccountQuota("anthropic", ids[0]!)).toMatchObject({ fiveHourPercent: 100, weeklyPercent: 61 });
+          return new Response("sidecar-ok", {
+            headers: {
+              "anthropic-ratelimit-unified-5h-utilization": "0.23",
+              "anthropic-ratelimit-unified-7d-utilization": "0.47",
+            },
+          });
+        }) as typeof fetch,
+      },
+    },
+  } as unknown as OcxConfig;
+
+  const { createRequestExecutionBudget } = await import("../../../src/lib/request-execution-budget");
+  const sendBudget = spent ? createRequestExecutionBudget({ maxTotalModelSends: 1, baseSendAllowance: 1,
+    finalRecoveryAllowance: 0, maxAlternateTargetSends: 0, maxTargetTransitions: 0 }) : undefined;
+  const response = await handleResponses(new Request("http://localhost/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "anthropic/model",
+      input: "search",
+      stream: true,
+      tools: [{ type: "web_search" }],
+    }),
+  }), config, { model: "", provider: "" }, { sendBudget });
+
+  expect(response.status).toBe(count === 8 || spent ? 429 : 200);
+  expect(await response.text()).toBe(count === 8 || spent ? "rate limited" : "sidecar-ok");
+  const expectedSends = spent ? 1 : count === 8 ? 6 : count === 6 ? 5 : 2;
+  expect(observedKeys).toEqual(Array.from({ length: expectedSends }, (_, index) => `Bearer anthropic-access-${index}`));
+  expect(getCachedProviderAccountQuota("anthropic", ids[0]!)).toMatchObject({ fiveHourPercent: 100, weeklyPercent: 61 });
+  if (count !== 8 && !spent) expect(getCachedProviderAccountQuota("anthropic", ids[expectedSends - 1]!)).toMatchObject({ fiveHourPercent: 23, weeklyPercent: 47 });
+});
+
+// Parity with v2.65.0-vadymhimself.27 "Anthropic web-search sidecar rotates on 403 credential denial".
+// Upstream routes the 403 through the same physical-send-bound hook as a 429, so the refusal is a
+// real send the pool owns rather than a synthetic response handed to a separate callback.
 test("Anthropic web-search sidecar rotates on 403 credential denial", async () => {
-  sidecarMode = "403";
+  sidecarMode = true;
   for (let index = 0; index < 2; index += 1) {
     await saveCredential("anthropic", {
-      access: `anthropic-access-${index}`,
-      refresh: `anthropic-refresh-${index}`,
-      expires: Date.now() + 3_600_000,
-      accountId: `anthropic-account-${index}`,
-    } as never, { addAccount: true });
+      access: `anthropic-access-${index}`, refresh: `anthropic-refresh-${index}`,
+      expires: Date.now() + 3_600_000, accountId: `anthropic-account-${index}`,
+    });
   }
   const ids = getAccountSet("anthropic")!.accounts.map(account => account.id);
   await setActiveAccount("anthropic", ids[0]!);
-
   const config = {
-    port: 0,
-    defaultProvider: "anthropic",
+    port: 0, defaultProvider: "anthropic",
     anthropicAccountPool: { enabled: false, strategy: "round-robin" },
-    providers: {
-      anthropic: {
-        adapter: "test-anthropic-sidecar",
-        baseUrl: "https://anthropic-sidecar.test/v1",
-        authMode: "oauth",
-        models: ["model"],
-      },
-    },
+    providers: { anthropic: { adapter: "test-anthropic-sidecar", baseUrl: "https://anthropic-sidecar.test/v1", authMode: "oauth", models: ["model"],
+      fetch: (async (_input, init) => {
+        observedKeys.push(new Headers(init?.headers).get("authorization") ?? "");
+        return observedKeys.length === 1 ? Response.json({ type: "error", error: { type: "oauth_org_not_allowed",
+          message: "Your organization has disabled Claude subscription access for Claude Code. Use an Anthropic API key instead, or ask your admin to enable access." } }, { status: 403 })
+          : new Response("sidecar-ok");
+      }) as typeof fetch } },
   } as unknown as OcxConfig;
-
-  const response = await handleResponses(new Request("http://localhost/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "anthropic/model",
-      input: "search",
-      stream: true,
-      tools: [{ type: "web_search" }],
-    }),
-  }), config, { model: "", provider: "" });
-
+  const request = () => new Request("http://localhost/v1/responses", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "anthropic/model", input: "search", stream: true, tools: [{ type: "web_search" }] }),
+  });
+  const response = await handleResponses(request(), config, { model: "", provider: "" });
   expect(response.status).toBe(200);
   expect(await response.text()).toBe("sidecar-ok");
-  expect(observedKeys).toEqual([
-    "Bearer anthropic-access-0",
-    "Bearer anthropic-access-1",
-  ]);
-  expect(getAccountSet("anthropic")!.accounts.find(account => account.id === ids[0])?.needsReauth).toBe(true);
+  expect(observedKeys).toEqual(["Bearer anthropic-access-0", "Bearer anthropic-access-1"]);
+  // Ordinary installs cool the entitlement refusal, so a re-enabled organization serves again without a login.
+  expect(getAnthropicAccountHealthSnapshot(ids[0]!)?.cooldownUntil).toBeGreaterThan(Date.now() + 9 * 60_000);
+  expect(getAccountSet("anthropic")!.accounts.find(account => account.id === ids[0])?.needsReauth).not.toBe(true);
+
 });
 
-test("Anthropic web-search sidecar rotates on 429 when proactive pooling is disabled", async () => {
-  sidecarMode = "429";
+// Upstream routes the 403 through the same physical-send-bound hook as a 429, so the refusal is a
+// real send the pool owns rather than a synthetic response handed to a separate callback.
+test("Anthropic web-search sidecar rotates on 403 credential denial (AgentRadar: org-disabled needs reauth)", async () => {
+  const previous = process.env.OPENCODEX_AGENTRADAR;
+  process.env.OPENCODEX_AGENTRADAR = "1";
+  try {
+  sidecarMode = true;
   for (let index = 0; index < 2; index += 1) {
     await saveCredential("anthropic", {
-      access: `anthropic-access-${index}`,
-      refresh: `anthropic-refresh-${index}`,
-      expires: Date.now() + 3_600_000,
-      accountId: `anthropic-account-${index}`,
-    } as never, { addAccount: true });
+      access: `anthropic-access-${index}`, refresh: `anthropic-refresh-${index}`,
+      expires: Date.now() + 3_600_000, accountId: `anthropic-account-${index}`,
+    });
   }
   const ids = getAccountSet("anthropic")!.accounts.map(account => account.id);
   await setActiveAccount("anthropic", ids[0]!);
-
   const config = {
-    port: 0,
-    defaultProvider: "anthropic",
+    port: 0, defaultProvider: "anthropic",
     anthropicAccountPool: { enabled: false, strategy: "round-robin" },
-    providers: {
-      anthropic: {
-        adapter: "test-anthropic-sidecar",
-        baseUrl: "https://anthropic-sidecar.test/v1",
-        authMode: "oauth",
-        models: ["model"],
-      },
-    },
+    providers: { anthropic: { adapter: "test-anthropic-sidecar", baseUrl: "https://anthropic-sidecar.test/v1", authMode: "oauth", models: ["model"],
+      fetch: (async (_input, init) => {
+        observedKeys.push(new Headers(init?.headers).get("authorization") ?? "");
+        return observedKeys.length === 1 ? Response.json({ type: "error", error: { type: "oauth_org_not_allowed",
+          message: "Your organization has disabled Claude subscription access for Claude Code. Use an Anthropic API key instead, or ask your admin to enable access." } }, { status: 403 })
+          : new Response("sidecar-ok");
+      }) as typeof fetch } },
   } as unknown as OcxConfig;
-
-  const response = await handleResponses(new Request("http://localhost/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "anthropic/model",
-      input: "search",
-      stream: true,
-      tools: [{ type: "web_search" }],
-    }),
-  }), config, { model: "", provider: "" });
-
+  const request = () => new Request("http://localhost/v1/responses", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "anthropic/model", input: "search", stream: true, tools: [{ type: "web_search" }] }),
+  });
+  const response = await handleResponses(request(), config, { model: "", provider: "" });
   expect(response.status).toBe(200);
   expect(await response.text()).toBe("sidecar-ok");
-  expect(observedKeys).toEqual([
-    "Bearer anthropic-access-0",
-    "Bearer anthropic-access-1",
-  ]);
+  expect(observedKeys).toEqual(["Bearer anthropic-access-0", "Bearer anthropic-access-1"]);
+  // .27 contract on gateways: the org-disabled account rotates and is marked for reauthentication.
+  expect(getAccountSet("anthropic")!.accounts.find(account => account.id === ids[0])?.needsReauth).toBe(true);
+  } finally { if (previous === undefined) delete process.env.OPENCODEX_AGENTRADAR; else process.env.OPENCODEX_AGENTRADAR = previous; }
+
+});
+
+// Parity with v2.65.0-vadymhimself.27 "Anthropic sidecar dispatch seam records A429 and B200 when proactive
+// pooling is disabled": its 429 carries Retry-After and utilization but no unified status, which upstream
+// classifies as a transient throttle; a 30s wait exceeds the inline bound, so the sidecar detours once.
+test("Anthropic sidecar dispatch seam records A429 and B200 when proactive pooling is disabled", async () => {
+  sidecarMode = true;
+  for (let index = 0; index < 2; index += 1) {
+    await saveCredential("anthropic", { access: `anthropic-access-${index}`, refresh: `anthropic-refresh-${index}`,
+      expires: Date.now() + 3_600_000, accountId: `anthropic-account-${index}` });
+  }
+  const ids = getAccountSet("anthropic")!.accounts.map(account => account.id);
+  await setActiveAccount("anthropic", ids[0]!);
+  const config = {
+    port: 0, defaultProvider: "anthropic", anthropicAccountPool: { enabled: false, strategy: "round-robin" },
+    providers: { anthropic: { adapter: "test-anthropic-sidecar", baseUrl: "https://anthropic-sidecar.test/v1", authMode: "oauth", models: ["model"],
+      fetch: (async (_input, init) => {
+        observedKeys.push(new Headers(init?.headers).get("authorization") ?? "");
+        if (observedKeys.length === 1) return new Response("rate limited", { status: 429, headers: {
+          "retry-after": "30", "anthropic-ratelimit-unified-5h-utilization": "1", "anthropic-ratelimit-unified-7d-utilization": "0.61" } });
+        expect(observedKeys).toHaveLength(2);
+        expect(getCachedProviderAccountQuota("anthropic", ids[0]!)).toMatchObject({ fiveHourPercent: 100, weeklyPercent: 61 });
+        return new Response("sidecar-ok", { headers: { "anthropic-ratelimit-unified-5h-utilization": "0.23", "anthropic-ratelimit-unified-7d-utilization": "0.47" } });
+      }) as typeof fetch } },
+  } as unknown as OcxConfig;
+  const response = await handleResponses(new Request("http://localhost/v1/responses", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "anthropic/model", input: "search", stream: true, tools: [{ type: "web_search" }] }),
+  }), config, { model: "", provider: "" });
+  expect(response.status).toBe(200);
+  expect(await response.text()).toBe("sidecar-ok");
+  expect(observedKeys).toEqual(["Bearer anthropic-access-0", "Bearer anthropic-access-1"]);
+  expect(getCachedProviderAccountQuota("anthropic", ids[0]!)).toMatchObject({ fiveHourPercent: 100, weeklyPercent: 61 });
+  expect(getCachedProviderAccountQuota("anthropic", ids[1]!)).toMatchObject({ fiveHourPercent: 23, weeklyPercent: 47 });
 });

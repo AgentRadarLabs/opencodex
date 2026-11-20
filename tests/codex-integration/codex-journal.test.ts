@@ -1,6 +1,6 @@
 import { describe, expect, test, beforeEach, afterEach, setDefaultTimeout } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, lstatSync, symlinkSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -17,9 +17,11 @@ const repoRoot = dirname(fileURLToPath(new URL("../../package.json", import.meta
 setDefaultTimeout(SPAWN_BUDGET_MS);
 
 function runScript(codexHome: string, script: string): { stdout: string; stderr: string; status: number } {
+  mkdirSync(join(codexHome, "ocx-home"), { recursive: true });
   const result = spawnSync(process.execPath, ["--eval", script], {
     cwd: repoRoot,
-    env: { ...process.env, CODEX_HOME: codexHome },
+    // OPENCODEX_HOME too: adoption and injection take the config mutation lock in that home.
+    env: { ...process.env, CODEX_HOME: codexHome, OPENCODEX_HOME: join(codexHome, "ocx-home") },
     encoding: "utf8",
     timeout: SPAWN_BUDGET_MS - 5_000,
   });
@@ -56,6 +58,228 @@ describe("codex-journal", () => {
     expect(out.hasPid).toBe(true);
   });
 
+  test("hashless interrupted snapshot preserves later native config edits", () => {
+    const edited = '# current user settings\nmodel_provider = "openai"\nmodel = "user-selected-model"\n';
+    const r = runScript(testDir, `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const { writeJournal, restoreJournalState } = require("./src/codex/journal");
+      const configPath = path.join(process.env.CODEX_HOME, "config.toml");
+      const journalPath = path.join(process.env.CODEX_HOME, "opencodex-journal.json");
+      writeJournal();
+      const before = fs.readFileSync(journalPath, "utf8");
+      fs.writeFileSync(configPath, ${JSON.stringify(edited)});
+      const result = restoreJournalState();
+      console.log(JSON.stringify({ result, config: fs.readFileSync(configPath, "utf8"),
+        journalPreserved: fs.existsSync(journalPath) && fs.readFileSync(journalPath, "utf8") === before }));
+    `);
+    expect(r.status).toBe(0);
+    const out = JSON.parse(r.stdout);
+    expect(out.config).toBe(edited);
+    expect(out.result.configRestored).toBe(false);
+    expect(out.result.complete).toBe(false);
+    expect(out.journalPreserved).toBe(true);
+  });
+
+  test("hashless interrupted snapshot preserves a later profile", () => {
+    const edited = 'model_provider = "openai"\nmodel = "user-profile-model"\n';
+    const r = runScript(testDir, `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const { writeJournal, restoreJournalState } = require("./src/codex/journal");
+      const profilePath = path.join(process.env.CODEX_HOME, "opencodex.config.toml");
+      const journalPath = path.join(process.env.CODEX_HOME, "opencodex-journal.json");
+      writeJournal();
+      const before = fs.readFileSync(journalPath, "utf8");
+      fs.writeFileSync(profilePath, ${JSON.stringify(edited)});
+      const result = restoreJournalState();
+      console.log(JSON.stringify({ result, profile: fs.existsSync(profilePath) ? fs.readFileSync(profilePath, "utf8") : null,
+        journalPreserved: fs.existsSync(journalPath) && fs.readFileSync(journalPath, "utf8") === before }));
+    `);
+    expect(r.status).toBe(0);
+    const out = JSON.parse(r.stdout);
+    expect(out.profile).toBe(edited);
+    expect(out.result.profileRestored).toBe(false);
+    expect(out.result.complete).toBe(false);
+    expect(out.journalPreserved).toBe(true);
+  });
+
+  test("hashless already-original snapshot completes without rewriting config", () => {
+    const r = runScript(testDir, `
+      const { spyOn } = require("bun:test");
+      const config = require("./src/config");
+      const { writeJournal, restoreJournalState } = require("./src/codex/journal");
+      writeJournal();
+      const originalWrite = config.atomicWriteFile;
+      let writes = 0;
+      const spy = spyOn(config, "atomicWriteFile").mockImplementation((...args) => {
+        writes += 1;
+        return originalWrite(...args);
+      });
+      try { console.log(JSON.stringify({ result: restoreJournalState(), writes })); }
+      finally { spy.mockRestore(); }
+    `);
+    expect(r.status).toBe(0);
+    const out = JSON.parse(r.stdout);
+    expect(out.result.complete).toBe(true);
+    expect(out.writes).toBe(0);
+    expect(existsSync(join(testDir, "opencodex-journal.json"))).toBe(false);
+  });
+
+  test("hashless snapshot distinguishes an empty original profile from absence", () => {
+    writeFileSync(join(testDir, "opencodex.config.toml"), "", "utf8");
+    const r = runScript(testDir, `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const { writeJournal, restoreJournalState } = require("./src/codex/journal");
+      writeJournal();
+      const journalPath = path.join(process.env.CODEX_HOME, "opencodex-journal.json");
+      const profilePath = path.join(process.env.CODEX_HOME, "opencodex.config.toml");
+      const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+      const result = restoreJournalState();
+      console.log(JSON.stringify({ originalProfile: journal.originalProfile, result,
+        profileExists: fs.existsSync(profilePath), profile: fs.readFileSync(profilePath, "utf8"),
+        journalExists: fs.existsSync(journalPath) }));
+    `);
+    expect(r.status).toBe(0);
+    const out = JSON.parse(r.stdout);
+    expect(out.originalProfile).toBe("");
+    expect(out.result.complete).toBe(true);
+    expect(out.profileExists).toBe(true);
+    expect(out.profile).toBe("");
+    expect(out.journalExists).toBe(false);
+  });
+
+  test("hashless native restore refuses instead of reporting an uncertain snapshot as restored", () => {
+    const edited = '# current user settings\nmodel_provider = "openai"\nmodel = "user-selected-model"\n';
+    const r = runScript(testDir, `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const { writeJournal } = require("./src/codex/journal");
+      const { restoreNativeCodex } = require("./src/codex/inject");
+      const configPath = path.join(process.env.CODEX_HOME, "config.toml");
+      const journalPath = path.join(process.env.CODEX_HOME, "opencodex-journal.json");
+      writeJournal();
+      const before = fs.readFileSync(journalPath, "utf8");
+      fs.writeFileSync(configPath, ${JSON.stringify(edited)});
+      const result = restoreNativeCodex();
+      console.log(JSON.stringify({ result, config: fs.readFileSync(configPath, "utf8"),
+        journalPreserved: fs.existsSync(journalPath) && fs.readFileSync(journalPath, "utf8") === before }));
+    `);
+    expect(r.status).toBe(0);
+    const out = JSON.parse(r.stdout);
+    expect(out.result.success).toBe(false);
+    expect(out.result.message).toContain("journal recovery was not verified");
+    expect(out.result.artifacts.config).toMatchObject({ state: "failed", changed: false });
+    for (const artifact of [out.result.artifacts.catalog, out.result.artifacts.history]) {
+      expect(artifact).toMatchObject({ state: "skipped", changed: false });
+    }
+    expect(out.config).toBe(edited);
+    expect(out.journalPreserved).toBe(true);
+  });
+
+  test("hashless routed snapshot is not promoted by reinjection after user edits", () => {
+    const edited = '# current user settings\nmodel = "user-selected-model"\n# Auto-injected by opencodex\nopenai_base_url = "http://127.0.0.1:10100/v1"\n';
+    const r = runScript(testDir, `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const { writeJournal } = require("./src/codex/journal");
+      const { injectCodexConfig } = require("./src/codex/inject");
+      const configPath = path.join(process.env.CODEX_HOME, "config.toml");
+      const profilePath = path.join(process.env.CODEX_HOME, "opencodex.config.toml");
+      const journalPath = path.join(process.env.CODEX_HOME, "opencodex-journal.json");
+      writeJournal();
+      const before = fs.readFileSync(journalPath, "utf8");
+      fs.writeFileSync(configPath, ${JSON.stringify(edited)});
+      (async () => {
+        const config = { port: 10200, providers: {}, defaultProvider: "openai" };
+        const preflight = await injectCodexConfig(10200, config, { catalogPath: null, validateOnly: true });
+        const result = await injectCodexConfig(10200, config, { catalogPath: null });
+        console.log(JSON.stringify({ preflight, result, config: fs.readFileSync(configPath, "utf8"),
+          profileCreated: fs.existsSync(profilePath), journal: JSON.parse(fs.readFileSync(journalPath, "utf8")),
+          journalPreserved: fs.readFileSync(journalPath, "utf8") === before }));
+      })();
+    `);
+    expect(r.status).toBe(0);
+    const out = JSON.parse(r.stdout);
+    expect(out.preflight.success).toBe(false);
+    expect(out.result.success).toBe(false);
+    expect(out.config).toBe(edited);
+    expect(out.profileCreated).toBe(false);
+    expect(out.journal.injectedConfigHash).toBeUndefined();
+    expect(out.journalPreserved).toBe(true);
+  });
+
+  test("hashless empty config snapshot does not recreate a later deleted file", () => {
+    writeFileSync(join(testDir, "config.toml"), "", "utf8");
+    const r = runScript(testDir, `
+      const fs = require("node:fs");
+      const { CODEX_CONFIG_PATH } = require("./src/codex/paths");
+      const { writeJournal, restoreJournalState, JOURNAL_PATH } = require("./src/codex/journal");
+      writeJournal();
+      fs.unlinkSync(CODEX_CONFIG_PATH);
+      console.log(JSON.stringify({ result: restoreJournalState(), configExists: fs.existsSync(CODEX_CONFIG_PATH),
+        journalExists: fs.existsSync(JOURNAL_PATH) }));
+    `);
+    expect(r.status).toBe(0);
+    const out = JSON.parse(r.stdout);
+    expect(out.configExists).toBe(false);
+    expect(out.journalExists).toBe(true);
+    expect(out.result.complete).toBe(false);
+    expect(out.result.unverified).toBe(true);
+  });
+
+  test("hashless client reconcile does not report an uncertain snapshot as restored", () => {
+    const edited = 'model_provider = "openai"\nmodel = "current-user-model"\n';
+    const r = runScript(testDir, `
+      const fs = require("node:fs");
+      const { CODEX_CONFIG_PATH } = require("./src/codex/paths");
+      const { writeJournal, reconcileJournal, JOURNAL_PATH } = require("./src/codex/journal");
+      writeJournal({ owner: { kind: "client", apiKeyId: "previous-client" } });
+      const before = fs.readFileSync(JOURNAL_PATH, "utf8");
+      fs.writeFileSync(CODEX_CONFIG_PATH, ${JSON.stringify(edited)});
+      const restored = reconcileJournal({ activeClientApiKeyId: "different-client" });
+      console.log(JSON.stringify({ restored, config: fs.readFileSync(CODEX_CONFIG_PATH, "utf8"),
+        journalPreserved: fs.existsSync(JOURNAL_PATH) && fs.readFileSync(JOURNAL_PATH, "utf8") === before }));
+    `);
+    expect(r.status).toBe(0);
+    const out = JSON.parse(r.stdout);
+    expect(out.restored).toBe(false);
+    expect(out.config).toBe(edited);
+    expect(out.journalPreserved).toBe(true);
+    expect(r.stderr).toContain("recovery was not verified");
+    expect(r.stderr).not.toContain("was restored from the Codex journal");
+  });
+
+  test("hashless native edits become the new snapshot before a successful injection", () => {
+    const edited = 'model_provider = "openai"\nmodel = "current-user-model"\n';
+    const profile = 'model_provider = "openai"\nmodel = "current-user-profile"\n';
+    const r = runScript(testDir, `
+      const fs = require("node:fs");
+      const { CODEX_CONFIG_PATH, CODEX_PROFILE_PATH } = require("./src/codex/paths");
+      const { writeJournal, restoreJournalState } = require("./src/codex/journal");
+      const { injectCodexConfig } = require("./src/codex/inject");
+      writeJournal();
+      fs.writeFileSync(CODEX_CONFIG_PATH, ${JSON.stringify(edited)});
+      fs.writeFileSync(CODEX_PROFILE_PATH, ${JSON.stringify(profile)});
+      (async () => {
+        const config = { port: 10100, providers: {}, defaultProvider: "openai" };
+        const preflight = await injectCodexConfig(10100, config, { catalogPath: null, validateOnly: true });
+        const injected = await injectCodexConfig(10100, config, { catalogPath: null });
+        const restored = restoreJournalState();
+        console.log(JSON.stringify({ preflight, injected, restored, config: fs.readFileSync(CODEX_CONFIG_PATH, "utf8"),
+          profile: fs.readFileSync(CODEX_PROFILE_PATH, "utf8") }));
+      })();
+    `);
+    expect(r.status).toBe(0);
+    const out = JSON.parse(r.stdout);
+    expect(out.preflight.success).toBe(true);
+    expect(out.injected.success).toBe(true);
+    expect(out.restored.complete).toBe(true);
+    expect(out.config).toBe(edited);
+    expect(out.profile).toBe(profile);
+  });
+
   test("reconcileJournal restores config when journaled PID is dead", () => {
     const journalPath = join(testDir, "opencodex-journal.json");
     const original = "# original config\nmodel_provider = \"openai\"\n";
@@ -65,6 +289,8 @@ describe("codex-journal", () => {
       version: 1,
       originalConfig: Buffer.from(original).toString("base64"),
       originalProfile: null,
+      injectedConfigHash: createHash("sha256").update(modified).digest("hex"),
+      injectedProfileHash: null,
       pid: 999999,
       timestamp: new Date().toISOString(),
     }), "utf8");
@@ -80,7 +306,7 @@ describe("codex-journal", () => {
     expect(existsSync(journalPath)).toBe(false);
   });
 
-  test("reconcileJournal handles corrupt JSON gracefully", () => {
+  test("reconcileJournal preserves corrupt JSON without authorizing recovery", () => {
     const journalPath = join(testDir, "opencodex-journal.json");
     writeFileSync(journalPath, "NOT VALID JSON{{{", "utf8");
 
@@ -91,7 +317,8 @@ describe("codex-journal", () => {
     `);
     expect(r.status).toBe(0);
     expect(JSON.parse(r.stdout).restored).toBe(false);
-    expect(existsSync(journalPath)).toBe(false);
+    expect(readFileSync(journalPath, "utf8")).toBe("NOT VALID JSON{{{");
+    expect(r.stderr).toContain("ownership could not be verified");
   });
 
   test("reconcileJournal no-ops when no journal exists", () => {
@@ -136,6 +363,8 @@ describe("codex-journal", () => {
       version: 1,
       originalConfig: Buffer.from(original).toString("base64"),
       originalProfile: null,
+      injectedConfigHash: createHash("sha256").update(injected).digest("hex"),
+      injectedProfileHash: null,
       owner: { kind: "client", apiKeyId: "client-key-1" },
       pid: 999999,
       timestamp: new Date().toISOString(),
@@ -160,19 +389,172 @@ describe("codex-journal", () => {
     expect(existsSync(journalPath)).toBe(false);
   });
 
-  test("removeJournal cleans up", () => {
+  // A Remote Link Child linked while a standalone proxy had routing injected: `ocx connect --link`
+  // re-injects for the client, but the journal stayed the standalone process's. Once that process
+  // exited into its supervisor (desktop exit 75, service exit 1), the supervisor's fresh start saw a
+  // dead process owner and restored native Codex and the old catalog under the new link.
+  // A Remote Link Child linked while a standalone proxy had routing injected: `ocx connect --link`
+  // re-injects for the client. The journal must stay the live standalone's until the connection
+  // commits (a runtime starting mid-connect then skips it), and become the client's right after, or
+  // the supervisor's relaunch reads a dead process owner and restores native Codex under the link.
+  test("a client injection leaves the journal to its owner until connect commits and adopts it", () => {
+    const original = '# original config\nmodel_provider = "openai"\n';
+    writeFileSync(join(testDir, "config.toml"), original, "utf8");
+    const linked = runScript(testDir, `
+      const { injectCodexConfig } = require("./src/codex/inject");
+      const { adoptJournalForClient } = require("./src/codex/journal");
+      const fs = require("fs"), path = require("path");
+      const owner = () => JSON.parse(fs.readFileSync(path.join(process.env.CODEX_HOME, "opencodex-journal.json"), "utf8")).owner;
+      (async () => {
+        const config = { port: 10100, providers: {}, defaultProvider: "openai" };
+        await injectCodexConfig(10100, config, { catalogPath: null });
+        await injectCodexConfig(10100, config, { catalogPath: null, journalOwner: { kind: "client", apiKeyId: "link-key" } });
+        const beforeCommit = owner();
+        const adopted = adoptJournalForClient("link-key");
+        const again = adoptJournalForClient("link-key");
+        console.log(JSON.stringify({ beforeCommit: beforeCommit.kind, adopted, again, pid: process.pid }));
+      })();
+    `);
+    expect(linked.status).toBe(0);
+    expect(JSON.parse(linked.stdout)).toMatchObject({ beforeCommit: "process", adopted: "adopted", again: "owned" });
+    const journal = JSON.parse(readFileSync(join(testDir, "opencodex-journal.json"), "utf8"));
+    expect(journal.owner).toEqual({ kind: "client", apiKeyId: "link-key" });
+    expect(Buffer.from(journal.originalConfig, "base64").toString("utf8")).toBe(original);
+    const routed = readFileSync(join(testDir, "config.toml"), "utf8");
+
+    // The supervisor's start: the injecting process is gone, the link is the committed client.
+    const restarted = runScript(testDir, `
+      const { reconcileJournal } = require("./src/codex/journal");
+      console.log(JSON.stringify({ restored: reconcileJournal({ activeClientApiKeyId: "link-key" }) }));
+    `);
+    expect(restarted.status).toBe(0);
+    expect(JSON.parse(restarted.stdout).restored).toBe(false);
+    expect(readFileSync(join(testDir, "config.toml"), "utf8")).toBe(routed);
+  });
+
+  // Review round 2: a stale sync must never hand a later connection's journal to its own key, so
+  // adoption never takes another client's journal and re-runs the caller's connection guard
+  // under the Codex config lock.
+  test("adoption never takes another client's journal and honors the caller's guard", () => {
+    writeFileSync(join(testDir, "config.toml"), '# original config\nmodel_provider = "openai"\n', "utf8");
+    const r = runScript(testDir, `
+      const { injectCodexConfig } = require("./src/codex/inject");
+      const { adoptJournalForClient } = require("./src/codex/journal");
+      const fs = require("fs"), path = require("path");
+      const owner = () => JSON.parse(fs.readFileSync(path.join(process.env.CODEX_HOME, "opencodex-journal.json"), "utf8")).owner;
+      (async () => {
+        const config = { port: 10100, providers: {}, defaultProvider: "openai" };
+        await injectCodexConfig(10100, config, { catalogPath: null, journalOwner: { kind: "client", apiKeyId: "newer-key" } });
+        const foreign = adoptJournalForClient("stale-key");
+        const afterForeign = owner();
+        let refused = null;
+        await injectCodexConfig(10100, config, { catalogPath: null });
+        fs.writeFileSync(path.join(process.env.CODEX_HOME, "opencodex-journal.json"), JSON.stringify({ ...JSON.parse(fs.readFileSync(path.join(process.env.CODEX_HOME, "opencodex-journal.json"), "utf8")), owner: { kind: "process", pid: process.pid } }));
+        try { adoptJournalForClient("link-key", () => { throw new Error("client_connection_changed"); }); } catch (error) { refused = error.message; }
+        console.log(JSON.stringify({ foreign, afterForeign, refused, afterGuard: owner() }));
+      })();
+    `);
+    expect(r.status).toBe(0);
+    const out = JSON.parse(r.stdout);
+    expect(out.foreign).toBe("foreign");
+    expect(out.afterForeign).toEqual({ kind: "client", apiKeyId: "newer-key" });
+    expect(out.refused).toBe("client_connection_changed");
+    expect(out.afterGuard.kind).toBe("process");
+  });
+
+  // Review round 3: the connection guard and the journal write share the config mutation lock
+  // (taken inside the Codex config lock), so no connection or runtime change can land between them;
+  // and a missing journal is reported as such, never as a completed handover.
+  test("adoption holds the config mutation lock through its guard and reports a missing journal", () => {
+    writeFileSync(join(testDir, "config.toml"), '# original config\nmodel_provider = "openai"\n', "utf8");
+    const ocxHome = join(testDir, "ocx-home");
+    require("node:fs").mkdirSync(ocxHome, { recursive: true });
+    const r = spawnSync(process.execPath, ["--eval", `
+      const { injectCodexConfig } = require("./src/codex/inject");
+      const { adoptJournalForClient } = require("./src/codex/journal");
+      const { prepareConfigMutationDatabasePathForWrite } = require("./src/config/mutation-lock");
+      const { Database } = require("bun:sqlite");
+      const fs = require("fs"), path = require("path");
+      (async () => {
+        const missing = adoptJournalForClient("link-key");
+        await injectCodexConfig(10100, { port: 10100, providers: {}, defaultProvider: "openai" }, { catalogPath: null });
+        let competingWriter = "not-run";
+        const mutationDb = prepareConfigMutationDatabasePathForWrite();
+        const adopted = adoptJournalForClient("link-key", () => {
+          let db;
+          try { db = new Database(mutationDb); db.exec("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE"); competingWriter = "admitted"; db.exec("ROLLBACK"); }
+          catch (error) { competingWriter = /locked|busy/i.test(String(error)) ? "refused" : String(error); }
+          finally { db?.close(); }
+        });
+        console.log(JSON.stringify({ missing, adopted, competingWriter }));
+      })();
+    `], { cwd: repoRoot, env: { ...process.env, CODEX_HOME: testDir, OPENCODEX_HOME: ocxHome }, encoding: "utf8", timeout: SPAWN_BUDGET_MS - 5_000 });
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout.trim())).toEqual({ missing: "missing", adopted: "adopted", competingWriter: "refused" });
+  });
+
+  // Review round 4: external Codex providers (approved or not) leave no standard journal, and no
+  // journal means startup recovery has nothing to restore. Only another client's journal leaves the
+  // routing at risk, so only that counts as an incomplete handover.
+  test("an external provider leaves no journal to hand over, and only a foreign journal is incomplete", () => {
+    writeFileSync(join(testDir, "config.toml"), 'model_provider = "acme"\n\n[model_providers.acme]\nname = "Acme"\nbase_url = "https://acme.example.test/v1"\n', "utf8");
+    const r = runScript(testDir, `
+      const { injectCodexConfig } = require("./src/codex/inject");
+      const { adoptJournalForClient, journalHandoverIncomplete } = require("./src/codex/journal");
+      (async () => {
+        const injected = await injectCodexConfig(10100, { port: 10100, providers: {}, defaultProvider: "openai" }, { catalogPath: null, journalOwner: { kind: "client", apiKeyId: "link-key" } });
+        const adoption = adoptJournalForClient("link-key");
+        const verdicts = ["adopted", "owned", "missing", "foreign"].map(journalHandoverIncomplete);
+        console.log(JSON.stringify({ success: injected.success, adoption, verdicts }));
+      })();
+    `);
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout)).toEqual({ success: true, adoption: "missing", verdicts: [false, false, false, true] });
+  });
+
+  // Review round 5: only a confirmed absence is safe. A journal that passes the ownership check but
+  // cannot be read on the handover's own read must fail the handover, never read as "missing".
+  test("an unreadable journal on the handover read fails instead of reading as missing", () => {
+    writeFileSync(join(testDir, "config.toml"), '# original config\nmodel_provider = "openai"\n', "utf8");
+    const r = runScript(testDir, `
+      const { spyOn } = require("bun:test");
+      const { injectCodexConfig } = require("./src/codex/inject");
+      const owner = require("./src/codex/codex-home-owner");
+      const { adoptJournalForClient } = require("./src/codex/journal");
+      (async () => {
+        await injectCodexConfig(10100, { port: 10100, providers: {}, defaultProvider: "openai" }, { catalogPath: null });
+        const real = owner.readCodexHomeJournal;
+        let calls = 0;
+        spyOn(owner, "readCodexHomeJournal").mockImplementation(path => (++calls === 2 ? { kind: "unknown" } : real(path)));
+        let outcome;
+        try { outcome = adoptJournalForClient("link-key"); } catch (error) { outcome = "threw"; }
+        const fs = require("fs"), path = require("path");
+        const kind = JSON.parse(fs.readFileSync(path.join(process.env.CODEX_HOME, "opencodex-journal.json"), "utf8")).owner.kind;
+        console.log(JSON.stringify({ outcome, calls, kind }));
+      })();
+    `);
+    expect(r.status).toBe(0);
+    const out = JSON.parse(r.stdout);
+    expect(out.calls).toBeGreaterThanOrEqual(2);
+    expect(out.outcome).toBe("threw");
+    expect(out.kind).toBe("process");
+  });
+
+  test("removeJournal refuses unknown journal evidence", () => {
     const journalPath = join(testDir, "opencodex-journal.json");
     writeFileSync(journalPath, "{}", "utf8");
 
     const r = runScript(testDir, `
       const { removeJournal } = require("./src/codex/journal");
-      removeJournal();
+      let refusal;
+      try { removeJournal(); } catch (error) { refusal = error.reason; }
       const fs = require("fs");
       const path = require("path");
-      console.log(JSON.stringify({ exists: fs.existsSync(path.join(process.env.CODEX_HOME, "opencodex-journal.json")) }));
+      console.log(JSON.stringify({ refusal, exists: fs.existsSync(path.join(process.env.CODEX_HOME, "opencodex-journal.json")) }));
     `);
     expect(r.status).toBe(0);
-    expect(JSON.parse(r.stdout).exists).toBe(false);
+    expect(JSON.parse(r.stdout)).toEqual({ refusal: "owner-unknown", exists: true });
+    expect(readFileSync(journalPath, "utf8")).toBe("{}");
   });
 
   test("removeCodexConfig is a successful no-op when Codex is not installed", () => {
@@ -189,6 +571,80 @@ describe("codex-journal", () => {
     expect(result.remove.message).toContain("no native restore was needed");
     expect(result.restore.success).toBe(true);
     expect(existsSync(join(testDir, "opencodex.config.toml"))).toBe(false);
+  });
+
+  for (const originalProfile of [null, 'model_provider = "openai"\n']) {
+    for (const symlinked of [true, false]) {
+    test.skipIf(process.platform === "win32")(`native journal restore ${symlinked ? "preserves a symlinked" : "restores a regular"} ${originalProfile === null ? "generated" : "existing"} profile before config writes`, () => {
+      const configPath = join(testDir, "config.toml");
+      const profilePath = join(testDir, "opencodex.config.toml");
+      const targetPath = join(testDir, "journal-profile-target.toml");
+      const journalPath = join(testDir, "opencodex-journal.json");
+      const injectedConfig = '# Auto-injected by opencodex\nopenai_base_url = "http://127.0.0.1:10100/v1"\n';
+      const injectedProfile = 'model_provider = "opencodex"\n';
+      const journal = JSON.stringify({ version: 1, originalConfig: Buffer.from('model_provider = "openai"\n').toString("base64"),
+        originalProfile: originalProfile === null ? null : Buffer.from(originalProfile).toString("base64"),
+        injectedConfigHash: createHash("sha256").update(injectedConfig).digest("hex"),
+        injectedProfileHash: createHash("sha256").update(injectedProfile).digest("hex"),
+        pid: 999999, timestamp: new Date().toISOString() });
+      writeFileSync(configPath, injectedConfig);
+      writeFileSync(targetPath, injectedProfile);
+      writeFileSync(journalPath, journal);
+      if (symlinked) symlinkSync(targetPath, profilePath, "file");
+      else writeFileSync(profilePath, injectedProfile);
+      const result = runScript(testDir, `
+        const { restoreNativeCodex } = require("./src/codex/inject");
+        const out = restoreNativeCodex({ skipHistory: true });
+        console.log(JSON.stringify({success: out.success, config: out.artifacts.config}));
+      `);
+      expect(result.status).toBe(0);
+      const out = JSON.parse(result.stdout);
+      if (symlinked) {
+        expect(out.success).toBe(false);
+        expect(out.config.state).toBe("failed");
+        expect(readFileSync(configPath, "utf8")).toBe(injectedConfig);
+        expect(readFileSync(journalPath, "utf8")).toBe(journal);
+        expect(existsSync(profilePath)).toBe(true);
+        expect(lstatSync(profilePath).isSymbolicLink()).toBe(true);
+        expect(out.config.changed).toBe(false);
+      } else {
+        expect(out.config.state).toBe("ok");
+        expect(readFileSync(configPath, "utf8")).toBe('model_provider = "openai"\n');
+        expect(existsSync(journalPath)).toBe(false);
+        if (originalProfile === null) expect(existsSync(profilePath)).toBe(false);
+        else expect(readFileSync(profilePath, "utf8")).toBe(originalProfile);
+      }
+      expect(existsSync(targetPath)).toBe(true);
+      expect(readFileSync(targetPath, "utf8")).toBe(injectedProfile);
+    });
+    }
+  }
+
+  test.skipIf(process.platform === "win32")("removeCodexConfig refuses a symlinked profile without changing its target or config", () => {
+    const configPath = join(testDir, "config.toml");
+    const profilePath = join(testDir, "opencodex.config.toml");
+    const targetPath = join(testDir, "external-profile.toml");
+    const journalPath = join(testDir, "opencodex-journal.json");
+    const config = '# Auto-injected by opencodex\nopenai_base_url = "http://127.0.0.1:10100/v1"\n';
+    const target = 'model_provider = "openai"\nmodel = "external-profile"\n';
+    const journal = '{"recovery":"sentinel"}\n';
+    writeFileSync(configPath, config, "utf8");
+    writeFileSync(targetPath, target, "utf8");
+    writeFileSync(journalPath, journal, "utf8");
+    symlinkSync(targetPath, profilePath, "file");
+
+    const r = runScript(testDir, `
+      const { removeCodexConfig } = require("./src/codex/inject");
+      console.log(JSON.stringify(removeCodexConfig()));
+    `);
+
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout).success).toBe(false);
+    expect(JSON.parse(r.stdout).message).toContain("symbolic link");
+    expect(readFileSync(configPath, "utf8")).toBe(config);
+    expect(readFileSync(targetPath, "utf8")).toBe(target);
+    expect(readFileSync(journalPath, "utf8")).toBe(journal);
+    expect(existsSync(profilePath)).toBe(true);
   });
 
   test("removeCodexConfig reports damaged managed-default cleanup and preserves the ambiguous value", () => {
@@ -293,17 +749,23 @@ describe("codex-journal", () => {
           marker + '\\ndefault_subagent_model',
           marker + '\\n\\ndefault_subagent_model',
         ), "utf8");
-        console.log(JSON.stringify(restoreNativeCodex()));
+        const paths = ["config.toml", "opencodex.config.toml", "opencodex-journal.json"].map(name => path.join(process.env.CODEX_HOME, name));
+        const snapshot = () => paths.map(file => ({ exists: fs.existsSync(file), content: fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null }));
+        const before = snapshot();
+        const result = restoreNativeCodex();
+        console.log(JSON.stringify({ result, before, after: snapshot() }));
       })();
     `);
 
     expect(r.status).toBe(0);
-    const result = JSON.parse(r.stdout);
-    expect(result.success).toBe(false);
-    expect(result.message).toContain("could not be safely removed");
-    expect(result.message).toContain("orphaned managed subagent default marker");
+    const out = JSON.parse(r.stdout);
+    expect(out.result.success).toBe(false);
+    expect(out.result.message).toContain("could not be safely removed");
+    expect(out.result.message).toContain("orphaned managed subagent default marker");
+    expect(out.after).toEqual(out.before);
+    expect(out.result.artifacts.config.state).toBe("failed");
     const after = readFileSync(join(testDir, "config.toml"), "utf8");
-    expect(after).not.toContain("openai_base_url");
+    expect(after).toContain("openai_base_url");
     expect(after).toContain("# Managed by opencodex: native subagent default");
     expect(after).toContain('default_subagent_model = "gpt-5.6-sol"');
     expect(existsSync(join(testDir, "opencodex-journal.json"))).toBe(true);
@@ -344,6 +806,11 @@ describe("codex-journal", () => {
         ''
       ].join("\\n"), "utf8");
       fs.writeFileSync(path.join(process.env.CODEX_HOME, "opencodex.config.toml"), 'model_provider = "opencodex"\\n', "utf8");
+      require("./src/codex/journal").markJournalInjectedState(
+        fs.readFileSync(path.join(process.env.CODEX_HOME, "config.toml"), "utf8"),
+        fs.readFileSync(path.join(process.env.CODEX_HOME, "opencodex.config.toml"), "utf8"),
+        { injectedOpenaiBaseUrl: null, injectedRealtimeWsBaseUrl: null, injectedCatalogPath: null },
+      );
       const result = restoreNativeCodex();
       console.log(JSON.stringify({ success: result.success, message: result.message }));
     `);
@@ -440,20 +907,21 @@ describe("codex-journal", () => {
     expect(existsSync(join(testDir, "opencodex-journal.json"))).toBe(true);
   });
 
-  test("full lifecycle: write → crash → reconcile restores", () => {
+  test("full lifecycle: snapshot → mark injection → crash → reconcile restores", () => {
     const r = runScript(testDir, `
-      const { writeJournal } = require("./src/codex/journal");
+      const { writeJournal, markJournalInjectedState } = require("./src/codex/journal");
       writeJournal();
+      const injected = "# injected opencodex config\\n";
+      require("node:fs").writeFileSync(require("./src/codex/paths").CODEX_CONFIG_PATH, injected);
+      markJournalInjectedState(injected, null, {
+        injectedOpenaiBaseUrl: null, injectedRealtimeWsBaseUrl: null, injectedCatalogPath: null,
+      });
       console.log("written");
     `);
     expect(r.status).toBe(0);
 
     const journalPath = join(testDir, "opencodex-journal.json");
     expect(existsSync(journalPath)).toBe(true);
-    const journal = JSON.parse(readFileSync(journalPath, "utf8"));
-
-    writeFileSync(join(testDir, "config.toml"), "# injected opencodex config\n", "utf8");
-
     const r2 = runScript(testDir, `
       const { reconcileJournal } = require("./src/codex/journal");
       const result = reconcileJournal();
@@ -675,6 +1143,65 @@ describe("codex-journal", () => {
     // outcome the removal wanted.
     expect(body).toContain('=== "ENOENT"');
     // And completeness still gates journal deletion.
-    expect(body).toContain("if (complete) removeJournal();");
+    expect(body).toMatch(/if \(complete\) \{\s*try \{ publishCodexArtifact\(JOURNAL_PATH, held, \(_path, hooks\) => removeJournal\(hooks\)\)/);
+  });
+
+  test("a sibling instance neither restores, injects over, nor drops the live owner's journal", () => {
+    // A sibling shares CODEX_HOME with the live proxy. The desired-state re-reads in the restore
+    // path would read its closed gate as "Codex is OFF" and replay the owner's journal, and the
+    // external-provider courtesy in both directions deletes the journal outright. The mark has to
+    // win before either runs.
+    for (const provider of ["opencodex", "custom-provider"]) {
+      const original = '# original\nmodel_provider = "openai"\n';
+      const injected = `# injected\nmodel_provider = "${provider}"\nopenai_base_url = "http://127.0.0.1:10100/v1"\n`;
+      writeFileSync(join(testDir, "config.toml"), injected);
+      const journal = JSON.stringify({
+        version: 1,
+        originalConfig: Buffer.from(original).toString("base64"),
+        originalProfile: null,
+        injectedConfigHash: createHash("sha256").update(injected).digest("hex"),
+        injectedProfileHash: null,
+        pid: 999_999,
+        timestamp: new Date().toISOString(),
+      });
+      writeFileSync(join(testDir, "opencodex-journal.json"), journal);
+      const r = runScript(testDir, `
+        const fs = require("node:fs");
+        const path = require("node:path");
+        const { markSiblingStart, resetSiblingStartForTests } = require("./src/codex/sibling-start");
+        const { injectCodexConfig, restoreNativeCodex, restoreNativeCodexAsync } = require("./src/codex/inject");
+        const configPath = path.join(process.env.CODEX_HOME, "config.toml");
+        const journalPath = path.join(process.env.CODEX_HOME, "opencodex-journal.json");
+        const bytes = () => ({
+          config: fs.readFileSync(configPath, "utf8"),
+          journal: fs.existsSync(journalPath) ? fs.readFileSync(journalPath, "utf8") : null,
+        });
+        markSiblingStart(10100);
+        const sync = restoreNativeCodex();
+        const afterSync = bytes();
+        const async = await restoreNativeCodexAsync({ revalidateDesiredState: true });
+        const afterAsync = bytes();
+        const inject = await injectCodexConfig(10199, { port: 10199, providers: {}, defaultProvider: "openai" });
+        const afterInject = bytes();
+        // Unmarked, the same process restores: the mark is what held the bytes.
+        resetSiblingStartForTests();
+        const unmarked = restoreNativeCodex();
+        console.log(JSON.stringify({ sync, async, inject, afterSync, afterAsync, afterInject, unmarked, afterUnmarked: bytes() }));
+      `);
+      expect(r.status, r.stderr).toBe(0);
+      const out = JSON.parse(r.stdout.split("\n").at(-1)!);
+      for (const result of [out.sync, out.async]) {
+        expect(result.success).toBe(true);
+        expect(result.message).toContain("Client routing stays on the proxy at port 10100");
+        expect(result.artifacts.config).toMatchObject({ state: "skipped", changed: false });
+      }
+      expect(out.inject).toMatchObject({ success: true, status: "skipped", skippedReason: "sibling" });
+      for (const snapshot of [out.afterSync, out.afterAsync, out.afterInject]) {
+        expect(snapshot).toEqual({ config: injected, journal });
+      }
+      // Control: the unmarked restore does act (restores or, for an external provider, drops the
+      // stale journal), so the assertions above are not vacuous.
+      expect(out.afterUnmarked).not.toEqual({ config: injected, journal });
+    }
   });
 });

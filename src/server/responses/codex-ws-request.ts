@@ -4,6 +4,9 @@ import {
   CODEX_RESPONSES_LITE_METADATA_KEY,
 } from "../../codex/forward-transport-headers";
 
+/** Per-turn headers the WebSocket carries in `client_metadata` of each frame, not in the upgrade. */
+export const CODEX_WS_FRAME_HEADERS = ["x-codex-turn-state", "x-codex-turn-metadata"] as const;
+
 export const CODEX_RESPONSES_HTTP_URL = "https://chatgpt.com/backend-api/codex/responses";
 export const CODEX_RESPONSES_WS_URL = "wss://chatgpt.com/backend-api/codex/responses";
 export const WS_BETA = "responses_websockets=2026-02-06";
@@ -15,6 +18,8 @@ export interface PreparedCodexWsRequest {
   /** Original HTTP body/framing/options with only the canonical routing hint re-derived. */
   httpInit: RequestInit;
   canonical: boolean;
+  /** The request's model id, when the body names one: a model the relayed metadata may report. */
+  model?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -32,7 +37,7 @@ function applyLiteMetadata(body: Record<string, unknown>, headers: Headers): boo
     body.client_metadata = { ...(metadata as Record<string, string> | undefined),
       [CODEX_RESPONSES_LITE_METADATA_KEY]: lite };
   }
-  for (const name of ["x-codex-turn-state", "x-codex-turn-metadata"]) {
+  for (const name of CODEX_WS_FRAME_HEADERS) {
     const value = headers.get(name);
     const current = body.client_metadata as Record<string, string> | undefined;
     if (value !== null && !Object.hasOwn(current ?? {}, name)) {
@@ -80,7 +85,7 @@ export function prepareCodexWsRequest(url: string, init: RequestInit): PreparedC
         ? headers["openai-beta"]
         : `${headers["openai-beta"]}, ${WS_BETA}`
       : WS_BETA;
-    return { frameText, headers, httpInit, canonical };
+    return { frameText, headers, httpInit, canonical, ...(typeof body.model === "string" ? { model: body.model } : {}) };
   } catch {
     return null;
   }

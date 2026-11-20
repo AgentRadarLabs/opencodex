@@ -35,29 +35,15 @@ function mockFetch(responses: Array<Response | Error>): { calls: RequestInit[]; 
 }
 
 describe("kiro retry fetch", () => {
-  test("retries connection resets through the request executor with the next-dispatch label", async () => {
-    globalThis.fetch = (async () => { throw new Error("request bypassed custom executor"); }) as typeof fetch;
+  test("retries connection resets and broken pipes", async () => {
     for (const code of ["ECONNRESET", "EPIPE"]) {
       const error = Object.assign(new Error(`network failure: ${code}`), { code });
-      const recoveries: Array<string | undefined> = [];
-      let nextRecovery: string | undefined;
-      let calls = 0;
-      const executor = (async () => {
-        recoveries.push(nextRecovery);
-        nextRecovery = undefined;
-        calls += 1;
-        if (calls === 1) throw error;
-        return new Response("ok", { status: 200 });
-      }) as typeof fetch;
+      const mock = mockFetch([error, new Response("ok", { status: 200 })]);
 
-      const res = await fetchKiroWithRetry(request, {
-        timeoutMs: 5_000,
-        executor,
-        onRetry: recovery => { nextRecovery = recovery; },
-      });
+      const res = await fetchKiroWithRetry(request, { timeoutMs: 5_000 });
 
       expect(res.status).toBe(200);
-      expect(recoveries).toEqual([undefined, "connection-reset"]);
+      expect(mock.calls).toHaveLength(2);
     }
   });
 
@@ -85,7 +71,9 @@ describe("kiro retry fetch", () => {
       });
     }) as typeof fetch;
 
-    await expect(fetchKiroWithRetry(request, { timeoutMs: 1 })).rejects.toMatchObject({ name: "TimeoutError" });
+    const response = await fetchKiroWithRetry(request, { timeoutMs: 1 });
+    expect(response.status).toBe(504);
+    expect(await response.text()).toBe("Kiro upstream gateway timeout");
     expect(calls).toBe(1);
     expect(timeoutReasons).toHaveLength(1);
     expect((timeoutReasons[0] as Error).name).toBe("TimeoutError");
@@ -248,28 +236,23 @@ describe("kiro retry fetch", () => {
 
   test("does not replay ordinary 5xx responses", async () => {
     const mock = mockFetch([
-      new Response("temporarily unavailable", { status: 503, headers: { "Retry-After": "0" } }),
+      new Response("temporarily unavailable", { status: 500, headers: { "Retry-After": "0" } }),
       new Response("ok", { status: 200 }),
     ]);
     const res = await fetchKiroWithRetry(request, { timeoutMs: 5_000 });
-    expect(res.status).toBe(503);
+    expect(res.status).toBe(500);
     expect(mock.calls).toHaveLength(1);
   });
 
   test("falls back once from canonical runtime to the legacy endpoint for 404", async () => {
-    const recoveries: string[] = [];
     const mock = mockFetch([new Response("missing", { status: 404 }), new Response("ok", { status: 200 })]);
-    const res = await fetchKiroWithRetry(request, {
-      timeoutMs: 5_000,
-      onRetry: recovery => recoveries.push(recovery),
-    });
+    const res = await fetchKiroWithRetry(request, { timeoutMs: 5_000 });
     expect(res.status).toBe(200);
     expect(mock.calls).toHaveLength(2);
     expect(mock.urls).toEqual([
       "https://runtime.us-east-1.kiro.dev/",
       "https://q.us-east-1.amazonaws.com/",
     ]);
-    expect(recoveries).toEqual(["adapter-retry"]);
   });
 
   test("falls back for endpoint-specific 403 and connection-refused errors", async () => {

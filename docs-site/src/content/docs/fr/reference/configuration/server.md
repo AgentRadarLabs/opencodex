@@ -11,43 +11,48 @@ exécute des fonctionnalités d'assistance autour des demandes du fournisseur.
 | Champ | Type | Par défaut | Signification |
 | --- | --- | --- | --- |
 | `port` | `number` | `10100` | Port d'écoute proxy. |
-| `hostname?` | `string` | `"127.0.0.1"` | Adresse de liaison. Les liaisons hors bouclage nécessitent `OPENCODEX_API_AUTH_TOKEN`. |
-| `proxy?` | `string` | — | URL du proxy HTTP(S) sortant ou `${ENV_VAR}`. Appliquée à `HTTP_PROXY` / `HTTPS_PROXY` uniquement lorsque ces variables ne sont pas définies ; le bouclage reste dans `NO_PROXY`. |
+| `hostname?` | `string` | `"127.0.0.1"` | Adresse d’écoute. Hors bouclage, il faut une clé client `config.apiKeys` ou un token de données résolu depuis `OPENCODEX_API_AUTH_TOKEN`, puis `OCX_API_TOKEN_FILE`, puis le fichier privé installé `service-api-token`. Voir [Accès à distance](#remote-access). |
+| `proxy?` | `string` | — | URL du proxy HTTP(S) ou SOCKS5 sortant (`socks5://host:port`) ou `${ENV_VAR}`. Les URL HTTP s’appliquent à `HTTP_PROXY` / `HTTPS_PROXY` si elles sont vides. Les URL SOCKS5 utilisent le tunnel SOCKS5 intégré et sont aussi exposées via `ALL_PROXY` (`ocx start --socks5`); `HTTP(S)_PROXY` héritées sont effacées dans ce processus. Le bouclage reste dans `NO_PROXY`. |
 | `emptyCompletionRetry?` | `boolean` | `false` | Active une nouvelle tentative Responses identique lorsqu’une réponse ne contient ni texte ni appel d’outil. Cette tentative peut être facturée. `OCX_EMPTY_COMPLETION_RETRY=0` la désactive sans modifier la configuration ; les combinaisons et les tours de compactage routés restent exclus. |
-| `stallTimeoutSec?` | `number` | `300` | Nombre de secondes sans données en amont avant `response.incomplete`. Minimum : 1. |
-| `connectTimeoutMs?` | `number` | `200000` | Délai maximal par tentative pour DNS/TCP/TLS et les en-têtes finaux ; il prend fin avant la génération du corps. |
+| `stallTimeoutSec?` | `number` | `300` (public) / désactivé (local) | Secondes sans progression utile en amont (Responses et Chat natif) avant la coupure du flux. Sans réglage, un amont **local** (loopback, privé ou nom `.local`/`.lan`) est désactivé par défaut et un amont public vaut 300 s ; une valeur positive s'applique aux deux (minimum 1 s) ; `0` désactive partout le watchdog de silence. Pour Responses qui replie le SSE canonique ChatGPT en JSON non-streaming, un plafond total indépendant de 15 minutes subsiste même lorsque ce watchdog est désactivé. Les lectures de corps en attente de `/v1/responses/compact` partagent ce budget mais valent 300 s par défaut même pour un amont local ; une valeur explicite, y compris `0`, prime. |
+| `connectTimeoutMs?` | `number` | `200000` (public) / désactivé (local) | Délai par tentative entre l'envoi de la requête et le premier en-tête de réponse de l'amont (DNS/TCP/TLS et attente des en-têtes) ; il prend fin avant la génération du corps et est indépendant de `stallTimeoutSec`, qui régit le flux du corps. Sans réglage, un amont **local** (loopback, privé ou nom `.local`/`.lan`) est désactivé par défaut et un amont public vaut 200 s ; une valeur positive s'applique aux deux ; `0` (ou toute valeur non positive) désactive partout ce délai d'en-tête. La désactivation permet à un modèle local de passer plusieurs minutes en prompt prefill sur une requête volumineuse sans que l'horloge du premier en-tête ne coupe une requête saine. |
 | `shutdownTimeoutMs?` | `number` | `5000` | Délai de vidange gracieux avant l’annulation des tours actifs. |
 | `websockets?` | `boolean` | `false` | Annonce et autorise la route WebSocket Responses destinée aux clients. La valeur false maintient les clients sur HTTP/SSE ; elle ne désactive pas une optimisation WebSocket canonique admissible vers ChatGPT en amont. |
 | `corsAllowOrigins?` | `string[]` | `[]` | Origines exactes supplémentaires autorisées par CORS. Les origines de bouclage sont toujours autorisées. Les origines d'extensions de navigateur basées sur l'autorité telles que `chrome-extension://<extension-id>` sont prises en charge ; `*` n'est pas un caractère générique. Firefox et Safari régénèrent l'extension UUID (par installation / par lancement de navigateur), mettez donc à jour l'entrée lorsque l'origine change. |
-| `apiKeys?` | `OcxApiKey[]` | `[]` | Identifiants `ocx_…` générés, acceptés par l'API de gestion et l'authentification du plan de données sur les liaisons hors bouclage. Gérés depuis le tableau de bord. |
+| `apiKeys?` | `OcxApiKey[]` | `[]` | Identifiants `ocx_…` générés pour l'admission au plan de données sur les liaisons hors bouclage. Ils n'autorisent pas les API de gestion ; l'accès à la gestion utilise l'identifiant distinct décrit dans la [référence de l'API de gestion](/fr/reference/management-api/). Gérés depuis le tableau de bord. |
 | `storageCleanupPolicy?` | `StorageCleanupPolicy` | désactivé | Politique facultative de nettoyage des sessions archivées. Elle n'est jamais activée implicitement. |
 | `appOwnedMemoryBudgetMb?` | `number` | `256` | Plafond en Mio pour les journaux, caches, objets binaires et charges utiles de continuation évincables qui appartiennent à l'application. Plage : 64–4096 ; il ne s'agit pas d'un plafond RSS. |
+| `metricsExport.enabled?` | `boolean` | `false` | Active les métriques de requêtes agrégées, locales au processus, sur `GET /api/metrics` authentifié. Redémarrage requis ; lorsque désactivé, le chemin renvoie 404 et aucune activité d'export n'est démarrée. |
+| `serviceHealthRecovery.enabled?` | `boolean` | `false` | Récupération optionnelle du service en arrière-plan : un petit processus sentinelle interroge `/healthz` et, lorsque le proxy reste vivant mais ne répond plus pendant environ une minute de sondes consécutives, le termine pour que le gestionnaire de service (Planificateur de tâches, launchd, systemd, WinSW) le redémarre. Seul le processus enfant du service géré en lance une ; les requêtes détenues par le processus bloqué ne sont pas rejouées. Au plus trois récupérations par heure. Redémarrage requis. La récupération automatique exige une adresse de liaison numérique (ou le mappage localhost/générique par défaut) ; les noms de liaison DNS ne sont pas surveillés. Une adresse ou un port enregistré modifié arrête la surveillance. |
 | `codexAutoStart?` | `boolean` | `true` | Autorise le lanceur intermédiaire Codex à exécuter `ocx ensure` avant de démarrer Codex. Avec la valeur false, cette vérification ne fait rien. |
 | `codexShimAutoRestore?` | `boolean` | `true` | Restaure le lanceur intermédiaire installé après son remplacement par une mise à jour externe de Codex terminée. Désactivation par variable d'environnement : `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0`. |
 | `syncResumeHistory?` | `boolean` | `true` | Compatibilité historique Codex App réversible. Les métadonnées originales sont sauvegardées et restaurées par `ocx stop` / `ocx restore`. |
-| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | désactivé | Redirigez les appels Codex helper/shadow reconnus vers un modèle choisi tout en conservant l'effort de raisonnement configuré pour la requête. Le préfixe source par défaut est `gpt-5.6-luna` ; les clients plus anciens via 0.144.x utilisaient `gpt-5.4-mini`, que `sourceModels` peut restaurer. |
+| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | désactivé | Redirigez les appels Codex helper/shadow reconnus vers un modèle choisi tout en conservant l'effort de raisonnement configuré pour la requête. Le préfixe source par défaut est `gpt-6-luna`, `gpt-5.6-luna` ; les clients plus anciens via 0.144.x utilisaient `gpt-5.4-mini`, que `sourceModels` peut restaurer. |
 | `webSearchSidecar?` | `OcxWebSearchSidecarConfig` | activé lorsqu'il est utilisable | Options du service auxiliaire de recherche Web. |
 | `visionSidecar?` | `OcxVisionSidecarConfig` | activé lorsqu'il est utilisable | Options du service auxiliaire de description d'images. |
 | `images?` | `OcxImagesConfig` | sélection automatique OpenAI | Options de relais d'images autonomes pour Codex `image_gen`. |
+| `telemetry?` | `OcxTelemetryConfig` | activé par défaut après information d'un humain | État du consentement à la télémétrie quotidienne anonyme (`decision`, `decidedAt`, `noticeShownAt`). Rien n'est envoyé tant qu'une personne n'a pas vu l'avis ou donné son accord. Remplacé par `OCX_TELEMETRY=0` ou `DO_NOT_TRACK=1`. Voir [Télémétrie (`telemetry`)](#télémétrie-telemetry) et [Télémétrie et confidentialité](/fr/guides/telemetry/). |
 
 Si une ancienne version de développement a modifié les métadonnées de l'historique de reprise avant que la prise en charge de la sauvegarde n'existe, exécutez
 `ocx recover-history --legacy-openai --yes` pour forcer la récupération du fournisseur natif.
 La commande réétiquette chaque ligne `opencodex` contenant un message utilisateur, y compris l'historique légitime d'un fournisseur dédié ; consultez l'avertissement sur la portée complète dans la référence du cycle de vie avant de l'exécuter.
 
+### Délais et fin de réponse du Chat natif
+
+Le Chat natif utilise aussi `stallTimeoutSec` pendant l’attente de la sortie amont. Le texte non vide, le raisonnement, le refus, les mises à jour d’outils et les événements de fin renouvellent ce délai ; les commentaires de maintien de connexion, le rôle seul et les statistiques seules ne le renouvellent pas. L’attente d’un client lent suspend le décompte. Un blocage produit `upstream_stall_timeout` : un événement d’erreur en streaming, ou HTTP 502 sans streaming. Une annulation avant le résultat terminal renvoie une erreur d’annulation plutôt qu’une réponse partielle réussie. Le Chat sans streaming accepte les délimiteurs SSE LF et CRLF et les champs data multilignes.
+
+<a id="remote-access"></a>
+
 ## Accès à distance
 
-La liaison par défaut à `127.0.0.1` est limitée au bouclage. Une adresse hors bouclage telle que `0.0.0.0`
-exige un identifiant pour le plan de données : `OPENCODEX_API_AUTH_TOKEN` ou au moins une entrée `apiKeys`
-configurée. Pour utiliser le jeton d’environnement, exportez-le avant le démarrage :
+La liaison par défaut à `127.0.0.1` est limitée au bouclage. Hors bouclage, par exemple sur `0.0.0.0`, les requêtes de modèle exigent une clé client configurée dans `config.apiKeys` ou un token de données partagé. Les routes de gestion `/api/*` utilisent l’identifiant indépendant `OPENCODEX_ADMIN_AUTH_TOKEN` ou le token administrateur généré, y compris en bouclage. Un identifiant de données ne donne aucun accès de gestion ; ne donnez jamais le token administrateur à un client de modèle.
 
 ```bash
 export OPENCODEX_API_AUTH_TOKEN="your-secret-token"
 ocx start
 ```
 
-Le proxy refuse une liaison distante sans identifiant du plan de données. L’installation d’un service exige
-spécifiquement `OPENCODEX_API_AUTH_TOKEN` ; exportez-le avant `ocx service install` afin que launchd, systemd
-ou le Planificateur de tâches le reçoive. Les clients du plan de données peuvent envoyer :
+L’exemple utilise un token d’environnement. L’export est facultatif si un token est déjà disponible dans `OCX_API_TOKEN_FILE` ou le fichier privé `service-api-token`, ou si une clé client valide est configurée. `ocx service install` peut créer le fichier de token manquant ; il n’exige pas que cette variable soit exportée. Les clients de modèles peuvent envoyer :
 
 ```text
 x-opencodex-api-key: your-secret-token
@@ -59,15 +64,13 @@ indépendant décrit dans la [documentation de l’API de gestion](/fr/reference
 
 | Point de terminaison | `Authorization: Bearer` | `x-opencodex-api-key` | `x-api-key` |
 | --- | --- | --- | --- |
-| `/v1/responses` | non accepté | **obligatoire** | non accepté |
-| `/v1/chat/completions` | non accepté | **obligatoire** | non accepté |
+| `/v1/responses` | accepté | accepté | non accepté |
+| `/v1/chat/completions` | accepté | accepté | non accepté |
 | `/v1/messages` | accepté | accepté | accepté |
 | `/v1/messages/count_tokens` | accepté | accepté | accepté |
 | `/v1/models` | accepté | accepté | accepté |
 
-Responses et Chat Completions réservent `Authorization` à un éventuel transfert direct vers Codex ; seul
-l'en-tête d'admission dédié y est donc accepté. Les `apiKeys` générées depuis le tableau de bord peuvent remplacer le
-jeton d'environnement après le démarrage ; les valeurs candidates sont comparées en temps constant.
+Responses et Chat Completions acceptent un identifiant reconnu du plan de données dans `x-opencodex-api-key` ou, si cet en-tête dédié est absent ou vide après suppression des espaces, dans `Authorization: Bearer`. Un en-tête dédié non vide après suppression des espaces est prioritaire même s’il est invalide ; un bearer valide ne corrige pas son refus. Un bearer sans rapport ne donne aucun accès au proxy et `x-api-key` n’est pas accepté sur ces routes. Les `apiKeys` générées par le tableau de bord et le token de données partagé sont comparés en temps constant ; les identifiants de gestion ne donnent pas accès aux modèles.
 
 Messages et `count_tokens` continuent d'accepter les trois formes d'admission pour assurer la compatibilité avec les clients routés. Le
 transfert natif vers Anthropic est plus strict sur une liaison hors bouclage : l'admission du proxy doit utiliser
@@ -149,6 +152,35 @@ La commande `ssh -L` simple écoute sur votre interface de bouclage locale et co
 `0.0.0.0`. Liez explicitement avec `ssh -L 127.0.0.1:20100:localhost:10100` en cas de doute.
 :::
 
+## Télémétrie (`telemetry`)
+
+La télémétrie d'utilisation quotidienne anonyme n'est activée par défaut qu'après qu'une personne a vu l'avis d'information (dans la fenêtre du tableau de bord ou une invite de terminal interactif). Le bloc `telemetry` dans `config.json` enregistre cet état de consentement :
+
+```json
+{
+  "telemetry": {
+    "decision": "accepted",
+    "decidedAt": "2026-11-07T09:00:00.000Z",
+    "noticeShownAt": "2026-11-07T09:00:00.000Z"
+  }
+}
+```
+
+| Champ | Type | Par défaut | Signification |
+| --- | --- | --- | --- |
+| `telemetry.decision?` | `"accepted" \| "declined"` | non défini (indécis) | Choix explicite de l'utilisateur. `"declined"` désactive la télémétrie et supprime `<OPENCODEX_HOME>/telemetry-id.json` ; `"accepted"` active les rapports quotidiens. |
+| `telemetry.decidedAt?` | `string` (ISO 8601) | non défini | Horodatage UTC de l'enregistrement de `decision`. Seuls les jours calendaires UTC complets strictement postérieurs au jour UTC de `decidedAt ?? noticeShownAt` (`day > formatUtcDay(decidedAt ?? noticeShownAt)`) sont envoyés ; le jour du consentement et les jours antérieurs ne sont jamais envoyés rétroactivement. |
+| `telemetry.noticeShownAt?` | `string` (ISO 8601) | non défini | Horodatage UTC auquel un humain a vu l'avis dans le tableau de bord web ou un terminal interactif. Lorsque `decision` n'est pas défini, la télémétrie n'envoie de rapport que si `noticeShownAt` est défini (`default-on`) ; sans lui, le proxy reste en `awaiting-notice`. |
+
+Le point de terminaison du collecteur (`https://telemetry.opencodex.me/v1/events`) est une constante du code et ne peut pas être configuré dans `config.json`.
+
+Deux variables d'environnement remplacent `config.json` et désactivent immédiatement la télémétrie sans modifier `config.json` (observer l'une d'elles au démarrage ou lors d'un cycle enregistre aussi `ineligibleThroughDay` dans `<OPENCODEX_HOME>/telemetry-state.json` et supprime `<OPENCODEX_HOME>/telemetry-id.json`, de sorte que ces jours ne sont jamais envoyés ultérieurement) :
+
+- `OCX_TELEMETRY=0` (accepte aussi `false`, `off` ou `no`, insensible à la casse)
+- `DO_NOT_TRACK=1` (accepte aussi `true` ou `yes`, insensible à la casse)
+
+`ocx config set telemetry` et `ocx config unset telemetry` sont refusés, et `ocx config import` ignore tout bloc `telemetry` importé pour tous les appelants en préservant l'état existant ; utilisez plutôt `ocx telemetry enable` (nécessite un terminal humain interactif avec invite de confirmation, sinon échoue avec `agent_consent_required` / `tty_required`), `ocx telemetry disable`, `ocx telemetry status [--json]` ou le commutateur **Détails du proxy** du tableau de bord. Voir [Télémétrie et confidentialité](/fr/guides/telemetry/) pour le schéma complet et la politique de conservation.
+
 ## Nettoyage du stockage
 
 `storageCleanupPolicy` est désactivé par défaut. Lorsqu'il est activé, il s'exécute selon `startup`, `daily`, `weekly`
@@ -179,19 +211,29 @@ l'abonnement avec un avertissement lorsque la détection n'est pas concluante. V
 Codex utilise de petits modèles auxiliaires pour des tâches telles que les titres et les messages de commit. Activez
 `shadowCallIntercept` pour rediriger les préfixes de modèle source reconnus vers un autre modèle configuré. Le
 modèle de remplacement conserve l'effort de raisonnement configuré pour la requête. Définissez `sourceModels` uniquement lorsqu'un client utilise d'autres identifiants de modèles auxiliaires.
-L'interception dépend du modèle : toute requête dont l'identifiant de modèle nu correspond à `sourceModels`
-peut être redirigée, y compris une requête normale portant `request_kind: "turn"`.
-`x-codex-turn-metadata` n'exempte pas une requête correspondante.
+Un identifiant de modèle nu correspondant à `sourceModels` peut être intercepté, mais un tour utilisateur
+conserve son modèle si `x-codex-turn-metadata` contient à la fois `request_kind: "turn"` et `thread_source: "user"`.
+Les enfants identifiés par l'en-tête de connexion `x-openai-subagent: collab_spawn` (requête HTTP ou ouverture WebSocket) ou par les métadonnées
+`subagent_kind: "thread_spawn"` conservent aussi leur modèle. Sur WebSocket, seules les métadonnées de chaque
+trame dans `client_metadata["x-codex-turn-metadata"]` décident, jamais les métadonnées de tour de la connexion initiale.
+Des métadonnées absentes ou mal formées conservent le comportement d'interception existant. Les auxiliaires
+peuvent porter `request_kind: "turn"` ; ce champ seul ne les exempte pas. Ces règles couvrent les modèles et les combos.
 
 ```json
 {
   "shadowCallIntercept": {
     "enabled": true,
     "model": "gpt-5.5",
-    "sourceModels": ["gpt-5.6-luna"]
+    "sourceModels": ["gpt-6-luna", "gpt-5.6-luna"]
   }
 }
 ```
+
+### Quand la cible est indisponible
+
+Le remplacement est la seule destination choisie par l'opérateur : une cible qui ne se résout plus fait échouer l'appel auxiliaire au lieu de l'envoyer ailleurs. Lorsque le fournisseur de la cible est désactivé ou supprimé, ou que son combo n'existe plus, une requête interceptée renvoie `409` avec le code d'erreur `intercept_target_unavailable` avant tout envoi en amont. Le journal des requêtes enregistre le même code. La requête n'est pas transmise au modèle auxiliaire natif et ne se replie pas sur le fournisseur par défaut, car l'un comme l'autre changerait la destination, les identifiants et le coût sans votre choix. Une cible combo ou profil de routage continue de basculer entre ses propres membres. Une cible qualifiée comme `provider/model` dont le segment fournisseur ne désigne rien de configuré est traitée de la même façon, et l'API des réglages refuse de l'enregistrer. Un identifiant de modèle nu résolu via le fournisseur par défaut reste valide.
+
+Désactiver (`PATCH /api/providers?name=<provider>` avec `disabled: true`) ou supprimer un fournisseur vers lequel la cible se résout réussit toujours ; la réponse ajoute `dependentShadowIntercept: { model, enabled }` et le tableau de bord affiche un avertissement. Réactiver le fournisseur, ou choisir une autre cible, rétablit l'interception.
 
 ## Services auxiliaires
 
@@ -201,6 +243,7 @@ peut être redirigée, y compris une requête normale portant `request_kind: "tu
 | --- | --- | --- | --- |
 | `provider?` | `string` | sélection automatique OpenAI | Fournisseur personnalisé `openai-responses` à clé API, sélectionné explicitement pour `/v1/images/generations` et `/v1/images/edits`. Les identifiants gérés par le registre sont rejetés. |
 | `timeoutMs?` | `number` | `300000` | Délai d’expiration de l’ensemble de la demande pour une demande d’images autonome. |
+| `videoProvider?` | `string` | xAI | Fournisseur à clé d'API qui traite le pont `video_gen` en cours de tour avec ses propres `baseUrl` et clé. `xai` reste fixé à `https://api.x.ai/v1` ; les autres identifiants du registre sont refusés. Une valeur inutilisable renvoie son erreur à chaque appel `video_gen` et n'envoie rien. Voir [Pont vidéo](/fr/guides/video-bridge/#choisir-le-fournisseur-vidéo). |
 
 La sélection explicite échoue de manière sûre lorsque le fournisseur est absent, désactivé, incompatible ou ne dispose pas d'une
 clé utilisable ; elle ne se rabat jamais sur un autre service en amont payant. Le point de terminaison doit implémenter les routes de
@@ -210,7 +253,7 @@ l'API Images d'OpenAI et la forme de réponse attendue par Codex.
 
 | Champ | Type | Par défaut | Signification |
 | --- | --- | --- | --- |
-| `enabled?` | `boolean` | activé lorsqu'il est utilisable | Interrupteur principal. |
+| `enabled?` | `boolean` | activé lorsqu'il est utilisable | Interrupteur principal. Avec `false`, OpenCodex cesse d'intercepter `web_search` et l'intégration Codex écrit `web_search = "disabled"` dans `~/.codex/config.toml`. |
 | `backend?` | `"openai" \| "anthropic" \| "xai" \| "gemini" \| "exa"` | `openai` | Une valeur explicite est prioritaire ; l'absence de valeur sélectionne toujours `openai`. `anthropic` et `xai` ne s'exécutent que s'ils sont configurés explicitement ; `gemini` et `exa` restent réservés jusqu'à la livraison de leur executor. |
 | `model?` | `string` | dépendant du backend | `gpt-5.6-luna` pour OpenAI, `claude-sonnet-5` pour Anthropic ou `grok-4.6` pour xAI. L'héritage explicite `gpt-5.4-mini` migre au démarrage. |
 | `exaApiKey?` | `string` | aucun | Clé opérateur pour le backend `exa`. Écriture seule : les lectures de gestion ne renvoient jamais la valeur stockée. |
@@ -240,7 +283,7 @@ une garde d'inactivité, pas un délai de génération total.
 | --- | --- | --- | --- |
 | `enabled?` | `boolean` | activé lorsqu'il est utilisable | Commutateur principal de description d'images. |
 | `backend?` | `"openai" \| "anthropic"` | automatique | La valeur explicite prévaut ; si elle est omise, un identifiant OAuth Anthropic stocké et utilisable est privilégié, sinon `openai`. |
-| `model?` | `string` | dépendant du backend | `gpt-5.4-mini` pour OpenAI ou `claude-sonnet-5` pour Anthropic. |
+| `model?` | `string` | dépendant du backend | `gpt-5.6-luna` pour OpenAI ou `claude-sonnet-5` pour Anthropic. |
 | `maxDescriptionsPerTurn?` | `number` | `8` | Nouvelles descriptions des ratés du cache admises par tour principal. `0` désactive les appels ; les valeurs non valides utilisent la valeur par défaut. |
 | `timeoutMs?` | `number` | `45000` | Délai d'expiration de la récupération par le service auxiliaire. Entier 1–2147483647. |
 
@@ -258,3 +301,59 @@ compte et la charge de travail prévus.
 `runtimeRole` vaut `standalone` par défaut. Un hub utilise `hub.managementPublicOrigin`, `hub.managementIngress` limité au loopback (`enabled:false` si absent) et les identités exactes de `remoteGui.allowedTailscaleUsers` (liste vide si absente). La clé client reste dans `service-api-token`, jamais dans `config.json`; `service-api-token.prev` peut exister pendant une rotation. Les usages ne sont pas répliqués.
 
 `remoteGui.allowInsecureHttp` est un ancien no-op déprécié, conservé uniquement pour que les anciens fichiers passent encore le schéma strict. Supprimez-le de la configuration : les grants de pairing ne sont acceptés que sur loopback ou via HTTPS authentifié, et `true` ne réactive pas le pairing HTTP en clair.
+
+## Diagnostic réseau des quotas Codex
+
+Le champ `quotaRefresh` de la ligne du compte Codex principal décrit la récupération du quota, pas le quota restant ni les droits d’accès au modèle. Il peut être absent lorsque les données sont en cache ou qu’aucune récupération n’a eu lieu. La requête utilise l’environnement du service proxy en cours d’exécution, pas celui du terminal interactif. Sans `proxy`, l’environnement existant est conservé ; `"auto"` lit les paramètres HTTP/HTTPS statiques de Windows ou macOS au démarrage. Sur macOS, un proxy hérité empêche cette lecture. Sur macOS, un motif valide `*.<domain>` devient `.<domain>` : `foo.local` contourne le proxy pour `*.local`, `xlocal` non, et le nom racine `local` le contourne aussi. Les plages exactes `169.254/16`, `169.254.0.0/16` et `fe80::/10` sont ignorées avec un diagnostic : les adresses IP link-local passent par le proxy. Les autres plages CIDR, motifs glob et exceptions de noms simples refusent la découverte sans modifier l’environnement. Les adresses IP et `*` restent acceptés. PAC/WPAD, les paramètres SOCKS seuls et les changements à chaud ne sont pas pris en compte automatiquement. Un succès avec TUN ne valide pas à lui seul le chemin du proxy HTTP. Consultez [les commandes et les états en anglais](/reference/configuration/server/#codex-quota-network-diagnostics).
+
+### Forced Claude Code subagent model
+
+The Subagents page offers **Force all subagents onto one model**, off by default. Select an exposed roster-style id, such as `combo/tev-auto`, then enable the switch. The roster is offered first; unavailable saved roster entries cannot be force targets.
+
+`ocx agent subagents force combo/tev-auto` sets `claudeCode.subagentModelForce`; `ocx agent subagents force -` clears it. `ocx agent status` reports the setting. `GET /api/subagent-models` returns `force`, `forceAvailable`, and `forceStatus`; `PUT` accepts `{ "force": "combo/tev-auto" }` or `{ "force": null }` without changing the roster. Omitting `force` leaves it unchanged. Invalid or unexposed targets are rejected on write; stale targets are reported and skipped at launch.
+
+This takes effect on the **next routed `ocx claude` launch**, injecting `CLAUDE_CODE_SUBAGENT_MODEL` as an explicit proxy alias (with `[1m]` only for an authoritative million-token window; native Claude targets use a reversible native alias) and `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`. Each nonempty shell-exported variable independently wins. Native launches inject neither variable; plain `claude` is not affected. No plugin files or `settings.json` are modified by this setting.
+
+Claude Code **2.1.257 or newer** is required for FORCE. Plugin and built-in agents (including Explore/Plan) and per-call model arguments are overridden. Forks and subagent skills with `model: inherit` keep the main conversation model. The main loop and Haiku/small-fast sidecars are unaffected. Existing roster files remain available.
+
+The dashboard warns about old or unknown CLI versions, unavailable targets, and either variable already present in `settings.json` → `env` (which overrides launch env). Detection is read-only and server-local: it cannot inspect another launch shell, another machine, or project-local settings. An unknown result is not proof of force support.
+
+## Continuité de l’historique des pools
+
+Le plafond d’un pool s’applique au fournisseur canonique choisi par le routage, indépendamment du libellé de compte dans les journaux. Pour chaque fournisseur `P` actuellement configuré, OpenCodex associe automatiquement `h(pool, P)`, son alias de pool salé propre à cette installation, à `P` lors de la lecture des soldes. Cela inclut les soldes historiques conservés sous ce même alias. Les plafonds indépendants ne nécessitent ni association manuelle du fournisseur à lui-même ni calcul avec le sel.
+
+Les autres libellés historiques, y compris ceux contenant un numéro de compte, restent sans propriétaire confirmé. Chaque solde d’origine est compté une seule fois dans son groupe associé ; tout solde positif encore non associé est ajouté, par prudence, une fois à chaque pool candidat. Les montants réglés, réservés et non résolus comptent tous. Un historique inconnu peut donc limiter un pool inutilisé. Les noms actuels et l’ordre des comptes ne prouvent pas à quel fournisseur cet historique appartient. Les plafonds de racine et d’identité restent indépendants.
+
+Pour un historique dont vous avez vérifié le propriétaire, ajoutez une entrée dans `spendPoolAliases`, au premier niveau de `config.json`, en dehors de `spend`. La clé est l’alias salé exact du pool dans le journal de cette installation, composé de 32 caractères hexadécimaux minuscules ; la valeur est l’ID exact d’un fournisseur vérifié et actuellement configuré, sans espaces au début ni à la fin. Gardez le journal, le sel et les éléments justificatifs privés. L’alias propre d’un fournisseur configuré ne peut pas être attribué à un autre fournisseur. La validation est répétée lorsque les fournisseurs changent et lit le sel existant sans en créer.
+
+Les associations automatiques et explicites s’appliquent uniquement à la lecture : elles ne déplacent pas les soldes et n’inscrivent aucun lien d’identité dans le journal. Supprimer une association explicite rend l’historique inconnu, sauf si son alias est celui d’un fournisseur actuellement configuré. Une association invalide est rejetée à l’écriture ; une modification manuelle invalide conserve les plafonds mais bloque l’admission du pool.
+
+Un historique inconnu et inactif expire seulement quand sa dernière activité est strictement antérieure à la limite de `spend.retentionDays`. Un manque de capacité ne raccourcit pas ce délai pour un solde positif. Les réservations actives et leurs cibles restent protégées, même à zéro jeton. La suppression doit être enregistrée durablement avant de réduire le total utilisé pour l’admission.
+
+### Réservations et limite d’envoi
+
+Lorsqu’un plafond de racine, d’identité ou de pool s’applique, le premier envoi pour chaque cible ou clé nécessite une réservation dans la capacité normale de suivi. Sans réservation, aucun envoi n’atteint le fournisseur. Les nouvelles tentatives stables réutilisent les mêmes périmètres ; une autre cible ou clé nécessite une nouvelle réservation. `L` est la limite des envois physiques pour l’ensemble de la requête, figée au démarrage de la requête : quatre par défaut, ou jusqu’à dix-huit avec le profil de requête OAuth existant.
+
+L’activation des limites, les plafonds de jetons applicables à la racine, à l’identité et au pool, ainsi que `L`, sont déterminés au démarrage de chaque requête. Les changements de configuration s’appliquent uniquement aux requêtes démarrées après le changement. Une requête déjà en cours garde sa politique initiale pour toutes les nouvelles tentatives et continuations : activer ou abaisser un plafond ne la restreint pas davantage ; le relever ou le supprimer ne l’assouplit pas. Une requête commencée en observation seule reste dans ce mode jusqu’à sa fin.
+
+Le règlement final attend les rapports des envois démarrés. Un ID d’envoi n’est oublié qu’après enregistrement durable de sa comptabilité ; son solde demeure. La limite borne les envois, pas la facture : toute utilisation réelle supérieure à l’estimation reste comptabilisée. Sans plafond applicable, le comportement reste en observation seule, y compris l’omission des écritures lorsque la capacité de suivi est pleine. Aucun point de contrôle d’identité n’est ajouté.
+
+Claude CLI, CodeBuddy et Qoder comptent chaque invocation CLI comme un envoi et exigent une réservation normale avant le lancement. Les nouvelles tentatives et les tours d’outils internes au CLI ne consomment pas séparément la limite d’envois de la requête. Leur coût est réglé selon l’utilisation réelle rapportée, y compris la part dépassant l’estimation initiale.
+
+### Retour à 2.80.0 : contrat C
+
+Les nouveaux enregistrements utilisent le format v1 ordinaire et le domaine d’alias `pool`. La version 2.80.0 non modifiée les lit, compacte le journal et applique la rétention selon ses propres règles par libellé. Conservez le journal actuel et son sel : restaurer une ancienne copie perd les dépenses enregistrées depuis. Aucun correctif rétroporté, blocage du lanceur ou commande de rapprochement n’est nécessaire.
+
+Le retour à 2.80.0 ne garantit ni l’agrégation canonique ni le même solde disponible que si un trafic identique avait toujours été traité par 2.80.0. Lors d’une nouvelle mise à niveau, les associations automatiques des fournisseurs configurés et les correspondances explicites actuelles s’appliquent aux soldes d’origine encore conservés. Aucun nouveau point de contrôle ne dépend de métadonnées de liaison d’identité à préserver par l’ancien lecteur.
+
+Les journaux de versions expérimentales non publiées contenant `pool-current` ou `poolContinuity` sont exclus du contrat C, même après compactage. Leurs soldes d’origine restent un historique inconnu jusqu’à l’expiration normale, sans conversion ni suppression immédiate.
+
+Un enregistrement complet mais invalide, y compris un `null` final, bloque l’admission sous plafond. Le compactage peut conserver les données valides dans un point de contrôle propre, mais le refus reste actif jusqu’au redémarrage avec ce journal propre. Une dernière ligne JSON incomplète suit les règles de récupération existantes. Voir les limites et codes d’erreur dans la [référence anglaise](/reference/configuration/server/#historical-pool-continuity).
+
+## Classification des délais des upstreams locaux
+
+Cette classification règle les délais, pas les autorisations réseau. Sans requête DNS, les destinations HTTP(S) locales sont : `localhost` exact (casse indifférente, point final admis), `0.0.0.0`, loopback IPv4 (127/8), plages privées RFC 1918 et link-local (169.254/16), loopback IPv6, link-local (fe80::/10), unique-local (fc00::/7), équivalents IPv4-mapped et noms `.local`/`.lan`. Les autres noms DNS gardent les délais publics même s'ils résolvent vers loopback. Les destinations invalides, les schémas non pris en charge et `localhost.example` restent publics.
+
+Désactiver le délai d'en-tête préserve l'annulation client et toute échéance globale englobante. Un `stallTimeoutSec` explicitement positif borne le silence du corps local ; sans délais locaux header/stall configurés, aucune borne automatique ne précède les en-têtes. Le JSON local de Chat/Messages natif utilise le budget stall ; le JSON public conserve `max(connectTimeoutMs ?? 200000, 5000)`. Le corps compact conserve 300 secondes par défaut, même en local. Les budgets image/recherche restent inchangés.
+
+Le bloc facultatif `opencodeClientExport` accepte `headerTimeoutMs`, `chunkTimeoutMs` et `timeoutMs` : millisecondes positives ou `false` pour désactiver. Les valeurs absentes préservent les défauts OpenCode ; les champs invalides sont omis. Ces réglages couvrent tout le provider, dans options V1 et settings V2. Voir [modèles locaux lents](/guides/opencode/#slow-local-models-prefill-timeouts).

@@ -72,7 +72,7 @@ Grok Build 通过 Responses API 与 opencodex 通信。当路由声明推理档�
 
 即使在 loopback 上，Grok Build 对自定义模型也要求一个非空 API key。注入的条目携带的是占位符（`opencodex-loopback`）——opencodex 会忽略 loopback 连接的接入密钥，因此这里不涉及任何真实机密。
 
-**自动注册仅限 loopback。** 当 opencodex 绑定到非 loopback 主机时——包括通配符 `0.0.0.0` 和 `::`，它们会暴露所有网卡——请求需要你的真实接入令牌，而受管理区块无法安全地携带它。把字面令牌写进去会把你的密钥放进 `~/.grok/config.toml`，并在下次 `ocx start`/`ensure`/`restart` 时覆盖你在那里设置的内容。所以在这种情况下，opencodex 根本不会写入任何内容（并且会移除早先 loopback 绑定留下的任何区块），然后你需要在受管理标记之外自己配置这些模型，因为 opencodex 在那里做的任何事都不会覆盖它们。精确表结构见[手动方案](#manual-recipe-without-auto-registration)，并同时设置 `base_url`（从你运行 `grok` 的位置实际可达的主机）和 `api_key`（你的 `OPENCODEX_API_AUTH_TOKEN`）。
+**自动注册仅限 loopback。** 当 opencodex 绑定到非 loopback 主机时——包括通配符 `0.0.0.0` 和 `::`，它们会暴露所有网卡——请求需要你的真实接入令牌，而受管理区块无法安全地携带它。把字面令牌写进去会把你的密钥放进 `~/.grok/config.toml`，并在下次 `ocx start`/`ensure`/`restart` 时覆盖你在那里设置的内容。所以在这种情况下，opencodex 根本不会写入任何内容（并且会移除早先 loopback 绑定留下的任何区块），然后你需要在受管理标记之外自己配置这些模型，因为 opencodex 在那里做的任何事都不会覆盖它们。精确表结构见[手动方案](#手动方案不使用自动注册)，并同时设置 `base_url`（从你运行 `grok` 的位置实际可达的主机）和 `api_key`（你的 `OPENCODEX_API_AUTH_TOKEN`）。
 
 不要在这里把 `api_key` 换成 `env_key`。解析失败的 `env_key` 不会阻止请求——Grok 会回退到你的 xAI 会话令牌，并把它发送到该条目指定的 `base_url`，而对于局域网部署来说，这通常是一个并非 xAI 的明文 HTTP 端点。
 
@@ -93,11 +93,11 @@ model = "anthropic/claude-opus-4-8"
 model_provider = "opencodex"
 ```
 
-如果代理可通过网络访问，请把 `base_url` 指向 `grok` 实际可以连接的地址，并使用你的接入令牌：
+提供令牌前，请先配置 TLS 前端并使用其 HTTPS URL，或使用本地隧道的回环地址。Grok 会把 `api_key` 的字面值保存到 `~/.grok/config.toml`；请限制文件访问权限，并将其排除在版本控制和共享备份之外。
 
 ```toml
 [model_providers.opencodex]
-base_url = "http://192.168.1.10:10100/v1"   # the reachable host, not 127.0.0.1
+base_url = "https://proxy.example.com/v1"   # configured TLS frontend
 api_backend = "responses"
 api_key = "your-OPENCODEX_API_AUTH_TOKEN"
 

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OAUTH_PROVIDERS, runLogin } from "../../../src/oauth";
 import { inspectKiroCliSqlite, kiroCliInstallGuidance, loginKiro, readKiroCliSqlite, refreshKiroToken, resolveKiroApiRegion, resolveKiroProfileArn, resolveKiroRegion, settleKiroLoginTransaction } from "../../../src/oauth/kiro";
+import { KIRO_BUILDER_ID_SERVICE_PROFILE_ARN } from "../../../src/adapters/kiro-constants";
 import { removeTreeWithRetry } from "../../helpers/remove-tree";
 
 // Windows CI cold runners take 5-7s for the real SQLite create/inspect cycles here
@@ -456,6 +457,36 @@ describe("kiro oauth — import-first", () => {
     expect(nested.accountId).toBe(arn);
   });
 
+  test("the Profile block kiro-cli 2.32 prints after the whoami JSON does not hide the user", async () => {
+    const arn = "arn:aws:codewhisperer:us-east-1:123456789012:profile/ORGPROFILE";
+    seedKiroCliDb({ access_token: "aoa-org", refresh_token: "rt-org" }, { stateArn: arn });
+    const identity = JSON.stringify({
+      accountType: "IamIdentityCenter", email: "Org.User@Example.com", region: "us-east-1", startUrl: "https://org.awsapps.com/start",
+    });
+    const runner = async (args: string[]) => {
+      if (args[0] === "whoami") return { exitCode: 0, stdout: `${identity}\n\nProfile:\nKiroProfile-us-east-1\n${arn}\n\n` };
+      throw new Error(`unexpected Kiro CLI command: ${args[0]}`);
+    };
+
+    const cred = await loginKiro({}, { cliRunner: runner });
+
+    expect(cred).toMatchObject({ accountId: arn, email: "org.user@example.com" });
+  });
+
+  test("a second whoami value on the same line leaves the identity unread", async () => {
+    seedKiroCliDb({ access_token: "aoa-two", refresh_token: "rt-two" });
+    const runner = async (args: string[]) => {
+      if (args[0] === "whoami") {
+        return { exitCode: 0, stdout: `${JSON.stringify({ email: "first@example.com" })}${JSON.stringify({ email: "second@example.com" })}\n` };
+      }
+      throw new Error(`unexpected Kiro CLI command: ${args[0]}`);
+    };
+
+    const cred = await loginKiro({}, { cliRunner: runner });
+
+    expect(cred.email).toBeUndefined();
+  });
+
   test("a malformed whoami ARN is ignored without breaking the login (#993)", async () => {
     seedKiroCliDb({ access_token: "aoa-bad", refresh_token: "rt-bad" });
     const badRunner = async (args: string[]) => {
@@ -470,7 +501,7 @@ describe("kiro oauth — import-first", () => {
     expect(bad.kiro?.profileArn).toBeUndefined();
   });
 
-  test("an imported SQLite profileArn stays authoritative over whoami (#993)", async () => {
+  test("same-session whoami wins over a leftover sqlite profile ARN (#4435)", async () => {
     const sqliteArn = "arn:aws:codewhisperer:us-east-1:123456789012:profile/SQLITE";
     const whoamiArn = "arn:aws:codewhisperer:us-east-1:123456789012:profile/WHOAMI";
     seedKiroCliDb({ access_token: "aoa-both", refresh_token: "rt-both", profile_arn: sqliteArn });
@@ -479,7 +510,33 @@ describe("kiro oauth — import-first", () => {
       throw new Error("unexpected");
     };
     const cred = await loginKiro({}, { cliRunner: runner });
-    expect(cred.accountId).toBe(sqliteArn);
+    expect(cred.accountId).toBe(whoamiArn);
+    expect(cred.kiro?.profileArn).toBe(whoamiArn);
+  });
+
+  test("the Builder ID service profile ARN is not an account identity (#4435)", async () => {
+    seedKiroCliDb({
+      access_token: "aoa-builder",
+      refresh_token: "rt-builder",
+      profile_arn: KIRO_BUILDER_ID_SERVICE_PROFILE_ARN,
+    }, { stateArn: KIRO_BUILDER_ID_SERVICE_PROFILE_ARN });
+    const cred = await loginKiro({}, {
+      cliRunner: async args => {
+        if (args[0] === "whoami") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              email: "builder@example.test",
+              profileArn: KIRO_BUILDER_ID_SERVICE_PROFILE_ARN,
+            }),
+          };
+        }
+        throw new Error("unexpected");
+      },
+    });
+    expect(cred.accountId).toBeUndefined();
+    expect(cred.email).toBe("builder@example.test");
+    expect(cred.kiro?.profileArn).toBeUndefined();
   });
 
   test("a session switch between the SQLite read and whoami discards whoami's ARN (#993)", async () => {

@@ -23,7 +23,7 @@ interface ProviderAdapter {
 `AdapterEvent`'lere yükseltir. `fetchResponse`, bir adaptörün yeniden
 denemelere/zaman aşımlarına sahip olmasına izin verirken `runTurn`, tek bir HTTP
 getirmesini takip eden tek bir yanıt akışı olarak temsil edilemeyen aktarımları
-destekler. [`bridge.ts`](/tr/reference/architecture/#kopru-bridge) daha sonra
+destekler. [`bridge.ts`](/tr/reference/architecture/#köprü-bridge) daha sonra
 olayları Responses SSE'ye dönüştürür.
 
 ## `openai-chat`
@@ -141,6 +141,7 @@ Pro/Max için Bearer + `anthropic-beta`).
   (en az 1024 … en çok 32000) eşler, ardından çıktı payı ile güvenli bir
   `max_tokens` hesaplar ve düşünme etkinleştirildiğinde
   **`temperature`/`top_p`'yi bırakır** (Anthropic orada bunları yasaklar).
+- **Uyarlanabilir thinking gösterimi:** uyarlanabilir thinking modellerine (Opus 4.7+, Sonnet 5, Fable) `thinking.display: "summarized"` gönderilir; böylece uzun bir düşünme, Chat ve Responses istemcilerine dakikalarca heartbeat yerine reasoning deltaları olarak ulaşır. Reasoning özetini gizleyen bir istek (`reasoning.summary: "none"`) sağlayıcının varsayılanını korur. Ancak `api.anthropic.com` üzerindeki Opus 5.5 varsayılan olarak `display: "updates"` kullanır; açıkça `reasoning.summary: "concise"` veya `"detailed"` gönderildiğinde updates betası olmadan `"summarized"` seçilir. Bkz. [Opus 5.5 ilerleme güncellemeleri](/guides/providers/#claude-opus-55-progress-updates).
 - **Yapılandırılmış çıktı:** `type: "json_schema"` içeren Responses
   `text.format` ve Chat Completions `response_format` istekleri Anthropic
   `output_config.format` haline gelir. Format, uyumlu bir
@@ -201,22 +202,53 @@ veya Google Antigravity OAuth.
 **Kimlik Doğrulama:** Kiro kimlik bilgisinden bölge/profil meta verileriyle
 birlikte Bearer olarak Kiro OAuth erişim belirteci.
 
+`meteringEvent` kredileri `providerCredits` içinde ölçülür: bir fiziksel yanıttaki son değer tutulur, ayrı ücretlendirilen gönderimler ise isteğin toplam harcamasına eklenir. Tokenlardan kredi tahmini yapılmaz.
+
+Bir istek hesaba kabul edildikten sonra proxy, hesabın model listesini bölgesel yönetim
+hizmetinden arka planda okur. Gözlenen modeller yerleşik listeye eklenir; boş veya tanınmayan
+yanıt son geçerli listeyi korur. Üyelik yalnızca uygun hesaplar arasında tercih sağlar; bilinmeyen
+model kimlikleri de üst hizmete gönderilir. Bildirilen giriş sınırları bağlam penceresini
+bilgilendirir ve kısmi kanıtta yerleşik sınır kullanılır. Henüz hizmet vermemiş hesaplarda
+model listesi kanıtı bulunmayabilir.
+
 - Kiro `conversationState` oluşturur, Codex araçlarını ve araç sonuçlarını eşler
   ve Kiro hattı tarafından desteklenen görsel bloklarını gönderir.
 - `application/vnd.amazon.eventstream` kodunu çözer, metin/düşünme/araç
   olaylarını yeniden oluşturur, kesilmiş araç JSON'ını algılar ve yukarı akış
   belirteç sayılarını döndürmediği için kullanımı tahmin eder.
+- İstek başına en fazla 48 istemci aracı ve 96 KB dönüştürülmüş araç JSON'ı gönderir, her araç
+  açıklamasını 1.024 karaktere (`gpt-5.6-sol` için 9.216) kısaltır. Tool search ile yüklenen
+  araçlar ve Codex code-mode yürütme aracı önce alınır, atlanan araçlar modele bildirilir. Proxy
+  ortamında `OCX_KIRO_TOOL_BUDGET=off` tüm istemci kataloğunu, `OCX_KIRO_TOOL_DESCRIPTION_LIMIT=off`
+  tam açıklamaları göndermenizi sağlar. İkisi de istek dönüştürülürken okunur, tüm Kiro modellerine
+  uygulanır ve diğer sınırları değiştirmez. Bütçeyi kapatmak sınırın kendisini ortadan kaldırır:
+  önceliklendirilecek ya da atlanacak bir şey kalmaz. Bildirilen tüm araçlar bildirim sırasıyla
+  gönderilir, atlama bildirimi kaybolur ve Kiro'nun kabul ettiğinden fazlasını bildiren istemci
+  kırpılmış katalog yerine yukarı akıştan `ValidationException` alır. İstek boyutu da istemci
+  kataloğuyla birlikte büyür. Bu anahtarlar daha büyük isteği kabul ettiği ölçülmüş bir hesap için
+  geri çekilme seçeneğidir; aşırı büyük bir kataloğu güvenli hale getirme yolu değildir.
+- Kiro doğrulayıcısının reddettiği JSON Schema anahtar sözcüklerini (`pattern`, `minLength`,
+  `maximum`, `additionalProperties` ve 25 diğeri) araç ve yapılandırılmış çıktı şemalarından
+  çıkarır, ancak bir testin o modelde ölçtüğü anahtar sözcükleri bırakır. `claude-opus-4.5`
+  hepsini korur. `claude-opus-5.5`, Claude Desktop ve Claude Code kataloglarının taşıdığı on iki anahtar sözcüğü korur (`$schema`, `additionalProperties`, `pattern`, `format`, `minLength`, `maxLength`, `minimum`, `maximum`, `exclusiveMinimum`, `minItems`, `maxItems`, `propertyNames`),
+  bunlar üretim trafiğinde ölçüldü; `claude-sonnet-5.5` yalnızca `pattern` ve `maximum` anahtar sözcüklerini korur.
+  Diğerleri çıkarılmış kalır, çünkü hiçbir istek bunları bu modellere göndermedi. Diğer Claude
+  kimlikleri dahil öteki Kiro modelleri tam çıkarmayı korur. İstisna model ve anahtar sözcük
+  bazındadır, çünkü bu hat akıl yürütme çabasında Claude modellerini zaten ayırıyor ve Kiro'nun
+  reddettiği bir anahtar sözcük yalnızca bir ipucunu kaybettirmekle kalmayıp tüm isteği
+  başarısız kılıyor.
 - Özel olduğunda yapılandırılmış `baseUrl`'i birebir kullanır. Kurallı bir
   `runtime.{region}.kiro.dev` URL'si içe aktarılan kimlik bilgisinin API
-  bölgesini takip eder; bir uç nokta, imza, DNS veya bağlantı hatasından sonra
+  bölgesini takip eder; bir uç nokta, imza, DNS veya bağlantı hatasından ya da çıktı başlamadan alınan HTTP 502/503/504 yanıtından sonra
   `q.{region}.amazonaws.com`'a tek bir sınırlı geri dönüş için yalnızca bu
   kurallı şekil uygundur.
 - Yeniden oynatma güvenli bağlantı sıfırlama kurtarmasına, bu tek uygun uç nokta
   geri dönüşüne, HTTP 401'den sonra bir OAuth yenileme/yeniden oynatmaya ve
   geçici Kiro 429'ları için sınırlı kurtarmaya sahiptir. Paylaşılan bir soğuma
   süresi ve soğuma sonrası tek bir araştırma, eşzamanlı isteklerin bağımsız
-  yeniden deneme bütçelerini tüketmesini önler; sabit kota hataları ve sıradan
-  hizmet hataları yeniden oynatılmaz.
+  yeniden deneme bütçelerini tüketmesini önler; kota tükenmesi aynı hesapta yeniden
+  denenmez ve diğer hizmet hataları yeniden oynatılmaz. Tüm Kiro gönderimleri yapılandırılmış sağlayıcı çıkışını kullanır; başlık zaman aşımı 504 döndürür, istemci iptali isteği durdurur ve son HTTP 5xx gövdeleri sabit genel metin kullanır.
+- İki hesap kayıtlıysa hız sınırı reddi ilgili hesabı kısa süreliğine bekletir. Doğrulanmış aylık kota reddi (HTTP 400 veya 429) hesabı gözlenen sıfırlamaya ya da kanıtın süresinin dolmasına kadar dışlar. Doğrulanmış askıya alma (HTTP 403) hesabı geçici olarak karantinaya alır; sıradan bir 403 hesap değişimine yol açmaz. Redden sonraki hesap değişimi proaktif tercih kapalıyken de çalışır. İlk gönderimden önce hesap değiştirmek proaktif tercih gerektirir ve sağlayıcı ayarı genel ayardan önceliklidir. Aynı hesapta tamamlanan tur eski tükenme kararını temizler.
 - Akışsız ayrıştırıcısı web arama döngüsü için aynı olay akışını boşaltır.
 
 ### Tamamlama anlambilimi
@@ -268,15 +300,40 @@ tam olarak tekrarlasa bile, çünkü aşama doğruluğu kozmetik tekilleştirmed
 
 ### Akıl yürütme çabası
 
-`gpt-5.6-sol` ve `claude-opus-5` doğrulanmış yerel çaba desteğine sahiptir ve
-her model ailesi istek alanını farklı şekilde adlandırır. Seçilen `low`,
-`medium`, `high`, `xhigh` veya `max` değeri `gpt-5.6-sol` için
-`additionalModelRequestFields.reasoning.effort` olarak ve `claude-opus-5` için
-`additionalModelRequestFields.output_config.effort` olarak gönderilir. Diğer
-Kiro modelleri şu anda öykünülmüş akıl yürütme kullanır: opencodex yerel çaba
-alanları doğrulanmadığı için seçilen seviyeyi kullanıcı içeriğinde sınırlı
-düşünme talimatlarına dönüştürür. Bu modellerde bildirilen bir çaba denetimini
-yukarı akış yerel akıl yürütme desteğinin kanıtı olarak yorumlamayın.
+GPT-5.6 ailesi ve GPT-6 modelleri (`gpt-6-sol`, `gpt-6-luna`, `gpt-6.1-sol`, `gpt-6.1-terra`)
+`additionalModelRequestFields.reasoning.effort`, aşağıda listelenen Claude modelleri ise
+`additionalModelRequestFields.output_config.effort` alanını kullanır.
+`gpt-5.6-luna` ve `gpt-5.6-terra` için yalnızca doğrulanmış `low`, `medium`, `high` ve `max`
+seviyeleri yerel alandan gönderilir. Bu iki modelin yerel `xhigh` seviyesi doğrulanmadığı için mevcut
+sınırlı düşünme talimatlarıyla öykünme korunur. `gpt-5.6-sol` ve GPT-6 modelleri yerel `low`,
+`medium`, `high`, `xhigh` ve `max` davranışını aynı `reasoning.effort` alanı üzerinden sürdürür.
+
+Kiro `output_config.effort` alanını `claude-opus-5`, `claude-opus-5.5`, `claude-opus-4.8`,
+`claude-opus-4.7`, `claude-opus-4.6`, `claude-sonnet-5.5`, `claude-sonnet-5`, `claude-sonnet-4.6`
+ve `claude-haiku-5.5` için `low`, `medium`, `high`, `xhigh` ve `max` seviyelerinde kabul
+eder. Tek istisna `claude-opus-4.6` ile `claude-sonnet-4.6` modellerinin yerel `xhigh` seviyesini
+reddetmesidir; o seviye öykünülen düşünme bloğunu korur.
+
+Kiro'da `minimal` seviyesi yoktur. Yukarıdaki dokuz modelden `claude-opus-5` ve `claude-opus-5.5`
+dışındakiler, yerel çaba açılmadan önce çalışan bir isteği başarısız kılmamak için `minimal`
+seviyesinde öykünülen bloğu korur. Bu iki Opus 5 modeli ve yerel çaba kullanan GPT modelleri
+`minimal` seviyesini hiçbir şey gönderilmeden önce 400 `invalid_request_error` ile reddeder.
+
+Yüzeyler bu reddi farklı bildirir. Responses isteği `error.message` alanına modeli ve reddedilen
+seviyeyi belirten bir cümle koyar. Messages ve Chat Completions yolları aynı yere proxy'nin sabit
+metnini, `The provider rejected the request.`, koyar; ikisi de adaptörün ayrıntısını olduğu gibi
+aktarmak yerine kendi metniyle değiştirir. Modeli ve seviyeyi yalnızca Responses belirtir. Akışlı ve
+akışsız istekler bütün yüzeylerde aynı okunur: ret, sağlayıcıya giden istek gövdesi kurulurken oluşur;
+bu yüzden akış açılmaz ve sağlayıcıya çağrı yapılmaz.
+
+Çağıranın `ultra` değeri ayrıştırma sırasında `max` olur. `pinnedReasoningEffort`,
+`modelPinnedReasoningEfforts` ve `modelPinnedEfforts` pinleri daha sonra uygulanır. Yerel Kiro
+çabası kullanan modellerde adaptör pinlenmiş `ultra` değerini de `max` yapar. Öykünme kullanan
+modellerde pin düşürülür ve istek akıl yürütme sinyali olmadan gönderilir.
+
+`claude-haiku-4.5`, `claude-opus-4.5`, `claude-sonnet-4.5` ve
+yukarıda listelenmeyen Kiro modelleri her seviyede öykünme kullanır; çaba seçeneği yerel desteğin
+kanıtı değildir.
 
 ## `cursor`
 
@@ -308,6 +365,17 @@ başlığından Cursor OAuth/erişim belirteci.
   `unsafeAllowNativeLocalExec: true` yalnızca `nativeLocalExec` ayarlanmadığında
   eşdeğer kalır.
 
+## `devin`
+
+**Hedef:** Cognition'ın `exa.api_server_pb.ApiServerService/GetChatMessage` uç noktası; `server.codeium.com` üzerinde Connect akışı.
+**Kimlik doğrulama:** `provider.apiKey` veya iletilen authorization başlığındaki Devin/Cognition API anahtarı. Giriş önce kurulu Devin CLI'nin zaten tuttuğu kimlik bilgisini içe aktarmayı dener: `devin auth login`, CLI'nin kendi PKCE oturumunu tamamlar ve `devin-session-token`'ı kendi `credentials.toml` dosyasına yazar; bu, `SeatManagementService.RegisterUser`'ın tarayıcı girişi için ürettiği kimlikle aynıdır. Kullanılabilir bir CLI kimliği yoksa giriş, tarayıcıda Auth0 oturumuna geri döner ve yapıştırılan belirteci `RegisterUser` ile uzun ömürlü bir anahtara dönüştürür. `devin-cli` yalnızca kullanımdan kaldırılmış bir takma ad olarak kalır: `ocx login devin-cli` hâlâ `devin`'e yönlendirilir ve eski id ile kaydedilmiş bir yapılandırma başlangıçta yeniden yazılır.
+
+- Olağan fetch/parse yolu yerine `runTurn` kullanır. İstekler ve sunucu olayları `devin/cloud-direct/wire.ts` içindeki elle yazılmış protobuf çerçevelemesiyle işlenir.
+- Modeller hesaba göre `GetCascadeModelConfigs` ile keşfedilir; pakette olmayanlar istek anında hata vermek yerine listeden düşer.
+- Cognition araç açıklamaları için uzunluk sınırı ve birebir ifade engeli uygular. Bağdaştırıcı bilinen ifadeleri yeniden yazar, uzun açıklamaları kırpar.
+- Anahtarlar yenilenmez. Süresi dolduğunda veya iptal edildiğinde `ocx login devin` komutunu yeniden çalıştırın.
+- CLI içe aktarma yolu kullanıldığında yerel olan yalnızca kimlik bilgisidir; tur her iki yolda da Cognition'a gider. Önceki bir sürüm, `devin-cli` kimliği altında turu yerel bir `devin acp` alt sürecine karşı Agent Client Protocol oturumu olarak çalıştıran ikinci bir bağdaştırıcıyla geliyordu. Kaldırıldı: o bağdaştırıcıyı hâlâ adlandıran kayıtlı bir yapılandırma, `"devin-acp"` gibi özel adlı bir satır da dahil olmak üzere başlangıçta `devin`'e yeniden yazılır.
+
 ## `azure-openai` (takma ad: `azure`)
 
 **Hedefler:** **Azure OpenAI**. `openai-responses`'ı sarar (bu nedenle
@@ -318,6 +386,9 @@ başlığından Cursor OAuth/erişim belirteci.
   çözümlenmemiş şablon yer tutucusu içermediğini doğrular ve `Authorization`'ı
   `api-key` ile değiştirir. Yapılandırılan URL doğrudan Azure'un v1 Responses
   API'sini hedefler, bu nedenle adaptör `api-version` eklemez.
+- Başka bir sağlayıcının ürettiği akıl yürütme durumu için Responses kurtarmasını paylaşır:
+  `400 invalid_encrypted_content` aldığında isteği bu durum olmadan (şifreli içerik ve akıl
+  yürütme öğesinin `rs_…` kimliği) yalnızca bir kez yeniden gönderir.
 
 ## Görsel yardımcıları (`image.ts`)
 
@@ -328,4 +399,3 @@ Vizyon duyarlı adaptörler tarafından kullanılan paylaşılan yardımcılar:
 - `contentPartsToText(content)` — salt metin araç mesajları için içerik
   parçalarını metne düzleştirir (açıklanmayan bir görsel kısa bir `[image]`
   işaretçisi haline gelir, asla belirteç patlatan bir base64 bloğu olmaz).
-

@@ -1,4 +1,13 @@
+import { markProxyError } from "../lib/client-error-body";
 export class AnthropicRequestError extends Error {}
+
+/** A date-shaped Desktop ID can also name a genuine native model absent from discovery. */
+export class DesktopModelMappingUnavailableError extends AnthropicRequestError {
+  constructor() {
+    super("Claude Desktop model mapping is unavailable; refresh model discovery or reapply the connected hub profile");
+    markProxyError(this);
+  }
+}
 
 export type Rec = Record<string, unknown>;
 

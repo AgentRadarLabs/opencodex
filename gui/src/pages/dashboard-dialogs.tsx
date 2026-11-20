@@ -6,6 +6,9 @@ import {
 } from "./dashboard-shared";
 import type { useDashboardData } from "./use-dashboard-data";
 import { shadowSourceModelLabel } from "./shadow-call-source";
+import SubagentSurfaceWarningModal from "../components/SubagentSurfaceWarningModal";
+import PlaintextV2ConsentModal from "../components/PlaintextV2ConsentModal";
+import { SUBAGENT_SURFACE_GUIDE_URL } from "../subagent-surface";
 
 type Dash = ReturnType<typeof useDashboardData>;
 
@@ -19,6 +22,7 @@ export function DashboardDialogs(d: Dash) {
     effortCapHelpOpen, setEffortCapHelpOpen, effortCapHelpDialogRef,
     shadowCallHelpOpen, setShadowCallHelpOpen, shadowCallHelpDialogRef,
     shadowCall,
+    maAdvisory, maAdvisoryOpen, pendingMaMode, maBusy, keepMaMode, chooseMaV1, dismissMaSurfaceDialog,
   } = d;
 
   return (
@@ -69,7 +73,9 @@ export function DashboardDialogs(d: Dash) {
                   {updateCheck.updateAvailable ? t("dash.updateAvailable") : t("dash.updateCurrent")}
                 </span>
               </div>
-              <div className="muted update-command">{t("dash.updateCommand")} <code className="chip">{updateCheck.command}</code></div>
+              {updateCheck.command && (
+                <div className="muted update-command">{t("dash.updateCommand")} <code className="chip">{updateCheck.command}</code></div>
+              )}
               {updateCheck.reason === "source_checkout" && (
                 <div className="notice-warn" role="status"><IconAlert /> {t("dash.updateSource")}</div>
               )}
@@ -208,6 +214,25 @@ export function DashboardDialogs(d: Dash) {
           </div>
         </div>
       </dialog>
+      {pendingMaMode === "v2-plaintext" ? (
+        // Dedicated consent: one checkbox-gated PUT covers the experimental plaintext notice
+        // and the mode write; the generic advisory warning stays for every other reason.
+        <PlaintextV2ConsentModal
+          busy={maBusy}
+          onConfirm={() => { void keepMaMode(); }}
+          onDismiss={dismissMaSurfaceDialog}
+        />
+      ) : (pendingMaMode || maAdvisoryOpen) && (
+        <SubagentSurfaceWarningModal
+          reason={pendingMaMode ? "selection" : "advisory"}
+          mode={pendingMaMode ?? maAdvisory?.mode ?? "default"}
+          docsUrl={maAdvisory?.docsUrl ?? SUBAGENT_SURFACE_GUIDE_URL}
+          busy={maBusy}
+          onContinue={() => { void keepMaMode(); }}
+          onChooseV1={() => { void chooseMaV1(); }}
+          onDismiss={dismissMaSurfaceDialog}
+        />
+      )}
     </>
   );
 }

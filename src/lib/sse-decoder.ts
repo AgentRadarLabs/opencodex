@@ -56,6 +56,7 @@ export function sseFieldOffset(text: string, lineStart: number, lineEnd: number,
 
 /**
  * Decode text/event-stream records across arbitrary fetch chunk boundaries.
+ * CR, LF and CRLF terminate lines; a split CRLF is one delimiter.
  *
  * The final record is dispatched at EOF even when the upstream omits the trailing blank line or
  * final newline. That matters for compatible APIs that place a terminal event in the last bytes of
@@ -77,9 +78,12 @@ export async function* decodeServerSentEvents(
   const reader = source.getReader();
   const decoder = new TextDecoder();
   let lineBuffer = "";
+  // Keep field classification separate from the growing line. Re-slicing its
+  // prefix on every fragment can repeatedly flatten/copy a long string rope.
+  let linePrefix = "";
+  let skipLineFeed = false;
   let lineRawBytes = 0;
   let lineRetainedBytes = 0;
-  let skipLfAfterCr = false;
   let event: string | undefined;
   let eventBytes = 0;
   let dataLines: string[] = [];
@@ -102,8 +106,8 @@ export async function* decodeServerSentEvents(
   };
 
   const linePrefixAfter = (sourceValue: string, start: number, end: number): string => {
-    if (lineBuffer.length >= 6) return lineBuffer.slice(0, 6);
-    return (lineBuffer + sourceValue.slice(start, Math.min(end, start + 6 - lineBuffer.length))).slice(0, 6);
+    if (linePrefix.length >= 6) return linePrefix;
+    return linePrefix + sourceValue.slice(start, Math.min(end, start + 6 - linePrefix.length));
   };
 
   const accountedLineBytes = (rawBytes: number, prefix: string): number => {
@@ -131,6 +135,7 @@ export async function* decodeServerSentEvents(
       translatorBudget.releaseRetained(lineRetainedBytes, scope);
       lineRawBytes = nextRawBytes;
       lineRetainedBytes = nextRawBytes;
+      linePrefix = prefix;
     } catch (error) {
       reservation.release();
       throw error;
@@ -193,6 +198,7 @@ export async function* decodeServerSentEvents(
       translatorBudget.releaseRetained(retainedLineBytes, scope);
     };
     lineBuffer = "";
+    linePrefix = "";
     lineRawBytes = 0;
     lineRetainedBytes = 0;
     try {
@@ -283,22 +289,28 @@ export async function* decodeServerSentEvents(
     decoded: string,
   ): AsyncGenerator<ServerSentEvent | SseRecord> {
     let offset = 0;
-    if (skipLfAfterCr && decoded.length > 0) {
-      skipLfAfterCr = false;
-      if (decoded.charCodeAt(0) === 10) offset = 1;
-    }
+    // Cached positions of the next CR and LF at or after `offset`, found with the native search so
+    // every stream keeps linear scanning. -1 means this decoded string has none left; it is never
+    // searched again, which keeps LF-only and CR-only chunks linear too.
+    let nextCr = decoded.indexOf("\r");
+    let nextLf = decoded.indexOf("\n");
     while (offset < decoded.length) {
-      let lineEnd = offset;
-      while (lineEnd < decoded.length) {
-        const code = decoded.charCodeAt(lineEnd);
-        if (code === 10 || code === 13) break;
-        lineEnd += 1;
+      if (skipLineFeed) {
+        skipLineFeed = false;
+        if (decoded[offset] === "\n") {
+          offset++;
+          continue;
+        }
       }
-      if (lineEnd >= decoded.length) {
+      if (nextCr >= 0 && nextCr < offset) nextCr = decoded.indexOf("\r", offset);
+      if (nextLf >= 0 && nextLf < offset) nextLf = decoded.indexOf("\n", offset);
+      const newline = nextCr < 0 ? nextLf : nextLf < 0 ? nextCr : Math.min(nextCr, nextLf);
+      if (newline < 0) {
         appendLine(decoded, offset, decoded.length);
         return;
       }
-      appendLine(decoded, offset, lineEnd);
+      appendLine(decoded, offset, newline);
+      skipLineFeed = decoded[newline] === "\r";
       const accepted = acceptLine();
       if (accepted) {
         try {
@@ -307,12 +319,7 @@ export async function* decodeServerSentEvents(
           translatorBudget.releaseRetained(accepted.bytes, scope);
         }
       }
-      if (decoded.charCodeAt(lineEnd) === 13) {
-        if (lineEnd + 1 >= decoded.length) skipLfAfterCr = true;
-        offset = lineEnd + (decoded.charCodeAt(lineEnd + 1) === 10 ? 2 : 1);
-      } else {
-        offset = lineEnd + 1;
-      }
+      offset = newline + 1;
     }
   };
 

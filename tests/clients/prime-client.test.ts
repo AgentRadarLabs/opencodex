@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   ClientPathError,
   EXPORT_CLIENTS,
@@ -37,18 +38,17 @@ function context(): ExportContext {
 }
 
 describe("Prime Agent client config", () => {
-  /**
-   * The load-bearing claim of this client: Prime Agent is the pi coding agent
-   * under a different brand, so it reads the SAME models.json contract rather
-   * than a lookalike. Locking the two documents together is what keeps that
-   * claim true — if a future Pi-only change diverges, this fails here instead
-   * of silently shipping Prime users a config their agent rejects.
-   */
-  test("generates byte-for-byte the document Pi generates", () => {
-    const prime = buildClientConfigText("prime", context());
-    const pi = buildClientConfigText("pi", context());
-    expect(prime.format).toBe("json");
-    expect(prime.text).toBe(pi.text);
+  test("shares Pi's model contract and developer-role statement without Pi's session headers", () => {
+    const prime = buildClientConfig("prime", context()) as PiGeneratedConfig;
+    const pi = buildClientConfig("pi", context()) as PiGeneratedConfig;
+    expect(pi.providers[OPENCODE_PROVIDER_ID]!.compat).toEqual({ sendSessionAffinityHeaders: true, supportsDeveloperRole: false });
+    // Prime runs Pi's runtime, which sends `developer` unless told otherwise (#8864).
+    expect(prime.providers[OPENCODE_PROVIDER_ID]!.compat).toEqual({ supportsDeveloperRole: false });
+    const { compat: _primeCompat, ...primeBlock } = prime.providers[OPENCODE_PROVIDER_ID]!;
+    const { compat: _piCompat, ...piBlock } = pi.providers[OPENCODE_PROVIDER_ID]!;
+    expect(primeBlock).toEqual(piBlock);
+    expect(buildClientContribution("prime", context()).fragments[0]!.value)
+      .toEqual(prime.providers[OPENCODE_PROVIDER_ID]);
   });
 
   test("adds only providers.opencodex, wired to the loopback proxy", () => {
@@ -81,7 +81,7 @@ describe("Prime Agent client config", () => {
   test("resolves the agent-dir override and the documented destination", () => {
     expect(primeAgentDir({}, "/home/u")).toBe(join("/home/u", ".prime", "agent"));
     expect(primeConfigPath({}, "/home/u")).toBe(join("/home/u", ".prime", "agent", "models.json"));
-    expect(primeConfigPath({ PRIME_AGENT_CODING_AGENT_DIR: "/elsewhere" }, "/home/u")).toBe(join("/elsewhere", "models.json"));
+    expect(primeConfigPath({ PRIME_AGENT_CODING_AGENT_DIR: join(tmpdir(), "elsewhere") }, "/home/u")).toBe(join(join(tmpdir(), "elsewhere"), "models.json"));
     expect(primeConfigPath({ PRIME_AGENT_CODING_AGENT_DIR: "~/alt" }, "/home/u")).toBe(join("/home/u", "alt", "models.json"));
     // A relative override would name different files for the proxy and the
     // agent, which have different working directories.
@@ -91,7 +91,7 @@ describe("Prime Agent client config", () => {
   test("detects installation by the agent directory the override names", () => {
     const spec = INTEGRATION_CLIENTS.prime;
     expect(spec.detectDir({}, "/home/u")).toBe(join("/home/u", ".prime", "agent"));
-    expect(spec.detectDir({ PRIME_AGENT_CODING_AGENT_DIR: "/elsewhere" } as NodeJS.ProcessEnv, "/home/u")).toBe("/elsewhere");
+    expect(spec.detectDir({ PRIME_AGENT_CODING_AGENT_DIR: join(tmpdir(), "elsewhere") } as NodeJS.ProcessEnv, "/home/u")).toBe(join(tmpdir(), "elsewhere"));
   });
 
   test("ships as a loopback-only integration with no env var to export", () => {

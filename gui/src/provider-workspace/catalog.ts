@@ -8,6 +8,7 @@
  * Binning rules (applied in priority order):
  *  1. disabled === true              -> disabled
  *  2. keyOptional === true           -> ready  (key not required — not the same as free pricing)
+ *     subscription CLI adapter       -> ready  (`claude-cli`: the CLI owns the login; see subscription-cli.ts)
  *  3. authMode === "oauth"           -> ready  (credentials managed externally)
  *  4. authMode === "forward"         -> ready  (passes caller credentials through)
  *  5. authMode === "local"           -> ready  (local runtime, no key required)
@@ -23,11 +24,15 @@
  * over free.
  */
 
+import { isSubscriptionCliProvider } from "./subscription-cli";
+import type { ProviderDiscoverySummary } from "../models-groups";
+
 /**
  * Shape of a single provider value as it appears in the proxy config map.
  * The provider name is the Record key, not a field here.
  */
 export interface WorkspaceProvider {
+  anthropicOAuthInstance?: "anthropic2";
   adapter: string;
   baseUrl: string;
   hasApiKey?: boolean;
@@ -41,22 +46,34 @@ export interface WorkspaceProvider {
   /** Optional upstream HTTP version pin. Cursor defaults to HTTP/2 when omitted. */
   upstreamHttpVersion?: "auto" | "http1.1" | "h1" | "http2" | "h2";
   authMode?: "key" | "forward" | "oauth" | "local" | string;
+  googleMode?: "ai-studio" | "vertex" | "cloud-code-assist";
+  project?: string;
+  location?: string;
+  vertexCredentialKind?: "ambient" | "marker" | "reference" | "api-key";
+  /** Server-observed: this process minted a token from the ADC source requests would use now. */
+  vertexCredentialVerified?: boolean;
   keyOptional?: boolean;
   /** Free pricing (may still require an API key). */
   freeTier?: boolean;
   disabled?: boolean;
   note?: string;
   allowPrivateNetwork?: boolean;
+  preserveResponsesReasoningContent?: boolean;
   requestPacing?: {
     enabled?: boolean;
     requestsPerMinute?: number;
     minIntervalMs?: number;
-    models?: Record<string, { requestsPerMinute?: number; minIntervalMs?: number }>;
+    maxConcurrentRequests?: number;
+    models?: Record<string, { requestsPerMinute?: number; minIntervalMs?: number; maxConcurrentRequests?: number }>;
+    keySelection?: "active" | "round-robin";
+    keys?: { requestsPerMinute?: number; minIntervalMs?: number; maxConcurrentRequests?: number };
   };
   /** Codex account routing mode for the canonical `openai` forward provider. */
   codexAccountMode?: "direct" | "pool";
   /** Derived state of the two xAI Grok Responses model-adapter entries. */
   xaiResponsesOptInState?: boolean | "mixed";
+  initialModelSelection?: { status: "pending" | "ready" | "all-off"; modelCount?: number };
+  discovery?: ProviderDiscoverySummary;
 }
 
 /** Three-way pricing/ownership tier for a ready provider row. */
@@ -80,6 +97,8 @@ export interface WorkspaceSections {
   ready: WorkspaceItem[];
   /** Enabled providers that are missing required credentials (e.g. an API key). */
   needsSetup: WorkspaceItem[];
+  /** Credentials may be supplied by the proxy host but have not been verified. */
+  unverified: WorkspaceItem[];
   /** Providers explicitly disabled by the user. */
   disabled: WorkspaceItem[];
 }
@@ -135,12 +154,30 @@ export function hasLoopbackBaseUrl(baseUrl: string): boolean {
 }
 
 function isConfigurationReady(p: WorkspaceProvider): boolean {
+  // A subscription CLI row is ready by adapter alone: `keyOptional` is enriched from the
+  // registry only for the canonical `claude-cli` name, and a renamed or hand-authored row using
+  // that adapter still never reads a key.
   return p.keyOptional === true ||
+    isSubscriptionCliProvider(p) ||
     p.authMode === "oauth" ||
     p.authMode === "forward" ||
     p.authMode === "local" ||
     hasLoopbackBaseUrl(p.baseUrl) ||
-    p.hasApiKey === true;
+    p.hasApiKey === true ||
+    p.vertexCredentialVerified === true;
+}
+
+/** A keyless Vertex row can use host credentials, but the dashboard has not verified them. */
+export function isVertexProvider(p: WorkspaceProvider | WorkspaceItem): boolean {
+  return ("name" in p && p.name === "google-vertex" && (p.googleMode === undefined || p.googleMode === "vertex"))
+    || (p.adapter === "google" && p.googleMode === "vertex");
+}
+
+export function usesUnverifiedVertexCredentials(p: WorkspaceProvider | WorkspaceItem): boolean {
+  if (p.disabled || (p.authMode !== undefined && p.authMode !== "key") || !isVertexProvider(p)) return false;
+  if (p.vertexCredentialVerified === true) return false;
+  if (p.vertexCredentialKind) return p.vertexCredentialKind !== "api-key";
+  return !p.hasApiKey;
 }
 
 /**
@@ -164,10 +201,13 @@ export function isAccountProvider(name: string, p: WorkspaceProvider): boolean {
 /**
  * Free pricing (badge / filter / sort): `freeTier`, keyless free (`keyOptional`),
  * local runtimes, or loopback. Forward passthrough is NOT free — those are
- * account providers. Does **not** imply ready-without-key — use
- * `binProviderStatus` for readiness.
+ * account providers, and a subscription CLI row (`claude-cli`) is NOT free either:
+ * its `keyOptional` means the CLI owns the credential and bills the user's
+ * subscription, so it sorts, filters and groups with the paid API rows. Does **not**
+ * imply ready-without-key — use `binProviderStatus` for readiness.
  */
 export function isFreeProvider(p: WorkspaceProvider): boolean {
+  if (isSubscriptionCliProvider(p)) return false;
   return p.freeTier === true
     || p.keyOptional === true
     || p.authMode === "local"
@@ -229,6 +269,7 @@ export function buildProviderWorkspace(
 ): WorkspaceSections {
   const ready: WorkspaceItem[] = [];
   const needsSetup: WorkspaceItem[] = [];
+  const unverified: WorkspaceItem[] = [];
   const disabled: WorkspaceItem[] = [];
 
   for (const [name, p] of Object.entries(providers)) {
@@ -236,14 +277,16 @@ export function buildProviderWorkspace(
       disabled.push({ name, ...p });
       continue;
     }
-    if (isConfigurationReady(p)) {
+    if (usesUnverifiedVertexCredentials({ name, ...p })) {
+      unverified.push({ name, ...p });
+    } else if (isConfigurationReady(p)) {
       ready.push({ name, ...p, tier: providerTier(name, p) });
     } else {
       needsSetup.push({ name, ...p });
     }
   }
 
-  return { ready, needsSetup, disabled };
+  return { ready, needsSetup, unverified, disabled };
 }
 
 /**
@@ -269,12 +312,13 @@ export function applyActiveAccountReauth(
   return {
     ready: tag(sections.ready),
     needsSetup: tag(sections.needsSetup),
+    unverified: tag(sections.unverified),
     disabled: sections.disabled,
   };
 }
 
 /** Canonical status string for a single provider — config plus optional live-auth overlay. */
-export type ProviderStatus = "ready" | "needs-setup" | "disabled";
+export type ProviderStatus = "ready" | "needs-setup" | "unverified" | "disabled";
 
 /**
  * Returns the canonical status for a single WorkspaceProvider (or WorkspaceItem).
@@ -284,6 +328,7 @@ export type ProviderStatus = "ready" | "needs-setup" | "disabled";
 export function binProviderStatus(p: WorkspaceProvider | WorkspaceItem): ProviderStatus {
   if (p.disabled) return "disabled";
   if ("activeNeedsReauth" in p && p.activeNeedsReauth) return "needs-setup";
+  if (usesUnverifiedVertexCredentials(p)) return "unverified";
   if (isConfigurationReady(p)) return "ready";
   return "needs-setup";
 }

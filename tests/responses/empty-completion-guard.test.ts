@@ -8,6 +8,7 @@ import {
   isContentEvent,
   observeEmptyCompletion,
 } from "../../src/server/responses/empty-completion-guard";
+import { bridgeToResponsesSSE } from "../../src/bridge/sse";
 import type { AdapterEvent } from "../../src/types";
 
 function collect(source: AsyncIterable<AdapterEvent>): Promise<AdapterEvent[]> {
@@ -91,24 +92,6 @@ describe("empty-completion guard retry", () => {
     ]);
   });
 
-  test("native Anthropic server output is content and is never retried", async () => {
-    let continuations = 0;
-    const block = {
-      type: "anthropic_server_block" as const,
-      block: { type: "web_fetch_tool_result", tool_use_id: "srvtoolu_1", content: [] },
-    };
-    const events = await collect(guardEmptyCompletionEventStream({
-      firstEvents: eventsOf(block, { type: "done", stopReason: "pause_turn" }),
-      continuation: () => {
-        continuations += 1;
-        return eventsOf();
-      },
-    }));
-
-    expect(continuations).toBe(0);
-    expect(events).toEqual([block, { type: "done", stopReason: "pause_turn" }]);
-  });
-
   test("a reasoning-only terminal turn is retried once and the identical-turn retry succeeds", async () => {
     let continuations = 0;
     const events = await collect(guardEmptyCompletionEventStream({
@@ -128,8 +111,8 @@ describe("empty-completion guard retry", () => {
     }));
 
     expect(continuations).toBe(1);
-    // First attempt reasoning is released in order, then an explicit attempt
-    // boundary, retry reasoning, content, and merged-usage terminal.
+    // The first attempt's buffered reasoning is released in order, then the
+    // retry's reasoning, then the content, then the merged-usage terminal.
     expect(withoutHeartbeats(events)).toEqual([
       { type: "thinking_delta", thinking: "first attempt" },
       { type: "reasoning_raw_delta", text: "raw" },
@@ -140,17 +123,35 @@ describe("empty-completion guard retry", () => {
     ]);
   });
 
+  test("the discarded attempt's reasoning stays out of the retry's reasoning item", async () => {
+    const guarded = guardEmptyCompletionEventStream({
+      firstEvents: eventsOf({ type: "thinking_delta", thinking: "discarded" }, { type: "done" }),
+      continuation: () => eventsOf(
+        { type: "thinking_delta", thinking: "retry" },
+        { type: "text_delta", text: "answer" },
+        { type: "done" },
+      ),
+    });
+    const sse = await new Response(bridgeToResponsesSSE(guarded, "fixture-model")).text();
+    const reasoning = sse.split("\n")
+      .filter(line => line.startsWith("data: {"))
+      .map(line => JSON.parse(line.slice(6)) as { type: string; item?: { type: string; summary?: { text: string }[] } })
+      .filter(event => event.type === "response.output_item.done" && event.item?.type === "reasoning")
+      .map(event => event.item!.summary!.map(part => part.text).join(""));
+    expect(reasoning).toEqual(["discarded", "retry"]);
+  });
+
   test("usage is merged across attempts", async () => {
     const events = await collect(guardEmptyCompletionEventStream({
       firstEvents: eventsOf(
         { type: "thinking_delta", thinking: "..." },
-        { type: "done", usage: { inputTokens: 100, outputTokens: 0, cachedInputTokens: 40 } },
+        { type: "done", usage: { inputTokens: 100, outputTokens: 0, cachedInputTokens: 40, providerCredits: 0.04 } },
       ),
       continuation: () => eventsOf(
         { type: "tool_call_start", id: "c1", name: "run" },
         { type: "tool_call_delta", arguments: "{}" },
         { type: "tool_call_end" },
-        { type: "done", usage: { inputTokens: 200, outputTokens: 30, reasoningOutputTokens: 12 } },
+        { type: "done", usage: { inputTokens: 200, outputTokens: 30, reasoningOutputTokens: 12, providerCredits: 0.01 } },
       ),
     }));
 
@@ -161,6 +162,7 @@ describe("empty-completion guard retry", () => {
       totalTokens: 330,
       cachedInputTokens: 40,
       reasoningOutputTokens: 12,
+      providerCredits: 0.05,
     });
   });
 

@@ -14,7 +14,7 @@
  * behavior at its own commit, which a runtime placeholder here would break.
  */
 import type { OcxConfig } from "../types";
-import type { ProviderModelDiscoveryFilter } from "../providers/registry";
+import type { ProviderModelDiscoveryFilter, ProviderModelDiscoveryPredicate } from "../providers/registry";
 
 /**
  * The non-CAS JSON record for the Codex integration.
@@ -448,8 +448,11 @@ export interface CatalogProviderDiscoveryPolicySnapshot {
   readonly finalMethod: "GET" | "POST";
   readonly finalUrl: string;
   readonly filter: CatalogDiscoveryPolicyField<ProviderModelDiscoveryFilter | undefined>;
+  readonly preferFirst: CatalogDiscoveryPolicyField<readonly ProviderModelDiscoveryPredicate[] | undefined>;
   readonly maxResponseBytes: number;
   readonly maxModels: number;
+  /** Operator opt-in `modelDiscovery.skipInvalidRows` (#7910). */
+  readonly skipInvalidRows: boolean;
   readonly trustedOpenAiApi: CatalogTrustedOpenAiApiPolicySnapshot;
 }
 

@@ -55,7 +55,8 @@ tam olarak neyi değiştirmeniz gerektiğini söyler:
   edemez.
 Katkıda bulunan PR'ları (depo yazma izni olmayan yazarlar) taslak olarak açılır
 ve açıklamadaki dört kutulu incelemeye hazırlık kontrol listesi tamamlanana
-kadar orada kalır: yerel CI yeşil, dal en son `dev` commit'inde, tüm doğru Codex
+kadar orada kalır: gerekli yerel doğrulama başarılı
+(komutlar, sonuçlar ve tam test paketi istisnaları belgelenmiş), dal en son `dev` commit'inde, tüm doğru Codex
 ve CodeRabbit bulguları düzeltildi ve incelemeye hazır onayı. Her kutu
 işaretlendikten sonra kontrol, PR'ı incelemeye hazır olarak işaretler ve
 `MAINTAINERS.md` dosyasında listelenen bakımcıları bilgilendirir (yazar hariç).
@@ -71,7 +72,7 @@ Bir tamamlama kabul edilmeden önce kapı, kontrol listesinin kendisinin kontrol
 edebileceği iddiaları doğrular: dal en son `dev` commit'inde veya en fazla 10
 commit gerisinde olmalı ve geçerli head üzerinde bir inceleme botu tarafından
 yazılan her Codex ve CodeRabbit inceleme konusu çözülmelidir (diğer yazarların
-çözülmemiş konuları engellemez). Yerel CI kutusu yalnızca bir yazar beyanıdır —
+çözülmemiş konuları engellemez). Gerekli yerel doğrulama kutusu yalnızca bir yazar beyanıdır —
 fork katkıda bulunanları depo CI'ını başlatamaz; bir bakımcının başlatması
 gerekir — bu nedenle kapı bunu asla çürütmez; yeni bir push yine de her kutuyu
 sıfırlar. Fark aralığının dışına düşen ve yalnızca geçerli head üzerindeki bir
@@ -93,17 +94,9 @@ PR-head kodu yürütülmez.
   lint veya tip bastırmaları, odaklanmış veya atlanmış testler, boş catch
   blokları, düzenlenen üretilmiş çıktılar ve manifestosu olmadan değiştirilen
   bir kilit dosyası (lockfile) açık bir onay etiketine ihtiyaç duyar. Bir kaynak
-  dosyadaki yalnızca yorum değişikliği bir davranış değişikliği değildir ve test
-  gerektirmez.
-- **Çapraz platform CI.** Test paketi her çekme isteği için Linux'ta parçalı
-  (sharded) ve macOS'ta tam olarak çalışır. Windows, dağıtım sınırında çalışır —
-  `main` veya `preview` dalına yükseltmede — bu nedenle yavaş veya kararsız bir
-  Windows çalıştırıcısı çekme isteğinizin ne zaman yeşile döneceğine karar
-  veremez.
-Bu, temel dalı ne olursa olsun **her** çekme isteği için çalışır — temeli başka
-bir açık PR'ın head'i olan yığılmış (stacked) bir alt öğe dahil. İşlerin çalışıp
-çalışmayacağına temel dal değil `paths:` filtresi karar verir: yalnızca
-dokümanlara veya `devlog/` dizinine dokunan bir PR hiçbir şeyi kuyruğa almaz.
+  dosyadaki yalnızca yorum değişikliği bir davranış değişikliği değildir ve yeni
+  bir regresyon testi gerektirmez. [Yerel test politikası](/tr/contributing/) yine geçerlidir.
+- **CI.** Yayınlama, CI, sürümler ve dallar için [İngilizce kaynak belgeye](/contributing/) bakın.
 
 - **Tür etiketi (Type label).** `label` denetimi, PR başlığınızdan `bug` /
   `enhancement` / `documentation` / `chore` etiketlerini türetir. Tanınabilir
@@ -122,7 +115,7 @@ engellemez.
 `enforce-target` ve `label` güvenilen varsayılan dal otomasyonunu kullanır. PR
 kapısı, her ikisi de depo varsayılan dalından yüklenen `pull_request_target`
 üzerinde ve CodeRabbit `status` olaylarında çalışır; bu nedenle yazma yeteneğine
-sahip davranış yalnızca kapı revizyonu `main` dalına yükseltildikten sonra
+sahip davranış yalnızca kapı revizyonu varsayılan dala ulaştıktan sonra
 değişir. Çapraz platform CI iş akışı `pull_request` üzerinde çalışır ve
 hedeflenen dalda yer aldığı anda yürürlüğe girer.
 
@@ -142,3 +135,13 @@ değildir: belirtilen neden çözüldükten sonra yeniden açın veya temiz bir
 tanesiyle değiştirin. Neden açık değilse sorun.
 
 
+
+## Eski bir inceleme hazırlığı listesini güncelleme
+
+Denetim eski yerel CI ifadesini bulursa PR açıklamasını değiştirmez. İlk maddeyi botun
+belirttiği metinle değiştirin, dört kutunun işaretini kaldırın ve kaydedin. Bot bu adımı
+onaylayana kadar bekleyin; gösterilen commit’i doğrulayın, dört kutuyu işaretleyin ve yeniden
+kaydedin. Yalnızca metni değiştirip dört işareti korumak yeni doğrulama sayılmaz. Yeni bir
+push veya hedef dal değişikliği bu kaydı geçersiz kılar. Bu işlem ve normal kalite kontrolleri
+tamamlanana kadar denetim başarısız, PR taslak kalır. Kayıt zamanı kontrol noktasıyla aynıysa
+açıklama gövdesini tekrar düzenleyip daha sonra kaydedin; yalnızca başlığı değiştirmek yetmez.

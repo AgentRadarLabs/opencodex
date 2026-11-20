@@ -9,20 +9,34 @@
  * Design of record: devlog/_fin/260802_client_toggle_api/040_wp4_management_api.md.
  */
 import { readFileSync } from "node:fs";
+import { LinkApplyBusyError, withLinkApply } from "../../client/link-home";
+import { saveConfigPreservingClaudeCode } from "../../config";
+import { listAsideProfileStates, type AsideProfilesInput } from "../../integrations/aside-profiles";
+import {
+  handleAsideProfileRoutes, asideJournalResponse, asideRestoreResponse,
+  asideJournalDeleteResponse, type AsideProfileRouteOptions,
+} from "./aside-profile-routes";
+import { hermesProfileListResponse, hermesRequestScope, scopeHermesProfileRequest } from "./hermes-profile-routes";
+import { HermesProfileError } from "../../integrations/hermes-profiles";
 import type { IntegrationIO } from "../../integrations/config-io";
+import { createClineIO } from "../../integrations/cline-io";
 import { matchesOperationResult } from "../../integrations/journal";
 import {
   INTEGRATION_CLIENT_IDS,
   isIntegrationClientId,
   type IntegrationClientId,
 } from "../../integrations/registry";
-import { readIntegrationState } from "../../integrations/state";
+import { detectRaycast, type RaycastInstall } from "../../integrations/raycast-detect";
+import { readIntegrationState, readOwnedDroidReasoningDefaults } from "../../integrations/state";
+import { droidReasoningModels, validateDroidReasoningDefaults } from "../../clients/config-export";
+import { isExportModelNames, supportsAliasModelNames, type ExportModelNames } from "../../clients/config-export/model-names";
 import { createIntegrationStateStore, type IntegrationStateStore } from "../../integrations/store";
 import {
   applyIntegrationCoordinated,
   disableIntegrationCoordinated,
   overwriteIntegrationCoordinated,
   restoreIntegrationCoordinated,
+  type CoordinatedIntegrationOptions,
   type IntegrationRestoreInput,
   type IntegrationWriteInput,
   type WriteRefused,
@@ -35,12 +49,22 @@ import {
   setIntegrationMutationFlightTestHook,
 } from "../../integrations/mutation-flight";
 import { jsonResponse } from "../auth-cors";
+import { isRouteClientId, type RouteClientIntent } from "../../link/route-intent";
+import { prepareHomeIntegrationDecision, recordHomeIntegrationDecision } from "./home-integration-decision";
 import { readManagementJsonBody, rethrowManagementBodyTooLarge } from "./body";
-import type { ManagementContext } from "./context";
-import { loadExportModels } from "./model-rows";
+import { managementInferencePort, type ManagementContext } from "./context";
+import { exportSnapshotIdentity, loadExportModels, previewExportSnapshot } from "./model-rows";
+import {
+  previewIntegration,
+  type IntegrationMutationPlan,
+  type IntegrationPlanOperation,
+  type PreviewRequest,
+} from "../../integrations/mutation-plan";
 
 
 const INTEGRATION_ROUTE_PREFIX = "/api/client-integrations/";
+const INTEGRATION_COLLECTION_PATH = "/api/client-integrations";
+const INTEGRATION_HISTORY_PATHS = ["/api/client-integrations/journal", "/api/client-integrations/restore"];
 export { INTEGRATION_MUTATION_TERMINAL_MS };
 
 type IntegrationStateRecord = Awaited<ReturnType<typeof readIntegrationState>>;
@@ -50,6 +74,19 @@ type RestoreResult = Awaited<ReturnType<typeof restoreIntegrationCoordinated>>;
 
 export type IntegrationStateEnvelope = {
   clientId: IntegrationClientId;
+  /**
+   * Raycast only, and only on the single-client read. Custom Providers is a
+   * Pro feature, so a file that is `current` can still be one Raycast ignores;
+   * this is the fact that lets status and the GUI say so. It is not part of
+   * the shared `IntegrationStatus`, which describes the file, not the app.
+   */
+  raycast?: RaycastInstall;
+  droidReasoning?: {
+    models: Array<{ model: string; label: string; efforts: string[] }>;
+    defaults: Record<string, string>;
+  };
+  /** The Hermes profile a profile-scoped read describes (#7674). */
+  hermesProfile?: string;
 } & IntegrationStateRecord;
 
 export interface IntegrationStateListEnvelope {
@@ -85,10 +122,12 @@ export interface IntegrationJournalRow {
    * is what a user reaches for right after the mistake.
    */
   deletable: boolean;
+  profileId?: number;
 }
 
 export interface IntegrationToggleBody {
   enabled: boolean;
+  modelNames?: ExportModelNames;
   /**
    * Opt in to replacing a conflicted block with the one opencodex would write.
    *
@@ -114,6 +153,8 @@ let integrationMutationTestHooks: {
    */
   store?: IntegrationStateStore;
   run?: (operation: () => Promise<unknown>) => Promise<unknown>;
+  afterWriterStart?: () => void;
+  afterBoundSnapshot?: () => Promise<void>;
 } | null = null;
 
 /**
@@ -132,12 +173,54 @@ export function setIntegrationPathTestHooks(hooks: { env?: NodeJS.ProcessEnv; ho
   integrationPathTestHooks = hooks;
 }
 
+/**
+ * Raycast detection override for tests. The real detector spawns `defaults` and
+ * reads the developer's own subscription state, which is exactly the kind of
+ * host fact a route test must not depend on.
+ */
+let raycastDetectTestHook: (() => RaycastInstall) | null = null;
+
+export function setRaycastDetectTestHook(hook: (() => RaycastInstall) | null): void {
+  raycastDetectTestHook = hook;
+}
+
 /** The `env`/`home` overrides, spread into every registry-resolving call. */
 function pathOverrides(): { env?: NodeJS.ProcessEnv; home?: string } {
   return {
     ...(integrationPathTestHooks?.env ? { env: integrationPathTestHooks.env } : {}),
     ...(integrationPathTestHooks?.home ? { home: integrationPathTestHooks.home } : {}),
   };
+}
+
+/** A selected Hermes profile's environment and explicit target; nothing for any other request. */
+function scopedPathOverrides(ctx: ManagementContext, clientId: IntegrationClientId): Pick<IntegrationWriteInput, "env" | "home" | "resolvedPaths"> {
+  const scope = clientId === "hermes" ? hermesRequestScope(ctx.req) : undefined;
+  return scope?.resolvedPaths ? { ...pathOverrides(), env: scope.env, resolvedPaths: { ...scope.resolvedPaths } } : pathOverrides();
+}
+
+/** Flight keys carry the profile, so a second profile is busy instead of joining the first one's write. */
+function scopedFlightKey(ctx: ManagementContext, key: string): string {
+  const scope = hermesRequestScope(ctx.req);
+  return scope?.resolvedPaths ? `hermes-profile:${scope.profile.name}:${key}` : key;
+}
+
+/** A Hermes-scoped request may only ever see Hermes operations. */
+function outsideHermesScope(ctx: ManagementContext, clientId: IntegrationClientId): boolean {
+  return hermesRequestScope(ctx.req) !== undefined && clientId !== "hermes";
+}
+
+/** The selected profile's boundary, as a writer refusal; null when it holds or nothing is pinned. */
+function hermesBoundaryRefusal(ctx: ManagementContext): WriteRefused | null {
+  const scope = hermesRequestScope(ctx.req);
+  try {
+    scope?.assertBoundary();
+    return null;
+  } catch (error) {
+    return {
+      ok: false, reason: "unsafe", state: "unsafe", clientId: "hermes",
+      message: error instanceof Error ? error.message : "Hermes profile cannot be changed safely",
+    };
+  }
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -162,13 +245,18 @@ export function setIntegrationMutationFlightTestHooks(
     /** Binds the WHOLE request — reads, writes and journal — to one store. */
     store?: IntegrationStateStore;
     run?: (operation: () => Promise<unknown>) => Promise<unknown>;
+    afterWriterStart?: () => void;
+    afterBoundSnapshot?: () => Promise<void>;
   } | null,
 ): void {
   integrationMutationTestHooks = hooks;
   setIntegrationMutationFlightTestHook(hooks?.run ?? null);
   // Path overrides are part of the same isolation contract: clearing flights
   // while leaving a temp home bound would let the next suite write real files.
-  if (hooks === null) integrationPathTestHooks = null;
+  if (hooks === null) {
+    integrationPathTestHooks = null;
+    raycastDetectTestHook = null;
+  }
 }
 
 /**
@@ -177,23 +265,108 @@ export function setIntegrationMutationFlightTestHooks(
  * while handing the writer a separate default store, so a test could not bind
  * the whole operation to a temp root (A-gate round 12).
  */
-function integrationStore(): IntegrationStateStore {
-  return integrationMutationTestHooks?.store ?? createIntegrationStateStore();
+function integrationStore(ctx?: ManagementContext): IntegrationStateStore {
+  // A selected Hermes profile owns its own store; every other request keeps the root.
+  return (ctx ? hermesRequestScope(ctx.req)?.store : undefined)
+    ?? integrationMutationTestHooks?.store ?? createIntegrationStateStore();
+}
+
+function asideOptions(ctx: ManagementContext): AsideProfileRouteOptions {
+  let input: AsideProfilesInput | undefined;
+  return {
+    input: () => input ??= {
+      config: ctx.config,
+      port: managementInferencePort(ctx),
+      models: () => loadExportModels(ctx.config),
+      store: integrationStore(),
+      ...pathOverrides(),
+      io: integrationMutationTestHooks?.io,
+      lockSeams: integrationMutationTestHooks?.lockSeams,
+      persistConfig: ctx.deps.saveConfigPreservingClaudeCode ?? saveConfigPreservingClaudeCode,
+    },
+    failure: result => writerFailureResponse("aside", result, ctx),
+  };
+}
+
+/**
+ * Which Aside requests are a Home decision, and the profiles each may enable: a toggle of one
+ * profile or all of them, or a profile restore. Undefined for reads, previews, journal and sync.
+ */
+async function asideDecisionScope(ctx: ManagementContext, known: unknown): Promise<readonly number[] | "all" | undefined> {
+  // The paths handleAsideProfileRoutes owns: the whole set, the profile collection, one profile,
+  // and one profile's restore.
+  const match = /^\/api\/client-integrations\/aside(?:\/profiles(?:\/(0|[1-9][0-9]*)(\/restore)?)?)?$/.exec(ctx.url.pathname);
+  if (!match) return undefined;
+  const restore = match[2] !== undefined && ctx.req.method === "POST";
+  const toggle = match[2] === undefined && ctx.req.method === "PUT";
+  if (!toggle && !restore) return undefined;
+  const raw = match[1] ?? ctx.url.searchParams.get("profile");
+  const id = raw !== null && /^(0|[1-9][0-9]*)$/.test(raw) && Number.isSafeInteger(Number(raw)) ? Number(raw) : undefined;
+  if (restore) return id === undefined ? [] : [id];
+  const body = known !== undefined ? known : await readJsonBody({ ...ctx, req: ctx.req.clone() });
+  if (!isPlainRecord(body) || body.enabled !== true) return [];
+  return id === undefined ? "all" : [id];
+}
+
+/** A file client's Home decision as its ownership record stands after a restore. */
+function ownedIntent(store: IntegrationStateStore, clientId: IntegrationClientId): RouteClientIntent {
+  const owner = store.readRecords()[clientId];
+  return { enabled: Boolean(owner),
+    ...(owner?.modelNames && (clientId === "hermes" || clientId === "commandcode") ? { modelNames: owner.modelNames } : {}) };
 }
 
 async function buildIntegrationWriteInput(
   clientId: IntegrationClientId,
   ctx: ManagementContext,
   store: IntegrationStateStore,
+  droidReasoningDefaults?: Record<string, string>,
+  modelNames?: ExportModelNames,
 ): Promise<IntegrationWriteInput> {
   return {
     clientId,
     models: await loadExportModels(ctx.config),
     config: ctx.config,
-    port: Number(ctx.url.port) || ctx.config.port,
+    port: managementInferencePort(ctx),
+    ...(droidReasoningDefaults === undefined ? {} : { droidReasoningDefaults: { ...droidReasoningDefaults } }),
+    ...(modelNames === undefined ? {} : { modelNames }),
     store,
     io: integrationMutationTestHooks?.io,
-    ...pathOverrides(),
+    ...scopedPathOverrides(ctx, clientId),
+  };
+}
+
+/**
+ * The same input a mutation would build, from the read-only roster.
+ *
+ * It differs from the mutation's in exactly one way, and the difference is deliberate: the roster
+ * comes from `previewExportModels`, which gathers without running the initial-selection finalizer
+ * that persists configuration. Everything else is shared, so a preview and the commit that follows
+ * it cannot disagree for any reason except the state genuinely moving.
+ */
+function buildIntegrationPreviewInput(
+  clientId: IntegrationClientId,
+  ctx: ManagementContext,
+  store: IntegrationStateStore,
+  droidReasoningDefaults?: Record<string, string>,
+  modelNames?: ExportModelNames,
+): { input: IntegrationWriteInput; identity: string } | null {
+  const snapshot = previewExportSnapshot(ctx.config);
+  // No cached roster means no honest snapshot to plan against. Gathering one here would make a
+  // read refresh credentials and write the provider cache, which is the thing preview must not do.
+  if (snapshot === null) return null;
+  return {
+    identity: snapshot.identity,
+    input: {
+      clientId,
+      models: snapshot.models,
+      config: ctx.config,
+      port: managementInferencePort(ctx),
+      ...(droidReasoningDefaults === undefined ? {} : { droidReasoningDefaults: { ...droidReasoningDefaults } }),
+      ...(modelNames === undefined ? {} : { modelNames }),
+      store,
+      io: integrationMutationTestHooks?.io,
+      ...scopedPathOverrides(ctx, clientId),
+    },
   };
 }
 
@@ -222,7 +395,157 @@ function invalidClientResponse(ctx: ManagementContext): Response {
   }, 400, ctx.req, ctx.config);
 }
 
+/** Bind an explicitly scoped restore before profile delegation or mutation. */
+function restoreClientScopeResponse(ctx: ManagementContext, opId: string, expectedClientId: unknown, pathClientId?: IntegrationClientId): Response | null {
+  if (pathClientId !== undefined) {
+    if (expectedClientId !== undefined && (typeof expectedClientId !== "string" || !isIntegrationClientId(expectedClientId))) return invalidClientResponse(ctx);
+    if (expectedClientId !== undefined && expectedClientId !== pathClientId) return jsonResponse({ error: "restore identity does not match the client path", code: "integration_client_mismatch" }, 409, ctx.req, ctx.config);
+    expectedClientId = pathClientId;
+  }
+  if (expectedClientId === undefined) return null;
+  if (typeof expectedClientId !== "string" || !isIntegrationClientId(expectedClientId)) return invalidClientResponse(ctx);
+  try {
+    const operation = integrationStore(ctx).findOperation(opId);
+    if (!operation) return jsonResponse({ error: "integration operation not found", code: "integration_operation_not_found", opId }, 404, ctx.req, ctx.config);
+    if (operation.clientId !== expectedClientId) return jsonResponse({ error: "integration operation belongs to a different client", code: "integration_client_mismatch" }, 409, ctx.req, ctx.config);
+    return null;
+  } catch (error) {
+    return internalErrorResponse(error, ctx);
+  }
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.values(value).every(item => typeof item === "string");
+}
+
+function invalidDroidDefaultsResponse(ctx: ManagementContext, message: string): Response {
+  return jsonResponse({ error: message, code: "invalid_droid_reasoning_defaults" }, 400, ctx.req, ctx.config);
+}
+
+function readModelNames(ctx: ManagementContext, body: Record<string, unknown>, client: string, operation: string): ExportModelNames | Response | undefined {
+  if (!Object.hasOwn(body, "modelNames")) return undefined;
+  if (!isExportModelNames(body.modelNames) || !supportsAliasModelNames(client)
+    || (operation !== "apply" && operation !== "overwrite")) {
+    return jsonResponse({ error: "modelNames must be alias or routed and requires Hermes or Command Code apply or overwrite", code: "invalid_model_names" }, 400, ctx.req, ctx.config);
+  }
+  return body.modelNames;
+}
+
+function readDroidReasoningDefaults(
+  ctx: ManagementContext,
+  body: Record<string, unknown>,
+  clientId: string,
+  operation: IntegrationPlanOperation,
+): Record<string, string> | Response | undefined {
+  if (!Object.hasOwn(body, "droidReasoningDefaults")) return undefined;
+  if (clientId !== "droid" || (operation !== "apply" && operation !== "overwrite")) {
+    return invalidDroidDefaultsResponse(ctx, "droidReasoningDefaults is allowed only for Droid apply or overwrite");
+  }
+  const defaults = body.droidReasoningDefaults;
+  return isStringRecord(defaults)
+    ? defaults
+    : invalidDroidDefaultsResponse(ctx, "droidReasoningDefaults must map model names to effort strings");
+}
+
+/**
+ * No cached model roster, so there is nothing honest to plan against.
+ *
+ * Answered as a bounded refusal rather than by gathering one: discovery refreshes credentials and
+ * writes the provider cache, and a preview that did either would be a write wearing a read's name.
+ * The caller opens the models view or performs the mutation directly.
+ */
+function previewUnavailableResponse(ctx: ManagementContext): Response {
+  return jsonResponse({
+    error: "no model roster is cached yet, so this change cannot be planned",
+    code: "integration_preview_unavailable",
+  }, 409, ctx.req, ctx.config);
+}
+
+/**
+ * A confirmed plan, or a reason the request cannot carry one.
+ *
+ * Both fields or neither. A half-bound request is rejected rather than quietly treated as
+ * unbound, because dropping one half would answer 200 to a caller who believed their
+ * confirmation was being checked.
+ */
+function planBindingOf(
+  body: Record<string, unknown>,
+): { operation: IntegrationPlanOperation; fingerprint: string } | "none" | "half" | "unknown-operation" {
+  const { operation, planFingerprint } = body;
+  if (operation === undefined && planFingerprint === undefined) return "none";
+  if (operation === undefined || typeof planFingerprint !== "string" || planFingerprint.length === 0) return "half";
+  if (operation !== "apply" && operation !== "overwrite" && operation !== "disable" && operation !== "restore") {
+    return "unknown-operation";
+  }
+  return { operation, fingerprint: planFingerprint };
+}
+
+function halfBoundResponse(ctx: ManagementContext): Response {
+  return jsonResponse({
+    error: "operation and planFingerprint must be sent together",
+    code: "invalid_preview_binding",
+  }, 400, ctx.req, ctx.config);
+}
+
+/**
+ * Re-plan and compare before the mutation runs.
+ *
+ * The fingerprint is an optimistic token, never authorization: management authentication and
+ * every ownership rule still apply. What it adds is that a confirmation stops meaning anything
+ * the moment the state it described moved, and the refusal carries a fresh plan so the operator
+ * decides again against what is true now.
+ */
+function stalePlanGuard(
+  clientId: IntegrationClientId,
+  ctx: ManagementContext,
+  store: IntegrationStateStore,
+  request: PreviewRequest,
+  fingerprint: string,
+  capturedIdentity: string | null,
+  droidReasoningDefaults?: Record<string, string>,
+  modelNames?: ExportModelNames,
+): {
+  revalidate: NonNullable<CoordinatedIntegrationOptions["revalidate"]>;
+  response: () => Response | null;
+} {
+  let stale: IntegrationMutationPlan | "unavailable" | null = null;
+  return {
+    revalidate: async frozen => {
+      /*
+       * Plan the coordinator's OWN frozen input, never a freshly built one. Rebuilding here let
+       * the check validate against one roster while the mutation wrote from another, because an
+       * ordinary load can replace the snapshot at any time and nothing serialises that against
+       * this lock. The captured identity is verified separately, so a replacement is detected
+       * without ever swapping the roster this mutation is about to use.
+       */
+      if (exportSnapshotIdentity(ctx.config) !== capturedIdentity) {
+        const refreshed = await buildIntegrationPreviewInput(clientId, ctx, store, droidReasoningDefaults, modelNames);
+        stale = refreshed === null ? "unavailable" : previewIntegration(refreshed.input, request);
+        return { ok: false, reason: "conflict", state: "conflict", clientId, message: "the model roster changed while confirming" };
+      }
+      const plan = previewIntegration(frozen, request);
+      if (plan.canApply && plan.fingerprint === fingerprint) return null;
+      stale = plan;
+      return { ok: false, reason: "conflict", state: plan.state, clientId, message: "that confirmation no longer describes this file" };
+    },
+    response: () => {
+      if (stale === null) return null;
+      if (stale === "unavailable") return previewUnavailableResponse(ctx);
+      return jsonResponse({
+        error: "integration preview is stale",
+        code: "integration_preview_stale",
+        plan: stale,
+      }, 409, ctx.req, ctx.config);
+    },
+  };
+}
+
 function internalErrorResponse(error: unknown, ctx: ManagementContext): Response {
+  // A selected Hermes profile whose boundary stopped holding is a refusal, not a server fault.
+  if (error instanceof HermesProfileError) {
+    return jsonResponse({ error: error.message, code: error.code, clientId: "hermes" }, error.status, ctx.req, ctx.config);
+  }
   return jsonResponse({
     error: error instanceof Error ? error.message : String(error),
     code: "integration_internal_error",
@@ -239,6 +562,34 @@ async function readJsonBody(ctx: ManagementContext): Promise<unknown | Response>
       code: "invalid_json_body",
     }, 400, ctx.req, ctx.config);
   }
+}
+
+/**
+ * `ocx sync` refreshes an already-connected Pi file through this route instead of rebuilding it
+ * in the CLI process. Pi may carry raw nested selectors, and a raw selector is only safe when the
+ * proxy that will serve it proves it routes to the same model (#8172). Proving it against the
+ * CLI's own saved configuration and router cache could write a selector this proxy routes
+ * elsewhere, so the refresh runs here, against this process's config, router and roster.
+ */
+export const PI_SYNC_PATH = "/api/client-integrations/pi/sync";
+
+async function piSyncResponse(ctx: ManagementContext): Promise<Response> {
+  const body = await readJsonBody(ctx);
+  if (body instanceof Response) return body;
+  if (!isPlainRecord(body) || Object.keys(body).length !== 0) {
+    return jsonResponse({ error: "Pi sync expects an empty object", code: "invalid_pi_sync_body" }, 400, ctx.req, ctx.config);
+  }
+  const { refreshOwnedCatalogIntegrations } = await import("../../integrations/catalog-refresh");
+  const results = await refreshOwnedCatalogIntegrations({
+    config: ctx.config,
+    port: managementInferencePort(ctx),
+    models: () => loadExportModels(ctx.config),
+    store: integrationStore(),
+    ...pathOverrides(),
+    ...(integrationMutationTestHooks?.io ? { io: integrationMutationTestHooks.io } : {}),
+  }, ["pi"]);
+  const ok = results.every(result => result.ok);
+  return jsonResponse({ ok, clientId: "pi", results }, ok ? 200 : 207, ctx.req, ctx.config);
 }
 
 function writerFailureResponse(
@@ -331,10 +682,14 @@ async function handleJournalDelete(ctx: ManagementContext): Promise<Response> {
       code: "invalid_op_id",
     }, 400, req, ctx.config);
   }
+  if (!hermesRequestScope(ctx.req)) {
+    const aside = await asideJournalDeleteResponse(ctx, opId, asideOptions(ctx));
+    if (aside) return aside;
+  }
   try {
-    const store = integrationStore();
+    const store = integrationStore(ctx);
     const operation = store.findOperation(opId);
-    if (!operation) {
+    if (!operation || outsideHermesScope(ctx, operation.clientId)) {
       // Already retired, or never existed. Both are 404: the tombstone hides
       // the row from findOperation, so a double-click is idempotent here
       // rather than a second deletion of something.
@@ -391,12 +746,58 @@ async function handleJournalDelete(ctx: ManagementContext): Promise<Response> {
 }
 
 export async function handleIntegrationRoutes(ctx: ManagementContext): Promise<Response | null> {
+  // Aside delegates before the ordinary client handler. Reject unsupported intent before that
+  // delegation can enumerate profiles, load catalogs, or write a different preference.
+  let asideBody: unknown;
+  if (/^\/api\/client-integrations\/aside\/profiles(?:\/|$)/.test(ctx.url.pathname)
+    && (ctx.req.method === "PUT" || ctx.req.method === "POST")) {
+    const body = await readJsonBody({ ...ctx, req: ctx.req.clone() });
+    if (body instanceof Response) return body;
+    asideBody = body;
+    if (isPlainRecord(body)) {
+      const naming = readModelNames(ctx, body, "aside", "apply");
+      if (naming instanceof Response) return naming;
+    }
+  }
+  const hermesBase = { store: integrationStore(), ...pathOverrides() };
+  const hermesProfiles = await hermesProfileListResponse(ctx, hermesBase, () => loadExportModels(ctx.config),
+    (scope, models) => readIntegrationState({
+      clientId: "hermes", models, config: ctx.config,
+      port: managementInferencePort(ctx), store: scope?.store ?? hermesBase.store, ...pathOverrides(),
+      ...(scope?.resolvedPaths ? { env: scope.env, resolvedPaths: { ...scope.resolvedPaths } } : {}),
+    }));
+  if (hermesProfiles) return hermesProfiles;
+  const hermesScoped = scopeHermesProfileRequest(ctx, hermesBase);
+  if (hermesScoped instanceof Response) return hermesScoped;
+  if (hermesScoped) ctx = hermesScoped;
   const { req, url } = ctx;
+  const profileOptions = asideOptions(ctx);
+  // An Aside profile change is the Home's decision (home-integration-decision.ts).
+  const asideDecision = ctx.config.runtimeRole === "client" ? undefined : await asideDecisionScope(ctx, asideBody);
+  let aside: Response | null;
+  try {
+    aside = asideDecision === undefined ? await handleAsideProfileRoutes(ctx, profileOptions) : await withLinkApply(async () => {
+      const refused = prepareHomeIntegrationDecision(ctx, "aside", asideDecision);
+      if (refused) return refused;
+      const response = await handleAsideProfileRoutes(ctx, profileOptions);
+      return response && response.status >= 200 && response.status < 300 ? recordHomeIntegrationDecision(ctx, "aside", response) : response;
+    });
+  } catch (error) {
+    if (error instanceof LinkApplyBusyError) return jsonResponse({ error: "integration mutation busy", code: "integration_mutation_busy", clientId: "aside" }, 409, req, ctx.config);
+    throw error;
+  }
+  if (aside) return aside;
+  if (url.pathname === PI_SYNC_PATH && req.method === "POST") return piSyncResponse(ctx);
+  if (url.searchParams.has("profile")
+    && (url.pathname === INTEGRATION_COLLECTION_PATH || url.pathname.startsWith(INTEGRATION_ROUTE_PREFIX))
+    && !INTEGRATION_HISTORY_PATHS.includes(url.pathname)) {
+    return jsonResponse({ error: "profile applies only to Aside", code: "invalid_aside_profile" }, 400, req, ctx.config);
+  }
 
   if (url.pathname === "/api/client-integrations" && req.method === "GET") {
     try {
       const models = await loadExportModels(ctx.config);
-      const port = Number(url.port) || ctx.config.port;
+      const port = managementInferencePort(ctx);
       // One store for the whole collection read: without it this route retried
       // maintenance and counted snapshots in the default store even when the
       // caller had bound everything else to a temp root (A-gate round 13).
@@ -408,8 +809,13 @@ export async function handleIntegrationRoutes(ctx: ManagementContext): Promise<R
        * later one silently — a duplicate that could only ever hide a
        * disagreement, never surface it.
        */
-      const clients = INTEGRATION_CLIENT_IDS.map(clientId =>
-        readIntegrationState({ clientId, models, config: ctx.config, port, store, ...pathOverrides() }));
+      const clients = await Promise.all(INTEGRATION_CLIENT_IDS.map(async clientId => {
+        if (clientId === "aside") {
+          try { return await listAsideProfileStates({ ...profileOptions.input(), models }); }
+          catch { /* Existing status projection retains a safe unresolved-path diagnostic. */ }
+        }
+        return readIntegrationState({ clientId, models, config: ctx.config, port, store, ...pathOverrides() });
+      }));
       return jsonResponse({ clients } satisfies IntegrationStateListEnvelope, 200, req, ctx.config);
     } catch (error) {
       return internalErrorResponse(error, ctx);
@@ -426,8 +832,10 @@ export async function handleIntegrationRoutes(ctx: ManagementContext): Promise<R
     if (requestedClient !== null && !isIntegrationClientId(requestedClient)) {
       return invalidClientResponse(ctx);
     }
+    const asideJournal = hermesRequestScope(req) ? null : await asideJournalResponse(ctx, requestedClient, profileOptions);
+    if (asideJournal) return asideJournal;
     try {
-      const store = integrationStore();
+      const store = integrationStore(ctx);
       const storedOperations = store.listOperations(requestedClient ?? undefined);
       const newestByClient = new Map<IntegrationClientId, string>();
       for (const operation of storedOperations) {
@@ -435,7 +843,7 @@ export async function handleIntegrationRoutes(ctx: ManagementContext): Promise<R
           newestByClient.set(operation.clientId, operation.opId);
         }
       }
-      const operations: IntegrationJournalRow[] = storedOperations.map(operation => {
+      let operations: IntegrationJournalRow[] = storedOperations.map(operation => {
         /*
          * Resolved against the DISK, not read off the row.
          *
@@ -469,7 +877,11 @@ export async function handleIntegrationRoutes(ctx: ManagementContext): Promise<R
           undoable: (() => {
             if (snapshot === "expired") return false;
             if (newestByClient.get(operation.clientId) !== operation.opId) return false;
-            const current = currentConfigText(operation.configPath);
+            const current = operation.clientId === "cline" ? (() => {
+              const io = createClineIO(integrationMutationTestHooks?.io ?? store.io(), operation.configPath, store);
+              const read = io.readText(operation.configPath);
+              return read.kind === "text" ? read.text : read.kind === "missing" ? null : undefined;
+            })() : currentConfigText(operation.configPath);
             return current === undefined ? false : matchesOperationResult(operation, current);
           })(),
           /*
@@ -481,16 +893,129 @@ export async function handleIntegrationRoutes(ctx: ManagementContext): Promise<R
           deletable: newestByClient.get(operation.clientId) !== operation.opId,
         };
       });
+      if (requestedClient === null) {
+        const profiles = await asideJournalResponse(ctx, "aside", profileOptions);
+        if (profiles?.ok) {
+          const body = await profiles.json() as IntegrationJournalEnvelope;
+          operations = [...operations.filter(row => row.clientId !== "aside"), ...body.operations]
+            .sort((a, b) => b.at.localeCompare(a.at));
+        }
+      }
       return jsonResponse({ operations } satisfies IntegrationJournalEnvelope, 200, req, ctx.config);
     } catch (error) {
       return internalErrorResponse(error, ctx);
     }
   }
 
-  if (url.pathname === "/api/client-integrations/restore") {
+  if (url.pathname === "/api/client-integrations/preview") {
     if (req.method !== "POST") return null;
     const parsed = await readJsonBody(ctx);
     if (parsed instanceof Response) return parsed;
+    if (!isPlainRecord(parsed)) {
+      return jsonResponse({ error: "preview body must be an object", code: "invalid_preview_body" }, 400, req, ctx.config);
+    }
+    const previewClient = parsed.clientId;
+    if (typeof previewClient !== "string"
+      || !(INTEGRATION_CLIENT_IDS as readonly string[]).includes(previewClient)) {
+      return invalidClientResponse(ctx);
+    }
+    /*
+     * Aside is a set of profiles, not one file, and every mutation it has requires a profile. A
+     * plan built here would describe the legacy single-account location and no bound mutation
+     * would accept it, so an operator could confirm something nothing can carry out. The canonical
+     * per-profile preview answers this question properly, and the mutation routes already refuse
+     * the unscoped spelling the same way.
+     */
+    if (previewClient === "aside") {
+      return jsonResponse({ error: "Use the canonical Aside profile path", code: "invalid_aside_profile_path" }, 400, req, ctx.config);
+    }
+    if (outsideHermesScope(ctx, previewClient as IntegrationClientId)) {
+      return jsonResponse({ error: "A Hermes profile plan must name the Hermes client", code: "invalid_hermes_profile" }, 400, req, ctx.config);
+    }
+    const operation = parsed.operation;
+    if (operation !== "apply" && operation !== "overwrite" && operation !== "disable") {
+      return jsonResponse({
+        error: "operation must be apply, overwrite or disable",
+        code: "invalid_preview_operation",
+      }, 400, req, ctx.config);
+    }
+    const droidDefaults = readDroidReasoningDefaults(ctx, parsed, previewClient, operation);
+    if (droidDefaults instanceof Response) return droidDefaults;
+    const modelNames = readModelNames(ctx, parsed, previewClient, operation);
+    if (modelNames instanceof Response) return modelNames;
+    try {
+      const captured = await buildIntegrationPreviewInput(
+        previewClient as IntegrationClientId, ctx, integrationStore(ctx), droidDefaults, modelNames,
+      );
+      if (!captured) return previewUnavailableResponse(ctx);
+      if (droidDefaults !== undefined) {
+        const invalid = validateDroidReasoningDefaults(captured.input.models, droidDefaults);
+        if (invalid) return invalidDroidDefaultsResponse(ctx, invalid);
+      }
+      return jsonResponse(previewIntegration(captured.input, { operation }), 200, req, ctx.config);
+    } catch (error) {
+      return internalErrorResponse(error, ctx);
+    }
+  }
+
+  if (url.pathname === "/api/client-integrations/restore/preview" || url.pathname === "/api/client-integrations/commandcode/restore/preview") {
+    if (req.method !== "POST") return null;
+    const parsed = await readJsonBody(ctx);
+    if (parsed instanceof Response) return parsed;
+    if (isPlainRecord(parsed)) {
+      const naming = readModelNames(ctx, parsed, "", "restore");
+      if (naming instanceof Response) return naming;
+    }
+    if (!isPlainRecord(parsed) || typeof parsed.opId !== "string" || parsed.opId.trim().length === 0) {
+      return jsonResponse({ error: "opId must be a non-empty string", code: "invalid_op_id" }, 400, req, ctx.config);
+    }
+    if (parsed.confirmDrift !== undefined && typeof parsed.confirmDrift !== "boolean") {
+      return jsonResponse({ error: "confirmDrift must be a boolean", code: "invalid_confirm_drift" }, 400, req, ctx.config);
+    }
+    const opId = parsed.opId.trim();
+    const scopeResponse = restoreClientScopeResponse(ctx, opId, parsed.expectedClientId, url.pathname === "/api/client-integrations/commandcode/restore/preview" ? "commandcode" : undefined);
+    if (scopeResponse) return scopeResponse;
+    try {
+      const store = integrationStore(ctx);
+      const operation = store.findOperation(opId);
+      /*
+       * Answered as "not found" rather than by reading the row back to the caller. A preview is
+       * reached before any confirmation, so it is the cheapest place to probe journal contents,
+       * and it declines to be one.
+       */
+      if (!operation || outsideHermesScope(ctx, operation.clientId)) {
+        return jsonResponse({
+          error: "integration operation not found",
+          code: "integration_operation_not_found",
+          opId,
+        }, 404, req, ctx.config);
+      }
+      // Same rule, decided after the row is found so an unscoped undo of an Aside operation is
+      // refused for what it is rather than answered as a missing operation.
+      if (operation.clientId === "aside") {
+        return jsonResponse({ error: "Use the canonical Aside profile path", code: "invalid_aside_profile_path" }, 400, req, ctx.config);
+      }
+      const captured = await buildIntegrationPreviewInput(operation.clientId, ctx, store);
+      if (!captured) return previewUnavailableResponse(ctx);
+      const plan = previewIntegration(captured.input, {
+        operation: "restore",
+        opId,
+        confirmDrift: parsed.confirmDrift ?? false,
+      });
+      return jsonResponse(plan, 200, req, ctx.config);
+    } catch (error) {
+      return internalErrorResponse(error, ctx);
+    }
+  }
+
+  if (url.pathname === "/api/client-integrations/restore" || url.pathname === "/api/client-integrations/commandcode/restore") {
+    if (req.method !== "POST") return null;
+    const parsed = await readJsonBody(ctx);
+    if (parsed instanceof Response) return parsed;
+    if (isPlainRecord(parsed)) {
+      const naming = readModelNames(ctx, parsed, "", "restore");
+      if (naming instanceof Response) return naming;
+    }
     if (!isPlainRecord(parsed) || typeof parsed.opId !== "string" || parsed.opId.trim().length === 0) {
       return jsonResponse({
         error: "opId must be a non-empty string",
@@ -505,12 +1030,47 @@ export async function handleIntegrationRoutes(ctx: ManagementContext): Promise<R
     }
 
     const opId = parsed.opId.trim();
+    const scopeResponse = restoreClientScopeResponse(ctx, opId, parsed.expectedClientId, url.pathname === "/api/client-integrations/commandcode/restore" ? "commandcode" : undefined);
+    if (scopeResponse) return scopeResponse;
     const confirmDrift = parsed.confirmDrift ?? false;
+    const restoreBinding = planBindingOf(parsed);
+    if (restoreBinding === "half") return halfBoundResponse(ctx);
+    if (restoreBinding === "unknown-operation" || (restoreBinding !== "none" && restoreBinding.operation !== "restore")) {
+      return jsonResponse({
+        error: "operation does not match the requested change",
+        code: "invalid_preview_operation",
+      }, 400, req, ctx.config);
+    }
+    // The binding travels with the request. Dropping it here routed a bound Aside restore into
+    // the unbound path, which executed the mutation while its confirmation went unexamined.
+    // A Hermes-scoped restore never delegates: its operation lives in the selected Hermes store.
+    // A restore on the Home is its decision (home-integration-decision.ts); a Hermes profile's is not.
+    const restoreDecides = ctx.config.runtimeRole !== "client" && !hermesRequestScope(req)?.resolvedPaths;
+    const restoreAside = () => asideRestoreResponse(ctx, {
+      opId,
+      confirmDrift,
+      ...(parsed.operation === undefined ? {} : { operation: parsed.operation }),
+      ...(parsed.planFingerprint === undefined ? {} : { planFingerprint: parsed.planFingerprint }),
+    }, profileOptions);
+    let asideRestore: Response | null;
+    try {
+      const rootEntry = integrationStore(ctx).findOperation(opId);
+      asideRestore = hermesRequestScope(req) ? null : rootEntry && rootEntry.clientId !== "aside" ? await restoreAside() : restoreDecides ? await withLinkApply(async () => {
+        const refused = prepareHomeIntegrationDecision(ctx, undefined);
+        if (refused) return refused;
+        const response = await restoreAside();
+        return response && response.status >= 200 && response.status < 300 ? recordHomeIntegrationDecision(ctx, "aside", response) : response;
+      }) : await restoreAside();
+    } catch (error) {
+      if (error instanceof LinkApplyBusyError) return jsonResponse({ error: "integration mutation busy", code: "integration_mutation_busy" }, 409, req, ctx.config);
+      return internalErrorResponse(error, ctx);
+    }
+    if (asideRestore) return asideRestore;
     let restoreClientId: IntegrationClientId | undefined;
     try {
-      const store = integrationStore();
+      const store = integrationStore(ctx);
       const operation = store.findOperation(opId);
-      if (!operation) {
+      if (!operation || outsideHermesScope(ctx, operation.clientId)) {
         return jsonResponse({
           error: "integration operation not found",
           code: "integration_operation_not_found",
@@ -527,35 +1087,63 @@ export async function handleIntegrationRoutes(ctx: ManagementContext): Promise<R
         }, 410, req, ctx.config);
       }
 
-      const writeInput = await buildIntegrationWriteInput(operation.clientId, ctx, store);
-      const restoreInput: IntegrationRestoreInput = {
-        ...writeInput,
-        opId,
-        confirmDrift,
-      };
-      const result = await runIntegrationMutationFlight(
-        operation.clientId,
-        `restore:${opId}:${confirmDrift}`,
-        writeInput.io?.now ?? Date.now,
-        () => restoreIntegrationCoordinated(restoreInput, {
-          lockSeams: integrationMutationTestHooks?.lockSeams,
-        }),
-      );
-      if (!result.ok) {
-        /*
-         * Drift is NOT special-cased here.
-         *
-         * It used to be, and the hand-written branch dropped the writer's
-         * `message` — which is the only thing that tells the user WHICH file
-         * drifted and where its backup went. Every refusal leaves through the
-         * one serializer, so a refusal cannot lose its recovery fields by
-         * being routed through a shorter path.
-         */
-        return writerFailureResponse(operation.clientId, result, ctx);
+      // Every caller must hold a current passive roster before it can join a flight.
+      const boundRestore = restoreBinding === "none"
+        ? null
+        : await buildIntegrationPreviewInput(operation.clientId, ctx, store);
+      if (restoreBinding !== "none" && boundRestore === null) return previewUnavailableResponse(ctx);
+      if (boundRestore && integrationMutationTestHooks?.afterBoundSnapshot) await integrationMutationTestHooks.afterBoundSnapshot();
+      if (boundRestore && exportSnapshotIdentity(ctx.config) !== boundRestore.identity) {
+        const current = buildIntegrationPreviewInput(operation.clientId, ctx, store);
+        return current === null ? previewUnavailableResponse(ctx) : jsonResponse({
+          error: "integration preview is stale", code: "integration_preview_stale",
+          plan: previewIntegration(current.input, { operation: "restore", opId, confirmDrift }),
+        }, 409, req, ctx.config);
       }
-      return jsonResponse(result satisfies IntegrationRestoreEnvelope, 200, req, ctx.config);
+
+      const response = await runIntegrationMutationFlight(
+        operation.clientId,
+        scopedFlightKey(ctx, `restore:${opId}:${confirmDrift}:${restoreBinding === "none" ? "unbound" : JSON.stringify([restoreBinding.fingerprint, boundRestore?.identity])}`),
+        integrationMutationTestHooks?.io?.now ?? Date.now,
+        async () => {
+          const apply = async () => {
+            if (restoreDecides) {
+              const refused = prepareHomeIntegrationDecision(ctx, operation.clientId);
+              if (refused) return refused;
+            }
+            const writeInput = boundRestore
+              ? boundRestore.input
+              : await buildIntegrationWriteInput(operation.clientId, ctx, store);
+            const restoreGuard = restoreBinding === "none" ? null : stalePlanGuard(
+              operation.clientId,
+              ctx,
+              store,
+              { operation: "restore", opId, confirmDrift },
+              restoreBinding.fingerprint,
+              boundRestore === null ? null : boundRestore.identity,
+            );
+            const restoreInput: IntegrationRestoreInput = {
+              ...writeInput,
+              opId,
+              confirmDrift,
+            };
+            const result = await restoreIntegrationCoordinated(restoreInput, {
+              lockSeams: integrationMutationTestHooks?.lockSeams,
+              ...(restoreGuard ? { revalidate: restoreGuard.revalidate } : {}),
+              restoreGuard: () => hermesBoundaryRefusal(ctx),
+            });
+            const stale = restoreGuard?.response();
+            if (stale) return stale;
+            if (!result.ok) return writerFailureResponse(operation.clientId, result, ctx);
+            const restored = jsonResponse(result satisfies IntegrationRestoreEnvelope, 200, req, ctx.config);
+            return restoreDecides ? recordHomeIntegrationDecision(ctx, operation.clientId, restored, () => ownedIntent(store, operation.clientId)) : restored;
+          };
+          return restoreDecides ? withLinkApply(apply) : apply();
+        },
+      );
+      return jsonResponse(await response.clone().json(), response.status, req, ctx.config);
     } catch (error) {
-      if (error instanceof IntegrationMutationBusyError || error instanceof IntegrationWriterLockBusyError) {
+      if (error instanceof IntegrationMutationBusyError || error instanceof IntegrationWriterLockBusyError || error instanceof LinkApplyBusyError) {
         return jsonResponse({
           error: "integration mutation busy",
           code: "integration_mutation_busy",
@@ -570,12 +1158,31 @@ export async function handleIntegrationRoutes(ctx: ManagementContext): Promise<R
   const requestedClient = decodeClientPath(url.pathname);
   if (requestedClient === null) return null;
   if (!isIntegrationClientId(requestedClient)) return invalidClientResponse(ctx);
+  // Canonical Aside paths are owned above. Never decode an alternate spelling
+  // into the legacy single-account writer or bypass profile policy/guards.
+  if (requestedClient === "aside") {
+    return jsonResponse({ error: "Use the canonical Aside profile path", code: "invalid_aside_profile_path" }, 400, req, ctx.config);
+  }
 
   if (req.method === "GET") {
     try {
-      const input = await buildIntegrationWriteInput(requestedClient, ctx, integrationStore());
+      const input = await buildIntegrationWriteInput(requestedClient, ctx, integrationStore(ctx));
       const state = readIntegrationState(input);
-      return jsonResponse(state satisfies IntegrationStateEnvelope, 200, req, ctx.config);
+      const scope = hermesRequestScope(req);
+      // Detection runs only for the client that needs it: `defaults` is a
+      // process spawn, and no other client's read should pay for it.
+      const envelope: IntegrationStateEnvelope = requestedClient === "raycast"
+        ? { ...state, raycast: (raycastDetectTestHook ?? detectRaycast)() }
+        : requestedClient === "droid"
+          ? {
+              ...state,
+              droidReasoning: {
+                models: droidReasoningModels(input.models),
+                defaults: readOwnedDroidReasoningDefaults(input),
+              },
+            }
+          : scope ? { ...state, hermesProfile: scope.profile.name } : state;
+      return jsonResponse(envelope, 200, req, ctx.config);
     } catch (error) {
       return internalErrorResponse(error, ctx);
     }
@@ -608,24 +1215,98 @@ export async function handleIntegrationRoutes(ctx: ManagementContext): Promise<R
     }, 400, req, ctx.config);
   }
 
+  const requestedOperation: IntegrationPlanOperation = parsed.enabled
+    ? (parsed.overwriteConflict === true ? "overwrite" : "apply")
+    : "disable";
+  const droidDefaults = readDroidReasoningDefaults(ctx, parsed, requestedClient, requestedOperation);
+  if (droidDefaults instanceof Response) return droidDefaults;
+  const modelNames = readModelNames(ctx, parsed, requestedClient, requestedOperation);
+  if (modelNames instanceof Response) return modelNames;
+  const binding = planBindingOf(parsed);
+  if (binding === "half") return halfBoundResponse(ctx);
+  if (binding === "unknown-operation" || (binding !== "none" && binding.operation !== requestedOperation)) {
+    // A confirmation that names a different operation than the request performs is not a
+    // confirmation of this request.
+    return jsonResponse({
+      error: "operation does not match the requested change",
+      code: "invalid_preview_operation",
+    }, 400, req, ctx.config);
+  }
+
   try {
-    const input = await buildIntegrationWriteInput(requestedClient, ctx, integrationStore());
-    const result = await runIntegrationMutationFlight(
+    // The toggle is the Home's decision (home-integration-decision.ts): Children's defaults are
+    // saved first, an unreadable route-intent.json refuses while nothing has changed, and the
+    // result is recorded below. A selected Hermes profile is not the Home's client.
+    const recordsDecision = ctx.config.runtimeRole !== "client" && isRouteClientId(requestedClient) && !hermesRequestScope(req)?.resolvedPaths;
+    const boundToggle = binding === "none"
+      ? null
+      : await buildIntegrationPreviewInput(requestedClient, ctx, integrationStore(ctx), droidDefaults, modelNames);
+    if (binding !== "none" && boundToggle === null) return previewUnavailableResponse(ctx);
+    if (boundToggle && integrationMutationTestHooks?.afterBoundSnapshot) await integrationMutationTestHooks.afterBoundSnapshot();
+    /*
+     * A bound request is built from the same passive roster the guard re-plans against, and an
+     * unbound one keeps its existing refreshing path. Building the refreshing input first would
+     * have had the mutation and its own confirmation check disagree about the roster by
+     * construction, which is the disagreement this binding exists to detect.
+     */
+    if (boundToggle && exportSnapshotIdentity(ctx.config) !== boundToggle.identity) {
+      const current = buildIntegrationPreviewInput(requestedClient, ctx, integrationStore(ctx), droidDefaults, modelNames);
+      return current === null ? previewUnavailableResponse(ctx) : jsonResponse({
+        error: "integration preview is stale", code: "integration_preview_stale",
+        plan: previewIntegration(current.input, { operation: requestedOperation }),
+      }, 409, req, ctx.config);
+    }
+    const response = await runIntegrationMutationFlight(
       requestedClient,
-      parsed.enabled ? (parsed.overwriteConflict === true ? "overwrite" : "apply") : "disable",
-      input.io?.now ?? Date.now,
-      () => {
-        const options = { lockSeams: integrationMutationTestHooks?.lockSeams };
-        if (!parsed.enabled) return disableIntegrationCoordinated(input, options);
-        return parsed.overwriteConflict === true
-          ? overwriteIntegrationCoordinated(input, options)
-          : applyIntegrationCoordinated(input, options);
+      scopedFlightKey(ctx, `${requestedOperation}:modelNames:${modelNames ?? "omitted"}:binding:${binding === "none" ? "unbound" : JSON.stringify([binding.fingerprint, boundToggle?.identity])}:defaults:${JSON.stringify(droidDefaults ?? null)}`),
+      integrationMutationTestHooks?.io?.now ?? Date.now,
+      async () => {
+        const apply = async () => {
+          if (recordsDecision) {
+            const refused = prepareHomeIntegrationDecision(ctx, requestedClient);
+            if (refused) return refused;
+          }
+          const input = boundToggle
+            ? boundToggle.input
+            : await buildIntegrationWriteInput(requestedClient, ctx, integrationStore(ctx), droidDefaults, modelNames);
+          if (droidDefaults !== undefined) {
+            const invalid = validateDroidReasoningDefaults(input.models, droidDefaults);
+            if (invalid) return invalidDroidDefaultsResponse(ctx, invalid);
+          }
+          const guard = binding === "none" ? null : stalePlanGuard(
+            requestedClient,
+            ctx,
+            integrationStore(ctx),
+            { operation: binding.operation },
+            binding.fingerprint,
+            boundToggle === null ? null : boundToggle.identity,
+            droidDefaults,
+            modelNames,
+          );
+          const options = {
+            lockSeams: integrationMutationTestHooks?.lockSeams,
+            ...(guard ? { revalidate: guard.revalidate } : {}),
+            guard: () => hermesBoundaryRefusal(ctx),
+          };
+          const pending = !parsed.enabled ? disableIntegrationCoordinated(input, options)
+            : parsed.overwriteConflict === true ? overwriteIntegrationCoordinated(input, options)
+            : applyIntegrationCoordinated(input, options);
+          // Coordinators freeze their input synchronously before returning the promise.
+          integrationMutationTestHooks?.afterWriterStart?.();
+          const result = await pending;
+          const stale = guard?.response();
+          if (stale) return stale;
+          if (!result.ok) return writerFailureResponse(requestedClient, result, ctx);
+          const toggled = jsonResponse(result satisfies IntegrationToggleEnvelope, 200, req, ctx.config);
+          return recordsDecision ? recordHomeIntegrationDecision(ctx, requestedClient, toggled, () => ({ enabled: parsed.enabled === true,
+            ...(modelNames !== undefined && (requestedClient === "hermes" || requestedClient === "commandcode") ? { modelNames } : {}) })) : toggled;
+        };
+        return recordsDecision ? withLinkApply(apply) : apply();
       },
     );
-    if (!result.ok) return writerFailureResponse(requestedClient, result, ctx);
-    return jsonResponse(result satisfies IntegrationToggleEnvelope, 200, req, ctx.config);
+    return jsonResponse(await response.clone().json(), response.status, req, ctx.config);
   } catch (error) {
-    if (error instanceof IntegrationMutationBusyError || error instanceof IntegrationWriterLockBusyError) {
+    if (error instanceof IntegrationMutationBusyError || error instanceof IntegrationWriterLockBusyError || error instanceof LinkApplyBusyError) {
       return jsonResponse({
         error: "integration mutation busy",
         code: "integration_mutation_busy",

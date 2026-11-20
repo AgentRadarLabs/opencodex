@@ -12,7 +12,7 @@
  */
 
 import {
-  normalizeUsageEntryForTest,
+  normalizePersistedUsageRow,
   physicalUsageAttempts,
   type AttemptRecoveryKind,
   type PersistedUsageAttempt,
@@ -20,12 +20,8 @@ import {
   type UsageStatus,
 } from "../usage/log";
 import { normalizeCostTokens } from "../usage/cost";
-import {
-  computeEntryCost,
-  normalizePhysicalEntry,
-  type UsageSurface,
-} from "../usage/summary";
-import { openRequestHistoryIndex, requestHistoryDb } from "./history/indexer";
+import { computeEntryCost, type UsageSurface } from "../usage/summary";
+import { withRequestHistoryRead } from "./history/indexer";
 
 export const ANALYTICS_MAX_ROWS = 50_000;
 /** Default row cap for the management API (full cap remains available via `limit`). */
@@ -278,15 +274,37 @@ const COOLDOWN_RECOVERY_KINDS = new Set([
   "key-401",
   "key-429",
   "oauth-401",
+  "oauth-account-403",
   "anthropic-oauth-429",
   "oauth-account-429",
+  "oauth-account-402",
 ]);
 const USAGE_STATUSES = new Set<UsageStatus>([
   "reported", "unreported", "unsupported", "estimated",
 ]);
 const HOUR_MS = 3_600_000;
 const ANTHROPIC_DEFAULT_PROMPT_CACHE_TTL_MS = 5 * 60_000;
-const ANTHROPIC_ACCOUNT_PROVIDER_RE = /^anthropic-p[a-f0-9]{6}$/;
+const ANTHROPIC_ACCOUNT_PROVIDER_RE = /^anthropic-(p[a-f0-9]{6})$/;
+
+/**
+ * One Anthropic account is one physical route, counted once.
+ *
+ * An Anthropic attempt can name its account in the account-qualified provider (`anthropic-p<hex6>`),
+ * in the frozen `accountTag` (#8383, the same `p<hex6>`), and on hosted rows in `accountLogLabel`
+ * (the same digest, also on the plain active account whose provider stays `anthropic`). Keyed on
+ * the raw provider, one account would split into an `anthropic` route and an `anthropic-p<hex6>`
+ * route. So the route takes the account from exactly one source -- the tag or label the caller
+ * passes, else the provider suffix -- and the provider folds to `anthropic`.
+ */
+function physicalAccountRoute(
+  provider: string,
+  accountRef: string | undefined,
+): { provider: string; accountRef?: string } {
+  const suffix = ANTHROPIC_ACCOUNT_PROVIDER_RE.exec(provider)?.[1];
+  if (provider !== "anthropic" && suffix === undefined) return accountRef ? { provider, accountRef } : { provider };
+  const account = accountRef ?? suffix;
+  return { provider: "anthropic", ...(account ? { accountRef: account } : {}) };
+}
 
 function usesAnthropicCacheAlertPolicy(
   attempt: Pick<PhysicalAttempt, "provider" | "adapter">,
@@ -311,20 +329,17 @@ function classifyRow(row: ScannedRow): "success" | "failure" | "cancelled" {
   return "success";
 }
 
-interface ParsedEntry {
-  entry: PersistedUsageEntry | null;
+function parseEntry(rowJson: string): PersistedUsageEntry | null {
+  try {
+    return normalizePersistedUsageRow(JSON.parse(rowJson)) ?? null;
+  } catch {
+    return null;
+  }
 }
 
-function parseEntry(rowJson: string): ParsedEntry {
-  try {
-    const parsed = JSON.parse(rowJson) as PersistedUsageEntry;
-    if (!parsed || typeof parsed !== "object" || typeof parsed.requestId !== "string") {
-      return { entry: null };
-    }
-    return { entry: normalizeUsageEntryForTest(parsed) };
-  } catch {
-    return { entry: null };
-  }
+/** Account of an attempt: the frozen Anthropic tag, else the persisted account label. */
+function attemptAccount(source: { accountTag?: string; accountLogLabel?: string } | null | undefined): string | undefined {
+  return source?.accountTag ?? source?.accountLogLabel;
 }
 
 function usageStatus(value: unknown): UsageStatus {
@@ -351,21 +366,20 @@ function physicalAttemptsFor(
   const attempts = entry?.attempts;
   if (entry && attempts !== undefined) {
     const durable = physicalUsageAttempts(attempts);
-    const legacyAccountAttempt = entry.accountLogLabel
+    const legacyAccountAttempt = attemptAccount(entry)
       ? durable.reduce<PersistedUsageAttempt | undefined>((final, attempt) =>
           !final || attempt.ordinal > final.ordinal ? attempt : final, undefined)
       : undefined;
     const physical = durable
       .map((attempt): PhysicalAttempt => {
         const cache = cacheDecomposition(attempt.usage);
-        const accountRef = attempt.accountLogLabel
-          ?? (attempt === legacyAccountAttempt ? entry.accountLogLabel : undefined);
+        const route = physicalAccountRoute(attempt.provider, attemptAccount(attempt)
+          ?? (attempt === legacyAccountAttempt ? attemptAccount(entry) : undefined));
         return {
           ordinal: attempt.ordinal,
-          provider: attempt.provider,
           model: attempt.model,
           ...(attempt.adapter ? { adapter: attempt.adapter } : {}),
-          ...(accountRef ? { accountRef } : {}),
+          ...route,
           sendCount: attempt.sendCount,
           recoveryKinds: attempt.recoveryKinds,
           recoveryCount: attempt.recoveryCount ?? attempt.recoveryKinds.length,
@@ -391,9 +405,8 @@ function physicalAttemptsFor(
   const cache = cacheDecomposition(entry?.usage);
   return [{
     ordinal: 1,
-    provider: row.provider,
     model: row.model,
-    ...(entry?.accountLogLabel ? { accountRef: entry.accountLogLabel } : {}),
+    ...physicalAccountRoute(row.provider, attemptAccount(entry)),
     sendCount: 1,
     recoveryKinds: [],
     recoveryCount: 0,
@@ -409,16 +422,24 @@ function cooldownTriggering(entry: PersistedUsageEntry | null, status: number): 
     attempt.recoveryKinds.some(kind => COOLDOWN_RECOVERY_KINDS.has(kind)));
 }
 
-function successCostUsd(
-  row: Pick<ScannedRow, "provider" | "model">,
-  entry: PersistedUsageEntry,
-): number | null {
-  const cost = computeEntryCost(normalizePhysicalEntry({
-    ...entry,
-    provider: row.provider,
-    model: row.model,
-  }));
-  return cost.isPriced ? cost.costTotal : null;
+/**
+ * Same attempt-aware pricing as /api/usage, over physical attempts only. Legacy root usage with no
+ * per-attempt usage is priced on the final physical attempt, never added beside it.
+ */
+function successCostUsd(entry: PersistedUsageEntry): number | null {
+  let priced = entry;
+  if (entry.attempts !== undefined) {
+    const attempts = physicalUsageAttempts(entry.attempts).map(attempt => ({ ...attempt }));
+    const finalAttempt = attempts.at(-1);
+    if (finalAttempt && entry.usage && !attempts.some(attempt => attempt.usage !== undefined)) {
+      finalAttempt.usage = entry.usage;
+      finalAttempt.usageStatus = entry.usageStatus;
+    }
+    const { usage: _usage, totalTokens: _totalTokens, ...rest } = entry;
+    priced = { ...rest, attempts };
+  }
+  const { isPriced, costTotal } = computeEntryCost(priced);
+  return isPriced ? costTotal : null;
 }
 
 function blankUsage(): UsageAccumulator {
@@ -495,8 +516,6 @@ export async function computeRoutingAnalytics(
   options: { maxRows?: number } = {},
 ): Promise<RoutingAnalyticsResult> {
   const generatedAt = Date.now();
-  await openRequestHistoryIndex();
-  const handle = requestHistoryDb();
   const maxRows = Math.min(
     Math.max(1, Math.trunc(options.maxRows ?? ANALYTICS_MAX_ROWS)),
     ANALYTICS_MAX_ROWS,
@@ -518,7 +537,7 @@ export async function computeRoutingAnalytics(
   if (filters.to !== undefined) add("timestamp <= ?", filters.to);
   const whereSql = where.length > 0 ? ` WHERE ${where.join(" AND ")}` : "";
 
-  const rows = handle.query(
+  const rows = await withRequestHistoryRead(handle => handle.query(
     `SELECT request_id AS requestId, timestamp, provider, model,
             api_key_id AS apiKeyId, profile_id AS profileId,
             profile_revision AS profileRevision, status,
@@ -527,14 +546,13 @@ export async function computeRoutingAnalytics(
             usage_status AS usageStatus, attempt_count AS attemptCount,
             fallback, row_json AS rowJson
      FROM requests${whereSql} ORDER BY timestamp DESC, request_id DESC LIMIT ?`,
-  ).all(...values, maxRows + 1) as ScannedRow[];
+  ).all(...values, maxRows + 1) as ScannedRow[]);
 
   const scanned = rows.slice(0, maxRows);
   const historyTruncated = rows.length > maxRows;
   const expanded: ExpandedRow[] = scanned.map(row => {
-    const parsed = parseEntry(row.rowJson);
+    const entry = parseEntry(row.rowJson);
     row.rowJson = "";
-    const entry = parsed.entry;
     const attempts = physicalAttemptsFor(row, entry);
     const hasDurableAttempts = entry?.attempts !== undefined;
     const kind = classifyRow(row);
@@ -548,7 +566,7 @@ export async function computeRoutingAnalytics(
         ? { conversationId: entry.conversationId.trim() }
         : {}),
       kind,
-      rowCostUsd: kind === "success" && entry ? successCostUsd(row, entry) : null,
+      rowCostUsd: kind === "success" && entry ? successCostUsd(entry) : null,
       cooldownTriggering: kind === "failure" && cooldownTriggering(entry, row.status),
     };
   });

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { foldForMatching } from "../../src/lib/redact-folding";
 import { repoPath } from "../helpers/repo-root";
@@ -11,6 +11,20 @@ import {
 } from "../../src/lib/redact";
 
 describe("redactSecretString", () => {
+  test("ASCII folding preserves every byte and original offset, including literal escape syntax (#7846)", () => {
+    const ascii = Array.from({ length: 128 }, (_, code) => String.fromCharCode(code)).join("");
+    for (const decode of [true, false]) {
+      for (const value of ["", ascii, "Priority GPT-5.5 /helper", "author%69zation", "author\\u0069zation", "author&#105;zation", "x&ii;-api-key", "%invalid&plain\\text"]) {
+        // A dropped non-ASCII prefix forces the general folding path. Its output and offsets
+        // must match the ASCII path after accounting for that prefix, for either decode mode.
+        const general = foldForMatching(`\u200b${value}`, decode);
+        expect(foldForMatching(value, decode)).toEqual({
+          folded: general.folded, map: general.map.map(offset => offset - 1),
+        });
+      }
+    }
+  });
+
   test("masks bearer, api, access, refresh, and profile values", () => {
     const input = [
       "Authorization: Bearer access-token-value-123456",
@@ -335,6 +349,70 @@ describe("redactSecretString", () => {
       .toBe('<field data-name="authorization">public-status</field>');
   });
 
+  test("XML delimiter search work scales linearly without a wall-clock deadline", () => {
+    for (const tag of ["<a ", "<a >", '<a title="x>y">', '<a title="x>y" ']) {
+      const work: number[] = [];
+      for (const count of [4_000, 8_000]) {
+        const input = tag.repeat(count);
+        let searched = 0;
+        const original = String.prototype.indexOf;
+        const originalCharAt = String.prototype.charAt;
+        const characters = spyOn(String.prototype, "charAt").mockImplementation(function (this: string, index) {
+          searched += 1;
+          return originalCharAt.call(this, index);
+        });
+        const scan = spyOn(String.prototype, "indexOf").mockImplementation(function (this: string, needle, start) {
+          const found = original.call(this, needle, start);
+          if (needle === "<" || needle === ">") {
+            searched += (found < 0 ? this.length : found + 1) - (start ?? 0);
+          }
+          return found;
+        });
+        try {
+          expect(redactSecretString(input)).toBe(input);
+        } finally {
+          scan.mockRestore();
+          characters.mockRestore();
+        }
+        expect(searched).toBeGreaterThan(0);
+        expect(searched).toBeLessThanOrEqual(4 * input.length);
+        work.push(searched);
+      }
+      expect(work[1]!).toBeLessThanOrEqual(2 * work[0]! + 8);
+    }
+  });
+
+  test("XML attribute scanning keeps credential coverage after malformed and escaped prefixes", () => {
+    const prefix = "π ratio∶1\n";
+    for (const input of [
+      '<a '.repeat(4_000) + 'name="authorization">synthetic-xml-canary',
+      '<a >'.repeat(4_000) + '<field id="x-api-key">synthetic-xml-canary',
+      '<field name="author&#105;zation">synthetic-xml-canary',
+      '<field key="authorization"\n value="synthetic-xml-canary">',
+    ]) {
+      const result = redactSecretString(prefix + input);
+      expect(result.startsWith(prefix)).toBe(true);
+      expect(result).toContain(REDACTED_SECRET);
+      expect(result).not.toContain("synthetic-xml-canary");
+    }
+  });
+
+  test("XML quoted tag delimiters cannot hide a later credential attribute", () => {
+    for (const tag of [
+      '<field title="a>b" name="authorization">',
+      "<field title='a>b' key='x-api-key'>",
+      '<field title="a>b" note=\'c>d\' id="password">',
+      '<field title="a&gt;b" name="author&#105;zation">',
+    ]) {
+      const result = redactSecretString("diagnostic: safe\n" + tag + "synthetic-xml-canary");
+      expect(result).toBe("diagnostic: safe\n<field" + REDACTED_SECRET);
+    }
+    const harmless = '<field title="a>b">public-status</field>';
+    expect(redactSecretString(harmless)).toBe(harmless);
+    expect(redactSecretString(harmless + '<field name="authorization">synthetic-xml-canary'))
+      .toBe(harmless + "<field" + REDACTED_SECRET);
+  });
+
   test("a multipart credential part is masked through the rest of the body", () => {
     // Line-based masking left a multi-line body and the no-blank-line shape
     // partly intact, and stopping at the first `--` trusted an attacker-chosen
@@ -350,6 +428,27 @@ describe("redactSecretString", () => {
       expect(redacted).not.toContain("dXNlcjpwYXNz");
       expect(redacted).not.toContain("credential-suffix-123456");
     }
+  });
+
+  test("multipart part headers on an unterminated line are rejected in linear time", () => {
+    // As one regex, every `name=token` candidate on a line with no line break rescanned the rest
+    // of that line: 16,000 of them in one 176 KB message took seconds.
+    const unterminated = "name=token ".repeat(16_000);
+    const startedAt = performance.now();
+    expect(redactSecretString(unterminated)).toBe(unterminated);
+    expect(redactSecretString(`${unterminated}\rname=authorization\r\nsecret-body-123456`))
+      .toBe(`${unterminated}\rname=authorization\r\n${REDACTED_SECRET}`);
+    expect(performance.now() - startedAt).toBeLessThan(1_500);
+  });
+
+  test("JWT candidates inside one long token run are rejected in linear time", () => {
+    // As one regex, every `eyJ` in a run of token characters with no dot after it rescanned the
+    // rest of the run: tens of thousands of them took seconds. A real three-segment JWT is still masked.
+    const run = "eyJabcdefgh-".repeat(32_000);
+    const startedAt = performance.now();
+    expect(redactSecretString(run)).toBe(run);
+    expect(redactSecretString(`${run} eyJhbGciOiJIUzI1.eyJzdWIiOiIx.sig_-x`)).toBe(`${run} ${REDACTED_SECRET}`);
+    expect(performance.now() - startedAt).toBeLessThan(1_500);
   });
 
   test("a quoted form value is masked too", () => {
@@ -549,4 +648,27 @@ test("redact-folding folds colon confusables with aligned offsets and stays a ze
   expect(map).toEqual([0, 1]);
   const source = readFileSync(repoPath("src/lib/redact-folding.ts"), "utf8");
   expect(source).not.toMatch(/^import /m);
+});
+
+describe("bare credential shapes with no label to key off", () => {
+  test("a Devin session token is masked wherever it appears", () => {
+    // A Connect EOS trailer can quote the request that carried the key, and the
+    // labelled rules never fire on a quoted proto field.
+    const token = "devin-session-token$eyJhbGciOiJIUzI1NiJ9.eyJhIjoxfQ.c2ln";
+    const masked = redactSecretString(`permission_denied: api_key ${token} was rejected`);
+    expect(masked).not.toContain("devin-session-token$eyJ");
+    expect(masked).not.toContain("eyJhbGciOiJIUzI1NiJ9");
+  });
+
+  test("a bare JWT is masked, and ordinary prose is not", () => {
+    const masked = redactSecretString("token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c2lnbmF0dXJl here");
+    expect(masked).not.toContain("eyJhbGciOiJIUzI1NiJ9");
+    for (const benign of [
+      "version 1.2.3 shipped",
+      "see src/lib/redact.ts for the rules",
+      "a.b.c",
+    ]) {
+      expect(redactSecretString(benign)).toBe(benign);
+    }
+  });
 });

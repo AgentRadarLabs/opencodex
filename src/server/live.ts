@@ -1,3 +1,6 @@
+import { CodexInstallationIdUnavailableError } from "../codex/installation-id";
+import { isolateCodexPoolClientMetadata, mergeCodexSelectedHeaders } from "../codex/forward-transport-headers";
+import { codexCompatibleUrl } from "../codex/context-compat";
 /**
  * /v1/live and /v1/realtime/calls relay (issue #371).
  *
@@ -26,7 +29,7 @@
  * - `GET /v1/realtime?model=` — RealtimeV2 standalone (no intent)
  * - `GET /v1/live?model=` — Frameless standalone
  */
-import { appendFileSync } from "node:fs";
+import { closeSync, fchmodSync, fstatSync, openSync, statSync, writeSync } from "node:fs";
 import { formatErrorResponse } from "../bridge";
 import {
   CodexAccountCooldownError,
@@ -34,19 +37,29 @@ import {
   cooldownErrorResponse,
   CodexAuthContextError,
   CodexMainProfileDrainingError,
+  CodexModelAvailabilityError,
   CodexPoolAuthenticationError,
   CodexThreadAffinityExpiredError,
+  type CodexAuthContext,
 } from "../codex/auth-context";
 import { formatCodexProviderForLog } from "../codex/routing";
 import { cancelBodyOnAbort, signalWithTimeout } from "../lib/abort";
 import { sidecarEnter } from "../lib/sidecar-tracker";
+import { hardenSecretPath } from "../lib/windows-secret-acl";
 import type { OcxConfig } from "../types";
-import { resolveFirstUsableOpenAiSidecar, selectOpenAiImagesProvider } from "../providers/openai-sidecar";
-import { ForwardAdmissionCredentialError, validateForwardAdmissionCredential } from "./auth-cors";
+import {
+  resolveCallerOwnedOpenAiSidecar,
+  resolveFirstUsableOpenAiSidecar,
+  selectOpenAiImagesProvider,
+} from "../providers/openai-sidecar";
+import { ForwardAdmissionCredentialError, validateForwardAdmissionCredential, type DataPlaneAdmission } from "./auth-cors";
+import { admissionScopeDenial } from "./admission-model-scope";
+import { nativeLiveCalls } from "./live-native-calls";
 import type { RequestLogContext } from "./request-log";
 import { codexLogAccountId } from "./responses";
 import type { AdmissionLease } from "../lib/admission";
 import { codexAccountSelectionForTurn } from "./lifecycle";
+import { codexModelAvailabilityErrorResponse } from "./responses/codex-auth-error";
 
 /** Voice call create can wait on SDP negotiation; bound a hung upstream. */
 const LIVE_UPSTREAM_TIMEOUT_MS = 120_000;
@@ -69,7 +82,21 @@ export const LIVE_SIDEBAND_API_ROOT = "https://api.openai.com/v1";
  * Client protocol headers relayed verbatim to the upstream on call-create and sideband upgrade.
  * `openai-alpha: quicksilver=v2` carries the Frameless protocol negotiation — without it the
  * ChatGPT backend validates the type-less Frameless session as v1 quicksilver and 400s
- * (openai/codex `realtime_request_headers`, core/src/realtime_conversation.rs). Auth headers
+ * (openai/codex `realtime_request_headers`, core/src/realtime_conversation.rs).
+ *
+ * `x-codex-turn-metadata` is on the same list upstream builds for the sideband upgrade and was
+ * missing here, so every realtime turn reached the model with metadata the client had attached
+ * and this proxy silently dropped. The Responses passthrough already forwards it
+ * (`src/adapters/openai-responses/passthrough.ts`); the sideband goes to the same realtime
+ * upstream the caller was addressing, so there is nothing to scope it away from. That is not
+ * true of the images sidecar, which strips it deliberately and keeps doing so.
+ *
+ * `voice-session-id` is the client-generated voice session id Codex 0.164 forwards on WebSocket,
+ * WebRTC and existing-call transports (openai/codex#53784). It is a separate identity from the
+ * realtime session id carried in `x-session-id`, so neither may stand in for the other.
+ *
+ * Every name here is relayed only when the caller sent it. Nothing on this list is invented,
+ * which is what keeps a caller that omits one byte-identical upstream. Auth headers
  * (`authorization`, `chatgpt-account-id`) stay proxy-owned and are never taken from this list.
  */
 export const LIVE_CLIENT_PROTOCOL_HEADERS = [
@@ -79,6 +106,8 @@ export const LIVE_CLIENT_PROTOCOL_HEADERS = [
   "thread-id",
   "originator",
   "x-oai-attestation",
+  "x-codex-turn-metadata",
+  "voice-session-id",
 ] as const;
 
 /**
@@ -86,19 +115,58 @@ export const LIVE_CLIENT_PROTOCOL_HEADERS = [
  *
  * When `OCX_LIVE_FRAME_LOG` is set to a file path, every relayed sideband frame appends one
  * JSONL record: direction, frame kind, byte length, and whether the payload contains U+FFFD.
- * Privacy: full frame payloads are never written — only when U+FFFD is present, a short
- * excerpt around the first replacement character is included so the corruption point can be
- * attributed (upstream vs relay vs client). Disabled entirely when the env var is unset.
+ * Privacy: no frame content is written, including excerpts around replacement characters.
+ * For binary frames, U+FFFD may also be introduced by UTF-8 decoding; the flag alone does not
+ * identify the source of corruption. The log is created with owner-only permissions and is
+ * disabled entirely when the env var is unset.
  */
 export const LIVE_FRAME_LOG_ENV = "OCX_LIVE_FRAME_LOG";
-const LIVE_FRAME_LOG_CONTEXT_CHARS = 24;
+/**
+ * Append one JSONL record with owner-only permissions. `appendFileSync`'s `mode` only applies
+ * when it creates the file, so an existing permissive log would stay readable by other local
+ * users. Open for append, harden the target, and verify that the path still names
+ * the opened file before writing. A failed harden or identity check writes nothing. On Windows
+ * the hardened file's identity is remembered, so a replaced file is hardened again but an
+ * unchanged one does not spawn icacls for every frame.
+ */
+/** Windows ACL hardening spawns icacls; remember the file already hardened so frames do not. */
+let hardenedWindowsFrameLog: { path: string; dev: bigint; ino: bigint } | undefined;
 
-function fffdContext(text: string): string | undefined {
-  const idx = text.indexOf("\uFFFD");
-  if (idx < 0) return undefined;
-  const start = Math.max(0, idx - LIVE_FRAME_LOG_CONTEXT_CHARS);
-  const end = Math.min(text.length, idx + LIVE_FRAME_LOG_CONTEXT_CHARS);
-  return text.slice(start, end);
+export function appendOwnerOnly(
+  path: string,
+  line: string,
+  harden: (fd: number, path: string) => void = hardenLogDescriptor,
+  platform: NodeJS.Platform = process.platform,
+): void {
+  const fd = openSync(path, "a", 0o600);
+  try {
+    const before = fstatSync(fd, { bigint: true });
+    const memo = hardenedWindowsFrameLog;
+    const alreadyHardened = platform === "win32" && memo !== undefined && memo.path === path
+      && before.ino !== 0n && memo.dev === before.dev && memo.ino === before.ino;
+    if (!alreadyHardened) {
+      hardenedWindowsFrameLog = undefined;
+      harden(fd, path);
+    }
+    const opened = fstatSync(fd, { bigint: true });
+    const named = statSync(path, { bigint: true });
+    if (!opened.isFile() || !named.isFile() || opened.ino === 0n || named.ino === 0n
+      || opened.dev !== named.dev || opened.ino !== named.ino) {
+      throw new Error("Frame log path changed during hardening.");
+    }
+    if (platform === "win32") hardenedWindowsFrameLog = { path, dev: opened.dev, ino: opened.ino };
+    writeSync(fd, line);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function hardenLogDescriptor(fd: number, path: string): void {
+  if (process.platform === "win32") {
+    hardenSecretPath(path, { required: true });
+    return;
+  }
+  fchmodSync(fd, 0o600);
 }
 
 export function logLiveSidebandFrame(dir: "c2u" | "u2c", data: unknown): void {
@@ -107,18 +175,18 @@ export function logLiveSidebandFrame(dir: "c2u" | "u2c", data: unknown): void {
   try {
     let kind: "text" | "binary" = "binary";
     let bytes = 0;
-    let context: string | undefined;
+    let fffd = false;
     if (typeof data === "string") {
       kind = "text";
       bytes = Buffer.byteLength(data);
-      context = fffdContext(data);
+      fffd = data.includes("\uFFFD");
     } else if (data instanceof ArrayBuffer) {
       bytes = data.byteLength;
-      context = fffdContext(new TextDecoder().decode(new Uint8Array(data)));
+      fffd = new TextDecoder().decode(new Uint8Array(data)).includes("\uFFFD");
     } else if (ArrayBuffer.isView(data)) {
       const view = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
       bytes = data.byteLength;
-      context = fffdContext(new TextDecoder().decode(view));
+      fffd = new TextDecoder().decode(view).includes("\uFFFD");
     } else {
       return;
     }
@@ -127,12 +195,45 @@ export function logLiveSidebandFrame(dir: "c2u" | "u2c", data: unknown): void {
       dir,
       kind,
       bytes,
-      fffd: context !== undefined,
-      ...(context !== undefined ? { context } : {}),
+      fffd,
     };
-    appendFileSync(logPath, `${JSON.stringify(record)}\n`);
+    appendOwnerOnly(logPath, `${JSON.stringify(record)}\n`);
   } catch {
     // Frame forensics must never break the relay.
+  }
+}
+
+/**
+ * Sideband lifecycle stages, recorded in the same JSONL as the frame records.
+ *
+ * Frame forensics alone cannot separate the three realtime-voice failures reported in #4721.
+ * A join that never reached this proxy, a join whose upstream handshake was refused, and a
+ * relay that opened and then carried nothing all leave the same empty file, which is why the
+ * original report could only say "no frame log". One record per stage makes them distinct:
+ * no record at all means the client never dialed the proxy, `upstream-failed` carries the
+ * status the client was handed, and `relay-attached` with no following frame record means the
+ * transport is live and the silence is upstream of it.
+ */
+export type LiveSidebandStage = "upstream-open" | "upstream-failed" | "relay-attached" | "relay-closed";
+
+/**
+ * Append one lifecycle record. Same privacy rule as the frame records and for the same reason:
+ * no URL, no call id, no header, no frame content — only the stage and, on failure, the status
+ * and error code this proxy synthesized itself.
+ */
+export function logLiveSidebandStage(
+  stage: LiveSidebandStage,
+  detail?: { status?: number; code?: string },
+): void {
+  const logPath = process.env[LIVE_FRAME_LOG_ENV];
+  if (!logPath) return;
+  try {
+    const record: Record<string, unknown> = { ts: new Date().toISOString(), stage };
+    if (detail?.status !== undefined) record.status = detail.status;
+    if (detail?.code !== undefined) record.code = detail.code;
+    appendOwnerOnly(logPath, JSON.stringify(record) + "\n");
+  } catch {
+    // Diagnostics must never break the relay.
   }
 }
 
@@ -217,10 +318,12 @@ export type LiveSidebandTarget =
 
 export type LiveRelayTarget = {
   headers: Record<string, string>;
+  authContext?: CodexAuthContext;
   providerBaseUrl: string;
   usesBackendShape: boolean;
   keyed: boolean;
   recordOutcome?: (status: number | "timeout" | "connect_error") => void;
+  releaseProbeLease?: () => void;
 };
 
 function isChatGptBackendBaseUrl(baseUrl: string): boolean {
@@ -381,7 +484,7 @@ export function buildLiveSidebandUpstreamWsUrl(
   );
 }
 
-async function backendJsonBodyFromApiMultipart(
+export async function backendJsonBodyFromApiMultipart(
   body: ArrayBuffer,
   contentType: string,
 ): Promise<{ body: Uint8Array; contentType: string } | Response> {
@@ -434,14 +537,20 @@ export async function readBodyCapped(
   stream: ReadableStream<Uint8Array> | null,
   maxBytes: number,
   tooLargeMessage: (total: number) => string,
+  signal?: AbortSignal,
 ): Promise<ArrayBuffer | Response> {
   if (!stream) return new ArrayBuffer(0);
   const reader = stream.getReader();
+  const abortRead = () => { void reader.cancel(signal?.reason).catch(() => {}); };
+  signal?.addEventListener("abort", abortRead, { once: true });
   const chunks: Uint8Array[] = [];
   let total = 0;
   try {
+    if (signal?.aborted) abortRead();
+    signal?.throwIfAborted();
     for (;;) {
       const { done, value } = await reader.read();
+      signal?.throwIfAborted();
       if (done) break;
       if (!value || value.byteLength === 0) continue;
       total += value.byteLength;
@@ -460,6 +569,7 @@ export async function readBodyCapped(
     await reader.cancel(err).catch(() => {});
     throw err;
   } finally {
+    signal?.removeEventListener("abort", abortRead);
     try {
       // Always release: `reader.cancel()` does NOT drop the lock, and holding it would leave
       // the stream permanently locked for any later consumer (audit R-WP5-2).
@@ -507,6 +617,68 @@ async function readRequestBodyCapped(req: Request, maxBytes: number): Promise<Ar
 }
 
 /**
+ * Who is asking and for which live model, as far as a per-key scope is concerned.
+ *
+ * This path has no router to resolve a destination, so the model is read where
+ * the client states it — the call-create session, or a standalone socket's own
+ * query — and the provider is whichever OpenAI upstream this relay settles on.
+ * `model` is undefined when nobody stated one: a call-create that sends no
+ * session model, or a join onto a call this compatibility path never recorded.
+ */
+export interface LiveScopeDestination {
+  admission?: DataPlaneAdmission;
+  model: string | undefined;
+  /**
+   * The call a sideband join attaches to. When this process did not create it (no entry in
+   * `nativeLiveCalls`), the client created it with its own ChatGPT login — a V3 `existingCall` —
+   * and the join is authenticated as that caller instead of a Pool-selected account.
+   */
+  callerOwnedCallId?: string;
+}
+
+/**
+ * The live model a call-create body names, or undefined when it names none.
+ *
+ * Both inbound shapes carry it at `session.model` — JSON directly, multipart in
+ * the `session` field — and this path relays the body upstream unchanged, so
+ * the string is the destination rather than a selector the proxy rewrites. A
+ * body that states nothing readable leaves the model to the upstream, which is
+ * a destination no model list can describe.
+ */
+export async function liveCallCreateModel(body: ArrayBuffer, contentType: string): Promise<string | undefined> {
+  try {
+    let session: unknown;
+    if (contentType.toLowerCase().includes("multipart/form-data")) {
+      const form = await new Response(body, { headers: { "content-type": contentType } }).formData();
+      const raw = form.get("session");
+      session = typeof raw === "string" ? JSON.parse(raw) : undefined;
+    } else {
+      session = (JSON.parse(new TextDecoder().decode(body)) as { session?: unknown } | null)?.session;
+    }
+    const model = (session as { model?: unknown } | null | undefined)?.model;
+    return typeof model === "string" && model.trim() ? model.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The model a sideband upgrade is for, or undefined when the request names none.
+ *
+ * A standalone session states it in the query it forwards. A join names nothing
+ * of its own: the call it attaches to chose a model at create time, and only a
+ * recorded binding can say which. This compatibility path keeps no such record,
+ * so a native join is undefined here and the external path in `audio-live.ts`
+ * supplies the model its binding stored.
+ */
+export function liveSidebandModel(target: LiveSidebandTarget): string | undefined {
+  if (target.style === "realtime-standalone" || target.style === "frameless-standalone") {
+    return new URLSearchParams(target.query).get("model")?.trim() || undefined;
+  }
+  return undefined;
+}
+
+/**
  * Resolve OpenAI/ChatGPT auth + headers for live HTTP or sideband WebSocket relays.
  * Shared by call-create and sideband so pool token override stays consistent.
  */
@@ -515,6 +687,7 @@ export async function resolveLiveRelay(
   config: OcxConfig,
   logCtx: RequestLogContext,
   turnAdmissionLease?: AdmissionLease,
+  destination?: LiveScopeDestination,
 ): Promise<LiveRelayTarget | Response> {
   try {
     validateForwardAdmissionCredential(req.headers, config);
@@ -539,9 +712,14 @@ export async function resolveLiveRelay(
   let forwardAuthError: Response | undefined;
   if (candidates.forwardCandidates.length > 0) {
     try {
-      forward = await resolveFirstUsableOpenAiSidecar(candidates.forwardCandidates, req.headers, config, {
-        beginCodexAccountSelection: codexAccountSelectionForTurn(turnAdmissionLease),
-      });
+      const joinsForeignCall = destination?.callerOwnedCallId !== undefined
+        && !nativeLiveCalls.has(destination.callerOwnedCallId);
+      forward = (joinsForeignCall
+        ? resolveCallerOwnedOpenAiSidecar(candidates.forwardCandidates, req.headers, config)
+        : undefined)
+        ?? await resolveFirstUsableOpenAiSidecar(candidates.forwardCandidates, req.headers, config, {
+          beginCodexAccountSelection: codexAccountSelectionForTurn(turnAdmissionLease),
+        });
       if (forward) {
         logCtx.provider = formatCodexProviderForLog(
           forward.providerName,
@@ -550,7 +728,9 @@ export async function resolveLiveRelay(
         );
       }
     } catch (err) {
-      if (err instanceof CodexAccountCooldownError) {
+      if (err instanceof CodexInstallationIdUnavailableError) {
+        forwardAuthError = formatErrorResponse(503, "server_busy", err.message);
+      } else if (err instanceof CodexAccountCooldownError) {
         forwardAuthError = cooldownErrorResponse(err);
       } else if (err instanceof CodexMainProfileDrainingError) {
         forwardAuthError = codexMainProfileDrainingResponse();
@@ -568,6 +748,8 @@ export async function resolveLiveRelay(
           "authentication_error",
           "Selected Codex account needs reauthentication",
         );
+      } else if (err instanceof CodexModelAvailabilityError) {
+        forwardAuthError = codexModelAvailabilityErrorResponse(err);
       } else if (err instanceof CodexPoolAuthenticationError) {
         forwardAuthError = formatErrorResponse(401, "authentication_error", err.message);
       } else {
@@ -578,22 +760,43 @@ export async function resolveLiveRelay(
 
   // Client protocol headers first so provider/auth headers below always win on conflict.
   const headers: Record<string, string> = clientProtocolHeaders(req.headers);
+  const scopedModel = destination?.model;
   if (forward) {
     const { provider } = forward;
-    if (provider.headers) Object.assign(headers, provider.headers);
-    for (const [name, value] of forward.headers) headers[name] = value;
+    // The upstream is settled here and voice bills it for whatever model this
+    // request carries. Refuse before any of it is sent, and give back the probe
+    // lease the resolution took. A join states no model and this path keeps no
+    // record of the call it attaches to, so a key with a model list is refused
+    // there rather than admitted against an assumed default.
+    const denial = admissionScopeDenial(config, destination?.admission, scopedModel, {
+      providerName: forward.providerName,
+      modelId: scopedModel,
+    });
+    if (denial) {
+      forward.releaseProbeLease?.();
+      return denial;
+    }
+    const selectedHeaders = mergeCodexSelectedHeaders({ ...headers, ...provider.headers }, forward.headers);
     logCtx.model = "gpt-live";
     return {
-      headers,
+      headers: Object.fromEntries(selectedHeaders),
+      authContext: forward.authContext,
+      releaseProbeLease: forward.releaseProbeLease,
       providerBaseUrl: provider.baseUrl,
       usesBackendShape: isChatGptBackendBaseUrl(provider.baseUrl),
       keyed: false,
-      recordOutcome: status => forward.recordOutcome?.(status),
+      // A caller-owned or Direct credential selected no Pool account, so there is nothing to record.
+      ...(forward.recordOutcome ? { recordOutcome: (status: number | "timeout" | "connect_error") => forward.recordOutcome?.(status) } : {}),
     };
   }
   if (forwardAuthError) return forwardAuthError;
   if (candidates.keyed) {
     const { provider, apiKey, providerName } = candidates.keyed;
+    const denial = admissionScopeDenial(config, destination?.admission, scopedModel, {
+      providerName,
+      modelId: scopedModel,
+    });
+    if (denial) return denial;
     if (provider.headers) Object.assign(headers, provider.headers);
     headers.authorization = `Bearer ${apiKey}`;
     logCtx.provider = providerName;
@@ -617,13 +820,17 @@ export async function handleLive(
   config: OcxConfig,
   logCtx: RequestLogContext,
   turnAdmissionLease?: AdmissionLease,
+  admission?: DataPlaneAdmission,
 ): Promise<Response> {
   const inboundContentType = req.headers.get("content-type") ?? "application/octet-stream";
   const inboundBodyOrError = await readRequestBodyCapped(req, LIVE_REQUEST_MAX_BYTES);
   if (inboundBodyOrError instanceof Response) return inboundBodyOrError;
   const inboundBody = inboundBodyOrError;
 
-  const relay = await resolveLiveRelay(req, config, logCtx, turnAdmissionLease);
+  const relay = await resolveLiveRelay(req, config, logCtx, turnAdmissionLease, {
+    admission,
+    model: await liveCallCreateModel(inboundBody, inboundContentType),
+  });
   if (relay instanceof Response) return relay;
 
   const headers: Record<string, string> = { ...relay.headers };
@@ -646,7 +853,7 @@ export async function handleLive(
     // Frameless API-shape call-create posts to `{base}/live` without the AVAS
     // query (openai/codex RealtimeCallClient, realtime_call.rs); only the
     // realtime/calls inbound shape keeps the legacy keyed AVAS endpoint.
-    url = new URL(req.url).pathname === "/v1/live"
+    url = codexCompatibleUrl(req.url).pathname === "/v1/live"
       ? forwardLiveUrl(relay.providerBaseUrl, /* usesBackendShape */ false)
       : keyedLiveUrl(relay.providerBaseUrl);
   }
@@ -656,6 +863,18 @@ export async function handleLive(
   const linkedSignal = signalWithTimeout(LIVE_UPSTREAM_TIMEOUT_MS, req.signal);
   const sidecarExit = sidecarEnter("live");
   try {
+    if (relay.authContext?.kind === "pool") {
+      let parsed: unknown;
+      try { parsed = JSON.parse(new TextDecoder().decode(outboundBody)); } catch { /* Upstream owns invalid JSON. */ }
+      const accountId = relay.authContext.chatgptAccountId;
+      let isolated = isolateCodexPoolClientMetadata(parsed, accountId);
+      if (isolated && typeof isolated === "object" && !Array.isArray(isolated)) {
+        const record = isolated as Record<string, unknown>;
+        const session = isolateCodexPoolClientMetadata(record.session, accountId);
+        if (session !== record.session) isolated = { ...record, session };
+      }
+      if (isolated !== parsed) outboundBody = new TextEncoder().encode(JSON.stringify(isolated)).buffer as ArrayBuffer;
+    }
     const upstreamResponse = await fetch(url, {
       method: "POST",
       headers,
@@ -687,6 +906,11 @@ export async function handleLive(
       detachBodyGuard();
     }
     if (payload instanceof Response) return payload;
+    // Remember the calls this proxy created, so their joins keep the Pool account that created
+    // them while a join for any other call is authenticated as its caller (`resolveLiveRelay`).
+    if (upstreamResponse.status >= 200 && upstreamResponse.status < 300) {
+      nativeLiveCalls.record(upstreamResponse.headers.get("location"));
+    }
     const relayHeaders: Record<string, string> = {};
     for (const name of LIVE_RELAY_HEADERS) {
       const value = upstreamResponse.headers.get(name);
@@ -696,6 +920,10 @@ export async function handleLive(
   } catch (err) {
     if (req.signal.aborted) {
       return formatErrorResponse(499, "client_closed_request", "live request canceled by client");
+    }
+    if (err instanceof CodexInstallationIdUnavailableError) {
+      relay.releaseProbeLease?.();
+      return formatErrorResponse(503, "server_busy", err.message);
     }
     if (err instanceof Error && err.name === "TimeoutError") {
       relay.recordOutcome?.("timeout");
@@ -720,10 +948,16 @@ export async function resolveLiveSidebandUpgrade(
   logCtx: RequestLogContext,
   target: LiveSidebandTarget,
   turnAdmissionLease?: AdmissionLease,
-): Promise<{ headers: Record<string, string>; upstreamWsUrl: string; recordOutcome?: LiveRelayTarget["recordOutcome"] } | Response> {
-  const relay = await resolveLiveRelay(req, config, logCtx, turnAdmissionLease);
+  admission?: DataPlaneAdmission,
+): Promise<{ headers: Record<string, string>; upstreamWsUrl: string; authContext?: CodexAuthContext; recordOutcome?: LiveRelayTarget["recordOutcome"] } | Response> {
+  const relay = await resolveLiveRelay(req, config, logCtx, turnAdmissionLease, {
+    admission,
+    model: liveSidebandModel(target),
+    ...("callId" in target ? { callerOwnedCallId: target.callId } : {}),
+  });
   if (relay instanceof Response) return relay;
   return {
+    authContext: relay.authContext,
     headers: relay.headers,
     upstreamWsUrl: buildLiveSidebandUpstreamWsUrl(target, config.experimentalRealtimeWsBaseUrl),
     recordOutcome: relay.recordOutcome,

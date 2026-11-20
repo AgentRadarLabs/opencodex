@@ -26,9 +26,12 @@
 
 import {
   adapterEofIncompleteFrame,
+  type CodexSafetyBufferingFilterOptions,
   createSseTerminalOutputBoundary,
   doneFrame,
   failedTailFrame,
+  refusalFailedTailFrame,
+  upstreamErrorTailFrame,
 } from "./relay";
 import {
   nextSseBlock,
@@ -39,6 +42,8 @@ import {
   type SsePayloadRewrite,
 } from "./sse-payload-rewrite";
 import type { TranslatorBudget } from "../lib/translator-budget";
+import type { BareUpstreamError } from "./bare-upstream-error";
+import { carryPacedStream, isPacedStream, PACED_READ_AHEAD_BYTES } from "../lib/paced-stream";
 
 export type EagerRelayHooks = {
   /** Feed one upstream chunk through SSE inspection (createSseInspector.feed). */
@@ -63,7 +68,7 @@ export type EagerRelayHooks = {
   /** True once inspection has reported a protocol terminal (inspector.reported). */
   sawTerminal: () => boolean;
   /** Record a synthetic terminal (caller decides incomplete vs failed-502). */
-  onSynthetic: (kind: "incomplete" | "failed") => void;
+  onSynthetic: (kind: "incomplete" | "failed", reason?: "upstream_error") => void;
   /** Client cancelled and NO terminal arrived within the drain bounds. */
   onClientCancel: () => void;
   /** Exactly once, after the producer fully stops (unregisterTurn parity). */
@@ -81,6 +86,16 @@ export type EagerRelayOptions = {
   postCancelDrainMs?: number;
   /** Post-cancel discard-drain byte bound. Default 32 MiB. */
   postCancelDrainBytes?: number;
+  /** Last known upstream failure to preserve when EOF would otherwise become adapter_eof. */
+  upstreamError?: string;
+  /** Optional client-facing hint policy; inspection retains original frames. */
+  terminalBoundary?: CodexSafetyBufferingFilterOptions;
+  /** Mask the selected outbound credential in synthetic failures. */
+  maskCredential?: (text: string) => string;
+  /** Redaction for forwarded typed error frames, applied after classification (see relay.ts). */
+  redactForwardedEvidence?: (block: string) => string;
+  /** Receives the exact payload of every synthesized bare-verdict tail (see relaySseWithFailedTail). */
+  onSyntheticTail?: (payload: string, verdict?: BareUpstreamError) => void;
   /** Injectable clock for tests. */
   now?: () => number;
 };
@@ -101,7 +116,8 @@ export function relaySseEagerBounded(
   hooks: EagerRelayHooks,
   opts?: EagerRelayOptions,
 ): ReadableStream<Uint8Array> {
-  const maxQueueBytes = opts?.maxQueueBytes ?? DEFAULT_MAX_QUEUE_BYTES;
+  // A paced source (#8601) queues one chunk for its client instead of the default allowance.
+  const maxQueueBytes = opts?.maxQueueBytes ?? (isPacedStream(body) ? PACED_READ_AHEAD_BYTES : DEFAULT_MAX_QUEUE_BYTES);
   const drainMs = opts?.postCancelDrainMs ?? DEFAULT_DRAIN_MS;
   const drainBytes = opts?.postCancelDrainBytes ?? DEFAULT_DRAIN_BYTES;
   const now = opts?.now ?? Date.now;
@@ -111,12 +127,33 @@ export function relaySseEagerBounded(
   const terminalEncoder = new TextEncoder();
   const adapterEofFrame = adapterEofIncompleteFrame(terminalEncoder);
   const terminalSentinel = doneFrame(terminalEncoder);
-  const terminalBoundary = createSseTerminalOutputBoundary();
+  const terminalBoundary = createSseTerminalOutputBoundary({ ...opts?.terminalBoundary, maskCredential: opts?.maskCredential, redactForwardedEvidence: opts?.redactForwardedEvidence });
   const activeRewrite: SseBlockRewrite | undefined = hooks.rewriteBlocks
     ?? (hooks.rewritePayload ? payloadRewriteAsBlockRewrite(hooks.rewritePayload) : undefined);
   const encodeFailedTail = (error: unknown): Uint8Array | null => {
     try {
-      return failedTailFrame(terminalEncoder, error);
+      return failedTailFrame(terminalEncoder, error, opts?.maskCredential);
+    } catch {
+      return null;
+    }
+  };
+  /**
+   * Same tail, except that a bare verdict the boundary already captured outranks the
+   * read failure that followed it — the upstream stated the turn's outcome before the
+   * socket did. A refusal and a recognized class keep their identity; an ordinary
+   * error frame is the provider's own terminal and keeps the transport failure after
+   * it, so a mid-stream reset still reads as `upstream_reset`.
+   */
+  const encodeTerminalTail = (error: unknown): Uint8Array | null => {
+    const verdict = terminalBoundary.upstreamVerdict();
+    const message = terminalBoundary.upstreamError();
+    if (verdict === undefined || message === undefined
+      || (verdict.refusalCode === undefined && !terminalBoundary.recognizedBareError())) {
+      return encodeFailedTail(error);
+    }
+    try {
+      return refusalFailedTailFrame(terminalEncoder, message, verdict.refusalCode,
+        opts?.maskCredential, verdict.errorType, verdict.errorCode, verdict, opts?.onSyntheticTail);
     } catch {
       return null;
     }
@@ -239,6 +276,7 @@ export function relaySseEagerBounded(
 
   const producer = async () => {
     let syntheticKind: "incomplete" | "failed" | null = null;
+    let syntheticReason: "upstream_error" | undefined;
     let deliveryFallbackSent = false;
     let priorRewriteFailure = false;
     let priorRewriteError: unknown;
@@ -303,12 +341,28 @@ export function relaySseEagerBounded(
           } else if (!hooks.sawTerminal() && canDeliver()) {
             // A clean 200 EOF without a Responses terminal must be visible to
             // Codex as one incomplete turn, followed by the normal sentinel.
-            queuedBytes += adapterEofFrame.byteLength + terminalSentinel.byteLength;
+            const upstreamError = terminalBoundary.upstreamError() ?? opts?.upstreamError;
+            // A clean EOF is not a read failure: the winning verdict states the turn's outcome,
+            // so the tail carries it exactly as the request row and account inspector do.
+            const upstreamErrorFrame = upstreamError === undefined
+              ? adapterEofFrame
+              : upstreamErrorTailFrame(
+                terminalEncoder,
+                upstreamError,
+                terminalBoundary.upstreamRefusalCode(),
+                opts?.maskCredential,
+                terminalBoundary.upstreamErrorType(),
+                terminalBoundary.upstreamErrorCode(),
+                terminalBoundary.upstreamVerdict(),
+                opts?.onSyntheticTail,
+              );
+            queuedBytes += upstreamErrorFrame.byteLength + terminalSentinel.byteLength;
             try {
-              controllerRef?.enqueue(adapterEofFrame);
+              controllerRef?.enqueue(upstreamErrorFrame);
               controllerRef?.enqueue(terminalSentinel);
             } catch { /* client already gone */ }
-            syntheticKind = "incomplete";
+            syntheticKind = upstreamError === undefined ? "incomplete" : "failed";
+            syntheticReason = upstreamError === undefined ? undefined : "upstream_error";
           }
           break;
         }
@@ -427,13 +481,22 @@ export function relaySseEagerBounded(
         // getters, toString) that re-entrantly cancel the client or abort the
         // upstream. Build the tail FIRST, then re-check eligibility before
         // committing to the synthetic terminal (adversarial review blocker).
-        const tail = encodeFailedTail(err);
+        const tail = encodeTerminalTail(err);
         if (tail && canDeliver()) {
           // Inspection and client framing have separate bounded parsers. If
           // inspection resynchronized after an oversized frame and observed a
           // later real terminal, it still must not suppress a terminal delivery
           // to the client. Only accounting remains tied to the inspected result.
-          if (!hooks.sawTerminal()) syntheticKind = "failed";
+          if (!hooks.sawTerminal()) {
+            syntheticKind = "failed";
+            // Same predicate as encodeTerminalTail: only a refusal or a provider-stated class
+            // outranks the read failure. An unrecognized verdict keeps the transport-failure
+            // attribution (streamAborted, mid_stream) the tee path also records.
+            const verdict = terminalBoundary.upstreamVerdict();
+            if (verdict !== undefined && (verdict.refusalCode !== undefined || terminalBoundary.recognizedBareError())) {
+              syntheticReason = "upstream_error";
+            }
+          }
           deliveryFallbackSent = true;
           queuedBytes += tail.byteLength;
           try { controllerRef?.enqueue(tail); } catch { /* client already torn down */ }
@@ -441,6 +504,8 @@ export function relaySseEagerBounded(
         }
       }
     } finally {
+      upstream.signal.removeEventListener("abort", wakeUp);
+      upstream.signal.removeEventListener("abort", wakeParkedRead);
       // Release any retained rewrite-buffer bytes on every teardown path
       // (error, cancel, upstream abort) — consumption/EOF release alone
       // leaves them charged.
@@ -449,8 +514,13 @@ export function relaySseEagerBounded(
         frameBufferBytes = 0;
       }
       terminalBoundary.dispose();
-      if (syntheticKind && canDeliver()) hooks.onSynthetic(syntheticKind);
+      if (syntheticKind && canDeliver()) {
+        if (syntheticReason === undefined) hooks.onSynthetic(syntheticKind);
+        else hooks.onSynthetic(syntheticKind, syntheticReason);
+      }
       if (cancelled && !hooks.sawTerminal()) {
+        // Finalize transport telemetry before the cancellation hook persists its usage row.
+        upstream.abort();
         hooks.onClientCancel();
       }
       if (cancelled || upstream.signal.aborted || syntheticKind === "failed" || deliveryFallbackSent) {
@@ -465,7 +535,7 @@ export function relaySseEagerBounded(
     }
   };
 
-  return new ReadableStream<Uint8Array>({
+  return carryPacedStream(body, new ReadableStream<Uint8Array>({
     start(controller) {
       controllerRef = controller;
       clientGoneSignal?.addEventListener("abort", markClientGone, { once: true });
@@ -482,7 +552,7 @@ export function relaySseEagerBounded(
     cancel() {
       markClientGone();
     },
-  });
+  }));
 }
 
 function joinUint8Arrays(first: Uint8Array, second: Uint8Array): Uint8Array {

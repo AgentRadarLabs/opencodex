@@ -3,7 +3,8 @@ import { isLocalAttestationSecret } from "./local-management-attestation";
 
 export const GUI_PAIR_METHOD = "POST";
 export const GUI_PAIR_PATH = "/api/gui/pairing-grants";
-export const GUI_PAIR_CAPABILITY_VERSION = "v1";
+export const DESKTOP_GUI_PAIR_PATH = "/api/gui/desktop-pairing-grants";
+export const GUI_PAIR_CAPABILITY_VERSION = "v2";
 export const GUI_PAIR_EXPECTED_PID_HEADER = "x-opencodex-gui-pair-expected-pid";
 export const GUI_PAIR_NONCE_HEADER = "x-opencodex-gui-pair-nonce";
 export const GUI_PAIR_EXPIRES_AT_HEADER = "x-opencodex-gui-pair-expires-at";
@@ -38,6 +39,50 @@ export function canonicalGuiBrowserOrigin(value: unknown): string | null {
   }
 }
 
+/**
+ * A bare http(s) origin, or null.
+ *
+ * Stricter than {@link canonicalGuiBrowserOrigin}: that one also accepts non-HTTP schemes
+ * (a packaged app's custom scheme can be a browser origin), while this is the rule for an
+ * origin that will be DIALLED — the hub's management and data origins, and the `serverOrigin`
+ * a pairing grant is bound to. Credentials, a path, a query or a fragment are all rejected
+ * rather than silently dropped, because every caller goes on to print or compare the result.
+ *
+ * Exported here, beside the browser-origin canonicaliser, because this file is the only
+ * module the CLI pairing path and the hub command already share. `src/config.ts` and
+ * `src/server/gui-session.ts` still hold byte-identical private copies; folding those in
+ * would pull a heavy config import into a server security-boundary file, so it is its own
+ * change rather than a drive-by in a token-UX PR.
+ */
+export function canonicalHttpOrigin(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    if (parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Standalone pairing is only for this process's configured literal loopback origin.
+ * No CORS entry, public hub URL, wildcard bind, alias or client role can widen it.
+ * The CLI separately checks the attested runtime's actual port before requesting a grant.
+ */
+export function standaloneGuiPairingOrigin(config: {
+  runtimeRole?: string;
+  hostname?: string;
+  port: number;
+}): string | null {
+  if ((config.runtimeRole ?? "standalone") !== "standalone") return null;
+  const hostname = config.hostname ?? "127.0.0.1";
+  if (hostname !== "127.0.0.1" && hostname !== "::1") return null;
+  if (!Number.isInteger(config.port) || config.port < 1 || config.port > 65535) return null;
+  return new URL(`http://${hostname === "::1" ? "[::1]" : hostname}:${config.port}`).origin;
+}
+
 function capabilityPayload(
   nonce: string,
   method: string,
@@ -48,7 +93,7 @@ function capabilityPayload(
   expiresAt: number,
 ): string | null {
   if (!BASE64URL_256.test(nonce)) return null;
-  if (method !== GUI_PAIR_METHOD || path !== GUI_PAIR_PATH) return null;
+  if (method !== GUI_PAIR_METHOD || (path !== GUI_PAIR_PATH && path !== DESKTOP_GUI_PAIR_PATH)) return null;
   const canonicalOrigin = canonicalGuiBrowserOrigin(browserOrigin);
   if (!canonicalOrigin || canonicalOrigin !== browserOrigin) return null;
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;

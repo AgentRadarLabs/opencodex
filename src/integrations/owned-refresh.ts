@@ -27,6 +27,8 @@ export interface OwnedIntegrationRefreshInput {
   home?: string;
   store?: IntegrationStateStore;
   io?: IntegrationIO;
+  /** Internal profile target selected before entering the coordinated writer. */
+  resolvedPaths?: { configPath: string; detectDir: string };
 }
 
 export interface OwnedIntegrationRefreshOutcome {
@@ -34,11 +36,22 @@ export interface OwnedIntegrationRefreshOutcome {
   readonly ok: boolean;
   readonly changed?: boolean;
   readonly reason?: string;
+  readonly profileId?: number;
+  readonly refusalReason?: string;
+  readonly state?: string;
+  readonly snapshotPath?: string;
+  readonly residual?: boolean;
 }
 
 /**
- * Returns `null` when the client has never been connected by OpenCodex.
- * Callers use that distinction to report "left alone" rather than "skipped".
+ * Returns `null` when the client has never been connected by OpenCodex, or
+ * when it was connected and has since been uninstalled. Callers use that
+ * distinction to report "left alone" rather than "skipped".
+ *
+ * An uninstalled client keeps its ownership record: an implicit refresh must
+ * not edit ownership, and a reinstall resumes refreshing. Reporting it as a
+ * failure instead turned every model toggle into a "pi is not installed"
+ * warning for a client the user no longer has.
  */
 export async function refreshOwnedIntegration(
   input: OwnedIntegrationRefreshInput,
@@ -59,16 +72,22 @@ export async function refreshOwnedIntegration(
   const bound = { ...rest, models, store };
   const result = await runIntegrationMutationFlight(
     input.clientId,
-    "refresh",
+    // Separate catalog snapshots must not inherit another refresh's success.
+    // The shared flight owner returns busy for overlapping operations instead.
+    `refresh:${crypto.randomUUID()}`,
     input.io?.now ?? Date.now,
     () => refreshIntegrationCoordinated(bound, options),
   );
+  if (!result.ok && result.reason === "not_installed") return null;
   return result.ok
     ? {
         client: input.clientId,
         ok: true,
         changed: result.changed,
-        ...(result.state === "absent" ? { reason: result.message } : {}),
+        ...(result.state !== "current" ? { reason: result.message } : {}),
       }
-    : { client: input.clientId, ok: false, reason: result.message };
+    : { client: input.clientId, ok: false, reason: result.message, refusalReason: result.reason, state: result.state,
+        ...(result.snapshotPath ? { snapshotPath: result.snapshotPath } : {}),
+        ...(result.residual ? { residual: true } : {}),
+      };
 }

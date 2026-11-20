@@ -41,4 +41,22 @@ describe("isModelTextOnly (#1024)", () => {
   test("suffixed model IDs are resolved through family lookup", () => {
     expect(isModelTextOnly(provider({ modelInputModalities: { "base-model": ["text"] } }), "base-model:extended")).toBe(true);
   });
+
+  test("provider-wide inputModalities cover unlisted ids while a per-model entry still wins", () => {
+    const textOnly = provider({ inputModalities: ["text"], modelInputModalities: { "vision-model": ["text", "image"] } });
+    expect(isModelTextOnly(textOnly, "live-discovered-model")).toBe(true);
+    expect(isModelTextOnly(textOnly, "vision-model")).toBe(false);
+    expect(isModelTextOnly(provider({ inputModalities: ["text", "image"] }), "live-discovered-model")).toBe(false);
+  });
+});
+
+
+test("explicit capability keys are exact and take precedence over legacy declarations", () => {
+  const config = provider({ noVisionModels: ["ModelA"], modelCapabilities: { ModelA: { inputModalities: ["text", "image"] }, model: { inputModalities: ["text"] } } });
+  expect(isModelTextOnly(config, "ModelA")).toBe(false);
+  expect(isModelTextOnly(config, "model")).toBe(true);
+  expect(isModelTextOnly(config, "MODEL")).toBe(false);
+  expect(isModelTextOnly(config, "model:variant")).toBe(false);
+  delete config.modelCapabilities!.ModelA;
+  expect(isModelTextOnly(config, "ModelA")).toBe(true);
 });

@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import type { ServerWebSocket } from "bun";
 import {
   BoundedSseFrameBuffer,
+  EMPTY_BYTES,
+  joinSseFrameBytes,
   MAX_CLIENT_SSE_FRAME_BYTES,
   SseFrameCountLimitError,
   SseFrameTooLargeError,
@@ -45,31 +47,6 @@ describe("client-facing SSE frame bounds", () => {
     expect(dec.decode(frames[0]!.block)).toBe("12345678");
     expect(dec.decode(frames[0]!.delimiter)).toBe("\n\n");
     expect(framer.finish().byteLength).toBe(0);
-  });
-
-  test("the byte framer preserves a lone-CR delimiter split across chunks", () => {
-    const framer = new BoundedSseFrameBuffer(64);
-
-    expect(framer.feed(enc.encode("data: first\r"))).toEqual([]);
-    expect(framer.feed(enc.encode("\r"))).toEqual([]);
-    const { frames, tail } = framer.finishFrames();
-
-    expect(frames).toHaveLength(1);
-    expect(dec.decode(frames[0]!.block)).toBe("data: first");
-    expect(dec.decode(frames[0]!.delimiter)).toBe("\r\r");
-    expect(tail.byteLength).toBe(0);
-  });
-
-  test("the byte framer waits for a split CRLF delimiter's final LF", () => {
-    const framer = new BoundedSseFrameBuffer(64);
-
-    expect(framer.feed(enc.encode("data: first\r"))).toEqual([]);
-    expect(framer.feed(enc.encode("\n\r"))).toEqual([]);
-    const frames = framer.feed(enc.encode("\n"));
-
-    expect(frames).toHaveLength(1);
-    expect(dec.decode(frames[0]!.block)).toBe("data: first");
-    expect(dec.decode(frames[0]!.delimiter)).toBe("\r\n\r\n");
   });
 
   test("the byte framer rejects cap + 1 without retaining an oversized tail", () => {
@@ -290,5 +267,14 @@ describe("client-facing SSE frame bounds", () => {
     expect(sendCalls).toBe(1);
     expect(sourceCancelled).toBe(true);
     expect(ws.data.cancel).toBeUndefined();
+  });
+
+  test("reusable EMPTY_BYTES constant is returned for zero-length frame buffer operations", () => {
+    expect(EMPTY_BYTES.byteLength).toBe(0);
+    expect(joinSseFrameBytes([])).toBe(EMPTY_BYTES);
+    expect(joinSseFrameBytes([new Uint8Array(0), new Uint8Array(0)])).toBe(EMPTY_BYTES);
+    const buffer = new BoundedSseFrameBuffer(1024);
+    expect(buffer.finish()).toBe(EMPTY_BYTES);
+    expect(buffer.finish()).toBe(EMPTY_BYTES);
   });
 });

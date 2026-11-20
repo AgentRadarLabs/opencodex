@@ -23,10 +23,13 @@ import {
   clearAccountQuotaCache,
   setCachedProviderAccountQuotaForTests,
 } from "../../../src/providers/quota";
+import { accountQuotaCache } from "../../../src/providers/quota/account-cache";
 import {
   clearKiroAccountUsageState,
   commitKiroAccountUsageState,
 } from "../../../src/providers/kiro-usage";
+import { kiroEvidenceIdentity } from "../../../src/providers/kiro-account-state-disk";
+import type { ProviderAccount } from "../../../src/oauth/types";
 import { removeTreeWithRetry } from "../../helpers/remove-tree";
 
 const realFetch = globalThis.fetch;
@@ -37,8 +40,17 @@ afterEach(() => {
   clearKiroAccountUsageState();
 });
 
+function account(id: string): ProviderAccount {
+  return getAccountSet("kiro")?.accounts.find(row => row.id === id)
+    ?? { id, credential: { access: "fixture", refresh: "fixture", expires: 0 } };
+}
+function roster(...ids: string[]): ReadonlyMap<string, ProviderAccount> {
+  return new Map(ids.map(id => [id, account(id)]));
+}
+
 function seedPercent(provider: string, accountId: string, monthlyPercent: number): void {
   setCachedProviderAccountQuotaForTests(provider, accountId, { monthlyPercent, updatedAt: Date.now() });
+  if (provider === "kiro") accountQuotaCache.get(`kiro\u0000${accountId}`)!.identity = kiroEvidenceIdentity(account(accountId));
 }
 
 function seedExhausted(accountId: string, nextResetAt?: number): void {
@@ -46,32 +58,41 @@ function seedExhausted(accountId: string, nextResetAt?: number): void {
     quota: { monthlyPercent: 100, updatedAt: Date.now() },
     exhausted: true,
     ...(nextResetAt !== undefined ? { nextResetAt } : {}),
-  });
+  }, kiroEvidenceIdentity(account(accountId)));
 }
 
 describe("headroom ranking", () => {
   test("the account with more remaining allowance goes first", () => {
     seedPercent("kiro", "a", 10);
     seedPercent("kiro", "b", 90);
-    expect(rankAccountsByHeadroom("kiro", ["b", "a"])).toEqual(["a", "b"]);
+    expect(rankAccountsByHeadroom("kiro", ["b", "a"], undefined, roster("a", "b"))).toEqual(["a", "b"]);
   });
 
   test("a measured-healthy account outranks an unknown one even when heavily used", () => {
     // 95% used is still healthy: only a provider exhaustion verdict demotes an account.
     seedPercent("kiro", "b", 95);
-    expect(rankAccountsByHeadroom("kiro", ["a", "b"])).toEqual(["b", "a"]);
+    expect(rankAccountsByHeadroom("kiro", ["a", "b"], undefined, roster("a", "b"))).toEqual(["b", "a"]);
   });
 
   test("an unknown account outranks one known to be exhausted", () => {
     seedExhausted("b");
-    expect(rankAccountsByHeadroom("kiro", ["b", "a"])).toEqual(["a", "b"]);
+    expect(rankAccountsByHeadroom("kiro", ["b", "a"], undefined, roster("a", "b"))).toEqual(["a", "b"]);
   });
 
   test("an exhausted account sorts last even with a low percentage on record", () => {
     seedPercent("kiro", "a", 80);
     seedPercent("kiro", "b", 5);
     seedExhausted("b");
-    expect(rankAccountsByHeadroom("kiro", ["b", "a"])).toEqual(["a", "b"]);
+    expect(rankAccountsByHeadroom("kiro", ["b", "a"], undefined, roster("a", "b"))).toEqual(["a", "b"]);
+  });
+
+  test("an explicit non-exhausted verdict overrides a 100 percent bar", () => {
+    seedPercent("kiro", "a", 100);
+    commitKiroAccountUsageState("kiro\0a", {
+      quota: { monthlyPercent: 100, updatedAt: Date.now() }, exhausted: false,
+    }, kiroEvidenceIdentity(account("a")));
+    expect(rankAccountsByHeadroom("kiro", ["b", "a"], undefined, roster("a", "b")))
+      .toEqual(["a", "b"]);
   });
 
   test("with no quota evidence the ring order is returned untouched", () => {
@@ -81,7 +102,7 @@ describe("headroom ranking", () => {
   test("equal headroom preserves ring order", () => {
     seedPercent("kiro", "a", 40);
     seedPercent("kiro", "b", 40);
-    expect(rankAccountsByHeadroom("kiro", ["b", "a"])).toEqual(["b", "a"]);
+    expect(rankAccountsByHeadroom("kiro", ["b", "a"], undefined, roster("a", "b"))).toEqual(["b", "a"]);
   });
 
   test("the tightest window decides, not the roomiest", () => {
@@ -98,37 +119,42 @@ describe("headroom ranking", () => {
     let called = false;
     globalThis.fetch = (async () => { called = true; return new Response("{}"); }) as typeof fetch;
     seedPercent("kiro", "a", 10);
-    rankAccountsByHeadroom("kiro", ["a", "b"]);
+    rankAccountsByHeadroom("kiro", ["a", "b"], undefined, roster("a", "b"));
     expect(called).toBe(false);
   });
 
   test("a single candidate is returned as-is", () => {
-    expect(rankAccountsByHeadroom("kiro", ["only"])).toEqual(["only"]);
+    expect(rankAccountsByHeadroom("kiro", ["only"], undefined, roster("only"))).toEqual(["only"]);
   });
 });
 
 describe("exhaustion cooldown", () => {
-  test("a distant reset is clamped to a day", () => {
+  test("a distant reset is clamped to a day", async () => {
+    // A busy multi-file test process can cross a millisecond before the verdict is written.
+    await Bun.sleep(2);
+    const resetAt = Date.now() + 3 * 24 * 60 * 60_000;
+    seedExhausted("a", resetAt);
+    // The read clock must follow the observation; a future-dated verdict is invalid.
     const now = Date.now();
-    seedExhausted("a", now + 3 * 24 * 60 * 60_000);
-    expect(exhaustedCooldownMs("kiro", "a", now)).toBe(24 * 60 * 60_000);
+    expect(exhaustedCooldownMs("kiro", "a", now, account("a"))).toBe(24 * 60 * 60_000);
   });
 
   test("an imminent reset is floored at five minutes", () => {
+    seedExhausted("a", Date.now() + 30_000);
     const now = Date.now();
-    seedExhausted("a", now + 30_000);
-    expect(exhaustedCooldownMs("kiro", "a", now)).toBe(5 * 60_000);
+    expect(exhaustedCooldownMs("kiro", "a", now, account("a"))).toBe(5 * 60_000);
   });
 
   test("a reset inside the window is honoured exactly", () => {
+    const resetAt = Date.now() + 60 * 60_000;
+    seedExhausted("a", resetAt);
     const now = Date.now();
-    seedExhausted("a", now + 60 * 60_000);
-    expect(exhaustedCooldownMs("kiro", "a", now)).toBe(60 * 60_000);
+    expect(exhaustedCooldownMs("kiro", "a", now, account("a"))).toBe(resetAt - now);
   });
 
   test("a healthy account has no exhaustion cooldown", () => {
     seedPercent("kiro", "a", 10);
-    expect(exhaustedCooldownMs("kiro", "a")).toBeNull();
+    expect(exhaustedCooldownMs("kiro", "a", Date.now(), account("a"))).toBeNull();
   });
 
   test("providers without an exhaustion verdict are unaffected", () => {
@@ -143,7 +169,7 @@ describe("pre-dispatch account preference", () => {
     authMode: "oauth",
   } as unknown as OcxProviderConfig;
 
-  const config = { providers: { xai: OAUTH_PROVIDER } } as unknown as OcxConfig;
+  const config = { providers: { xai: OAUTH_PROVIDER }, oauthAccountFailover: { enabled: true } } as unknown as OcxConfig;
   const originalHome = process.env.OPENCODEX_HOME;
   let home: string;
 
@@ -159,7 +185,7 @@ describe("pre-dispatch account preference", () => {
     return getAccountSet(providerName)?.accounts.map(a => a.id) ?? [];
   }
 
-  test("the account with more headroom is chosen before the first request", async () => {
+  test("an enabled pool avoids a known-exhausted selected account", async () => {
     home = mkdtempSync(join(tmpdir(), "ocx-predispatch-"));
     process.env.OPENCODEX_HOME = home;
     clearGenericFailoverHealth();
@@ -167,7 +193,7 @@ describe("pre-dispatch account preference", () => {
     try {
       const ids = await seedAccounts(2);
       await setActiveAccount("xai", ids[0]!);
-      setCachedProviderAccountQuotaForTests("xai", ids[0]!, { monthlyPercent: 95, updatedAt: Date.now() });
+      setCachedProviderAccountQuotaForTests("xai", ids[0]!, { monthlyPercent: 100, updatedAt: Date.now() });
       setCachedProviderAccountQuotaForTests("xai", ids[1]!, { monthlyPercent: 5, updatedAt: Date.now() });
       expect(preferredInitialAccount(config, "xai")).toBe(ids[1]);
     } finally {
@@ -239,7 +265,7 @@ describe("pre-dispatch account preference", () => {
     }
   });
 
-  test("an exhausted account without Retry-After stays cooled through its reset window", async () => {
+  test("a Kiro rate refusal without Retry-After uses a short cooldown despite older quota evidence", async () => {
     home = mkdtempSync(join(tmpdir(), "ocx-predispatch-"));
     process.env.OPENCODEX_HOME = home;
     clearGenericFailoverHealth();
@@ -248,12 +274,13 @@ describe("pre-dispatch account preference", () => {
       const ids = await seedAccounts(2, "kiro");
       const now = Date.now();
       seedExhausted(ids[0]!, now + 60 * 60_000);
+      const dispatchAt = Date.now();
       const kiroConfig = {
         providers: { kiro: OAUTH_PROVIDER },
       } as unknown as OcxConfig;
 
-      expect(rotateGenericOAuthAccountOn429(kiroConfig, "kiro", ids[0]!, null, now)).toBe(ids[1]);
-      expect(genericFailoverRetryAfterSeconds("kiro", now)).toBe(60 * 60);
+      expect(rotateGenericOAuthAccountOn429(kiroConfig, "kiro", ids[0]!, null, dispatchAt)).toBe(ids[1]);
+      expect(genericFailoverRetryAfterSeconds("kiro", dispatchAt)).toBe(10);
     } finally {
       clearGenericFailoverHealth();
       clearAccountQuotaCache();
@@ -263,7 +290,7 @@ describe("pre-dispatch account preference", () => {
     }
   });
 
-  test("an unparseable Retry-After uses an exhausted account reset", async () => {
+  test("an unparseable Kiro rate Retry-After uses the short default", async () => {
     home = mkdtempSync(join(tmpdir(), "ocx-predispatch-"));
     process.env.OPENCODEX_HOME = home;
     clearGenericFailoverHealth();
@@ -272,14 +299,15 @@ describe("pre-dispatch account preference", () => {
       const ids = await seedAccounts(2, "kiro");
       const now = Date.now();
       seedExhausted(ids[0]!, now + 60 * 60_000);
+      const dispatchAt = Date.now();
       const kiroConfig = {
         providers: { kiro: OAUTH_PROVIDER },
       } as unknown as OcxConfig;
 
       expect(
-        rotateGenericOAuthAccountOn429(kiroConfig, "kiro", ids[0]!, "not-a-duration", now),
+        rotateGenericOAuthAccountOn429(kiroConfig, "kiro", ids[0]!, "not-a-duration", dispatchAt),
       ).toBe(ids[1]);
-      expect(genericFailoverRetryAfterSeconds("kiro", now)).toBe(60 * 60);
+      expect(genericFailoverRetryAfterSeconds("kiro", dispatchAt)).toBe(10);
     } finally {
       clearGenericFailoverHealth();
       clearAccountQuotaCache();
@@ -331,8 +359,8 @@ describe("pre-dispatch account preference", () => {
         providers: { kiro: OAUTH_PROVIDER },
       } as unknown as OcxConfig;
 
-      expect(rotateGenericOAuthAccountOn429(kiroConfig, "kiro", ids[0]!, "45", now)).toBe(ids[1]);
-      expect(genericFailoverRetryAfterSeconds("kiro", now)).toBe(45);
+      expect(rotateGenericOAuthAccountOn429(kiroConfig, "kiro", ids[0]!, "120", now)).toBe(ids[1]);
+      expect(genericFailoverRetryAfterSeconds("kiro", now)).toBe(120);
     } finally {
       clearGenericFailoverHealth();
       clearAccountQuotaCache();
@@ -365,14 +393,7 @@ describe("pre-dispatch account preference", () => {
     }
   });
 
-  test("neither a redirecting nor a non-redirecting selection touches the credential store", async () => {
-    // loadAuthStore chmods the config dir, chmods the secret, and re-parses the whole
-    // credential file on every call — and this runs on the initial resolution of EVERY
-    // request. The steady state of this feature is a pool where one account consistently
-    // ranks higher, so the REDIRECTING path must be cached too — validating the winner here
-    // would put a second uncached read in front of every such request. Deleting the store
-    // proves it: an uncached path could not answer at all. Staleness is caught at
-    // resolution instead, inside a store read the resolver already performs.
+  test("removing the credential store invalidates an earlier selection proposal", async () => {
     home = mkdtempSync(join(tmpdir(), "ocx-predispatch-"));
     process.env.OPENCODEX_HOME = home;
     clearGenericFailoverHealth();
@@ -381,11 +402,11 @@ describe("pre-dispatch account preference", () => {
       const ids = await seedAccounts(2);
       await setActiveAccount("xai", ids[0]!);
       // Redirecting: the other account holds more headroom on every call.
-      setCachedProviderAccountQuotaForTests("xai", ids[0]!, { monthlyPercent: 95, updatedAt: Date.now() });
+      setCachedProviderAccountQuotaForTests("xai", ids[0]!, { monthlyPercent: 100, updatedAt: Date.now() });
       setCachedProviderAccountQuotaForTests("xai", ids[1]!, { monthlyPercent: 5, updatedAt: Date.now() });
       expect(preferredInitialAccount(config, "xai")).toBe(ids[1]);
       rmSync(join(home, "auth.json"), { force: true });
-      for (let i = 0; i < 4; i++) expect(preferredInitialAccount(config, "xai")).toBe(ids[1]);
+      for (let i = 0; i < 4; i++) expect(preferredInitialAccount(config, "xai")).toBeNull();
 
       // Non-redirecting: the active account already ranks best.
       setCachedProviderAccountQuotaForTests("xai", ids[0]!, { monthlyPercent: 5, updatedAt: Date.now() });
@@ -412,15 +433,14 @@ describe("pre-dispatch account preference", () => {
     try {
       const ids = await seedAccounts(2);
       await setActiveAccount("xai", ids[0]!);
-      setCachedProviderAccountQuotaForTests("xai", ids[0]!, { monthlyPercent: 95, updatedAt: Date.now() });
+      setCachedProviderAccountQuotaForTests("xai", ids[0]!, { monthlyPercent: 100, updatedAt: Date.now() });
       setCachedProviderAccountQuotaForTests("xai", ids[1]!, { monthlyPercent: 5, updatedAt: Date.now() });
       expect(preferredInitialAccount(config, "xai")).toBe(ids[1]);
 
       await removeAccount("xai", ids[1]!);
-      // Selection is a cached PREFERENCE, so it may still name the removed account...
-      expect(preferredInitialAccount(config, "xai")).toBe(ids[1]);
-      // ...and resolution is where that is caught. The request path absorbs this throw and
-      // falls back to the active account.
+      // Selection reads the authoritative roster; a removed target is never proposed.
+      expect(preferredInitialAccount(config, "xai")).toBeNull();
+      // The credential resolver independently rejects the removed identity.
       await expect(
         getValidAccessSnapshotForAccount("xai", ids[1]!, { requireUsableAccount: true }),
       ).rejects.toThrow();
@@ -446,11 +466,12 @@ describe("pre-dispatch account preference", () => {
     try {
       const ids = await seedAccounts(2);
       await setActiveAccount("xai", ids[0]!);
-      setCachedProviderAccountQuotaForTests("xai", ids[0]!, { monthlyPercent: 95, updatedAt: Date.now() });
+      setCachedProviderAccountQuotaForTests("xai", ids[0]!, { monthlyPercent: 100, updatedAt: Date.now() });
       setCachedProviderAccountQuotaForTests("xai", ids[1]!, { monthlyPercent: 5, updatedAt: Date.now() });
       expect(preferredInitialAccount(config, "xai")).toBe(ids[1]);
 
       await markAccountNeedsReauth("xai", ids[1]!, true);
+      expect(preferredInitialAccount(config, "xai")).toBeNull();
       // An ordinary resolve SUCCEEDS — the credential is still readable — which is exactly
       // why the flag must be checked inside the resolver rather than trusted to throw.
       await expect(getValidAccessSnapshotForAccount("xai", ids[1]!)).resolves.toBeDefined();
@@ -466,4 +487,13 @@ describe("pre-dispatch account preference", () => {
       removeTreeWithRetry(home);
     }
   });
+});
+
+test("reset-first retains account-bound Kiro headroom and exhaustion when resets are unknown", async () => {
+  const { rankAccountsByResetFirst } = await import("../../../src/oauth/account-quota-rank");
+  seedPercent("kiro", "a", 90);
+  seedPercent("kiro", "b", 10);
+  seedExhausted("c");
+  expect(rankAccountsByResetFirst("kiro", ["a", "c", "b"], undefined, Date.now(), roster("a", "b", "c")))
+    .toEqual(["b", "a", "c"]);
 });

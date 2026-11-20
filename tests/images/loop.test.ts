@@ -2,25 +2,44 @@ import { afterAll, beforeAll, beforeEach, describe, expect, mock, test } from "b
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import type {
-  AdapterFetchContext,
-  AdapterRequest,
-  ProviderAdapter,
-  IncomingMeta,
-} from "../../src/adapters/base";
-import type { AdapterEvent, OcxParsedRequest } from "../../src/types";
+import type { ProviderAdapter, IncomingMeta } from "../../src/adapters/base";
+import type { AdapterEvent, OcxParsedRequest, OcxProviderConfig } from "../../src/types";
+import type { AttemptRecoveryKind } from "../../src/usage/log";
 import type { ImageBridgePlan, ImageCallResult } from "../../src/images/types";
 import type { ImageBridgeDeps } from "../../src/images/loop";
 import { createTestTranslatorBudget } from "../helpers/translator-budget";
-import { RequestPacingQueueOverloadError } from "../../src/providers/request-pacing";
+import { PROVIDER_INPUT_TOO_LARGE_MESSAGE } from "../../src/server/responses/context-overflow";
+import { markResponseNonReplayable } from "../../src/lib/upstream-retry";
+import {
+  providerRequestPacingStatus,
+  RequestPacingQueueOverloadError,
+  resetProviderRequestPacingForTest,
+  waitForProviderRequestSlot,
+  type ProviderRequestSlot,
+} from "../../src/providers/request-pacing";
+import { providerFetch } from "../../src/server/responses/fetch-helpers";
+import { bridgeToResponsesSSE as realBridgeToResponsesSSE } from "../../src/bridge";
+import { parseStreamWithProgress, WebSearchConsumerInactivityError, type ParseStreamWithProgressOptions } from "../../src/web-search/progress-stream";
+import { TRANSLATOR_MAX_CALL_ARGUMENT_BYTES, TRANSLATOR_MAX_TURN_BYTES, translatorLiveBudgetCountForTests } from "../../src/lib/translator-budget";
+
+const realParseStreamWithProgress = parseStreamWithProgress;
+const originalBridgeToResponsesSSE = realBridgeToResponsesSSE;
+let useRealProgressStream = false;
+let fulfillCallCount = 0;
+let bridgeEvents: AdapterEvent[] = [];
 
 const PREV_HOME = process.env.OPENCODEX_HOME;
+// `mock.restore()` does not undo `mock.module`: Bun keeps both overrides below for every
+// file that runs after this one in the same process. Keep the real modules to put back,
+// and restore only the ones captured: a setup that failed partway must not install an empty module.
+let realProgressStream: Record<string, unknown> | undefined;
+let realFulfill: Record<string, unknown> | undefined;
+let realBridge: Record<string, unknown> | undefined;
 let runWithImageBridgeProduction: typeof import("../../src/images/loop")["runWithImageBridge"];
 let clampImageMaxRounds: typeof import("../../src/images/loop")["clampImageMaxRounds"];
 let DEFAULT_MAX_ROUNDS: typeof import("../../src/images/loop")["DEFAULT_MAX_ROUNDS"];
 let MAX_ROUNDS_HARD_LIMIT: typeof import("../../src/images/loop")["MAX_ROUNDS_HARD_LIMIT"];
 
-let fulfillCalls = 0;
 let fulfillResult: ImageCallResult = {
   ok: true, model: "grok-imagine-image-quality", prompt: "a cat",
   files: ["/test/img.png"], count: 1, markdown: "![image](/test/img.png)",
@@ -29,18 +48,27 @@ let fulfillResult: ImageCallResult = {
 beforeAll(async () => {
   process.env.OPENCODEX_HOME = join(tmpdir(), "ocx-test-" + randomUUID());
   mock.restore();
+  realProgressStream = { ...(await import("../../src/web-search/progress-stream")) };
+  realFulfill = { ...(await import("../../src/images/fulfill")) };
+  realBridge = { ...(await import("../../src/bridge")) };
+  mock.module("../../src/bridge", () => ({
+    ...realBridge,
+    bridgeToResponsesSSE: (events: AsyncIterable<AdapterEvent>, ...args: Parameters<typeof realBridgeToResponsesSSE> extends [unknown, ...infer R] ? R : never) =>
+      originalBridgeToResponsesSSE((async function* () {
+        for await (const event of events) { bridgeEvents.push(event); yield event; }
+      })(), ...args),
+  }));
   mock.module("../../src/web-search/progress-stream", () => ({
-    parseStreamWithProgress: async function* (_resp: Response, parse: (r: Response) => AsyncGenerator<AdapterEvent>, _opts: unknown) {
-      for await (const e of parse(_resp)) yield e;
+    ...realProgressStream,
+    parseStreamWithProgress: async function* (_resp: Response, parse: ProviderAdapter["parseStream"], opts: ParseStreamWithProgressOptions) {
+      if (useRealProgressStream) yield* realParseStreamWithProgress(_resp, parse, opts);
+      else for await (const e of parse(_resp, opts.translatorBudget)) yield e;
     },
     RoutedModelInactivityError: class extends Error { readonly timeoutMs = 0; },
     WebSearchStreamProtocolError: class extends Error { /* */ },
   }));
   mock.module("../../src/images/fulfill", () => ({
-    fulfillImageCall: async (): Promise<ImageCallResult> => {
-      fulfillCalls++;
-      return fulfillResult;
-    },
+    fulfillImageCall: async (): Promise<ImageCallResult> => { fulfillCallCount++; return fulfillResult; },
   }));
   ({
     runWithImageBridge: runWithImageBridgeProduction,
@@ -61,7 +89,13 @@ function runWithImageBridge(
     },
   });
 }
-afterAll(() => { if (PREV_HOME === undefined) delete process.env.OPENCODEX_HOME; else process.env.OPENCODEX_HOME = PREV_HOME; mock.restore(); });
+afterAll(() => {
+  if (PREV_HOME === undefined) delete process.env.OPENCODEX_HOME; else process.env.OPENCODEX_HOME = PREV_HOME;
+  mock.restore();
+  if (realProgressStream) { const real = realProgressStream; mock.module("../../src/web-search/progress-stream", () => real); }
+  if (realFulfill) { const real = realFulfill; mock.module("../../src/images/fulfill", () => real); }
+  if (realBridge) { const real = realBridge; mock.module("../../src/bridge", () => real); }
+});
 
 // --- Mock adapter: yields canned events per iteration from a queue ---
 let streamQueue: AdapterEvent[][] = [];
@@ -72,21 +106,195 @@ const defaultFulfillResult: ImageCallResult = {
   files: ["/test/img.png"], count: 1, markdown: "![image](/test/img.png)",
 };
 beforeEach(() => {
-  fulfillCalls = 0;
+  useRealProgressStream = false;
+  fulfillCallCount = 0;
   fulfillResult = { ...defaultFulfillResult, files: [...defaultFulfillResult.files] };
   buildRequestCalls = 0;
   streamQueue = [];
+  bridgeEvents = [];
 });
 
-function dispatchAdapterRequest(request: AdapterRequest, ctx?: AdapterFetchContext): Promise<Response> {
-  if (!ctx?.executor) throw new Error("adapter executor missing");
-  return ctx.executor(request.url, {
-    method: request.method,
-    headers: request.headers,
-    body: request.body,
-    signal: ctx.abortSignal,
+describe.each(["runTurn", "parseStream"] as const)("image-loop collection bounds — %s", mode => {
+  beforeEach(() => { useRealProgressStream = true; });
+
+  function streamingAdapter(events: () => Generator<AdapterEvent>) {
+    const state = { produced: 0, terminalProduced: false, closed: false, cancelled: false, signal: undefined as AbortSignal | undefined, requests: [] as OcxParsedRequest[] };
+    async function* source(): AsyncGenerator<AdapterEvent> {
+      try {
+        for (const event of events()) {
+          if (state.signal?.aborted) return;
+          state.produced++;
+          if (event.type === "done") state.terminalProduced = true;
+          yield event;
+          // Keep queue backlog small: the regression is cumulative iteration retention.
+          await Bun.sleep(1);
+        }
+      } finally { state.closed = true; }
+    }
+    const adapter: ProviderAdapter = {
+      name: "bounded-media-fixture",
+      buildRequest: async (_parsed, incoming) => {
+        state.signal = incoming.abortSignal;
+        state.requests.push(_parsed);
+        return { url: "https://example.invalid/model", method: "POST", headers: {}, body: "{}" };
+      },
+      fetchResponse: async () => new Response(new ReadableStream<Uint8Array>({
+        cancel() { state.cancelled = true; },
+      })),
+      parseStream: source,
+      ...(mode === "runTurn" ? {
+        runTurn: async (_parsed: OcxParsedRequest, incoming: IncomingMeta, emit: (event: AdapterEvent) => void) => {
+          state.signal = incoming.abortSignal;
+          state.requests.push(_parsed);
+          for await (const event of source()) emit(event);
+        },
+      } : {}),
+    };
+    return { adapter, state };
+  }
+
+  test("aborts retained-event overflow before the producer reaches its terminal", async () => {
+    const { adapter, state } = streamingAdapter(function* () {
+      const text = "x".repeat(1024 * 1024);
+      for (let i = 0; i < 40; i++) yield { type: "text_delta", text };
+      yield { type: "done" };
+    });
+    const response = await runWithImageBridge({ parsed: makeParsed(), adapter, plan });
+    const sse = await response.text();
+    await Bun.sleep(5);
+    expect(state.terminalProduced).toBe(false);
+    expect(state.produced).toBeLessThan(40);
+    expect(state.signal?.aborted).toBe(true);
+    expect(state.closed).toBe(true);
+    if (mode === "parseStream") expect(state.cancelled).toBe(true);
+    expect(sse).toContain('"code":"translation_buffer_limit"');
+    expect(sse).not.toContain("event: response.completed");
+    expect(fulfillCallCount).toBe(0);
   });
-}
+
+  test("aborts cumulative UTF-8 arguments before media fulfillment or terminal", async () => {
+    const { adapter, state } = streamingAdapter(function* () {
+      yield { type: "tool_call_start", id: "oversize", name: "image_gen" };
+      const argumentsChunk = "한".repeat(Math.floor(TRANSLATOR_MAX_CALL_ARGUMENT_BYTES / 6));
+      for (let i = 0; i < 4; i++) {
+        yield { type: "tool_call_delta", arguments: argumentsChunk };
+        yield { type: "heartbeat" };
+      }
+      yield { type: "tool_call_end" };
+      yield { type: "done" };
+    });
+    const response = await runWithImageBridge({ parsed: makeParsed(), adapter, plan });
+    const sse = await response.text();
+    await Bun.sleep(5);
+    expect(state.terminalProduced).toBe(false);
+    expect(state.produced).toBeLessThan(9);
+    expect(state.signal?.aborted).toBe(true);
+    expect(state.closed).toBe(true);
+    if (mode === "parseStream") expect(state.cancelled).toBe(true);
+    expect(sse).toContain('"code":"translation_buffer_limit"');
+    expect(sse).not.toContain("event: response.completed");
+    expect(fulfillCallCount).toBe(0);
+    expect(translatorLiveBudgetCountForTests()).toBe(1); // Only the caller-owned budget remains.
+  });
+
+  test.each([0, 1])("retained JSON array boundary plus %i byte", async extra => {
+    const first: AdapterEvent[] = [{ type: "text_delta", text: "" }, ...imageCallEvents];
+    const overhead = Buffer.byteLength(JSON.stringify(first));
+    first[0] = { type: "text_delta", text: "x".repeat(TRANSLATOR_MAX_TURN_BYTES - overhead + extra) };
+    let iteration = 0;
+    const { adapter } = streamingAdapter(function* () {
+      if (iteration++ === 0) yield* first;
+      else { yield { type: "text_delta", text: "finished" }; yield { type: "done" }; }
+    });
+    const response = await runWithImageBridge({ parsed: makeParsed(), adapter, plan });
+    const sse = await response.text();
+    expect(sse.includes('"code":"translation_buffer_limit"')).toBe(extra === 1);
+    expect(sse.includes("event: response.completed")).toBe(extra === 0);
+    expect(fulfillCallCount).toBe(extra === 0 ? 1 : 0);
+  });
+
+  test("resets the retained-event budget between media iterations", async () => {
+    let iteration = 0;
+    const { adapter } = streamingAdapter(function* () {
+      if (iteration++ < 2) {
+        yield { type: "text_delta", text: "x".repeat(18 * 1024 * 1024) };
+        yield* imageCallEvents;
+      } else { yield { type: "text_delta", text: "finished" }; yield { type: "done" }; }
+    });
+    const response = await runWithImageBridge({ parsed: makeParsed(), adapter, plan });
+    const sse = await response.text();
+    expect(sse).toContain("event: response.completed");
+    expect(sse).not.toContain("translation_buffer_limit");
+    expect(fulfillCallCount).toBe(2);
+  });
+
+  test("accepts exact UTF-8 argument limits per call and preserves opaque metadata", async () => {
+    let iteration = 0;
+    const signatures = ["first-synthetic-signature", "second-synthetic-signature"];
+    const { adapter, state } = streamingAdapter(function* () {
+      if (iteration++ > 0) { yield { type: "done" }; return; }
+      for (const signature of signatures) {
+        yield { type: "tool_call_start", id: signature, name: "image_gen", providerMetadata: { google: { thoughtSignature: signature } } };
+        const prefix = '{"prompt":"';
+        const suffix = '"}';
+        yield { type: "tool_call_delta", arguments: prefix + "x".repeat(TRANSLATOR_MAX_CALL_ARGUMENT_BYTES - prefix.length - suffix.length - 4) };
+        yield { type: "tool_call_delta", arguments: "\uD83D" };
+        yield { type: "heartbeat" };
+        yield { type: "tool_call_delta", arguments: "\uDE00" + suffix };
+        yield { type: "tool_call_end" };
+      }
+      yield { type: "done" };
+    });
+    const response = await runWithImageBridge({ parsed: makeParsed(), adapter, plan });
+    const sse = await response.text();
+    expect(sse).toContain("event: response.completed");
+    expect(sse).not.toContain("translation_buffer_limit");
+    expect(fulfillCallCount).toBe(2);
+    const assistant = state.requests[1]?.context.messages.find(message => message.role === "assistant");
+    const calls = assistant?.role === "assistant" ? assistant.content.filter(part => part.type === "toolCall") : [];
+    expect(calls.map(call => call.providerMetadata?.google?.thoughtSignature)).toEqual(signatures);
+    expect(calls.map(call => Buffer.byteLength(JSON.stringify(call.arguments)))).toEqual([TRANSLATOR_MAX_CALL_ARGUMENT_BYTES, TRANSLATOR_MAX_CALL_ARGUMENT_BYTES]);
+  });
+
+  test("passes normal real tool calls through without media fulfillment", async () => {
+    const { adapter } = streamingAdapter(function* () {
+      yield { type: "tool_call_start", id: "real", name: "read_file", providerMetadata: { google: { thoughtSignature: "real-call-signature" } } };
+      yield { type: "tool_call_delta", arguments: '{"path":"example.txt"}' };
+      yield { type: "tool_call_end" };
+      yield { type: "done" };
+    });
+    const response = await runWithImageBridge({ parsed: makeParsed(), adapter, plan });
+    const sse = await response.text();
+    expect(sse).toContain("event: response.completed");
+    expect(sse).toContain('"name":"read_file"');
+    expect(sse).toContain('"thought_signature":"real-call-signature"');
+    expect(fulfillCallCount).toBe(0);
+  });
+
+  test("consumer cancellation aborts and releases an active collector", async () => {
+    const { adapter, state } = streamingAdapter(function* () {
+      for (let i = 0; i < 100; i++) yield { type: "text_delta", text: "pending" };
+      yield { type: "done" };
+    });
+    const response = await runWithImageBridge({ parsed: makeParsed(), adapter, plan });
+    const reader = response.body!.getReader();
+    const draining = (async () => { while (!(await reader.read()).done) { /* keep demanding SSE */ } })();
+    try {
+      for (let i = 0; i < 20 && state.produced === 0; i++) await Bun.sleep(1);
+      expect(state.produced).toBeGreaterThan(0);
+    } finally {
+      await reader.cancel("synthetic consumer closed");
+      await draining;
+    }
+    await Bun.sleep(5);
+    expect(state.signal?.aborted).toBe(true);
+    expect(state.closed).toBe(true);
+    expect(state.terminalProduced).toBe(false);
+    if (mode === "parseStream") expect(state.cancelled).toBe(true);
+    expect(fulfillCallCount).toBe(0);
+    expect(translatorLiveBudgetCountForTests()).toBe(1);
+  });
+});
 
 const mockAdapter: ProviderAdapter = {
   name: "test",
@@ -125,8 +333,138 @@ async function runAndGetSSE(streams: AdapterEvent[][], fulfill?: ImageCallResult
 }
 
 describe("runWithImageBridge", () => {
-  test("usage-bearing translator overflow reaches attempt, request, and wire without image dispatch", async () => {
-    const iterations: unknown[] = [];
+  test("a stalled search-stream consumer reports a timeout in the terminal", async () => {
+    const error = new WebSearchConsumerInactivityError(123);
+    const response = await runWithImageBridge({
+      parsed: makeParsed(), plan,
+      adapter: { ...mockAdapter, parseStream: async function* () { throw error; } },
+    });
+    const sse = await response.text();
+    expect(bridgeEvents.find(event => event.type === "error")).toMatchObject({ type: "error", status: 504, message: error.message });
+    expect(sse).toContain("response.failed");
+    expect(sse).toContain(error.message);
+  });
+
+  // #7316: once the image turn is streaming, a later iteration's provider overflow must end as the
+  // main path's terminal context_length_exceeded rather than a generic upstream failure.
+  test("a later iteration's HTTP 413 ends as a terminal context_length_exceeded", async () => {
+    streamQueue = [[...imageCallEvents]];
+    let sends = 0;
+    const response = await runWithImageBridge({
+      parsed: makeParsed(), plan,
+      adapter: {
+        ...mockAdapter,
+        fetchResponse: async () => (sends++ === 0
+          ? new Response("{}", { status: 200, headers: { "content-type": "application/json" } })
+          : new Response("Request body exceeds the 8 MiB limit", { status: 413 })),
+      },
+    });
+    expect(response.status).toBe(200);
+    const sse = await response.text();
+    expect(sse).toContain("response.failed");
+    expect(sse).toContain('"code":"context_length_exceeded"');
+    expect(sse).toContain(PROVIDER_INPUT_TOO_LARGE_MESSAGE);
+    expect(sends).toBe(2);
+  });
+
+  // A non-replayable turn may already have run; neither the loop nor the bridge's wording
+  // heuristics may turn it into an overflow that invites a compacted resend.
+  test("a later iteration's worded non-replayable 413 keeps its own failure", async () => {
+    streamQueue = [[...imageCallEvents]];
+    let sends = 0;
+    const response = await runWithImageBridge({
+      parsed: makeParsed(), plan,
+      adapter: {
+        ...mockAdapter,
+        formatErrorBody: (_status, _headers, body) => body,
+        fetchResponse: async () => {
+          if (sends++ === 0) return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+          const failed = new Response("This model's maximum context length is 8192 tokens", { status: 413 });
+          markResponseNonReplayable(failed);
+          return failed;
+        },
+      },
+    });
+    const sse = await response.text();
+    expect(sse).toContain("response.failed");
+    expect(sse).not.toContain("context_length_exceeded");
+    expect(sends).toBe(2);
+  });
+
+  test("a runTurn adapter's own overflow verdict keeps context_length_exceeded", async () => {
+    const response = await runWithImageBridge({
+      parsed: makeParsed(), plan,
+      adapter: {
+        ...mockAdapter,
+        runTurn: async (_parsed: OcxParsedRequest, _incoming: IncomingMeta, emit: (event: AdapterEvent) => void) => {
+          emit({ type: "error", code: "context_length_exceeded", message: "adapter overflow" });
+        },
+      },
+    });
+    const sse = await response.text();
+    expect(sse).toContain('"code":"context_length_exceeded"');
+  });
+
+  test("a pacing-queue overload passes through instead of becoming 502 Provider unreachable", async () => {
+    const overload = new RequestPacingQueueOverloadError("image-test", "queue_full", 2);
+    const result = await runWithImageBridge({
+      parsed: makeParsed(), plan,
+      adapter: { ...mockAdapter, fetchResponse: () => Promise.reject(overload) },
+    }).then(response => response.status, (error: unknown) => error);
+    expect(result).toBe(overload);
+  });
+
+  test.each([307, 308])("the direct image-loop send does not follow %i", async status => {
+    let targetHits = 0;
+    let originHits = 0;
+    const target = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => {
+      targetHits++;
+      return new Response("{}");
+    } });
+    const origin = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => {
+      originHits++;
+      return new Response("redirect", { status, headers: { location: `http://127.0.0.1:${target.port}/target` } });
+    } });
+    try {
+      const response = await runWithImageBridge({
+        parsed: makeParsed(), plan,
+        adapter: {
+          ...mockAdapter,
+          fetchResponse: undefined,
+          buildRequest: async () => ({ url: `http://127.0.0.1:${origin.port}/model`, method: "POST", headers: { "x-api-key": "synthetic-key" }, body: "synthetic prompt" }),
+        },
+      });
+      const error = await response.json() as { error: { type: string; message: string } };
+      expect(targetHits).toBe(0);
+      expect(originHits).toBe(1);
+      expect(response.status).toBe(status);
+      expect(error.error.type).toBe("upstream_error");
+      expect(error.error.message).toBe(`Provider error ${status}`);
+      expect(response.headers.get("location")).toBeNull();
+    } finally {
+      await origin.stop(true);
+      await target.stop(true);
+    }
+  });
+
+  test("translator overflow remains typed through the image loop and bridge", async () => {
+    const sse = await runAndGetSSE([[
+      {
+        type: "error",
+        status: 502,
+        errorType: "upstream_error",
+        code: "translation_buffer_limit",
+        message: "upstream translation buffer exceeded the safe limit",
+      },
+    ]]);
+    expect(sse).toContain("event: response.failed");
+    expect(sse).toContain('"code":"translation_buffer_limit"');
+    expect(sse).not.toContain("event: response.completed");
+  });
+
+  test("usage-bearing translator overflow reaches request and wire without image dispatch", async () => {
+    // The real collector folds the overflow event's usage (onErrorUsage) before it throws.
+    useRealProgressStream = true;
     const aggregate: unknown[] = [];
     streamQueue = [[
       { type: "tool_call_start", id: "call_1", name: "image_gen" },
@@ -145,7 +483,6 @@ describe("runWithImageBridge", () => {
       parsed: makeParsed(),
       adapter: mockAdapter,
       plan,
-      onIterationUsage: usage => iterations.push(usage),
       onUsage: usage => aggregate.push(usage),
     });
     const sse = await response.text();
@@ -154,9 +491,8 @@ describe("runWithImageBridge", () => {
     expect(sse).toContain('"code":"translation_buffer_limit"');
     expect(sse).toContain('"usage":{"input_tokens":7,"output_tokens":1,"total_tokens":8');
     expect(sse).not.toContain("event: response.completed");
-    expect(iterations).toEqual([{ inputTokens: 7, outputTokens: 1 }]);
     expect(aggregate).toEqual([{ inputTokens: 7, outputTokens: 1 }]);
-    expect(fulfillCalls).toBe(0);
+    expect(fulfillCallCount).toBe(0);
   });
 
   test("no image tool call → passthrough text + done", async () => {
@@ -254,24 +590,22 @@ describe("runWithImageBridge", () => {
     let retrySends = 0;
     const retryingAdapter: ProviderAdapter = {
       ...mockAdapter,
-      fetchResponse: dispatchAdapterRequest,
-    };
-    const fetchImpl = async (): Promise<Response> => {
-      sends += 1;
-      if (sends === 1) {
-        return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
-          status: 429,
-          headers: { "content-type": "application/json" },
-        });
-      }
-      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+      fetchResponse: async () => {
+        sends += 1;
+        if (sends === 1) {
+          return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+            status: 429,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+      },
     };
     streamQueue = [[{ type: "text_delta" as const, text: "recovered" }, { type: "done" as const }]];
     const response = await runWithImageBridge({
       parsed: makeParsed(),
       adapter: retryingAdapter,
       plan,
-      fetchImpl,
       retryOn429Policy: { enabled: true, attempts: 2, intervalMs: 120, maxIntervalMs: 60_000, respectRetryAfter: false },
       waitForRequestSlot: async () => { pacingReservations += 1; },
       on429: () => {
@@ -400,97 +734,22 @@ describe("runWithImageBridge", () => {
     expect(abortedAtFetch).toEqual([false, false]);
   }, 5_000);
 
-  test("adapter-owned retry pacing starts a fresh header deadline", async () => {
-    let sends = 0;
-    let pacingReservations = 0;
-    const attemptSignals: (AbortSignal | undefined)[] = [];
-    const abortedAtFetch: boolean[] = [];
-    const retryingAdapter: ProviderAdapter = {
-      ...mockAdapter,
-      fetchResponse: async (request, ctx) => {
-        if (!ctx?.executor) throw new Error("adapter executor missing");
-        const init = {
-          method: request.method,
-          headers: request.headers,
-          body: request.body,
-          signal: ctx.abortSignal,
-        };
-        await ctx.executor(request.url, init);
-        ctx.onRetry?.("connection-reset");
-        return ctx.executor(request.url, init);
-      },
-    };
-    const fetchImpl = async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-      sends += 1;
-      attemptSignals.push(init?.signal ?? undefined);
-      abortedAtFetch.push(init?.signal?.aborted ?? true);
-      init?.signal?.throwIfAborted();
-      if (sends === 1) {
-        await Bun.sleep(120);
-        init?.signal?.throwIfAborted();
-      }
-      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
-    };
-    streamQueue = [[{ type: "text_delta" as const, text: "recovered" }, { type: "done" as const }]];
-
-    const response = await runWithImageBridge({
-      parsed: makeParsed(),
-      adapter: retryingAdapter,
-      plan,
-      fetchImpl,
-      connectTimeoutMs: 200,
-      waitForRequestSlot: async signal => {
-        pacingReservations += 1;
-        if (pacingReservations === 2) {
-          await Bun.sleep(120);
-          signal?.throwIfAborted();
-        }
-      },
-    });
-
-    expect(response.status).toBe(200);
-    const sse = await response.text();
-    expect(sends).toBe(2);
-    expect(pacingReservations).toBe(2);
-    expect(attemptSignals).toHaveLength(2);
-    expect(attemptSignals[1]).not.toBe(attemptSignals[0]);
-    expect(abortedAtFetch).toEqual([false, false]);
-    expect(sse).toContain("recovered");
-    expect(sse).toContain("event: response.completed");
-  }, 5_000);
-
-  test("pacing queue overload remains typed for outer 429 handling", async () => {
-    const overload = new RequestPacingQueueOverloadError("routed", "queue_full", 2);
-    const adapter: ProviderAdapter = {
-      ...mockAdapter,
-      fetchResponse: dispatchAdapterRequest,
-    };
-
-    await expect(runWithImageBridge({
-      parsed: makeParsed(),
-      adapter,
-      plan,
-      waitForRequestSlot: async () => { throw overload; },
-    })).rejects.toBe(overload);
-  });
-
   test("retryOn429 budget is shared across iterations (per request, not per round)", async () => {
     let sends = 0;
     let retrySends = 0;
     let rotations = 0;
     const retryingAdapter: ProviderAdapter = {
       ...mockAdapter,
-      fetchResponse: dispatchAdapterRequest,
-    };
-    const fetchImpl = async (): Promise<Response> => {
-      sends += 1;
-      if (sends === 1 || sends === 3) {
-        return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
-          status: 429,
-          headers: { "content-type": "application/json" },
-        });
-      }
-      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+      fetchResponse: async () => {
+        sends += 1;
+        if (sends === 1 || sends === 3) {
+          return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+            status: 429,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+      },
     };
     // Round 0: 429 -> one same-key replay (attempts=1) -> 200 carrying an image call.
     // Round 1 (forced final): 429 with the request budget already spent -> no replay -> rotation.
@@ -502,7 +761,6 @@ describe("runWithImageBridge", () => {
       parsed: makeParsed(),
       adapter: retryingAdapter,
       plan,
-      fetchImpl,
       maxRounds: 1,
       retryOn429Policy: { enabled: true, attempts: 1, intervalMs: 50, maxIntervalMs: 60_000, respectRetryAfter: false },
       on429: () => {
@@ -527,21 +785,19 @@ describe("runWithImageBridge", () => {
     let rotations = 0;
     const retryingAdapter: ProviderAdapter = {
       ...mockAdapter,
-      fetchResponse: dispatchAdapterRequest,
-    };
-    const fetchImpl = async (): Promise<Response> => {
-      sends += 1;
-      return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
-        status: 429,
-        headers: { "content-type": "application/json" },
-      });
+      fetchResponse: async () => {
+        sends += 1;
+        return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+          status: 429,
+          headers: { "content-type": "application/json" },
+        });
+      },
     };
     streamQueue = [[{ type: "text_delta" as const, text: "unused" }, { type: "done" as const }]];
     const response = await runWithImageBridge({
       parsed: makeParsed(),
       adapter: retryingAdapter,
       plan,
-      fetchImpl,
       retryOn429Policy: { enabled: true, attempts: 1, intervalMs: 50, maxIntervalMs: 60_000, respectRetryAfter: false },
       on429: () => {
         rotations += 1;
@@ -551,9 +807,12 @@ describe("runWithImageBridge", () => {
           ? {
               adapter: {
                 ...mockAdapter,
-                fetchResponse: dispatchAdapterRequest,
+                fetchResponse: async () => {
+                  sends += 1;
+                  return new Response("{}", { status: 429 });
+                },
               } as ProviderAdapter,
-              recoveryKind: "key-429",
+              recoveryKind: "key-429" as const,
             }
           : null;
       },
@@ -769,52 +1028,20 @@ describe("runWithImageBridge", () => {
     });
     await response.text();
     // Hidden iter (10/4) + final (3/2) once — not 2*hidden + final.
-    expect(seen).toEqual({ inputTokens: 13, outputTokens: 6, totalTokens: 19 });
-  });
-
-  test("403 credential rotation awaits a replacement adapter and retries the iteration", async () => {
-    let fetchCalls = 0;
-    let rotations = 0;
-    const makeRotatingAdapter = (label: string): ProviderAdapter => ({
-      name: label,
-      buildRequest: async () => ({ url: "https://test/v1/chat", method: "POST", headers: {}, body: "{}" }),
-      fetchResponse: async () => {
-        fetchCalls++;
-        if (fetchCalls === 1) return new Response("credential denied", { status: 403 });
-        streamQueue = [[{ type: "text_delta", text: "after rotate" }, { type: "done" }]];
-        return new Response("{}", { status: 200 });
-      },
-      parseStream: async function* (): AsyncGenerator<AdapterEvent> {
-        const events = streamQueue.shift();
-        if (events) for (const e of events) yield e;
-      },
-    });
-    const firstAdapter = makeRotatingAdapter("before-rotate");
-    const secondAdapter = makeRotatingAdapter("after-rotate");
-    const response = await runWithImageBridge({
-      parsed: makeParsed(),
-      adapter: firstAdapter,
-      plan,
-      onCredentialError: async () => {
-        rotations++;
-        await Promise.resolve();
-        return { adapter: secondAdapter, recoveryKind: "anthropic-oauth-403" };
-      },
-    });
-
-    const sse = await response.text();
-    expect(rotations).toBe(1);
-    expect(fetchCalls).toBe(2);
-    expect(sse).toContain("after rotate");
+    expect(seen).toEqual({ inputTokens: 13, outputTokens: 6 });
   });
 
   test("429 OAuth rotation awaits a refreshed adapter and retries the iteration", async () => {
     let fetchCalls = 0;
     let rotations = 0;
     let activeAdapter: ProviderAdapter | undefined;
+    let retryState: Pick<OcxParsedRequest, "_kiroAuthContext" | "_providerContinuation"> | undefined;
     const makeRotatingAdapter = (label: string): ProviderAdapter => ({
       name: label,
-      buildRequest: async () => ({ url: "https://test/v1/chat", method: "POST", headers: {}, body: "{}" }),
+      buildRequest: async requestParsed => {
+        if (label === "after-rotate") retryState = requestParsed;
+        return { url: "https://test/v1/chat", method: "POST", headers: {}, body: "{}" };
+      },
       fetchResponse: async () => {
         fetchCalls++;
         if (fetchCalls === 1) return new Response("rate limited", { status: 429, headers: { "retry-after": "1" } });
@@ -829,13 +1056,19 @@ describe("runWithImageBridge", () => {
     const firstAdapter = makeRotatingAdapter("before-rotate");
     const secondAdapter = makeRotatingAdapter("after-rotate");
     activeAdapter = firstAdapter;
+    const outerParsed = makeParsed();
+    outerParsed._kiroAuthContext = { apiRegion: "eu-west-1", profileArn: "account-a" };
+    outerParsed._providerContinuation = { kiro: { conversationId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" } };
     const response = await runWithImageBridge({
-      parsed: makeParsed(),
+      parsed: outerParsed,
       adapter: firstAdapter,
       plan,
-      on429: async () => {
+      on429: async (_retryAfter, _responseHeaders, retryParsed) => {
         rotations++;
         await Promise.resolve();
+        if (!retryParsed) throw new Error("the loop must pass the iteration request to on429");
+        retryParsed._kiroAuthContext = { apiRegion: "ap-southeast-2", profileArn: "account-b" };
+        delete retryParsed._providerContinuation;
         activeAdapter = secondAdapter;
         return { adapter: secondAdapter, recoveryKind: "key-429" };
       },
@@ -844,7 +1077,53 @@ describe("runWithImageBridge", () => {
     expect(rotations).toBe(1);
     expect(fetchCalls).toBe(2);
     expect(activeAdapter).toBe(secondAdapter);
+    expect(retryState?._kiroAuthContext).toEqual({ apiRegion: "ap-southeast-2", profileArn: "account-b" });
+    expect(retryState?._providerContinuation).toBeUndefined();
     expect(sse).toContain("after rotate");
+  });
+
+  // An account rotation and a key rotation are different operator-facing events, and the
+  // rotated fetch's recovery kind is the only place the attempt row records which happened.
+  // The loop used to hardcode `key-429` for both.
+  test("429 rotation reports the rotator's recovery kind", async () => {
+    const recoveryKindsFor = async (
+      rotation: (next: ProviderAdapter) => { adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind },
+    ): Promise<(AttemptRecoveryKind | undefined)[]> => {
+      let fetchCalls = 0;
+      const sends: (AttemptRecoveryKind | undefined)[] = [];
+      const makeAdapter = (label: string): ProviderAdapter => ({
+        name: label,
+        buildRequest: async () => ({ url: "https://test/v1/chat", method: "POST", headers: {}, body: "{}" }),
+        fetchResponse: async () => {
+          fetchCalls++;
+          if (fetchCalls === 1) return new Response("rate limited", { status: 429, headers: { "retry-after": "1" } });
+          streamQueue = [[{ type: "text_delta", text: "after rotate" }, { type: "done" }]];
+          return new Response("{}", { status: 200 });
+        },
+        parseStream: async function* (): AsyncGenerator<AdapterEvent> {
+          const events = streamQueue.shift();
+          if (events) for (const e of events) yield e;
+        },
+      });
+      const secondAdapter = makeAdapter("after-rotate");
+      const response = await runWithImageBridge({
+        parsed: makeParsed(),
+        adapter: makeAdapter("before-rotate"),
+        plan,
+        onAttemptSend: recovery => { sends.push(recovery); },
+        on429: () => rotation(secondAdapter),
+      });
+      expect(await response.text()).toContain("after rotate");
+      return sends;
+    };
+
+    // A rotator that crossed accounts says so, and the rotated send carries that kind.
+    expect(await recoveryKindsFor(next => ({ adapter: next, recoveryKind: "oauth-account-429" })))
+      .toEqual([undefined, "oauth-account-429"]);
+    expect(await recoveryKindsFor(next => ({ adapter: next, recoveryKind: "anthropic-oauth-429" })))
+      .toEqual([undefined, "anthropic-oauth-429"]);
+    expect(await recoveryKindsFor(next => ({ adapter: next, recoveryKind: "key-429" })))
+      .toEqual([undefined, "key-429"]);
   });
 });
 
@@ -854,6 +1133,97 @@ describe("runWithImageBridge", () => {
 // ---------------------------------------------------------------------------
 
 describe("runWithImageBridge — runTurn adapter", () => {
+  test("charges the queue's coalesced tail, not each delta it discarded", async () => {
+    // createAdapterEventQueue merges adjacent text deltas into chunks while no reader is
+    // scheduled, so a synchronous producer's one-character deltas survive as a handful of
+    // strings. Charging each original event's envelope instead billed ~31 bytes apiece and
+    // tripped the 32 MiB turn limit on roughly 1 MiB of retained output.
+    const deltas = 1_200_000;
+    const response = await runWithImageBridge({
+      parsed: makeParsed(), plan,
+      adapter: {
+        ...mockAdapter,
+        runTurn: async (_parsed, _incoming, emit) => {
+          for (let i = 0; i < deltas; i++) emit({ type: "text_delta", text: "x" });
+          emit({ type: "done" });
+        },
+      },
+    });
+    const sse = await response.text();
+    expect(Buffer.byteLength(JSON.stringify({ type: "text_delta", text: "x" })) * deltas)
+      .toBeGreaterThan(TRANSLATOR_MAX_TURN_BYTES);
+    expect(sse).not.toContain("translation_buffer_limit");
+    expect(sse).toContain("event: response.completed");
+  });
+
+  test("queue backlog overflow keeps its upstream error instead of becoming client cancellation", async () => {
+    const response = await runWithImageBridge({
+      parsed: makeParsed(), plan,
+      adapter: {
+        ...mockAdapter,
+        runTurn: async (_parsed, _incoming, emit) => {
+          for (let i = 0; i < 1100; i++) emit({ type: "tool_call_start", id: `call_${i}`, name: "read_file" });
+          emit({ type: "done" });
+        },
+      },
+    });
+    const sse = await response.text();
+    expect(sse).toContain("adapter event backlog exceeded");
+    expect(sse).not.toContain("client closed request");
+    expect(sse).not.toContain("event: response.completed");
+  });
+
+  test("a completed batch is not fulfilled after its turn signal aborts", async () => {
+    const abort = new AbortController();
+    const adapter: ProviderAdapter = {
+      ...mockAdapter,
+      runTurn: async (_parsed, _incoming, emit) => {
+        for (const event of imageCallEvents) emit(event);
+        abort.abort("synthetic cancelled turn");
+      },
+    };
+    const response = await runWithImageBridge({ parsed: makeParsed(), adapter, plan, abortSignal: abort.signal });
+    const sse = await response.text();
+    expect(sse).not.toContain("event: response.completed");
+    expect(fulfillCallCount).toBe(0);
+  });
+
+  test("emits after runTurn settles cannot recharge its collection", async () => {
+    let lateEmit!: (event: AdapterEvent) => void;
+    let resolveRun!: () => void;
+    let incomingSignal: AbortSignal | undefined;
+    const finished = new Promise<void>(resolve => { resolveRun = resolve; });
+    const adapter: ProviderAdapter = {
+      ...mockAdapter,
+      runTurn: (_parsed, incoming, emit) => {
+        incomingSignal = incoming.abortSignal;
+        lateEmit = emit;
+        // Alternate event types so the queue still has a batch to drain after producer settlement.
+        for (let i = 0; i < 32; i++) {
+          emit({ type: "text_delta", text: "finished" });
+          emit({ type: "thinking_delta", thinking: "synthetic thought" });
+        }
+        emit({ type: "done" });
+        resolveRun();
+        return finished;
+      },
+    };
+    const response = await runWithImageBridge({ parsed: makeParsed(), adapter, plan });
+    const reading = response.text();
+    await finished;
+    // Queue the emit after the bridge's promise completion handler, while the batch can still drain.
+    await Promise.resolve();
+    const abortedBeforeLateEmit = incomingSignal?.aborted;
+    expect(abortedBeforeLateEmit).toBe(false);
+    expect(() => lateEmit({ type: "tool_call_start", id: "late", name: "image_gen" })).not.toThrow();
+    expect(() => lateEmit({ type: "tool_call_delta", arguments: "x".repeat(TRANSLATOR_MAX_CALL_ARGUMENT_BYTES + 1) })).not.toThrow();
+    expect(incomingSignal?.aborted).toBe(abortedBeforeLateEmit);
+    const sse = await reading;
+    expect(sse).toContain("event: response.completed");
+    expect(sse).not.toContain("translation_buffer_limit");
+    expect(fulfillCallCount).toBe(0);
+  });
+
   let runTurnEventQueue: AdapterEvent[][] = [];
   const runTurnAdapter: ProviderAdapter = {
     ...mockAdapter,
@@ -891,56 +1261,61 @@ describe("runWithImageBridge — runTurn adapter", () => {
     expect(sse).toContain("hello from runTurn");
   });
 
-  test("runTurn adapter paces and records every physical dispatch", async () => {
+  test("runTurn adapter paces every physical dispatch inside its turn lease", async () => {
+    // A capped provider: the turn's own lease must not block its BidiAppend sends.
     let transportSends = 0;
-    let pacingReservations = 0;
     let recordedSends = 0;
+    let turnSlot: ProviderRequestSlot | undefined;
+    const configured: OcxProviderConfig = {
+      adapter: "cursor", baseUrl: "https://cursor.test", requestPacing: { enabled: true, maxConcurrentRequests: 1 },
+      fetch: Object.assign(async () => {
+        transportSends += 1;
+        return new Response("ok");
+      }, { preconnect() {} }) as typeof globalThis.fetch,
+    };
     const dispatchingAdapter: ProviderAdapter = {
       ...mockAdapter,
       runTurn: async (_parsed, incoming, emit) => {
         if (!incoming.providerFetch) throw new Error("missing provider fetch");
-        await incoming.providerFetch("https://test/run-sse");
-        await incoming.providerFetch("https://test/bidi-append");
-        await incoming.providerFetch("https://test/bidi-append");
+        for (const url of ["https://cursor.test/run-sse", "https://cursor.test/bidi-append", "https://cursor.test/bidi-append"]) {
+          await (await incoming.providerFetch(url, { signal: AbortSignal.timeout(1_000) })).text();
+        }
+        expect(providerRequestPacingStatus("cursor", configured).inFlight).toBe(1);
         emit({ type: "text_delta", text: "sent" });
         emit({ type: "done" });
       },
     };
-    const response = await runWithImageBridge({
-      parsed: makeParsed(),
-      adapter: dispatchingAdapter,
-      plan,
-      fetchImpl: async () => {
-        transportSends += 1;
-        return new Response(null, { status: 200 });
-      },
-      waitForRequestSlot: async () => { pacingReservations += 1; },
-      onAttemptSend: () => { recordedSends += 1; },
-    });
+    try {
+      const response = await runWithImageBridge({
+        parsed: makeParsed(),
+        adapter: dispatchingAdapter,
+        plan,
+        waitForRequestSlot: async signal => (turnSlot = await waitForProviderRequestSlot("cursor", configured, "model-a", signal)),
+        runTurnFetch: pacingSlot => providerFetch(configured, undefined, {
+          providerName: "cursor", modelId: "model-a", pacingSlotAcquired: true, pacingSlot, turnScopedPacing: true,
+        }),
+        onAttemptSend: () => { recordedSends += 1; },
+      });
 
-    expect(await response.text()).toContain("sent");
-    expect(transportSends).toBe(3);
-    expect(pacingReservations).toBe(3);
-    expect(recordedSends).toBe(3);
+      expect(await response.text()).toContain("sent");
+      expect(transportSends).toBe(3);
+      // One attempt per runTurn, as on the normal runTurn lane; the lease ends with the turn.
+      expect(recordedSends).toBe(1);
+      expect(turnSlot?.released).toBe(true);
+      expect(providerRequestPacingStatus("cursor", configured).inFlight).toBe(0);
+    } finally {
+      turnSlot?.release();
+      resetProviderRequestPacingForTest();
+    }
   });
 
-  test("runTurn adapter → error usage reaches attempt and request accounting", async () => {
-    const iterations: unknown[] = [];
-    const aggregate: unknown[] = [];
+  test("runTurn adapter → error event surfaces as upstream failure", async () => {
     runTurnEventQueue = [
-      [{ type: "error", message: "cursor blew up", usage: { inputTokens: 8, outputTokens: 2 } }],
+      [{ type: "error", message: "cursor blew up" }],
     ];
-    const response = await runWithImageBridge({
-      parsed: makeParsed(),
-      adapter: runTurnAdapter,
-      plan,
-      onIterationUsage: usage => iterations.push(usage),
-      onUsage: usage => aggregate.push(usage),
-    });
+    const response = await runWithImageBridge({ parsed: makeParsed(), adapter: runTurnAdapter, plan });
     const sse = await response.text();
     expect(sse).toContain("cursor blew up");
-    expect(iterations).toEqual([{ inputTokens: 8, outputTokens: 2 }]);
-    expect(aggregate).toEqual([{ inputTokens: 8, outputTokens: 2 }]);
   });
 
   test("runTurn adapter → SSE headers return before slow collect completes", async () => {
@@ -1075,5 +1450,109 @@ describe("runWithImageBridge — runTurn adapter", () => {
     expect(seenIds[0]).toBeUndefined();
     expect(seenIds[1]).toBe("conv-from-first-turn");
     expect(parsed._cursorConversationId).toBe("conv-from-first-turn");
+  });
+});
+
+describe.each(["runTurn", "parseStream"] as const)("image-loop provider identity — %s", mode => {
+  test("forwards the routed provider identity to every bridge iteration", async () => {
+    const seen: (string | undefined)[] = [];
+    let iteration = 0;
+    const eventsFor = (): AdapterEvent[] => iteration++ === 0
+      ? imageCallEvents
+      : [{ type: "text_delta", text: "finished" }, { type: "done" }];
+    const adapter: ProviderAdapter = {
+      name: "provider-identity-fixture",
+      buildRequest: async (_parsed, incoming) => {
+        seen.push(incoming.providerName);
+        return { url: "https://example.invalid/model", method: "POST", headers: {}, body: "{}" };
+      },
+      fetchResponse: async () => new Response("{}", { status: 200, headers: { "content-type": "application/json" } }),
+      parseStream: async function* (): AsyncGenerator<AdapterEvent> { for (const e of eventsFor()) yield e; },
+      ...(mode === "runTurn" ? {
+        runTurn: async (_parsed: OcxParsedRequest, incoming: IncomingMeta, emit: (event: AdapterEvent) => void) => {
+          seen.push(incoming.providerName);
+          for (const e of eventsFor()) emit(e);
+        },
+      } : {}),
+    };
+    const response = await runWithImageBridge({
+      parsed: makeParsed(),
+      adapter,
+      plan,
+      incomingMeta: { headers: new Headers(), providerName: "github-copilot", translatorBudget: createTestTranslatorBudget() },
+    });
+    await response.text();
+    expect(seen.length).toBe(2);
+    expect(seen).toEqual(["github-copilot", "github-copilot"]);
+  });
+});
+
+describe("image-loop adapter error usage", () => {
+  const imageCall = (usage: { inputTokens: number; outputTokens: number }): AdapterEvent[] => [
+    { type: "tool_call_start", id: "call_1", name: "image_gen" },
+    { type: "tool_call_delta", arguments: '{"prompt":"a cat"}' },
+    { type: "tool_call_end" },
+    { type: "done", usage },
+  ];
+  const errored: AdapterEvent = { type: "error", message: "provider blew up", usage: { inputTokens: 3, outputTokens: 2 } };
+
+  test("parseStream: an errored iteration's usage is added to the hidden iterations'", async () => {
+    useRealProgressStream = true;
+    streamQueue = [imageCall({ inputTokens: 10, outputTokens: 4 }), [{ type: "text_delta", text: "partial" }, errored]];
+    let seen: unknown = "unset";
+    const response = await runWithImageBridge({ parsed: makeParsed(), adapter: mockAdapter, plan, onUsage: usage => { seen = usage; } });
+    const sse = await response.text();
+    expect(sse).toContain("Provider stream error: provider blew up");
+    expect(seen).toEqual({ inputTokens: 13, outputTokens: 6 });
+  });
+
+  test("runTurn: an errored iteration's usage is reported", async () => {
+    const queue = [imageCall({ inputTokens: 10, outputTokens: 4 }), [errored]];
+    const adapter: ProviderAdapter = {
+      ...mockAdapter,
+      runTurn: async (_parsed: OcxParsedRequest, _incoming: IncomingMeta, emit: (e: AdapterEvent) => void) => {
+        for (const e of queue.shift() ?? []) emit(e);
+      },
+    };
+    let seen: unknown = "unset";
+    const response = await runWithImageBridge({ parsed: makeParsed(), adapter, plan, onUsage: usage => { seen = usage; } });
+    const sse = await response.text();
+    expect(sse).toContain("provider blew up");
+    expect(seen).toEqual({ inputTokens: 13, outputTokens: 6 });
+  });
+});
+
+describe("image-loop rotated usage", () => {
+  // Hidden rounds before a 429 rotation were spent by the account the loop left. Once the caller
+  // bills them to that account's attempt, the final report must not bill them again; the client
+  // terminal still shows the whole turn.
+  test.each([true, false])("a rotation offers the hidden usage; accepted=%p", async accepted => {
+    streamQueue = [
+      [
+        { type: "tool_call_start", id: "call_1", name: "image_gen" },
+        { type: "tool_call_delta", arguments: '{"prompt":"a cat"}' },
+        { type: "tool_call_end" },
+        { type: "done", usage: { inputTokens: 10, outputTokens: 4 } },
+      ],
+      [{ type: "text_delta", text: "after rotate" }, { type: "done", usage: { inputTokens: 30, outputTokens: 3 } }],
+    ];
+    let sends = 0;
+    const adapter: ProviderAdapter = {
+      ...mockAdapter,
+      fetchResponse: async () => ++sends === 2 ? new Response("rate limited", { status: 429 }) : new Response("{}"),
+    };
+    const offered: unknown[] = [];
+    let reported: unknown;
+    const response = await runWithImageBridge({
+      parsed: makeParsed(), adapter, plan,
+      on429: async () => ({ adapter, recoveryKind: "oauth-account-429" }),
+      onRotatedUsage: usage => { offered.push(usage); return accepted; },
+      onUsage: usage => { reported = usage; },
+    });
+    const sse = await response.text();
+    expect(sends).toBe(3);
+    expect(offered).toEqual([{ inputTokens: 10, outputTokens: 4 }]);
+    expect(reported).toEqual(accepted ? { inputTokens: 30, outputTokens: 3 } : { inputTokens: 40, outputTokens: 7 });
+    expect(sse).toContain('"input_tokens":40');
   });
 });

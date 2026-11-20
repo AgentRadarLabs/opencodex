@@ -26,17 +26,171 @@ async function bodyOf(p: OcxParsedRequest, configuredProvider = provider): Promi
 }
 
 describe("anthropic extended-thinking gate", () => {
-  test("reasoning 'none' does NOT enable thinking and preserves temperature/top_p", async () => {
-    const b = await bodyOf(parsed("none", { temperature: 0.3, topP: 0.9 }));
-    expect(b.thinking).toBeUndefined();
+  test.each([[false, "disabled"], [true, "enabled"]] as const)("toggle-only models serialize direct boolean %s as %s", async (thinkingEnabled, type) => {
+    const modelId = "toggle-only-model";
+    const request = parsed(undefined, { temperature: 0.3, topP: 0.9 }, modelId);
+    request.options.thinkingEnabled = thinkingEnabled;
+    const b = await bodyOf(request, {
+      ...provider,
+      thinkingToggleModels: [modelId],
+      modelCapabilities: { [modelId]: {
+        supportsReasoning: true,
+        supportsThinkingToggle: true,
+        supportsReasoningEffort: false,
+        defaultThinkingEnabled: true,
+      } },
+    });
+    expect(b.thinking).toEqual({ type });
+    expect(b.output_config).toBeUndefined();
+    expect(b.max_tokens).toBe(8192);
     expect(b.temperature).toBe(0.3);
     expect(b.top_p).toBe(0.9);
   });
 
-  test("reasoning absent does NOT enable thinking and preserves sampling", async () => {
-    const b = await bodyOf(parsed(undefined, { temperature: 0.5, topP: 0.8 }));
+  test("toggle-only models apply their capability default without adding strength fields", async () => {
+    const modelId = "toggle-only-default";
+    const b = await bodyOf(parsed(undefined, {}, modelId), {
+      ...provider,
+      thinkingToggleModels: [modelId],
+      modelCapabilities: { [modelId]: {
+        supportsReasoning: true,
+        supportsThinkingToggle: true,
+        supportsReasoningEffort: false,
+        defaultThinkingEnabled: true,
+      } },
+    });
+    expect(b.thinking).toEqual({ type: "enabled" });
+    expect(b.output_config).toBeUndefined();
+    expect(b.max_tokens).toBe(8192);
+  });
+
+  test("models with genuine effort strengths retain their effort wire", async () => {
+    const modelId = "ordinary-strength-model";
+    const b = await bodyOf(parsed("high", {}, modelId), {
+      ...provider,
+      baseUrl: "https://gateway.example.test/anthropic",
+      modelCapabilities: { [modelId]: {
+        supportsReasoning: true,
+        supportsThinkingToggle: true,
+        supportsReasoningEffort: true,
+        defaultThinkingEnabled: true,
+      } },
+    });
+    expect(b.thinking).toEqual({ type: "enabled", budget_tokens: 16384 });
+  });
+
+  test("an explicit toggle off wins over a genuine high effort", async () => {
+    const modelId = "toggle-dual-axis";
+    const request = parsed("high", { temperature: 0.3, topP: 0.9, thinkingEnabled: false }, modelId);
+    const b = await bodyOf(request, {
+      ...provider,
+      thinkingToggleModels: [modelId],
+      modelCapabilities: { [modelId]: {
+        supportsReasoning: true,
+        supportsThinkingToggle: true,
+        supportsReasoningEffort: true,
+        defaultThinkingEnabled: true,
+      } },
+    });
+    expect(b.thinking).toEqual({ type: "disabled" });
+    expect(b.output_config).toBeUndefined();
+    expect(b.max_tokens).toBe(8192);
+    expect(b.temperature).toBe(0.3);
+    expect(b.top_p).toBe(0.9);
+  });
+
+  test("an explicitly unsupported capability suppresses direct Anthropic controls", async () => {
+    const modelId = "unsupported-reasoning";
+    const request = parsed("high", { thinkingEnabled: true }, modelId);
+    const b = await bodyOf(request, {
+      ...provider,
+      thinkingToggleModels: [modelId],
+      modelCapabilities: { [modelId]: { supportsReasoning: false } },
+    });
     expect(b.thinking).toBeUndefined();
-    expect(b.temperature).toBe(0.5);
+    expect(b.output_config).toBeUndefined();
+  });
+
+  test.each([
+    "claude-sonnet-5-5", "claude-opus-4-8", "claude-haiku-5-5", "claude-fable-5",
+  ])("%s keeps its native contract with a declared generic toggle", async (modelId) => {
+    const target = {
+      ...provider,
+      thinkingToggleModels: [modelId],
+      modelCapabilities: { [modelId]: {
+        supportsReasoning: true, supportsThinkingToggle: true, supportsReasoningEffort: false,
+      } },
+    };
+    const on = await bodyOf(parsed("high", {}, modelId), target);
+    expect(on.thinking).toEqual({ type: "adaptive", display: "summarized" });
+    expect(on.output_config).toEqual({ effort: "high" });
+    const off = await bodyOf(parsed("none", { maxOutputTokens: 64 }, modelId), target);
+    expect(off.thinking).toEqual(modelId === "claude-sonnet-5-5" ? { type: "between_tools" }
+      : modelId === "claude-haiku-5-5" ? { type: "disabled" } : undefined);
+    expect(off.output_config).toBeUndefined();
+    expect(off.max_tokens).toBe(64);
+    const explicitOff = await bodyOf(parsed("high", { thinkingEnabled: false, maxOutputTokens: 64 }, modelId), target);
+    expect(explicitOff.thinking).toEqual(off.thinking);
+    expect(explicitOff.output_config).toBeUndefined();
+    expect(explicitOff.max_tokens).toBe(64);
+    const explicitOn = await bodyOf(parsed(undefined, { thinkingEnabled: true }, modelId), target);
+    expect(explicitOn.thinking).toEqual(on.thinking);
+  });
+
+  test.each([
+    ["claude-haiku-4-5", true, undefined],
+    ["claude-sonnet-4-6", true, undefined],
+    ["claude-opus-4-6", true, undefined],
+    ["claude-haiku-4-5", false, "high"],
+    ["claude-sonnet-4-6", false, "high"],
+    ["claude-opus-4-6", false, "high"],
+  ] as const)("%s preserves native budget thinking (effort support=%s, effort=%s)", async (modelId, supportsReasoningEffort, reasoning) => {
+    const target = {
+      ...provider,
+      thinkingToggleModels: [modelId],
+      modelCapabilities: { [modelId]: {
+        supportsReasoning: true, supportsThinkingToggle: true, supportsReasoningEffort,
+      } },
+    };
+    const options = { temperature: 0.3, topP: 0.9, ...(supportsReasoningEffort ? { thinkingEnabled: true } : {}) };
+    const on = await bodyOf(parsed(reasoning, options, modelId), target);
+    expect(on.thinking).toEqual({ type: "enabled", budget_tokens: 16384 });
+    expect(on.max_tokens).toBe(24576);
+    expect(on.output_config).toBeUndefined();
+    expect(on.temperature).toBeUndefined();
+    expect(on.top_p).toBeUndefined();
+    // Explicit off must still win without allocating a thinking budget or increasing the limit.
+    const off = await bodyOf(parsed("high", { thinkingEnabled: false, maxOutputTokens: 64 }, modelId), target);
+    expect(off.thinking).toBeUndefined();
+    expect(off.output_config).toBeUndefined();
+    expect(off.max_tokens).toBe(64);
+  });
+
+  test("both unsupported axes suppress native thinking and token headroom", async () => {
+    const modelId = "claude-sonnet-5-5";
+    const b = await bodyOf(parsed("high", { thinkingEnabled: true, maxOutputTokens: 64 }, modelId), {
+      ...provider,
+      thinkingToggleModels: [modelId],
+      modelCapabilities: { [modelId]: { supportsThinkingToggle: false, supportsReasoningEffort: false } },
+    });
+    expect(b.thinking).toBeUndefined();
+    expect(b.output_config).toBeUndefined();
+    expect(b.max_tokens).toBe(64);
+  });
+
+  // Sonnet 4.5 takes temperature or top_p alone but 400s on both (live 2026-09-29), so a request
+  // carrying both keeps temperature; each field alone survives.
+  test("reasoning 'none' does NOT enable thinking and preserves temperature", async () => {
+    const b = await bodyOf(parsed("none", { temperature: 0.3, topP: 0.9 }));
+    expect(b.thinking).toBeUndefined();
+    expect(b.temperature).toBe(0.3);
+    expect(b.top_p).toBeUndefined();
+  });
+
+  test("reasoning absent does NOT enable thinking and preserves sampling", async () => {
+    expect((await bodyOf(parsed(undefined, { temperature: 0.5 }))).temperature).toBe(0.5);
+    const b = await bodyOf(parsed(undefined, { topP: 0.8 }));
+    expect(b.thinking).toBeUndefined();
     expect(b.top_p).toBe(0.8);
   });
 
@@ -98,13 +252,17 @@ describe("anthropic extended-thinking gate", () => {
     "claude-opus-4-8.1",
   ])("adaptive-thinking model %s sends thinking.adaptive + output_config.effort", async (modelId) => {
     const b = await bodyOf(parsed("xhigh", { temperature: 0.3, topP: 0.9 }, modelId));
-    expect(b.thinking).toEqual({ type: "adaptive" });
+    expect(b.thinking).toEqual({ type: "adaptive", display: "summarized" });
     expect(b.output_config).toEqual({ effort: "xhigh" });
     expect(b.temperature).toBeUndefined();
     expect(b.top_p).toBeUndefined();
   });
 
   test("adaptive-thinking model maps unsupported 'minimal' effort to 'low'", async () => {
+    // #5824: summarized thinking keeps a long think visible as reasoning deltas; a caller that
+    // hides the summary keeps the provider default instead.
+    const hidden = await bodyOf(parsed("high", { hideThinkingSummary: true }, "claude-opus-4-8"));
+    expect(hidden.thinking).toEqual({ type: "adaptive" });
     const b = await bodyOf(parsed("minimal", {}, "claude-fable-5"));
     expect(b.output_config).toEqual({ effort: "low" });
     expect(b.max_tokens).toBe(12_288);
@@ -259,7 +417,7 @@ describe("anthropic extended-thinking gate", () => {
     // Exact regression: effort=max budget is 32000; adaptive ceiling adds OUTPUT_HEADROOM (8192)
     // so max_tokens = 40192, genuinely above the reasoning budget at full effort.
     expect(b.max_tokens as number).toBe(40_192);
-    expect(b.thinking).toEqual({ type: "adaptive" });
+    expect(b.thinking).toEqual({ type: "adaptive", display: "summarized" });
     expect(b.output_config).toEqual({ effort: "max" });
   });
 
@@ -279,6 +437,50 @@ describe("anthropic extended-thinking gate", () => {
     const b = await bodyOf(parsed("max", { maxOutputTokens: 64000 }, "claude-fable-5"));
     // Explicit caller values above 32k must not be silently capped.
     expect(b.max_tokens as number).toBe(64000);
+  });
+
+  // The adaptive branch above already honours an explicit limit above 32k. Budget thinking did
+  // not: it clamped to a flat REASONING_MAX_TOKENS_CEILING (32000) even for Opus 4.6 and Sonnet
+  // 4.6, which document 128K output, so a caller asking for 128000 silently got a quarter of it.
+  test("budget thinking clamps to the model's real maximum, not a flat 32k", async () => {
+    const seeded = {
+      ...provider,
+      defaultMaxOutputTokens: 64_000,
+      modelMaxOutputTokens: { "claude-opus-4-6": 128_000, "claude-sonnet-4-6": 128_000 },
+    };
+    for (const modelId of ["claude-opus-4-6", "claude-sonnet-4-6"]) {
+      for (const asked of [undefined, 128_000]) {
+        const b = await bodyOf(parsed("high", asked === undefined ? {} : { maxOutputTokens: asked }, modelId), seeded);
+        expect(b.max_tokens as number, modelId).toBe(128_000);
+        expect(b.max_tokens as number).toBeGreaterThan((b.thinking as { budget_tokens: number }).budget_tokens);
+      }
+    }
+    // Haiku 4.5 really is 64K, so it must be capped there rather than raised to 128000.
+    const haiku = await bodyOf(parsed("high", { maxOutputTokens: 128_000 }, "claude-haiku-4-5"), seeded);
+    expect(haiku.max_tokens as number).toBe(64_000);
+    // A small explicit limit is still only lifted to budget+headroom, exactly as before.
+    expect((await bodyOf(parsed("high", { maxOutputTokens: 10_000 }, "claude-opus-4-6"), seeded)).max_tokens).toBe(24_576);
+    // With no configured maxima the flat 32k ceiling remains the fallback.
+    const bare = { adapter: "anthropic", baseUrl: "https://api.anthropic.com", apiKey: "sk-x", authMode: "apiKey" } as unknown as OcxProviderConfig;
+    expect((await bodyOf(parsed("high", { maxOutputTokens: 128_000 }, "claude-opus-4-6"), bare)).max_tokens).toBe(32_000);
+  });
+
+  // `defaultMaxOutputTokens` is a fallback budget for omitted requests, not a statement that the
+  // model cannot emit more. Reading it as a capability ceiling would let a deliberately cheap
+  // budget clamp an explicit request BELOW what this path sent before, squeezing the thinking
+  // budget with it, so the configured value may only ever raise the ceiling.
+  test("a low fallback budget never lowers the ceiling for a larger explicit request", async () => {
+    const cheap = { ...provider, defaultMaxOutputTokens: 8192 } as unknown as OcxProviderConfig;
+    const b = await bodyOf(parsed("high", { maxOutputTokens: 128_000 }, "claude-opus-4-6"), cheap);
+    // Regression: this returned max_tokens 8192 / budget 4096, worse than the 32000/16384 the
+    // flat ceiling produced, because the fallback budget was treated as a capability.
+    expect(b.max_tokens as number).toBe(32_000);
+    expect((b.thinking as { budget_tokens: number }).budget_tokens).toBe(16_384);
+    // The budget still decides an OMITTED request, which is what it is actually for.
+    expect((await bodyOf(parsed("none", {}, "claude-opus-4-6"), cheap)).max_tokens).toBe(8192);
+    // A model whose stated maximum really is higher still gets it.
+    const seeded = { ...cheap, modelMaxOutputTokens: { "claude-opus-4-6": 128_000 } } as unknown as OcxProviderConfig;
+    expect((await bodyOf(parsed("high", { maxOutputTokens: 128_000 }, "claude-opus-4-6"), seeded)).max_tokens).toBe(128_000);
   });
 
   test("configured provider output budget replaces the 8192 default when the caller omits max_output_tokens", async () => {
@@ -354,7 +556,7 @@ describe("anthropic extended-thinking gate", () => {
     "claude-opus-4-8/vendor-suffix",
   ])("adaptive-thinking model %s keeps the adaptive wire shape", async (modelId) => {
     const b = await bodyOf(parsed("high", {}, modelId));
-    expect(b.thinking).toEqual({ type: "adaptive" });
+    expect(b.thinking).toEqual({ type: "adaptive", display: "summarized" });
     expect(b.output_config).toEqual({ effort: "high" });
   });
 
@@ -362,7 +564,8 @@ describe("anthropic extended-thinking gate", () => {
     const b = await bodyOf(parsed("none", { temperature: 0.3 }, "claude-fable-5"));
     expect(b.thinking).toBeUndefined();
     expect(b.output_config).toBeUndefined();
-    expect(b.temperature).toBe(0.3);
+    // Fable rejects any non-default temperature (live 2026-09-29), so the adapter drops it.
+    expect(b.temperature).toBeUndefined();
   });
 
   // #545: Claude Desktop's Auto Mode classifier sends thinking:{type:"disabled"} with
@@ -389,9 +592,6 @@ describe("anthropic extended-thinking gate", () => {
     // without the field and the model thinks anyway, on a 64-token budget it shares
     // with generation (#545).
     "Claude-Sonnet-5",
-    "claude-opus-4-7",
-    "claude-opus-4-8",
-    "claude-opus-5",
   ])("%s + reasoning 'none' sends an explicit thinking disable (#545)", async (modelId) => {
     const b = await bodyOf(parsed("none", { maxOutputTokens: 64, stopSequences: ["</block>"] }, modelId));
     expect(b.thinking).toEqual({ type: "disabled" });
@@ -409,14 +609,17 @@ describe("anthropic extended-thinking gate", () => {
 
   test.each([
     "claude-fable-5",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
     "claude-haiku-4-5",
     "claude-sonnet-4-6",
     "anthropic/claude-fable-5",
     "claude-fable-5/foo",
     "not-a-claude-model",
   ])("%s + 'none' sends NO explicit disable (#545 gate stays narrow)", async (modelId) => {
-    // Fable always thinks and rejects an explicit disable. Widening the gate to every
-    // adaptive family would trade a silent truncation for a 400.
+    // Fable always thinks and rejects an explicit disable; the Opus 4.7/4.8 adaptive wire
+    // leaves thinking off when omitted. Widening the gate to every adaptive family would
+    // trade a silent truncation for a 400.
     const b = await bodyOf(parsed("none", {}, modelId));
     expect(b.thinking).toBeUndefined();
   });
@@ -441,7 +644,7 @@ describe("anthropic extended-thinking gate", () => {
     }));
     const messages = b.messages as { role: string; content: unknown }[];
 
-    expect(b.cache_control).toEqual({ type: "ephemeral" });
+    expect(b.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
     expect(JSON.stringify(messages)).not.toContain("rs_other_provider");
     expect(JSON.stringify(messages)).not.toContain("signature");
     expect(messages).toEqual([{ role: "user", content: "continue on anthropic" }]);
@@ -449,6 +652,21 @@ describe("anthropic extended-thinking gate", () => {
 });
 
 describe("Anthropic Messages stored-OAuth round trip", () => {
+  test("Messages adaptive display omission survives the stored OAuth round trip", async () => {
+    const inbound = anthropicToResponsesBody({
+      model: "claude-opus-4-8",
+      max_tokens: 256,
+      messages: [{ role: "user", content: "Keep thinking hidden" }],
+      thinking: { type: "adaptive", display: "omitted" },
+      output_config: { effort: "high" },
+    });
+
+    const body = await bodyOf(parseRequest(inbound), { ...provider, authMode: "oauth" });
+
+    expect(body.thinking).toEqual({ type: "adaptive" });
+    expect(body.output_config).toEqual({ effort: "high" });
+  });
+
   test("Messages structured output survives the stored OAuth round trip", async () => {
     const schema = {
       type: "object",
@@ -539,5 +757,60 @@ describe("provider default reasoning effort (#2494)", () => {
     const model = "anthropic/claude-sonnet-4.5";
     const b = await bodyOf(parsed(undefined, {}, model), withDefault(model, "   "));
     expect(b.thinking).toBeUndefined();
+  });
+});
+
+/**
+ * Audit F7 (2026-09-14) at the FINAL WIRE, not the projection.
+ *
+ * The Chat inbound allowlist used to drop `reasoning_effort: "none"`, so a Pi user who
+ * turned thinking off produced a request with no effort at all. That is not neutral
+ * here: for a model carrying a provider default of "high", omission lets the default
+ * win and thinking is re-enabled. Asserting the projected Responses body carries
+ * `effort: "none"` does not prove that, because the conflict only resolves inside this
+ * adapter. These drive the Chat body all the way to the Anthropic wire.
+ */
+describe("F7 an explicit disable beats a provider default at the Anthropic wire", () => {
+  const model = "claude-sonnet-5";
+  const defaultingProvider = {
+    adapter: "anthropic",
+    baseUrl: "https://api.anthropic.com",
+    apiKey: "sk-x",
+    authMode: "apiKey",
+    modelDefaultReasoningEfforts: { [model]: "high" },
+  } as unknown as OcxProviderConfig;
+
+  async function wireFromChat(raw: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const request = parseRequest(chatCompletionsToResponsesBody({
+      model,
+      messages: [{ role: "user", content: "hello" }],
+      ...raw,
+    }));
+    const { body } = await createAnthropicAdapter(defaultingProvider).buildRequest(request);
+    return JSON.parse(typeof body === "string" ? body : JSON.stringify(body)) as Record<string, unknown>;
+  }
+
+  test("reasoning_effort none over Chat disables thinking on the wire", async () => {
+    const wire = await wireFromChat({ reasoning_effort: "none" });
+    // Before the fix this was the provider default, reached via adaptive/enabled.
+    expect(wire.thinking).toEqual({ type: "disabled" });
+  });
+
+  test("the nested reasoning.effort spelling behaves identically", async () => {
+    expect((await wireFromChat({ reasoning: { effort: "none" } })).thinking).toEqual({ type: "disabled" });
+  });
+
+  test("omitting an effort still lets the provider default apply", async () => {
+    // The contrast that makes the assertion above meaningful: absence is NOT disable.
+    const wire = await wireFromChat({});
+    expect(wire.thinking).toBeDefined();
+    expect((wire.thinking as { type?: string }).type).not.toBe("disabled");
+  });
+
+  test("the same disable through the Responses ingress agrees", async () => {
+    const request = parseRequest({ model, input: "hello", reasoning: { effort: "none" } });
+    const { body } = await createAnthropicAdapter(defaultingProvider).buildRequest(request);
+    const wire = JSON.parse(typeof body === "string" ? body : JSON.stringify(body)) as Record<string, unknown>;
+    expect(wire.thinking).toEqual({ type: "disabled" });
   });
 });

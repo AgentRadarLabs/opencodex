@@ -3,16 +3,13 @@
 
 # The `ocx` management surface
 
-Every capability the CLI declares, with the management routes it drives and whether it
-mutates state. This file is generated from the same table `ocx capabilities --json`
-serves, so it cannot describe a command that does not exist.
-
-Ask the running binary instead of trusting this file when the two disagree:
+Declared capabilities, grouped by operating task. This index is not every CLI verb.
+Read the chapter for routes, flags and mutation notes; use the running binary when versions differ.
 
 ```bash
-ocx capabilities --json                 # the whole table
-ocx capabilities --mutating-only --json  # only state-changing verbs
-ocx capabilities --route /api/logs      # which verbs drive one route
+ocx capabilities --json                 # the declared table
+ocx capabilities --mutating-only --json  # declared state-changing verbs
+ocx capabilities --route /api/logs       # declarations for one route
 ```
 
 ## Resolved before dispatch
@@ -24,584 +21,1630 @@ These answer in the CLI head and never reach the proxy, so they work with nothin
 | `--version` `-v` `version` | Print the CLI version and exit. |
 | `help` `--help` `-h` | Print the command list, or one command's usage with `ocx help <command>`. |
 
+## Task chapters
+
+| Chapter | Declared capabilities |
+|---|---|
+| [lifecycle](01_surface_lifecycle.md) | 14 |
+| [providers-models](01_surface_providers-models.md) | 53 |
+| [accounts](01_surface_accounts.md) | 43 |
+| [agents-routing](01_surface_agents-routing.md) | 71 |
+| [integrations](01_surface_integrations.md) | 41 |
+| [observe-system](01_surface_observe-system.md) | 105 |
+| [access-remote](01_surface_access-remote.md) | 51 |
+| [lab](01_surface_lab.md) | 21 |
+
 ## Read-only capabilities
 
-Safe to run at any time; none of these change state.
-
-### `ocx status`
-
-Proxy status, injection state, and version skew between this CLI and the running proxy.
-
-Drives no management route.
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the status envelope as JSON. |
-
-JSON mode: `envelope`.
-
-- Reads /healthz plus local config; drives no management API route.
-
-### `ocx capabilities`
-
-List the declared CLI capabilities and the management routes they drive.
-
-Drives no management route.
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the full capability table as JSON. |
-| `--mutating-only` | boolean | Restrict output to capabilities that mutate state. |
-| `--route` | string | Show which capabilities drive a management route. |
-
-JSON mode: `envelope`.
-
-- Start here when driving ocx programmatically: it is the declared surface index, not a complete verb list.
-
-### `ocx provider list`
-
-Configured providers with connectivity and selected models.
-
-Drives no management route.
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the provider list as JSON. |
-
-JSON mode: `envelope`.
-
-- Reads local config; drives no management API route.
-
-### `ocx provider resets`
-
-Recently detected quota resets and whether reset notifications are enabled.
-
-| Method | Route |
-|---|---|
-| GET | `/api/quota-resets` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit reset events as JSON. |
-| `--limit` | number | Limit returned events; defaults to 20, capped at 100. |
-
-JSON mode: `payload`.
-
-### `ocx account list`
-
-Codex OAuth accounts with pool priority and pause state.
-
-| Method | Route |
-|---|---|
-| GET | `/api/codex-auth/accounts` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the account list as JSON. |
-
-JSON mode: `payload`.
-
-- STATUS names `paused` alongside `selected`: a paused-but-selected account still receives requests.
-- `--quota` shows cached Codex windows (including 5h); `--refresh` bypasses the server TTL.
-
-### `ocx usage`
-
-Token and estimated-cost report over a time range.
-
-| Method | Route |
-|---|---|
-| GET | `/api/usage` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--range` | string | today | 1d | 7d | 30d | all |
-| `--provider` | string | Restrict to one provider. |
-| `--model` | string | Restrict to one model id. |
-| `--json` | boolean | Emit the usage report as JSON. |
-
-JSON mode: `payload`.
-
-- Per-account totals are withheld under `--provider` or `--model`: account rows cannot be honestly re-partitioned by provider, so the report says so rather than printing an empty table.
-- An `(ambiguous)` account row aggregates several accounts; do not read it as one identity.
-
-### `ocx logs`
-
-Recent request log rows, filterable by provider, model, conversation, and status.
-
-| Method | Route |
-|---|---|
-| GET | `/api/logs` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--provider` | string | Restrict to one provider, matching failover attempts too. |
-| `--model` | string | Restrict to one model id, matching failover attempts too. |
-| `--conversation` | string | Restrict to one conversation id (`--conversationId` is accepted too). |
-| `--status` | string | An exact code (429) or a class (5xx). |
-| `--limit` | number | Row cap; defaults to 200. |
-| `--follow` | boolean | Poll for new rows; add --jsonl to emit JSONL. |
-| `--json` | boolean | Emit the server payload as JSON. |
-| `--jsonl` | boolean | Emit one row per line. |
-
-JSON mode: `payload`.
-
-- `--provider` and `--model` both match a failover attempt, so a request is findable by what actually served it, not only by what was asked for.
-- Rows print `conv=<id>` when the entry carries one, so a conversation filter can be told apart from an empty result.
-- `--follow` deduplicates by row id and cannot be combined with `--json`.
-
-### `ocx storage report`
-
-Disk usage under CODEX_HOME, with the log-guard protection report.
-
-| Method | Route |
-|---|---|
-| GET | `/api/storage` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the storage report as JSON. |
-
-JSON mode: `payload`.
-
-### `ocx inspect config`
-
-The effective merged configuration the proxy is running.
-
-| Method | Route |
-|---|---|
-| GET | `/api/config` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the config as JSON. |
-
-JSON mode: `payload`.
-
-### `ocx inspect catalog`
-
-The generated model catalog served to clients.
-
-| Method | Route |
-|---|---|
-| GET | `/api/catalog` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the catalog as JSON. |
-
-JSON mode: `payload`.
-
-### `ocx inspect routing-analytics`
-
-Aggregate routing outcomes per provider and model.
-
-| Method | Route |
-|---|---|
-| GET | `/api/routing-analytics` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the analytics payload as JSON. |
-
-JSON mode: `payload`.
-
-### `ocx inspect pacing`
-
-Request-pacing state for one provider or all of them.
-
-| Method | Route |
-|---|---|
-| GET | `/api/provider-request-pacing` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--name` | string | Restrict to one provider; omitted means every provider. |
-| `--json` | boolean | Emit the pacing state as JSON. |
-
-JSON mode: `payload`.
-
-- An unknown provider name is a 404 rather than an empty result.
-
-### `ocx inspect key-providers`
-
-Providers that authenticate with an API key rather than OAuth.
-
-| Method | Route |
-|---|---|
-| GET | `/api/key-providers` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the provider list as JSON. |
-
-JSON mode: `payload`.
-
-### `ocx inspect codex-prompt`
-
-The Codex system prompt state, or the prompt text itself.
-
-| Method | Route |
-|---|---|
-| GET | `/api/codex-prompt` |
-| GET | `/api/codex-prompt/text` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--text` | boolean | Print the prompt body verbatim instead of its metadata. |
-| `--json` | boolean | Emit the prompt metadata as JSON. |
-
-JSON mode: `payload`.
-
-- Read-only by design: the six mutating prompt routes require a dashboard session.
-
-### `ocx inspect client-config`
-
-The generated configuration snippet for a supported client.
-
-| Method | Route |
-|---|---|
-| GET | `/api/client-config` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--client` | string | Required client id; the route names every accepted value on error. |
-| `--json` | boolean | Emit the snippet payload as JSON. |
-
-JSON mode: `payload`.
-
-### `ocx inspect star`
-
-Whether this repository is starred by the signed-in GitHub account.
-
-| Method | Route |
-|---|---|
-| GET | `/api/github/star` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the star status as JSON. |
-
-JSON mode: `payload`.
-
-- Starring is never available from the CLI; the verb says so rather than offering a flag that cannot work.
-
-### `ocx inspect windows-tray`
-
-Windows tray helper state.
-
-| Method | Route |
-|---|---|
-| GET | `/api/windows-tray` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the tray state as JSON. |
-
-JSON mode: `payload`.
-
-### `ocx system codex-app-server`
-
-Codex app-server reachability and process state, as the dashboard sees it.
-
-| Method | Route |
-|---|---|
-| GET | `/api/system/codex-app-server` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the app-server state as JSON. |
-
-JSON mode: `payload`.
-
-- The GUI reads this state directly; without a verb an agent could not tell whether the Codex app-server was reachable at all.
-
-### `ocx system codex-cli-update check`
-
-Inspect a configured Codex CLI candidate and its ownership provenance.
-
-Drives no management route.
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the redacted provenance report as JSON. |
-
-JSON mode: `envelope`.
-
-- Proof-bound published-launcher context authenticates the configured candidate snapshot, not successful Codex execution; this check does not attest or admit a selected runtime.
-- On Windows this first slice performs no candidate or configuration filesystem I/O: only a proof-captured absolute environment candidate can receive lexical app-bundle or version-manager labels; every other Windows candidate fails closed.
-- Makes no package-registry request.
-- Does not execute Codex or npm, install or repair software, control a process, or write configuration or cache state.
-
-### `ocx claude desktop status`
-
-Applied-vs-desired Claude Desktop state, including staleness, drift, and health.
-
-| Method | Route |
-|---|---|
-| GET | `/api/claude-desktop/status` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the live status as JSON. |
-
-JSON mode: `payload`.
-
-- Distinct from `claude desktop show`, which reports what this machine WOULD write; this reports what is actually in effect, which only the running proxy knows.
+Read-oriented tasks are marked non-mutating in the registry. Probes may contact providers,
+consume quota or refresh caches; this label does not promise cost-free or effect-free execution.
 
 ## State-changing capabilities
 
-Each of these writes. Check the flags column before running one unattended.
+Check the chapter's flags, the requested authority and the operating skill's consent and secret rules.
+
+## Canonical invocation index
+
+Original invocation order. These headings preserve links to the previous single-file reference.
+
+### `ocx codex-provider`
+
+[State-changing task](01_surface_lifecycle.md#ocx-codex-provider)
+
+### `ocx chatgpt`
+
+[State-changing task](01_surface_lifecycle.md#ocx-chatgpt)
+
+### `ocx link probe`
+
+[State-changing task](01_surface_access-remote.md#ocx-link-probe)
+
+### `ocx link add`
+
+[State-changing task](01_surface_access-remote.md#ocx-link-add)
+
+### `ocx link port`
+
+[Read-oriented task](01_surface_access-remote.md#ocx-link-port)
+
+### ocx link issue
+
+[State-changing task](01_surface_access-remote.md#ocx-link-issue)
+
+### `ocx link status`
+
+[Read-oriented task](01_surface_access-remote.md#ocx-link-status)
+
+### `ocx link diagnostics`
+
+[Read-oriented task](01_surface_access-remote.md#ocx-link-diagnostics)
+
+### `ocx link revoke`
+
+[State-changing task](01_surface_access-remote.md#ocx-link-revoke)
+
+### `ocx link recover`
+
+[State-changing task](01_surface_access-remote.md#ocx-link-recover)
+
+### `ocx link reconnect`
+
+[State-changing task](01_surface_access-remote.md#ocx-link-reconnect)
+
+### `ocx link cleanup`
+
+[Read-oriented task](01_surface_access-remote.md#ocx-link-cleanup)
+
+### `ocx remote-workspace pair`
+
+[State-changing task](01_surface_access-remote.md#ocx-remote-workspace-pair)
+
+### `ocx remote-workspace agent`
+
+[State-changing task](01_surface_access-remote.md#ocx-remote-workspace-agent)
+
+### `ocx remote-workspace status`
+
+[Read-oriented task](01_surface_access-remote.md#ocx-remote-workspace-status)
+
+### `ocx models price`
+
+[Read-oriented task](01_surface_providers-models.md#ocx-models-price)
+
+### `ocx models set-price`
+
+[State-changing task](01_surface_providers-models.md#ocx-models-set-price)
+
+### `ocx models set`
+
+[State-changing task](01_surface_providers-models.md#ocx-models-set)
+
+### `ocx status`
+
+[Read-oriented task](01_surface_lifecycle.md#ocx-status)
+
+### `ocx resolve`
+
+[Read-oriented task](01_surface_lifecycle.md#ocx-resolve)
+
+### ocx hub invite
+
+[State-changing task](01_surface_access-remote.md#ocx-hub-invite)
 
 ### `ocx connect rotate`
 
-Rotate the connected client's data key against the hub, with commit and abort.
+[State-changing task](01_surface_access-remote.md#ocx-connect-rotate)
 
-| Method | Route |
-|---|---|
-| POST | `/api/keys/rotate` |
-| POST | `/api/keys/rotate/commit` |
-| DELETE | `/api/keys/rotate` |
+### `ocx update`
 
-| Flag | Value | Meaning |
-|---|---|---|
-| `--pairing-code-stdin` | boolean | Read a one-time pairing code from stdin as the rotation authority. |
-| `--admin-token-stdin` | boolean | Read the hub admin token from stdin as the rotation authority. |
-| `--json` | boolean | Emit the rotation result as JSON. |
+[State-changing task](01_surface_observe-system.md#ocx-update)
 
-JSON mode: `payload`.
+### `ocx capabilities`
 
-- Requires transient authority on stdin; the credential is never persisted or echoed.
-- A rotation left pending by a crash is resumed here — startup and status stop rather than guess which key generation is live.
+[Read-oriented task](01_surface_lifecycle.md#ocx-capabilities)
+
+### `ocx provider list`
+
+[Read-oriented task](01_surface_providers-models.md#ocx-provider-list)
+
+### `ocx provider resets`
+
+[Read-oriented task](01_surface_providers-models.md#ocx-provider-resets)
 
 ### `ocx provider keychain`
 
-Move a provider's API key into the OS keychain, restore it, or report where it lives.
+[State-changing task](01_surface_providers-models.md#ocx-provider-keychain)
 
-| Method | Route |
-|---|---|
-| GET | `/api/providers/keychain` |
-| POST | `/api/providers/keychain` |
+### `ocx companion`
 
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the keychain status or result as JSON. |
+[State-changing task](01_surface_observe-system.md#ocx-companion)
 
-JSON mode: `payload`.
+### `ocx account login`
 
-- `store` verifies every keychain write by read-back before config.json is rewritten with keychain: references; an unavailable keychain refuses with 503 and leaves the file untouched.
-- Headless services usually have no unlocked keychain session; prefer ${ENV_VAR} references there.
+[State-changing task](01_surface_accounts.md#ocx-account-login)
+
+### `ocx account history`
+
+[Read-oriented task](01_surface_accounts.md#ocx-account-history)
+
+### `ocx account main reauth`
+
+[State-changing task](01_surface_accounts.md#ocx-account-main-reauth)
+
+### `ocx account list`
+
+[Read-oriented task](01_surface_accounts.md#ocx-account-list)
+
+### `ocx account import-orca`
+
+[State-changing task](01_surface_accounts.md#ocx-account-import-orca)
+
+### `ocx account refresh`
+
+[State-changing task](01_surface_accounts.md#ocx-account-refresh)
+
+### `ocx account grok-reset-coupons`
+
+[State-changing task](01_surface_accounts.md#ocx-account-grok-reset-coupons)
+
+### `ocx usage`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-usage)
 
 ### `ocx account pause`
 
-Stop routing new requests to one account in the Codex pool.
-
-| Method | Route |
-|---|---|
-| PUT | `/api/codex-auth/accounts/pause` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the pause result as JSON. |
-
-JSON mode: `envelope`.
-
-- Pausing also unbinds threads pinned to the account and selects a fallback if it was active -- side effects of the route, not of the word `pause`.
-- The issue that requested this reported the route as POST; it is PUT.
+[State-changing task](01_surface_accounts.md#ocx-account-pause)
 
 ### `ocx account resume`
 
-Return a paused account to the Codex pool.
-
-| Method | Route |
-|---|---|
-| PUT | `/api/codex-auth/accounts/pause` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the resume result as JSON. |
-
-JSON mode: `envelope`.
+[State-changing task](01_surface_accounts.md#ocx-account-resume)
 
 ### `ocx account pause-exhausted`
 
-Pause every Codex account whose quota is spent.
-
-| Method | Route |
-|---|---|
-| PUT | `/api/codex-auth/accounts/pause-exhausted` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit paused ids and the checked/failed counts as JSON. |
-
-JSON mode: `envelope`.
-
-- The route refreshes quota per account and can partially fail; a non-zero failed count exits 1 and sets ok:false, because silence would read as `none were exhausted`.
+[State-changing task](01_surface_accounts.md#ocx-account-pause-exhausted)
 
 ### `ocx account strategy`
 
-Show or set how an account pool picks the next account.
-
-| Method | Route |
-|---|---|
-| GET | `/api/codex-auth/active` |
-| PUT | `/api/codex-auth/pool-strategy` |
-| GET | `/api/oauth/accounts/pool` |
-| PUT | `/api/oauth/accounts/pool` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the applied strategy and sticky limit as JSON. |
-
-JSON mode: `envelope`.
-
-- A bare invocation reads and never writes.
-- The APPLIED value is echoed, not the requested one, so a server-side normalization stays visible.
-- Values are not re-validated in the CLI: the server owns the strategy names and the 1-100 sticky bound.
-- `anthropic` owns the full pool contract. Other OAuth providers reach the same endpoint with a generic subset (enabled/strategy/autoSwitchThreshold) whose settings persist but do not yet steer selection; `sticky` and `quotaWindow` are refused for them.
+[State-changing task](01_surface_accounts.md#ocx-account-strategy)
 
 ### `ocx account sticky`
 
-Show or set how many consecutive requests stay on one account.
+[State-changing task](01_surface_accounts.md#ocx-account-sticky)
 
-| Method | Route |
-|---|---|
-| GET | `/api/codex-auth/active` |
-| PUT | `/api/codex-auth/pool-strategy` |
-| GET | `/api/oauth/accounts/pool` |
-| PUT | `/api/oauth/accounts/pool` |
+### `ocx account routes`
 
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the applied strategy and sticky limit as JSON. |
+[State-changing task](01_surface_accounts.md#ocx-account-routes)
 
-JSON mode: `envelope`.
+### `ocx account auto-switch`
 
-- Only meaningful under the sticky-capable strategies; the pool strategy is the other half of this setting.
+[State-changing task](01_surface_accounts.md#ocx-account-auto-switch)
+
+### `ocx logs`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-logs)
+
+### `ocx storage report`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-storage-report)
 
 ### `ocx storage cleanup`
 
-Preview or delete the oldest archived sessions by percentage.
-
-| Method | Route |
-|---|---|
-| POST | `/api/storage/cleanup/preview` |
-| POST | `/api/storage/cleanup` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--percent` | number | Portion of the oldest archived sessions to target (0-100). |
-| `--mode` | string | quarantine (recoverable from trash) or permanent. |
-| `--yes` | boolean | Required to actually delete; without it this is a preview. |
-| `--json` | boolean | Emit the preview or result as JSON. |
-
-JSON mode: `payload`.
-
-- Without `--yes` it prints what WOULD be freed and exits 0 having changed nothing.
-- There is no interactive confirmation: a prompt an agent can answer is not a safety boundary.
-- `--mode quarantine` moves files to trash, so `storage trash restore` can undo it; `permanent` cannot be undone.
+[State-changing task](01_surface_observe-system.md#ocx-storage-cleanup)
 
 ### `ocx storage trash`
 
-List quarantined cleanup batches, or restore one.
-
-| Method | Route |
-|---|---|
-| GET | `/api/storage/trash` |
-| POST | `/api/storage/trash/restore` |
-
-| Flag | Value | Meaning |
-|---|---|---|
-| `--yes` | boolean | Required for restore, which moves files and reconciles database rows. |
-| `--json` | boolean | Emit the trash list or restore result as JSON. |
-
-JSON mode: `payload`.
-
-- Restore fails with a named 409 when the destination already exists, rather than overwriting it.
+[State-changing task](01_surface_observe-system.md#ocx-storage-trash)
 
 ### `ocx storage policy`
 
-Show, change, or run the automatic archived-session cleanup policy.
+[State-changing task](01_surface_observe-system.md#ocx-storage-policy)
 
-| Method | Route |
-|---|---|
-| GET | `/api/storage/cleanup-policy` |
-| PUT | `/api/storage/cleanup-policy` |
-| POST | `/api/storage/cleanup-policy/run` |
+### `ocx inspect config`
 
-| Flag | Value | Meaning |
-|---|---|---|
-| `--enabled` | string | true or false. |
-| `--percent` | number | Portion of oldest archived sessions each run targets. |
-| `--mode` | string | quarantine or permanent. |
-| `--schedule` | string | startup, daily, weekly, or manual. |
-| `--yes` | boolean | Required for `policy run`, which deletes immediately. |
-| `--json` | boolean | Emit the policy or run state as JSON. |
+[Read-oriented task](01_surface_observe-system.md#ocx-inspect-config)
 
-JSON mode: `payload`.
+### `ocx inspect catalog`
 
-- `policy set` never enables implicitly: omitting `--enabled` keeps the stored value.
-- `policy run` forces a run regardless of schedule, so it needs `--yes`.
+[Read-oriented task](01_surface_observe-system.md#ocx-inspect-catalog)
+
+### `ocx inspect routing-analytics`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-inspect-routing-analytics)
+
+### `ocx inspect pacing`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-inspect-pacing)
+
+### `ocx inspect key-providers`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-inspect-key-providers)
+
+### `ocx inspect codex-prompt`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-inspect-codex-prompt)
+
+### `ocx inspect client-config`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-inspect-client-config)
+
+### `ocx inspect star`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-inspect-star)
+
+### `ocx inspect windows-tray`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-inspect-windows-tray)
+
+### `ocx system codex-app-server`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-system-codex-app-server)
+
+### `ocx system codex-cli-update check`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-system-codex-cli-update-check)
+
+### `ocx system codex-cli-update attest`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-system-codex-cli-update-attest)
+
+### `ocx system codex-cli-update plan`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-system-codex-cli-update-plan)
+
+### `ocx system codex-cli-update apply`
+
+[State-changing task](01_surface_observe-system.md#ocx-system-codex-cli-update-apply)
+
+### `ocx system codex-cli-update status`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-system-codex-cli-update-status)
 
 ### `ocx system codex-restart`
 
-Restart the Codex app-server.
+[State-changing task](01_surface_observe-system.md#ocx-system-codex-restart)
 
-| Method | Route |
-|---|---|
-| POST | `/api/system/codex-restart` |
+### `ocx claude config`
 
-| Flag | Value | Meaning |
-|---|---|---|
-| `--yes` | boolean | Required: restarts the operator's running Codex app-server. |
-| `--json` | boolean | Emit the restart result as JSON. |
+[State-changing task](01_surface_integrations.md#ocx-claude-config)
 
-JSON mode: `payload`.
+### `ocx claude intercept start`
 
-- `sync --restart-codex` is not a substitute: it restarts only as a side effect after a catalog or cache write, so it cannot restart a healthy install on request.
-- --yes is mandatory because this interrupts a running editor session, which must never happen because an agent guessed a subcommand.
+[State-changing task](01_surface_integrations.md#ocx-claude-intercept-start)
+
+### `ocx claude desktop status`
+
+[Read-oriented task](01_surface_integrations.md#ocx-claude-desktop-status)
+
+### `ocx claude desktop bind`
+
+[State-changing task](01_surface_integrations.md#ocx-claude-desktop-bind)
+
+### `ocx claude desktop unbind`
+
+[State-changing task](01_surface_integrations.md#ocx-claude-desktop-unbind)
+
+### `ocx claude desktop picker status`
+
+[Read-oriented task](01_surface_integrations.md#ocx-claude-desktop-picker-status)
+
+### `ocx claude desktop picker on`
+
+[State-changing task](01_surface_integrations.md#ocx-claude-desktop-picker-on)
+
+### `ocx claude desktop picker off`
+
+[State-changing task](01_surface_integrations.md#ocx-claude-desktop-picker-off)
+
+### `ocx claude desktop picker trust`
+
+[State-changing task](01_surface_integrations.md#ocx-claude-desktop-picker-trust)
 
 ### `ocx integration native`
 
-Show or toggle the native Claude, Claude Desktop, Codex, and Grok integrations, and read the Cursor status (which builds are installed, gateway values, last request seen).
+[State-changing task](01_surface_integrations.md#ocx-integration-native)
 
-| Method | Route |
-|---|---|
-| GET | `/api/native-integrations` |
-| PUT | `/api/native-integrations/claude` |
-| PUT | `/api/native-integrations/claude-desktop` |
-| PUT | `/api/native-integrations/codex` |
-| PUT | `/api/native-integrations/grok` |
-| GET | `/api/native-integrations/cursor` |
+### `ocx integration client`
 
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the client rows or toggle result as JSON. |
+[State-changing task](01_surface_integrations.md#ocx-integration-client)
 
-JSON mode: `payload`.
+### `ocx sync`
 
-- The list renders per-client state, installed, and desired columns; a blocked disable is named rather than left silent.
-- Each client has its own route because a toggle rewrites that client's own config file.
+[State-changing task](01_surface_lifecycle.md#ocx-sync)
+
+### `ocx agent subagents force`
+
+[State-changing task](01_surface_agents-routing.md#ocx-agent-subagents-force)
 
 ### `ocx agent request-user-input`
 
-Show or set whether default mode may ask the operator a question mid-task.
+[State-changing task](01_surface_agents-routing.md#ocx-agent-request-user-input)
 
-| Method | Route |
-|---|---|
-| GET | `/api/codex-auth/features/default-mode-request-user-input` |
-| PUT | `/api/codex-auth/features/default-mode-request-user-input` |
+### `ocx agent roles`
 
-| Flag | Value | Meaning |
-|---|---|---|
-| `--json` | boolean | Emit the feature state as JSON. |
+[State-changing task](01_surface_agents-routing.md#ocx-agent-roles)
 
-JSON mode: `payload`.
+### `ocx agent injection`
 
-- A bare invocation reads and never writes.
+[State-changing task](01_surface_agents-routing.md#ocx-agent-injection)
+
+### `ocx api protocols`
+
+[Read-oriented task](01_surface_access-remote.md#ocx-api-protocols)
+
+### `ocx combo test`
+
+[State-changing task](01_surface_agents-routing.md#ocx-combo-test)
+
+### `ocx combo discover`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-combo-discover)
+
+### `ocx api explain`
+
+[Read-oriented task](01_surface_access-remote.md#ocx-api-explain)
+
+### `ocx api policy`
+
+[State-changing task](01_surface_access-remote.md#ocx-api-policy)
+
+### `ocx provider add`
+
+[State-changing task](01_surface_providers-models.md#ocx-provider-add)
+
+### `ocx provider show`
+
+[Read-oriented task](01_surface_providers-models.md#ocx-provider-show)
+
+### `ocx provider remove`
+
+[State-changing task](01_surface_providers-models.md#ocx-provider-remove)
+
+### `ocx provider set-default`
+
+[State-changing task](01_surface_providers-models.md#ocx-provider-set-default)
+
+### `ocx provider edit`
+
+[State-changing task](01_surface_providers-models.md#ocx-provider-edit)
+
+### `ocx provider test`
+
+[State-changing task](01_surface_providers-models.md#ocx-provider-test)
+
+### `ocx provider quota`
+
+[Read-oriented task](01_surface_providers-models.md#ocx-provider-quota)
+
+### `ocx provider presets`
+
+[Read-oriented task](01_surface_providers-models.md#ocx-provider-presets)
+
+### `ocx provider account-mode`
+
+[State-changing task](01_surface_providers-models.md#ocx-provider-account-mode)
+
+### `ocx provider selected`
+
+[State-changing task](01_surface_providers-models.md#ocx-provider-selected)
+
+### `ocx provider import-cc-switch`
+
+[State-changing task](01_surface_providers-models.md#ocx-provider-import-cc-switch)
+
+### `ocx models list`
+
+[Read-oriented task](01_surface_providers-models.md#ocx-models-list)
+
+### `ocx models add`
+
+[State-changing task](01_surface_providers-models.md#ocx-models-add)
+
+### `ocx models remove`
+
+[State-changing task](01_surface_providers-models.md#ocx-models-remove)
+
+### `ocx models list-custom`
+
+[Read-oriented task](01_surface_providers-models.md#ocx-models-list-custom)
+
+### `ocx models live`
+
+[Read-oriented task](01_surface_providers-models.md#ocx-models-live)
+
+### `ocx models edit`
+
+[State-changing task](01_surface_providers-models.md#ocx-models-edit)
+
+### `ocx models enable`
+
+[State-changing task](01_surface_providers-models.md#ocx-models-enable)
+
+### `ocx models disable`
+
+[State-changing task](01_surface_providers-models.md#ocx-models-disable)
+
+### `ocx models provider`
+
+[State-changing task](01_surface_providers-models.md#ocx-models-provider)
+
+### `ocx models selected`
+
+[State-changing task](01_surface_providers-models.md#ocx-models-selected)
+
+### `ocx models preset show`
+
+[Read-oriented task](01_surface_providers-models.md#ocx-models-preset-show)
+
+### `ocx models preset apply`
+
+[State-changing task](01_surface_providers-models.md#ocx-models-preset-apply)
+
+### `ocx models new-policy`
+
+[State-changing task](01_surface_providers-models.md#ocx-models-new-policy)
+
+### `ocx models new-arrivals`
+
+[Read-oriented task](01_surface_providers-models.md#ocx-models-new-arrivals)
+
+### `ocx models context status`
+
+[Read-oriented task](01_surface_providers-models.md#ocx-models-context-status)
+
+### `ocx models context value`
+
+[State-changing task](01_surface_providers-models.md#ocx-models-context-value)
+
+### `ocx models context provider`
+
+[State-changing task](01_surface_providers-models.md#ocx-models-context-provider)
+
+### `ocx models context all`
+
+[State-changing task](01_surface_providers-models.md#ocx-models-context-all)
+
+### `ocx models shadow status`
+
+[Read-oriented task](01_surface_providers-models.md#ocx-models-shadow-status)
+
+### `ocx models shadow set`
+
+[State-changing task](01_surface_providers-models.md#ocx-models-shadow-set)
+
+### `ocx models auto-review status`
+
+[Read-oriented task](01_surface_providers-models.md#ocx-models-auto-review-status)
+
+### `ocx models auto-review set`
+
+[State-changing task](01_surface_providers-models.md#ocx-models-auto-review-set)
+
+### `ocx alias list`
+
+[Read-oriented task](01_surface_providers-models.md#ocx-alias-list)
+
+### `ocx alias set`
+
+[State-changing task](01_surface_providers-models.md#ocx-alias-set)
+
+### `ocx alias rm`
+
+[State-changing task](01_surface_providers-models.md#ocx-alias-rm)
+
+### `ocx alias defaults`
+
+[State-changing task](01_surface_providers-models.md#ocx-alias-defaults)
+
+### `ocx alias template set`
+
+[State-changing task](01_surface_providers-models.md#ocx-alias-template-set)
+
+### `ocx alias template rm`
+
+[State-changing task](01_surface_providers-models.md#ocx-alias-template-rm)
+
+### `ocx alias template show`
+
+[Read-oriented task](01_surface_providers-models.md#ocx-alias-template-show)
+
+### `ocx provider pacing`
+
+[State-changing task](01_surface_providers-models.md#ocx-provider-pacing)
+
+### `ocx provider snapshot`
+
+[Read-oriented task](01_surface_providers-models.md#ocx-provider-snapshot)
+
+### `ocx provider apply`
+
+[State-changing task](01_surface_providers-models.md#ocx-provider-apply)
+
+### `ocx models display-name`
+
+[State-changing task](01_surface_providers-models.md#ocx-models-display-name)
+
+### `ocx models order status`
+
+[Read-oriented task](01_surface_providers-models.md#ocx-models-order-status)
+
+### `ocx models order set`
+
+[State-changing task](01_surface_providers-models.md#ocx-models-order-set)
+
+### `ocx models order reset`
+
+[State-changing task](01_surface_providers-models.md#ocx-models-order-reset)
+
+### `ocx account reset-affinity`
+
+[State-changing task](01_surface_accounts.md#ocx-account-reset-affinity)
+
+### `ocx account preserve-signed-in`
+
+[State-changing task](01_surface_accounts.md#ocx-account-preserve-signed-in)
+
+### `ocx logout`
+
+[State-changing task](01_surface_accounts.md#ocx-logout)
+
+### `ocx account current`
+
+[Read-oriented task](01_surface_accounts.md#ocx-account-current)
+
+### `ocx account use`
+
+[State-changing task](01_surface_accounts.md#ocx-account-use)
+
+### `ocx account clear`
+
+[State-changing task](01_surface_accounts.md#ocx-account-clear)
+
+### `ocx account alias`
+
+[State-changing task](01_surface_accounts.md#ocx-account-alias)
+
+### `ocx account priority`
+
+[State-changing task](01_surface_accounts.md#ocx-account-priority)
+
+### `ocx account clear-cooldown`
+
+[State-changing task](01_surface_accounts.md#ocx-account-clear-cooldown)
+
+### `ocx account remove`
+
+[State-changing task](01_surface_accounts.md#ocx-account-remove)
+
+### `ocx account add-key`
+
+[State-changing task](01_surface_accounts.md#ocx-account-add-key)
+
+### `ocx account import`
+
+[State-changing task](01_surface_accounts.md#ocx-account-import)
+
+### `ocx account reauth`
+
+[State-changing task](01_surface_accounts.md#ocx-account-reauth)
+
+### `ocx account code`
+
+[State-changing task](01_surface_accounts.md#ocx-account-code)
+
+### `ocx account cancel`
+
+[State-changing task](01_surface_accounts.md#ocx-account-cancel)
+
+### `ocx account reset-credits`
+
+[State-changing task](01_surface_accounts.md#ocx-account-reset-credits)
+
+### `ocx account main doctor`
+
+[Read-oriented task](01_surface_accounts.md#ocx-account-main-doctor)
+
+### `ocx account main list`
+
+[Read-oriented task](01_surface_accounts.md#ocx-account-main-list)
+
+### `ocx account main register`
+
+[State-changing task](01_surface_accounts.md#ocx-account-main-register)
+
+### `ocx account main add`
+
+[State-changing task](01_surface_accounts.md#ocx-account-main-add)
+
+### `ocx account main reauth status`
+
+[Read-oriented task](01_surface_accounts.md#ocx-account-main-reauth-status)
+
+### `ocx account main reauth cancel`
+
+[State-changing task](01_surface_accounts.md#ocx-account-main-reauth-cancel)
+
+### `ocx account main switch`
+
+[State-changing task](01_surface_accounts.md#ocx-account-main-switch)
+
+### `ocx account main recover`
+
+[State-changing task](01_surface_accounts.md#ocx-account-main-recover)
+
+### `ocx account pool`
+
+[State-changing task](01_surface_accounts.md#ocx-account-pool)
+
+### `ocx account use-remaining`
+
+[State-changing task](01_surface_accounts.md#ocx-account-use-remaining)
+
+### `ocx account credits`
+
+[State-changing task](01_surface_accounts.md#ocx-account-credits)
+
+### `ocx account quota-activation`
+
+[State-changing task](01_surface_accounts.md#ocx-account-quota-activation)
+
+### `ocx account anthropic-reset-grants`
+
+[Read-oriented task](01_surface_accounts.md#ocx-account-anthropic-reset-grants)
+
+### `ocx message sessions`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-message-sessions)
+
+### `ocx message send`
+
+[State-changing task](01_surface_agents-routing.md#ocx-message-send)
+
+### `ocx message mcp`
+
+[State-changing task](01_surface_agents-routing.md#ocx-message-mcp)
+
+### `ocx advisor`
+
+[State-changing task](01_surface_agents-routing.md#ocx-advisor)
+
+### `ocx message enable`
+
+[State-changing task](01_surface_agents-routing.md#ocx-message-enable)
+
+### `ocx message disable`
+
+[State-changing task](01_surface_agents-routing.md#ocx-message-disable)
+
+### `ocx message status`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-message-status)
+
+### `ocx message serve`
+
+[State-changing task](01_surface_agents-routing.md#ocx-message-serve)
+
+### `ocx message hosts probe`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-message-hosts-probe)
+
+### `ocx message hosts add`
+
+[State-changing task](01_surface_agents-routing.md#ocx-message-hosts-add)
+
+### `ocx message hosts allow-inbound`
+
+[State-changing task](01_surface_agents-routing.md#ocx-message-hosts-allow-inbound)
+
+### `ocx message hosts deny-inbound`
+
+[State-changing task](01_surface_agents-routing.md#ocx-message-hosts-deny-inbound)
+
+### `ocx message hosts list`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-message-hosts-list)
+
+### `ocx message hosts remove`
+
+[State-changing task](01_surface_agents-routing.md#ocx-message-hosts-remove)
+
+### `ocx message hosts abandon`
+
+[State-changing task](01_surface_agents-routing.md#ocx-message-hosts-abandon)
+
+### `ocx agent status`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-agent-status)
+
+### `ocx agent effort`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-agent-effort)
+
+### `ocx agent effort set`
+
+[State-changing task](01_surface_agents-routing.md#ocx-agent-effort-set)
+
+### `ocx agent subagents`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-agent-subagents)
+
+### `ocx agent subagents set`
+
+[State-changing task](01_surface_agents-routing.md#ocx-agent-subagents-set)
+
+### `ocx agent subagents clear`
+
+[State-changing task](01_surface_agents-routing.md#ocx-agent-subagents-clear)
+
+### `ocx agent fallback`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-agent-fallback)
+
+### `ocx agent fallback set`
+
+[State-changing task](01_surface_agents-routing.md#ocx-agent-fallback-set)
+
+### `ocx agent fallback clear`
+
+[State-changing task](01_surface_agents-routing.md#ocx-agent-fallback-clear)
+
+### `ocx agent sidecar`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-agent-sidecar)
+
+### `ocx agent sidecar web`
+
+[State-changing task](01_surface_agents-routing.md#ocx-agent-sidecar-web)
+
+### `ocx agent sidecar vision`
+
+[State-changing task](01_surface_agents-routing.md#ocx-agent-sidecar-vision)
+
+### `ocx fallback`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-fallback)
+
+### `ocx fallback off`
+
+[State-changing task](01_surface_agents-routing.md#ocx-fallback-off)
+
+### `ocx fallback on`
+
+[State-changing task](01_surface_agents-routing.md#ocx-fallback-on)
+
+### `ocx fallback clear`
+
+[State-changing task](01_surface_agents-routing.md#ocx-fallback-clear)
+
+### `ocx fallback local`
+
+[State-changing task](01_surface_agents-routing.md#ocx-fallback-local)
+
+### `ocx effort`
+
+[State-changing task](01_surface_agents-routing.md#ocx-effort)
+
+### `ocx effort set`
+
+[State-changing task](01_surface_agents-routing.md#ocx-effort-set)
+
+### `ocx effort clear`
+
+[State-changing task](01_surface_agents-routing.md#ocx-effort-clear)
+
+### `ocx effort model`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-effort-model)
+
+### `ocx v2 status`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-v2-status)
+
+### `ocx v2 on`
+
+[State-changing task](01_surface_agents-routing.md#ocx-v2-on)
+
+### `ocx v2 off`
+
+[State-changing task](01_surface_agents-routing.md#ocx-v2-off)
+
+### `ocx v2 mode`
+
+[State-changing task](01_surface_agents-routing.md#ocx-v2-mode)
+
+### `ocx v2 keep-native-v1`
+
+[State-changing task](01_surface_agents-routing.md#ocx-v2-keep-native-v1)
+
+### `ocx v2 threads`
+
+[State-changing task](01_surface_agents-routing.md#ocx-v2-threads)
+
+### `ocx v2 mode-hint`
+
+[State-changing task](01_surface_agents-routing.md#ocx-v2-mode-hint)
+
+### `ocx combo list`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-combo-list)
+
+### `ocx combo show`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-combo-show)
+
+### `ocx combo set`
+
+[State-changing task](01_surface_agents-routing.md#ocx-combo-set)
+
+### `ocx combo remove`
+
+[State-changing task](01_surface_agents-routing.md#ocx-combo-remove)
+
+### `ocx route policy list`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-route-policy-list)
+
+### `ocx route policy show`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-route-policy-show)
+
+### `ocx route policy dry-run`
+
+[State-changing task](01_surface_agents-routing.md#ocx-route-policy-dry-run)
+
+### `ocx route policy evaluate`
+
+[State-changing task](01_surface_agents-routing.md#ocx-route-policy-evaluate)
+
+### `ocx route policy create`
+
+[State-changing task](01_surface_agents-routing.md#ocx-route-policy-create)
+
+### `ocx route policy update`
+
+[State-changing task](01_surface_agents-routing.md#ocx-route-policy-update)
+
+### `ocx route policy remove`
+
+[State-changing task](01_surface_agents-routing.md#ocx-route-policy-remove)
+
+### `ocx combo stats`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-combo-stats)
+
+### `ocx agent memory-models show`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-agent-memory-models-show)
+
+### `ocx agent memory-models set`
+
+[State-changing task](01_surface_agents-routing.md#ocx-agent-memory-models-set)
+
+### `ocx agent memory-models clear`
+
+[State-changing task](01_surface_agents-routing.md#ocx-agent-memory-models-clear)
+
+### `ocx agent compaction-routing show`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-agent-compaction-routing-show)
+
+### `ocx agent compaction-routing set`
+
+[State-changing task](01_surface_agents-routing.md#ocx-agent-compaction-routing-set)
+
+### `ocx agent compaction-routing clear`
+
+[State-changing task](01_surface_agents-routing.md#ocx-agent-compaction-routing-clear)
+
+### `ocx grok status`
+
+[Read-oriented task](01_surface_integrations.md#ocx-grok-status)
+
+### `ocx grok set`
+
+[State-changing task](01_surface_integrations.md#ocx-grok-set)
+
+### `ocx grok exclude`
+
+[State-changing task](01_surface_integrations.md#ocx-grok-exclude)
+
+### `ocx grok include`
+
+[State-changing task](01_surface_integrations.md#ocx-grok-include)
+
+### `ocx grok clear`
+
+[State-changing task](01_surface_integrations.md#ocx-grok-clear)
+
+### `ocx grok apply`
+
+[State-changing task](01_surface_integrations.md#ocx-grok-apply)
+
+### `ocx integration client status`
+
+[Read-oriented task](01_surface_integrations.md#ocx-integration-client-status)
+
+### `ocx integration client history`
+
+[Read-oriented task](01_surface_integrations.md#ocx-integration-client-history)
+
+### `ocx integration client enable`
+
+[State-changing task](01_surface_integrations.md#ocx-integration-client-enable)
+
+### `ocx integration client disable`
+
+[State-changing task](01_surface_integrations.md#ocx-integration-client-disable)
+
+### `ocx integration client restore`
+
+[State-changing task](01_surface_integrations.md#ocx-integration-client-restore)
+
+### `ocx commandcode restore`
+
+[State-changing task](01_surface_integrations.md#ocx-commandcode-restore)
+
+### `ocx claude config status`
+
+[Read-oriented task](01_surface_integrations.md#ocx-claude-config-status)
+
+### `ocx claude config set`
+
+[State-changing task](01_surface_integrations.md#ocx-claude-config-set)
+
+### `ocx claude desktop show`
+
+[Read-oriented task](01_surface_integrations.md#ocx-claude-desktop-show)
+
+### `ocx claude desktop move`
+
+[State-changing task](01_surface_integrations.md#ocx-claude-desktop-move)
+
+### `ocx claude desktop default`
+
+[State-changing task](01_surface_integrations.md#ocx-claude-desktop-default)
+
+### `ocx claude desktop export`
+
+[State-changing task](01_surface_integrations.md#ocx-claude-desktop-export)
+
+### `ocx claude desktop import`
+
+[State-changing task](01_surface_integrations.md#ocx-claude-desktop-import)
+
+### `ocx claude desktop apply`
+
+[State-changing task](01_surface_integrations.md#ocx-claude-desktop-apply)
+
+### `ocx integration client preview`
+
+[Read-oriented task](01_surface_integrations.md#ocx-integration-client-preview)
+
+### `ocx integration client history remove`
+
+[State-changing task](01_surface_integrations.md#ocx-integration-client-history-remove)
+
+### `ocx integration client sync`
+
+[State-changing task](01_surface_integrations.md#ocx-integration-client-sync)
+
+### `ocx claude desktop profile show`
+
+[Read-oriented task](01_surface_integrations.md#ocx-claude-desktop-profile-show)
+
+### `ocx claude desktop profile import`
+
+[State-changing task](01_surface_integrations.md#ocx-claude-desktop-profile-import)
+
+### `ocx integration native cursor status`
+
+[Read-oriented task](01_surface_integrations.md#ocx-integration-native-cursor-status)
+
+### `ocx integration native cursor local-installer`
+
+[Read-oriented task](01_surface_integrations.md#ocx-integration-native-cursor-local-installer)
+
+### `ocx stop`
+
+[State-changing task](01_surface_lifecycle.md#ocx-stop)
+
+### `ocx logs filter`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-logs-filter)
+
+### `ocx observe logs filter`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-observe-logs-filter)
+
+### `ocx companion usage`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-companion-usage)
+
+### `ocx observe logs`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-observe-logs)
+
+### `ocx logs history`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-logs-history)
+
+### `ocx logs get`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-logs-get)
+
+### `ocx logs explain`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-logs-explain)
+
+### `ocx logs rebuild-index`
+
+[State-changing task](01_surface_observe-system.md#ocx-logs-rebuild-index)
+
+### `ocx logs index-status`
+
+[State-changing task](01_surface_observe-system.md#ocx-logs-index-status)
+
+### `ocx observe usage`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-observe-usage)
+
+### `ocx usage compare`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-usage-compare)
+
+### `ocx observe storage`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-observe-storage)
+
+### `ocx observe memory`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-observe-memory)
+
+### `ocx observe debug`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-observe-debug)
+
+### `ocx observe claude-inbound`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-observe-claude-inbound)
+
+### `ocx observe injection`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-observe-injection)
+
+### `ocx memory`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-memory)
+
+### `ocx storage codex-logs status`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-storage-codex-logs-status)
+
+### `ocx storage codex-logs protect`
+
+[State-changing task](01_surface_observe-system.md#ocx-storage-codex-logs-protect)
+
+### `ocx storage codex-logs unprotect`
+
+[State-changing task](01_surface_observe-system.md#ocx-storage-codex-logs-unprotect)
+
+### `ocx storage codex-logs repair`
+
+[State-changing task](01_surface_observe-system.md#ocx-storage-codex-logs-repair)
+
+### `ocx storage codex-logs compact`
+
+[State-changing task](01_surface_observe-system.md#ocx-storage-codex-logs-compact)
+
+### `ocx storage trash list`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-storage-trash-list)
+
+### `ocx storage policy show`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-storage-policy-show)
+
+### `ocx storage trash restore`
+
+[State-changing task](01_surface_observe-system.md#ocx-storage-trash-restore)
+
+### `ocx storage policy set`
+
+[State-changing task](01_surface_observe-system.md#ocx-storage-policy-set)
+
+### `ocx storage policy run`
+
+[State-changing task](01_surface_observe-system.md#ocx-storage-policy-run)
+
+### `ocx debug provider`
+
+[State-changing task](01_surface_observe-system.md#ocx-debug-provider)
+
+### `ocx debug provider status`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-debug-provider-status)
+
+### `ocx debug provider on`
+
+[State-changing task](01_surface_observe-system.md#ocx-debug-provider-on)
+
+### `ocx debug provider off`
+
+[State-changing task](01_surface_observe-system.md#ocx-debug-provider-off)
+
+### `ocx debug provider reset`
+
+[State-changing task](01_surface_observe-system.md#ocx-debug-provider-reset)
+
+### `ocx debug provider logs`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-debug-provider-logs)
+
+### `ocx debug usage`
+
+[State-changing task](01_surface_observe-system.md#ocx-debug-usage)
+
+### `ocx debug usage status`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-debug-usage-status)
+
+### `ocx debug usage on`
+
+[State-changing task](01_surface_observe-system.md#ocx-debug-usage-on)
+
+### `ocx debug usage off`
+
+[State-changing task](01_surface_observe-system.md#ocx-debug-usage-off)
+
+### `ocx debug usage reset`
+
+[State-changing task](01_surface_observe-system.md#ocx-debug-usage-reset)
+
+### `ocx debug usage logs`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-debug-usage-logs)
+
+### `ocx debug injection`
+
+[State-changing task](01_surface_observe-system.md#ocx-debug-injection)
+
+### `ocx debug injection status`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-debug-injection-status)
+
+### `ocx debug injection on`
+
+[State-changing task](01_surface_observe-system.md#ocx-debug-injection-on)
+
+### `ocx debug injection off`
+
+[State-changing task](01_surface_observe-system.md#ocx-debug-injection-off)
+
+### `ocx debug injection reset`
+
+[State-changing task](01_surface_observe-system.md#ocx-debug-injection-reset)
+
+### `ocx debug claude`
+
+[State-changing task](01_surface_observe-system.md#ocx-debug-claude)
+
+### `ocx debug claude status`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-debug-claude-status)
+
+### `ocx debug claude on`
+
+[State-changing task](01_surface_observe-system.md#ocx-debug-claude-on)
+
+### `ocx debug claude off`
+
+[State-changing task](01_surface_observe-system.md#ocx-debug-claude-off)
+
+### `ocx debug claude reset`
+
+[State-changing task](01_surface_observe-system.md#ocx-debug-claude-reset)
+
+### `ocx system status`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-system-status)
+
+### `ocx system settings`
+
+[State-changing task](01_surface_observe-system.md#ocx-system-settings)
+
+### `ocx system startup health`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-system-startup-health)
+
+### `ocx system startup install-service`
+
+[State-changing task](01_surface_observe-system.md#ocx-system-startup-install-service)
+
+### `ocx system startup install-shim`
+
+[State-changing task](01_surface_observe-system.md#ocx-system-startup-install-shim)
+
+### `ocx system diagnostics`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-system-diagnostics)
+
+### `ocx system sync`
+
+[State-changing task](01_surface_observe-system.md#ocx-system-sync)
+
+### `ocx system update check`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-system-update-check)
+
+### `ocx system update run`
+
+[State-changing task](01_surface_observe-system.md#ocx-system-update-run)
+
+### `ocx system update status`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-system-update-status)
+
+### `ocx config show`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-config-show)
+
+### `ocx config get`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-config-get)
+
+### `ocx config set`
+
+[State-changing task](01_surface_observe-system.md#ocx-config-set)
+
+### `ocx config unset`
+
+[State-changing task](01_surface_observe-system.md#ocx-config-unset)
+
+### `ocx config validate`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-config-validate)
+
+### ocx config export
+
+[State-changing task](01_surface_observe-system.md#ocx-config-export)
+
+### `ocx config import`
+
+[State-changing task](01_surface_observe-system.md#ocx-config-import)
+
+### `ocx companion show`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-companion-show)
+
+### `ocx companion set`
+
+[State-changing task](01_surface_observe-system.md#ocx-companion-set)
+
+### `ocx companion reset`
+
+[State-changing task](01_surface_observe-system.md#ocx-companion-reset)
+
+### `ocx service install`
+
+[State-changing task](01_surface_lifecycle.md#ocx-service-install)
+
+### `ocx service repair`
+
+[State-changing task](01_surface_lifecycle.md#ocx-service-repair)
+
+### `ocx service restart`
+
+[State-changing task](01_surface_lifecycle.md#ocx-service-restart)
+
+### `ocx service start`
+
+[State-changing task](01_surface_lifecycle.md#ocx-service-start)
+
+### `ocx service stop`
+
+[State-changing task](01_surface_lifecycle.md#ocx-service-stop)
+
+### `ocx service status`
+
+[Read-oriented task](01_surface_lifecycle.md#ocx-service-status)
+
+### `ocx service uninstall`
+
+[State-changing task](01_surface_lifecycle.md#ocx-service-uninstall)
+
+### `ocx codex-shim install`
+
+[State-changing task](01_surface_integrations.md#ocx-codex-shim-install)
+
+### `ocx codex-shim status`
+
+[Read-oriented task](01_surface_integrations.md#ocx-codex-shim-status)
+
+### `ocx codex-shim uninstall`
+
+[State-changing task](01_surface_integrations.md#ocx-codex-shim-uninstall)
+
+### `ocx tray install`
+
+[State-changing task](01_surface_observe-system.md#ocx-tray-install)
+
+### `ocx tray start`
+
+[State-changing task](01_surface_observe-system.md#ocx-tray-start)
+
+### `ocx tray stop`
+
+[State-changing task](01_surface_observe-system.md#ocx-tray-stop)
+
+### `ocx tray status`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-tray-status)
+
+### `ocx tray uninstall`
+
+[State-changing task](01_surface_observe-system.md#ocx-tray-uninstall)
+
+### `ocx system health`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-system-health)
+
+### `ocx companion timeline`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-companion-timeline)
+
+### `ocx telemetry status`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-telemetry-status)
+
+### `ocx telemetry enable`
+
+[State-changing task](01_surface_observe-system.md#ocx-telemetry-enable)
+
+### `ocx telemetry disable`
+
+[State-changing task](01_surface_observe-system.md#ocx-telemetry-disable)
+
+### `ocx telemetry profile status`
+
+[Read-oriented task](01_surface_observe-system.md#ocx-telemetry-profile-status)
+
+### `ocx telemetry profile connect`
+
+[State-changing task](01_surface_observe-system.md#ocx-telemetry-profile-connect)
+
+### `ocx telemetry profile disconnect`
+
+[State-changing task](01_surface_observe-system.md#ocx-telemetry-profile-disconnect)
+
+### `ocx disconnect`
+
+[State-changing task](01_surface_access-remote.md#ocx-disconnect)
+
+### `ocx hub disable`
+
+[State-changing task](01_surface_access-remote.md#ocx-hub-disable)
+
+### `ocx access key`
+
+[State-changing task](01_surface_access-remote.md#ocx-access-key)
+
+### `ocx access key list`
+
+[Read-oriented task](01_surface_access-remote.md#ocx-access-key-list)
+
+### `ocx access key get`
+
+[Read-oriented task](01_surface_access-remote.md#ocx-access-key-get)
+
+### `ocx access key set`
+
+[State-changing task](01_surface_access-remote.md#ocx-access-key-set)
+
+### `ocx access key rotate commit`
+
+[State-changing task](01_surface_access-remote.md#ocx-access-key-rotate-commit)
+
+### `ocx access key rotate abort`
+
+[State-changing task](01_surface_access-remote.md#ocx-access-key-rotate-abort)
+
+### `ocx access key remove`
+
+[State-changing task](01_surface_access-remote.md#ocx-access-key-remove)
+
+### `ocx access endpoints`
+
+[Read-oriented task](01_surface_access-remote.md#ocx-access-endpoints)
+
+### `ocx access models`
+
+[Read-oriented task](01_surface_access-remote.md#ocx-access-models)
+
+### `ocx access test`
+
+[State-changing task](01_surface_access-remote.md#ocx-access-test)
+
+### `ocx remote-workspace hub status`
+
+[Read-oriented task](01_surface_access-remote.md#ocx-remote-workspace-hub-status)
+
+### `ocx remote-workspace hub runtimes`
+
+[Read-oriented task](01_surface_access-remote.md#ocx-remote-workspace-hub-runtimes)
+
+### `ocx remote-workspace hub sessions`
+
+[Read-oriented task](01_surface_access-remote.md#ocx-remote-workspace-hub-sessions)
+
+### `ocx access key rename`
+
+[State-changing task](01_surface_access-remote.md#ocx-access-key-rename)
+
+### `ocx access audio transcribe`
+
+[State-changing task](01_surface_access-remote.md#ocx-access-audio-transcribe)
+
+### `ocx access audio live-check`
+
+[State-changing task](01_surface_access-remote.md#ocx-access-audio-live-check)
+
+### `ocx link check`
+
+[State-changing task](01_surface_access-remote.md#ocx-link-check)
+
+### `ocx link update`
+
+[State-changing task](01_surface_access-remote.md#ocx-link-update)
+
+### `ocx link sync`
+
+[State-changing task](01_surface_access-remote.md#ocx-link-sync)
+
+### `ocx link restart-codex`
+
+[State-changing task](01_surface_access-remote.md#ocx-link-restart-codex)
+
+### `ocx link capture start`
+
+[State-changing task](01_surface_access-remote.md#ocx-link-capture-start)
+
+### `ocx link capture stop`
+
+[State-changing task](01_surface_access-remote.md#ocx-link-capture-stop)
+
+### `ocx link capture status`
+
+[State-changing task](01_surface_access-remote.md#ocx-link-capture-status)
+
+### `ocx link policy`
+
+[State-changing task](01_surface_access-remote.md#ocx-link-policy)
+
+### `ocx link routes`
+
+[Read-oriented task](01_surface_access-remote.md#ocx-link-routes)
+
+### `ocx link routes add`
+
+[State-changing task](01_surface_access-remote.md#ocx-link-routes-add)
+
+### `ocx link routes remove`
+
+[State-changing task](01_surface_access-remote.md#ocx-link-routes-remove)
+
+### `ocx link routes order`
+
+[State-changing task](01_surface_access-remote.md#ocx-link-routes-order)
+
+### `ocx link operations`
+
+[Read-oriented task](01_surface_access-remote.md#ocx-link-operations)
+
+### `ocx link operations resolve`
+
+[State-changing task](01_surface_access-remote.md#ocx-link-operations-resolve)
+
+### `ocx link activity clear`
+
+[State-changing task](01_surface_access-remote.md#ocx-link-activity-clear)
+
+### `ocx lab status`
+
+[Read-oriented task](01_surface_lab.md#ocx-lab-status)
+
+### `ocx lab verdicts`
+
+[Read-oriented task](01_surface_lab.md#ocx-lab-verdicts)
+
+### `ocx lab subjects`
+
+[Read-oriented task](01_surface_lab.md#ocx-lab-subjects)
+
+### `ocx lab observations`
+
+[Read-oriented task](01_surface_lab.md#ocx-lab-observations)
+
+### `ocx lab events`
+
+[Read-oriented task](01_surface_lab.md#ocx-lab-events)
+
+### `ocx lab artifacts`
+
+[Read-oriented task](01_surface_lab.md#ocx-lab-artifacts)
+
+### `ocx lab catalog`
+
+[Read-oriented task](01_surface_lab.md#ocx-lab-catalog)
+
+### `ocx lab subject`
+
+[Read-oriented task](01_surface_lab.md#ocx-lab-subject)
+
+### `ocx lab event`
+
+[Read-oriented task](01_surface_lab.md#ocx-lab-event)
+
+### `ocx lab artifact`
+
+[Read-oriented task](01_surface_lab.md#ocx-lab-artifact)
+
+### `ocx lab production-signals`
+
+[Read-oriented task](01_surface_lab.md#ocx-lab-production-signals)
+
+### `ocx lab public preview`
+
+[Read-oriented task](01_surface_lab.md#ocx-lab-public-preview)
+
+### `ocx lab public export`
+
+[State-changing task](01_surface_lab.md#ocx-lab-public-export)
+
+### `ocx lab public verify`
+
+[Read-oriented task](01_surface_lab.md#ocx-lab-public-verify)
+
+### `ocx lab public import`
+
+[State-changing task](01_surface_lab.md#ocx-lab-public-import)
+
+### `ocx lab public community`
+
+[Read-oriented task](01_surface_lab.md#ocx-lab-public-community)
+
+### `ocx lab automation status`
+
+[Read-oriented task](01_surface_lab.md#ocx-lab-automation-status)
+
+### `ocx lab automation enable`
+
+[State-changing task](01_surface_lab.md#ocx-lab-automation-enable)
+
+### `ocx lab automation disable`
+
+[State-changing task](01_surface_lab.md#ocx-lab-automation-disable)
+
+### `ocx lab automation runs`
+
+[Read-oriented task](01_surface_lab.md#ocx-lab-automation-runs)
+
+### `ocx lab run`
+
+[State-changing task](01_surface_lab.md#ocx-lab-run)
+
+### `ocx route to`
+
+[State-changing task](01_surface_agents-routing.md#ocx-route-to)
+
+### `ocx route to status`
+
+[Read-oriented task](01_surface_agents-routing.md#ocx-route-to-status)
+
+### `ocx route to sync`
+
+[State-changing task](01_surface_agents-routing.md#ocx-route-to-sync)
 
 ## Counts
 
-- declared capabilities: 33
-- of those, state-changing: 13
+- declared capabilities: 399
+- of those, state-changing: 250
 - head-resolved invocations: 2

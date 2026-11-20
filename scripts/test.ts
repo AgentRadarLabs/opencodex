@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { gitRepositoryEnvNames, withoutGitRepositoryEnv } from "./git-repository-env";
+import { getTestRunnerBun } from "./lib/test-runner-bun";
 import {
   acquireTestRunLock,
   resolveWrappedTestRunLockPath,
@@ -9,6 +11,13 @@ import {
   TEST_RUN_LOCK_PATH_ENV,
   TEST_RUN_LOCK_TOKEN_ENV,
 } from "./test-run-lock";
+import {
+  createContainedTestTemp,
+  recoverStaleTestTempArtifactsOnce,
+  removeTestTempTree,
+  writeTestTempOwner,
+} from "./test-temp";
+import { listQuarantinedTestTemps } from "./test-temp-lock";
 
 export interface IsolatedTestEnvironment {
   root: string;
@@ -16,12 +25,37 @@ export interface IsolatedTestEnvironment {
   cleanup(): void;
 }
 
+/**
+ * Credentials of the developer's own OpenCodex install that the sandbox must not inherit. A
+ * Windows install stores its data-plane token as a user environment variable, so every shell on
+ * that machine carries it; a test that then builds a service definition or starts a proxy reads
+ * the live token instead of its fixture and fails only on a developer machine.
+ */
+export const LIVE_INSTALL_CREDENTIAL_ENV = [
+  "OPENCODEX_API_AUTH_TOKEN",
+  "OPENCODEX_ADMIN_AUTH_TOKEN",
+  "OCX_API_TOKEN_FILE",
+] as const;
+
 export function createIsolatedTestEnvironment(
   baseEnv: Record<string, string | undefined> = process.env,
 ): IsolatedTestEnvironment {
-  const root = mkdtempSync(join(tmpdir(), "opencodex-test-"));
+  const hostTemp = tmpdir();
+  const recovery = recoverStaleTestTempArtifactsOnce({ tempRoot: hostTemp });
+  if (recovery && (recovery.removed > 0 || recovery.errors > 0 || recovery.truncated)) {
+    console.warn(
+      `[test] stale TEMP recovery removed ${recovery.removed} OpenCodex test root(s)`
+      + (recovery.errors > 0 ? `; ${recovery.errors} could not be reclaimed` : "")
+      + (recovery.truncated ? "; the bounded scan will continue on a later run" : "")
+      + ".",
+    );
+  }
+  const root = mkdtempSync(join(hostTemp, "opencodex-test-"));
   const opencodexHome = join(root, ".opencodex");
   const codexHome = join(root, ".codex");
+  const containedTemp = createContainedTestTemp(root);
+  const transpilerCache = baseEnv.BUN_RUNTIME_TRANSPILER_CACHE_PATH ?? join(root, "bun-transpiler-cache");
+  if (baseEnv.BUN_RUNTIME_TRANSPILER_CACHE_PATH === undefined) mkdirSync(transpilerCache, { mode: 0o700 });
   mkdirSync(opencodexHome, { recursive: true });
   mkdirSync(codexHome, { recursive: true });
   if (process.platform === "win32") {
@@ -35,16 +69,27 @@ export function createIsolatedTestEnvironment(
     mkdirSync(join(root, "AppData", "Local"), { recursive: true });
     mkdirSync(join(root, "AppData", "Roaming"), { recursive: true });
   }
+  writeTestTempOwner(root, baseEnv[TEST_RUN_ID_ENV]);
+  const inherited = { ...baseEnv };
+  for (const name of LIVE_INSTALL_CREDENTIAL_ENV) delete inherited[name];
+  // A GIT_DIR/GIT_WORK_TREE inherited from a hook or wrapper re-points every git command the suite
+  // spawns, and fixture helpers then init, configure and commit into that repository. Starting the
+  // children without them also covers Bun.spawn calls that pass no env (scripts/git-repository-env.ts).
+  for (const name of gitRepositoryEnvNames(inherited)) delete inherited[name];
 
   return {
     root,
     env: {
-      ...baseEnv,
+      ...inherited,
       // Captured BEFORE HOME is overwritten: once the child starts with a rewritten
       // HOME, `homedir()` returns the sandbox, so this hand-off is the only way the
       // real-home write guard can still know which path to protect.
       // (devlog 260730_codex_rs_upstream_v2_live_handoff/070.)
       OCX_REAL_HOME: baseEnv.OCX_REAL_HOME ?? homedir(),
+      // Same hand-off for the guard's Claude entry: the child gets a sandboxed
+      // CLAUDE_CONFIG_DIR below, so the developer's own value only survives here.
+      OCX_REAL_CLAUDE_CONFIG_DIR: baseEnv.OCX_REAL_CLAUDE_CONFIG_DIR
+        ?? (baseEnv.CLAUDE_CONFIG_DIR?.trim() || join(baseEnv.OCX_REAL_HOME ?? homedir(), ".claude")),
       // Pin git's global config to the developer's real one before HOME moves.
       //
       // git resolves ~/.gitconfig from HOME, so a sandboxed HOME makes it invisible.
@@ -56,13 +101,29 @@ export function createIsolatedTestEnvironment(
       // whichever adapter collected the metadata. Naming the file keeps the sandbox
       // (git still writes nothing here) while leaving git's own trust decisions intact.
       GIT_CONFIG_GLOBAL: baseEnv.GIT_CONFIG_GLOBAL ?? join(homedir(), ".gitconfig"),
+      // Cached JavaScript is executable input. Keep the default beneath the exclusively created
+      // private root; nested sandboxes and fixture children retain this path even when HOME moves.
+      // Independent runs start cold. A protected explicit cache can share across runs; "" and "0"
+      // still disable caching. Never adopt, repair or reclaim the old shared host-TEMP cache.
+      BUN_RUNTIME_TRANSPILER_CACHE_PATH: transpilerCache,
       HOME: root,
       USERPROFILE: root,
       OPENCODEX_HOME: opencodexHome,
+      // Pin per process for both the preload and children that inherit this environment.
+      OCX_OWNER_REGISTRY_DIR: join(opencodexHome, "ocx-homes"),
       CODEX_HOME: codexHome,
+      // Client homes that otherwise default to os.homedir(). Bun keeps the home it read at
+      // startup, so a preload that only rewrites HOME leaves these at the developer's real
+      // directories, and Claude agent sync prunes generated files there (#6775). Pin them in
+      // the sandbox; never inherit a live override.
+      CLAUDE_CONFIG_DIR: join(root, ".claude"),
+      GROK_HOME: join(root, ".grok"),
+      TEMP: containedTemp,
+      TMP: containedTemp,
+      TMPDIR: containedTemp,
     },
     cleanup() {
-      rmSync(root, { recursive: true, force: true });
+      removeTestTempTree(root);
     },
   };
 }
@@ -220,6 +281,8 @@ export function inspectChangedRun(
 ): ChangedRunPreflight | null {
   const requestedComparisonRef = changedComparisonRef(requested);
   if (!requestedComparisonRef) return null;
+  // `cwd` names the checkout to compare; an inherited GIT_DIR must not substitute another one.
+  env = withoutGitRepositoryEnv(env);
   if (requestedComparisonRef.startsWith("-")) {
     throw new Error(
       `[test] --changed comparison ref ${JSON.stringify(requestedComparisonRef)} is invalid.`,
@@ -329,17 +392,70 @@ export const SERIAL_FULL_SUITE_FILES = [
   "providers/cursor/cursor-native-exec-shell.test.ts",
   "codex-integration/issue-452-empty-503.test.ts",
   "adapters/openai/openai-provider-option-e2e.test.ts",
+  // Three Linux runs in a row timed out mid-file inside a 12-file batch while
+  // every case passed alone (37730984813, 37732846946, 37735238354, all test
+  // 1/4 batch 4): the same multi-file process-state class as the entries below.
+  "ci-workflows/ci-gui-typecheck-gate.test.ts",
   "ci-workflows/release-helper.test.ts",
+  // The full macOS isolate pool stalled in the structure gate's synchronous Git
+  // child after earlier files; fresh-process execution retains the same assertions.
+  "ci-workflows/structure-ssot.test.ts",
+  // Synchronous injection subprocesses can wedge the long-lived macOS isolate
+  // parent while reaping a history Worker; contain them in a fresh bounded lane.
+  "codex-integration/codex-inject-write-lock.test.ts",
+  // Its management API import stalled the long-lived macOS isolate pool before
+  // any case ran; the complete file finishes in under a second in a fresh process.
+  "routing/subagent-roster-retention.test.ts",
+  // Linux run 36610213506 stalled this file after its WebSocket admission case
+  // in a multi-file process; all 11 cases completed in the attribution process.
+  // Keep its real listener lifecycle in a fresh process on every platform.
+  "codex-integration/active-registry-admission.test.ts",
   "update/update-stop-first.test.ts",
+  // Relays a 50 MiB WebSocket frame end to end against a 15s deadline, so its result is a
+  // measurement of the whole process, not of the relay. On a healthy 3-CPU macOS runner the
+  // echo leg alone spends 7.4s of that budget; whichever half of `--shard=N/2` it lands in
+  // decides whether it finishes. It has been passing by accident: it sat in the lighter half
+  // until three unrelated test files were added elsewhere in the tree, Bun repartitioned, and
+  // it went from 7.4s to over 15s twice in a row without anything on the sideband path
+  // changing. Quarantining it here is what keeps it a test of the relay instead of a test of
+  // its neighbours.
+  "server/server-live.test.ts",
+  // These exercise the default-home service authority, shared by parallel Bun workers.
+  // A fresh process/home prevents another file's authority from becoming this fixture's input.
+  "service/service-ownership-state.test.ts",
+  "service/service-sqlite-home.test.ts",
+  "service/service.test.ts",
+  "service/service-claim.test.ts",
+  "service/service-wsl-home-ownership.test.ts",
+  "service/launchd-repair.test.ts",
+  "cli/cli-update-restart-home.test.ts",
+  "codex-integration/native-codex-toggle.test.ts",
+  "codex-integration/native-grok-toggle.test.ts",
+  // Each compiles native/ocx-child (without, then with the link-ws-test-gate feature) and runs one Cargo
+  // test set; a cold build can take a minute, so each runs alone rather than inside a 12-file batch.
+  "clients/link-ocx-child-ws-gate.test.ts",
+  "clients/link-ocx-child-ws-feature.test.ts",
+  // The same cold build, for the conformance target; it is the only Cargo run of ocx-child on Windows (dev run
+  // 43483630535 cut it at 90 s while it was still compiling inside a shared batch).
+  "clients/link-ocx-child-conformance.test.ts",
 ] as const;
 
 type SerialLaneBasename = (typeof SERIAL_FULL_SUITE_FILES)[number] extends infer P
   ? P extends `${string}/${infer B}` ? B : P
   : never;
+/**
+ * The ocx-child conformance case's two Cargo bounds (tests/clients/link-ocx-child-conformance.test.ts): a cold build of
+ * the crate, then the conformance run. Its serial lane is derived from them, so a build that uses its whole bound still
+ * leaves the run its own. The CI batch script's process deadline (300 s Linux, 480 s Windows) also covers the sum.
+ */
+export const OCX_CHILD_CONFORMANCE_BUILD_MS = 180_000;
+export const OCX_CHILD_CONFORMANCE_RUN_MS = 90_000;
 const SERIAL_LANE_TIMEOUT_MS: Partial<Record<SerialLaneBasename, number>> = {
   // This file intentionally exercises 33 complete release-script subprocess trees.
   // It is ~90s on an idle machine and measured at ~170s under unrelated host load.
   "release-helper.test.ts": 5 * 60 * 1000,
+  // Both Cargo bounds plus 30 s for Bun startup and the file's other cases.
+  "link-ocx-child-conformance.test.ts": OCX_CHILD_CONFORMANCE_BUILD_MS + OCX_CHILD_CONFORMANCE_RUN_MS + 30_000,
 };
 
 export interface BunTestLane {
@@ -358,9 +474,18 @@ function canUseSerialLanes(requested: string[]): boolean {
 }
 
 /** Build the default full-suite plan: one bounded main lane plus isolated risky files. */
-export function resolveBunTestPlan(requested: string[], comparisonCommit?: string): BunTestLane[] {
+export function resolveBunTestPlan(
+  requested: string[], comparisonCommit?: string,
+  env: Record<string, string | undefined> = process.env,
+): BunTestLane[] {
+  const rawTimeout = env.OCX_TEST_MAIN_TIMEOUT_MS;
+  const mainTimeout = rawTimeout === undefined ? 900_000 : Number(rawTimeout);
+  if (rawTimeout !== undefined && (!/^\d+$/.test(rawTimeout)
+    || !Number.isSafeInteger(mainTimeout) || mainTimeout < 60_000 || mainTimeout > 3_600_000)) {
+    throw new Error("OCX_TEST_MAIN_TIMEOUT_MS must be an integer between 60000 and 3600000");
+  }
   if (!canUseSerialLanes(requested)) {
-    return [{ label: "suite", args: resolveBunTestArgs(requested, comparisonCommit), timeoutMs: 15 * 60 * 1000 }];
+    return [{ label: "suite", args: resolveBunTestArgs(requested, comparisonCommit), timeoutMs: mainTimeout }];
   }
 
   const mainArgs = resolveBunTestArgs(requested, comparisonCommit);
@@ -369,7 +494,7 @@ export function resolveBunTestPlan(requested: string[], comparisonCommit?: strin
   mainArgs.splice(rootIndex === -1 ? mainArgs.length : rootIndex, 0, ...ignores);
   const serialRequested = withoutParallelOverride(requested);
   return [
-    { label: "parallel suite", args: mainArgs, timeoutMs: 15 * 60 * 1000 },
+    { label: "parallel suite", args: mainArgs, timeoutMs: mainTimeout },
     ...SERIAL_FULL_SUITE_FILES.map(file => ({
       label: basename(file),
       args: resolveBunTestArgs(["--parallel=1", ...serialRequested, `./tests/${file}`]),
@@ -394,11 +519,115 @@ function waitWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T |
   });
 }
 
-async function runTestLane(
+/** Read continuously so a timeout can still report output received before EOF. */
+export function captureTestOutput(
+  stdout: ReadableStream<Uint8Array>,
+  stderr: ReadableStream<Uint8Array>,
+) {
+  const collect = (stream: ReadableStream<Uint8Array>) => {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    let reading = true;
+    let complete = false;
+    const done = (async () => {
+      try {
+        while (reading) {
+          const chunk = await reader.read();
+          if (!reading) break;
+          if (chunk.done) {
+            complete = true;
+            break;
+          }
+          text += decoder.decode(chunk.value, { stream: true });
+        }
+      } catch {
+        // Retain the prefix without turning a pipe error into an unhandled rejection.
+      } finally {
+        if (reading) text += decoder.decode();
+        reading = false;
+        reader.releaseLock();
+      }
+    })();
+    return {
+      done,
+      snapshot: () => ({ text, complete }),
+      cancel() {
+        if (!reading) return;
+        reading = false;
+        text += decoder.decode();
+        // A descendant may own a pipe, or a stream's cancellation may never settle.
+        // Cancellation is best effort; neither it nor EOF may extend the drain bound.
+        void reader.cancel().catch(() => {});
+      },
+    };
+  };
+  const out = collect(stdout);
+  const err = collect(stderr);
+  return {
+    async finish(timeoutMs: number) {
+      const drained = await waitWithTimeout(Promise.all([out.done, err.done]), timeoutMs);
+      if (drained === null) {
+        out.cancel();
+        err.cancel();
+      }
+      const stdout = out.snapshot();
+      const stderr = err.snapshot();
+      return {
+        stdout: stdout.text,
+        stderr: stderr.text,
+        complete: drained !== null && stdout.complete && stderr.complete,
+      };
+    },
+  };
+}
+
+/**
+ * Remove a sandbox root after its lane exits.
+ *
+ * A contained subtree that was only renamed aside (`.trash-*`) is still inside this root.
+ * If that rename-aside is still locked when the root itself cannot be removed, the lane
+ * fails: swallowing it would hide a hold that outlasted the whole batch. A root that cannot
+ * be removed and has no quarantine left keeps the previous deferral, because a later run's
+ * stale-temp recovery is what retries that case.
+ */
+/** A green lane does not stay green when a quarantined tree is still locked at the end of the run. */
+export function exitCodeAfterTempSweep(
+  exitCode: number,
+  sweep: "removed" | "deferred" | "quarantine-remains",
+): number {
+  return sweep === "quarantine-remains" && exitCode === 0 ? 1 : exitCode;
+}
+
+export function settleIsolatedTestRoot(
+  root: string,
+  remove: (path: string) => void = removeTestTempTree,
+): "removed" | "deferred" | "quarantine-remains" {
+  try {
+    remove(root);
+    return "removed";
+  } catch (error) {
+    const remaining = listQuarantinedTestTemps(root);
+    if (remaining.length === 0) {
+      console.error("[test] deferred cleanup of one test root after Windows kept a handle open; a later run will retry it.");
+      return "deferred";
+    }
+    console.error(`[test] quarantined temp still could not be deleted: ${remaining.join(", ")}`);
+    console.error(error instanceof Error ? error.message : String(error));
+    return "quarantine-remains";
+  }
+}
+
+export async function runTestLane(
   lane: BunTestLane,
   runId: string,
   inheritedLock: { lockPath: string; ownerToken: string } | undefined,
   capture = false,
+  writers = {
+    stdout: (value: string) => { process.stdout.write(value); },
+    stderr: (value: string) => { process.stderr.write(value); },
+  },
+  testRunner = getTestRunnerBun(),
 ): Promise<{ exitCode: number; output: string }> {
   const isolated = createIsolatedTestEnvironment({
     ...process.env,
@@ -412,14 +641,13 @@ async function runTestLane(
   });
   const startedAt = Date.now();
   let interrupted: NodeJS.Signals | null = null;
-  const child = Bun.spawn([process.execPath, "test", ...lane.args], {
+  const child = Bun.spawn([testRunner, "test", ...lane.args], {
     env: isolated.env,
     stdin: "inherit",
     stdout: capture ? "pipe" : "inherit",
     stderr: capture ? "pipe" : "inherit",
   });
-  const stdoutP = capture ? new Response(child.stdout).text() : Promise.resolve("");
-  const stderrP = capture ? new Response(child.stderr).text() : Promise.resolve("");
+  const captured = capture ? captureTestOutput(child.stdout!, child.stderr!) : undefined;
   const forward = (signal: NodeJS.Signals) => {
     interrupted = signal;
     try { child.kill(signal); } catch { /* child already exited */ }
@@ -430,8 +658,9 @@ async function runTestLane(
   process.once("SIGTERM", onTerminate);
 
   const exited = child.exited;
+  let laneResult: { exitCode: number; output: string } | undefined;
   try {
-    const exitCode = await waitWithTimeout(exited, lane.timeoutMs);
+    let exitCode = await waitWithTimeout(exited, lane.timeoutMs);
     if (exitCode === null) {
       console.error(`[test] ${lane.label} exceeded ${Math.round(lane.timeoutMs / 1000)}s; terminating pid ${child.pid}.`);
       try { child.kill("SIGTERM"); } catch { /* child already exited */ }
@@ -440,21 +669,42 @@ async function runTestLane(
         try { child.kill("SIGKILL"); } catch { /* child already exited */ }
         await waitWithTimeout(exited, 2_000);
       }
-      return { exitCode: 124, output: "" };
     }
-    const [stdout, stderr] = await Promise.all([stdoutP, stderrP]);
-    if (stdout) process.stdout.write(stdout);
-    if (stderr) process.stderr.write(stderr);
+    // Process exit does not guarantee EOF when a descendant inherited the pipe.
+    const result = await captured?.finish(1_000);
+    const stdout = result?.stdout ?? "";
+    const stderr = result?.stderr ?? "";
+    if (stdout) writers.stdout(stdout);
+    if (stderr) writers.stderr(stderr);
     const output = stdout + "\n" + stderr;
-    if (interrupted === "SIGINT") return { exitCode: 130, output };
-    if (interrupted === "SIGTERM") return { exitCode: 143, output };
+    if (result && !result.complete) {
+      console.error("[test] captured output is incomplete; collected output is shown above.");
+      if (exitCode === 0) exitCode = 1;
+    }
+    if (exitCode === null) {
+      laneResult = { exitCode: 124, output };
+      return laneResult;
+    }
+    if (interrupted === "SIGINT") {
+      laneResult = { exitCode: 130, output };
+      return laneResult;
+    }
+    if (interrupted === "SIGTERM") {
+      laneResult = { exitCode: 143, output };
+      return laneResult;
+    }
     const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
     console.warn(`[test] ${lane.label} finished in ${seconds}s (exit ${exitCode}).`);
-    return { exitCode, output };
+    laneResult = { exitCode, output };
+    return laneResult;
   } finally {
     process.off("SIGINT", onInterrupt);
     process.off("SIGTERM", onTerminate);
-    isolated.cleanup();
+    if (laneResult) {
+      laneResult.exitCode = exitCodeAfterTempSweep(laneResult.exitCode, settleIsolatedTestRoot(isolated.root));
+    } else {
+      settleIsolatedTestRoot(isolated.root);
+    }
   }
 }
 
@@ -500,6 +750,11 @@ export function ensureGuiDependencies(io: {
 }
 
 if (import.meta.main) {
+  let testRunner: string;
+  try { testRunner = getTestRunnerBun(); } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  }
   const requestedTests = process.argv.slice(2);
   const guiDependencies = ensureGuiDependencies();
   if (guiDependencies.kind === "failed") {
@@ -545,7 +800,7 @@ if (import.meta.main) {
       let exitCode = 0;
       let captured = "";
       for (const lane of resolveBunTestPlan(requestedTests, changedRun?.comparisonCommit)) {
-        const result = await runTestLane(lane, runId, inheritedLock, Boolean(changedRun));
+        const result = await runTestLane(lane, runId, inheritedLock, Boolean(changedRun), undefined, testRunner);
         captured += result.output;
         if (result.exitCode !== 0 && exitCode === 0) exitCode = result.exitCode;
         if ([124, 130, 143].includes(result.exitCode)) break;

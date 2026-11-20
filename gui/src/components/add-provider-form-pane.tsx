@@ -1,9 +1,21 @@
 import { IconExternal, IconKey } from "../icons";
 import { useT } from "../i18n/shared";
+import { Trans } from "../i18n/provider";
+import { Select } from "../ui";
 import type { CatalogPreset } from "./provider-catalog/provider-presets";
 import type { ProviderPayloadForm } from "../provider-payload";
 import { AddProviderField } from "./add-provider-modal-field";
 import { baseUrlForChoice } from "../base-url-choice";
+import { canConfigureResponsesReasoningReplay } from "../responses-reasoning-replay";
+import { ResponsesReasoningReplayControl } from "./responses-reasoning-replay-control";
+import { isSubscriptionCliProvider, SUBSCRIPTION_CLI_API_KEY_ALTERNATIVE } from "../provider-workspace/subscription-cli";
+
+const FORM_ADAPTERS = ["openai-responses", "openai-chat", "anthropic", "google", "azure-openai", "cursor"];
+
+/** The preset's own adapter stays selectable; otherwise the select shows the first option instead. */
+function adapterOptions(current: string): string[] {
+  return current && !FORM_ADAPTERS.includes(current) ? [current, ...FORM_ADAPTERS] : FORM_ADAPTERS;
+}
 
 export function AddProviderFormPane({
   preset,
@@ -39,6 +51,7 @@ export function AddProviderFormPane({
   onBack: () => void;
 }) {
   const t = useT();
+  const subscriptionCli = isSubscriptionCliProvider(form);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -66,34 +79,32 @@ export function AddProviderFormPane({
       {dup && <div className="text-label" style={{ color: "var(--amber)" }}>{t("modal.duplicateWarn", { name: form.name.trim() })}</div>}
       {!isReservedForward && <>
         <AddProviderField label={t("modal.adapter")}>
-          <select className="input" value={form.adapter} onChange={e => onFormChange({ ...form, adapter: e.target.value })}>
-            {["openai-responses", "openai-chat", "anthropic", "google", "azure-openai", "cursor"].map(a => <option key={a} value={a}>{a}</option>)}
-          </select>
+          <Select fullWidth label={t("modal.adapter")} value={form.adapter}
+            onChange={adapter => onFormChange({ ...form, adapter })}
+            options={adapterOptions(form.adapter).map(a => ({ value: a, label: a }))} />
         </AddProviderField>
         {preset.baseUrlChoices && preset.baseUrlChoices.length > 0 ? (
           <>
             <AddProviderField label={t("modal.endpoint")}>
-              <select
-                className="input"
+              <Select
+                fullWidth
+                label={t("modal.endpoint")}
                 value={endpointChoice}
-                onChange={e => {
-                  const id = e.target.value;
+                onChange={id => {
                   onEndpointChoiceChange(id);
                   onFormChange({
                     ...form,
                     baseUrl: baseUrlForChoice(preset.baseUrlChoices, id, form.baseUrl),
                   });
                 }}
-              >
-                {preset.baseUrlChoices.map(c => (
-                  <option key={c.id} value={c.id}>
-                    {c.id === "token-plan" ? t("modal.endpoint.tokenPlan")
-                      : c.id === "payg" ? t("modal.endpoint.payAsYouGo")
-                      : c.id === "custom" ? t("modal.endpoint.custom")
-                      : c.label}
-                  </option>
-                ))}
-              </select>
+                options={preset.baseUrlChoices.map(c => ({
+                  value: c.id,
+                  label: c.id === "token-plan" ? t("modal.endpoint.tokenPlan")
+                    : c.id === "payg" ? t("modal.endpoint.payAsYouGo")
+                    : c.id === "custom" ? t("modal.endpoint.custom")
+                    : c.label,
+                }))}
+              />
             </AddProviderField>
             {endpointChoice === "custom" && (
               <AddProviderField label={t("modal.baseUrl")}>
@@ -121,6 +132,10 @@ export function AddProviderFormPane({
           <p className="muted text-hint">{t("modal.allowPrivateNetworkHint")}</p>
         )}
       </>}
+      {isCustom && canConfigureResponsesReasoningReplay(form) && (
+        <ResponsesReasoningReplayControl checked={form.preserveResponsesReasoningContent === true}
+          onChange={checked => onFormChange({ ...form, preserveResponsesReasoningContent: checked })} />
+      )}
       {form.authMode === "forward" ? (
         <div className="text-label" style={{ color: "var(--green)", background: "var(--green-soft)", border: "1px solid var(--green)", borderRadius: "var(--radius-sm)", padding: "8px 10px" }}>
           {presetDescription(preset)}
@@ -128,6 +143,15 @@ export function AddProviderFormPane({
       ) : form.authMode === "local" ? (
         <div className="text-label leading-relaxed" style={{ color: "var(--amber)", background: "var(--amber-soft)", border: "1px solid var(--amber)", borderRadius: "var(--radius-sm)", padding: "8px 10px" }}>
           {t("modal.localHint")}
+        </div>
+      ) : subscriptionCli ? (
+        // Replaces both the key field and the green free box: this row bills a subscription
+        // through the signed-in CLI, and a key typed here would never be read.
+        <div role="note" data-subscription-cli-warning="" className="text-label leading-relaxed" style={{ color: "var(--amber)", background: "var(--amber-soft)", border: "1px solid var(--amber)", borderRadius: "var(--radius-sm)", padding: "10px 12px" }}>
+          <strong>{t("modal.subscriptionCliTitle")}</strong>
+          <div style={{ marginTop: 4 }}>
+            <Trans k="modal.subscriptionCliWarning" cmd="claude -p" vars={{ apiProvider: SUBSCRIPTION_CLI_API_KEY_ALTERNATIVE }} />
+          </div>
         </div>
       ) : preset.keyOptional ? (
         <div className="text-label leading-relaxed" style={{ color: "var(--green)", background: "var(--green-soft)", border: "1px solid var(--green)", borderRadius: "var(--radius-sm)", padding: "10px 12px" }}>
@@ -145,18 +169,30 @@ export function AddProviderFormPane({
           </AddProviderField>
           {form.adapter === "anthropic" && form.authMode === "key" && (
             <AddProviderField label={t("modal.apiKeyTransport")}>
-              <select
-                className="input"
+              <Select
+                fullWidth
+                label={t("modal.apiKeyTransport")}
                 value={form.apiKeyTransport ?? "x-api-key"}
-                onChange={e => onFormChange({ ...form, apiKeyTransport: e.target.value === "bearer" ? "bearer" : undefined })}
-              >
-                <option value="x-api-key">{t("modal.apiKeyTransportNative")}</option>
-                <option value="bearer">{t("modal.apiKeyTransportBearer")}</option>
-              </select>
+                onChange={value => onFormChange({ ...form, apiKeyTransport: value === "bearer" ? "bearer" : undefined })}
+                options={[
+                  { value: "x-api-key", label: t("modal.apiKeyTransportNative") },
+                  { value: "bearer", label: t("modal.apiKeyTransportBearer") },
+                ]}
+              />
             </AddProviderField>
           )}
         </>
       )}
+      {preset.id === "google-vertex" && form.adapter === "google" && <>
+        <p className="muted text-hint" style={{ margin: 0 }}>{t("modal.vertexAdcHint")}</p>
+        <p className="muted text-hint" style={{ margin: 0 }}>{t("modal.vertexStaticHint")}</p>
+        <AddProviderField label={t("modal.vertexProject")}>
+          <input className="input" value={form.project ?? ""} onChange={e => onFormChange({ ...form, project: e.target.value })} />
+        </AddProviderField>
+        <AddProviderField label={t("modal.vertexLocation")}>
+          <input className="input" aria-label={t("modal.vertexLocation")} value={form.location ?? ""} onChange={e => onFormChange({ ...form, location: e.target.value })} placeholder="us-central1" />
+        </AddProviderField>
+      </>}
       {!isReservedForward && <AddProviderField label={t("modal.defaultModel")}>
         <input className="input" value={form.defaultModel} onChange={e => onFormChange({ ...form, defaultModel: e.target.value })} placeholder={t("modal.defaultModelPlaceholder")} />
       </AddProviderField>}

@@ -15,18 +15,23 @@ import {
   resolveMetadataProvider,
 } from "../generated/model-metadata";
 import type { AttemptTierOutcome, OcxUsage } from "../types";
+import type { PromptLengthPricing } from "../types/provider";
 import { canonicalFastTierMarker } from "../providers/fastwire";
-import { baseProviderLabel, canonicalUsageProviderLabel } from "../providers/label";
+import { baseProviderLabel } from "../providers/label";
 import type { PersistedUsageAttempt, UsageStatus } from "./log";
 import { canonicalAntigravityUsageModel } from "../providers/antigravity-models";
-import { activeConfiguredProviders, activeUserCostOverlays, userCostOverlayVersion } from "./user-cost-overlays";
+import { activeAccountPricingProviders, activeConfiguredProviders, activeUserCostOverlays, userCostOverlayVersion } from "./user-cost-overlays";
 import {
   EXPECTED_PRICE_OVERLAYS,
   findExpectedPriceOverlay,
   findVerifiedPriceOverride,
   findPriorityPricingRule,
+  cursorFastPriceMultiplier,
+  cursorFastPriceSource,
+  cursorFastPriceSupported,
   findContextTier,
   isLongContext,
+  pricingFamilyProvider,
   type Cost4,
   type ExpectedPriceOverlay,
   type ExpectedPriceStatus,
@@ -60,6 +65,8 @@ export interface CostTokens {
   output: number;
   cacheRead: number;
   cacheWrite: number;
+  /** The 1-hour-TTL subset of `cacheWrite`, when the provider reports the split. */
+  cacheWrite1h?: number;
 }
 
 export interface CostBreakdown {
@@ -75,6 +82,7 @@ export interface MatchedPrice {
   modelId: string;
   jawcodeProvider?: string;
   cost4: Cost4;
+  promptLengthPricing?: PromptLengthPricing;
   source: "jawcode" | "expected" | "user";
   sourceRef?: string;
   verifiedAt?: string;
@@ -93,6 +101,8 @@ export interface AttemptCostEstimate {
   priorityMultiplier?: number;
   /** Set when the published long-context rate was applied (#908). */
   contextTier?: ContextTierName;
+  /** User absolute rates selected for this attempt, separate from catalog tiers. */
+  customThresholdApplied?: true;
   /** The numeric estimate is a known floor because the exact Priority price is unavailable. */
   priorityLowerBound?: boolean;
 }
@@ -107,6 +117,8 @@ export interface CostEstimate {
   priorityMultiplier?: number;
   /** Set when any priced attempt used the published long-context rate (#908). */
   contextTier?: ContextTierName;
+  /** At least one request/attempt selected the user threshold rates. */
+  customThresholdApplied?: true;
   /** The aggregate is a known floor because every priced attempt is a lower bound. */
   priorityLowerBound?: boolean;
 }
@@ -153,22 +165,35 @@ export function normalizeCostTokens(usage: OcxUsage): CostTokens | null {
   for (const cacheRead of candidates) {
     if (![input, output, cacheRead, cacheWrite].every(finiteNonNegative)) return null;
     if (cacheRead + cacheWrite > input) continue;
+    const cacheWrite1h = usage.cacheCreation1hInputTokens;
     return {
       input: Math.max(0, input - cacheRead - cacheWrite),
       output,
       cacheRead,
       cacheWrite,
+      ...(typeof cacheWrite1h === "number" && finiteNonNegative(cacheWrite1h) && cacheWrite1h > 0
+        ? { cacheWrite1h: Math.min(cacheWrite1h, cacheWrite) } : {}),
     };
   }
   return null;
 }
+
+/**
+ * Price of a 1-hour cache write relative to the 5-minute rate that Cost4.cacheWrite records.
+ * Anthropic bills 5m writes at 1.25x and 1h writes at 2x base input, so 2 / 1.25. Scaling the
+ * 5m rate (rather than input) keeps every tier multiplier already applied to the Cost4 and keeps
+ * a free-write row (cacheWrite 0) free.
+ */
+export const CACHE_WRITE_1H_OVER_5M = 2 / 1.25;
 
 /** jawcode unit convention: USD per 1M tokens (jawcode stats/db.ts calculateCatalogCost). */
 export function calculateCost(tokens: CostTokens, cost4: Cost4): CostBreakdown {
   const input = cost4.input * tokens.input / 1_000_000;
   const output = cost4.output * tokens.output / 1_000_000;
   const cacheRead = cost4.cacheRead * tokens.cacheRead / 1_000_000;
-  const cacheWrite = cost4.cacheWrite * tokens.cacheWrite / 1_000_000;
+  const write1h = Math.min(tokens.cacheWrite1h ?? 0, tokens.cacheWrite);
+  const cacheWrite = (cost4.cacheWrite * (tokens.cacheWrite - write1h)
+    + cost4.cacheWrite * CACHE_WRITE_1H_OVER_5M * write1h) / 1_000_000;
   return { input, output, cacheRead, cacheWrite, total: input + output + cacheRead + cacheWrite };
 }
 
@@ -177,8 +202,8 @@ export function calculateCost(tokens: CostTokens, cost4: Cost4): CostBreakdown {
  * bundle) nonzero -> overlay verified -> overlay verified-derived -> jawcode
  * model-level vendor price (cross-provider fallback: a model follows its official
  * vendor price — WP5 policy, e.g. kiro/claude-opus-4-6 uses the anthropic price)
- * -> null. All-zero rows are overlay candidates (zero is "not billable here",
- * not "free").
+ * -> null. An explicit all-zero user override means free; all-zero catalog
+ * rows remain overlay candidates rather than evidence of free pricing.
  */
 export function resolveMatchedPrice(
   provider: string,
@@ -187,21 +212,18 @@ export function resolveMatchedPrice(
   userOverlays: readonly ExpectedPriceOverlay[] = activeUserCostOverlays(),
   options: PriceResolutionOptions = {},
 ): MatchedPrice | null {
-  // User-configured overlays are keyed by the EXACT configured provider name.
-  // A provider that literally exists in config.providers keeps its own pricing
-  // namespace: a real custom provider can legitimately end with a label-shaped
-  // suffix (e.g. acme-pabcdef) and must not inherit the base provider's user
-  // overlay. Only NON-configured names (generated account log labels) collapse
-  // to their label base. chatgpt/openai-multi are the same OpenAI usage surface
-  // and always canonicalize to openai.
-  const collapsed = baseProviderLabel(provider);
-  if (collapsed !== provider && (canonicalUsageProviderLabel(provider) !== provider || !activeConfiguredProviders().has(provider))) {
+  // Literal configured providers win over account identities. Only then use
+  // config-owned Codex identities, followed by the existing historical suffix
+  // grammar. Never infer an account by stripping an arbitrary suffix.
+  const namespace = activeConfiguredProviders().has(provider)
+    ? provider
+    : activeAccountPricingProviders().get(provider) ?? baseProviderLabel(provider);
+  if (namespace !== provider) {
+    // An exact override (including caller-supplied rows) owns its namespace.
+    // Unchanged names use the memoized inner lookup's existing user-first order.
     const exactUserOverlay = userOverlayMatch(provider, modelId, userOverlays);
     if (exactUserOverlay) return exactUserOverlay;
-    // Pool/account log suffixes (e.g. google-antigravity-p442fff) must collapse
-    // before the compiled/overlay lookup; configured providers keep their own
-    // namespace above.
-    provider = collapsed;
+    provider = namespace;
   }
   // Memoize by (provider, model): usage summaries iterate hundreds of thousands of
   // rows that share a handful of provider/model keys, so resolving each time would
@@ -247,7 +269,7 @@ function resolveMatchedPriceInner(
 /**
  * Exact provider/model price lookup: user-configured `modelCosts` first, then
  * an exact official correction, the jawcode provider bundle, the expected-price overlay, then the
- * model-level vendor fallback. All-zero rows fall through ("not billable").
+ * model-level vendor fallback. All-zero catalog rows fall through; user zeros win.
  */
 function resolveMatchedPriceExact(
   provider: string,
@@ -260,18 +282,20 @@ function resolveMatchedPriceExact(
   // operator's explicit price is authoritative for the ~$ estimate.
   const userOverlay = userOverlayMatch(provider, modelId, userOverlays);
   if (userOverlay) return userOverlay;
+  if (!cursorFastPriceSupported(provider, modelId)) return null;
   const verifiedOverride = overlays === EXPECTED_PRICE_OVERLAYS
-    ? findVerifiedPriceOverride(provider, modelId)
+    ? findVerifiedPriceOverride(pricingFamilyProvider(provider), modelId)
     : undefined;
   if (verifiedOverride && verifiedOverride.status !== "unverified" && validCost4(verifiedOverride.cost4) && hasNonZeroCost(verifiedOverride.cost4)) {
     return {
       provider,
       modelId,
-      cost4: verifiedOverride.cost4,
+      cost4: multiplyCursorFastCost(verifiedOverride.cost4, provider, modelId),
       source: "expected",
       sourceRef: verifiedOverride.source,
       verifiedAt: verifiedOverride.verifiedAt,
       status: verifiedOverride.status,
+      ...cursorFastPriceProvenance(provider, modelId),
     };
   }
   const metadataProvider = resolveMetadataProvider(provider);
@@ -283,41 +307,64 @@ function resolveMatchedPriceExact(
       provider,
       modelId,
       jawcodeProvider: metadataProvider,
-      cost4: bundled.cost,
+      cost4: multiplyCursorFastCost(bundled.cost, provider, modelId),
       source: "jawcode",
       status: "verified",
+      ...cursorFastPriceProvenance(provider, modelId),
     };
   }
-  const overlay = findExpectedPriceOverlay(provider, modelId, overlays);
+  const overlay = findExpectedPriceOverlay(overlays === EXPECTED_PRICE_OVERLAYS ? pricingFamilyProvider(provider) : provider, modelId, overlays);
   if (!overlay || !validCost4(overlay.cost4) || !hasNonZeroCost(overlay.cost4)) {
-    return options.allowModelLevelFallback === false ? null : resolveModelLevelPrice(provider, modelId);
+    if (options.allowModelLevelFallback === false) return null;
+    const fallback = resolveModelLevelPrice(provider, modelId);
+    return fallback
+      ? { ...fallback, cost4: multiplyCursorFastCost(fallback.cost4, provider, modelId), ...cursorFastPriceProvenance(provider, modelId) }
+      : null;
   }
   if (overlay.status === "unverified") return null;
   return {
     provider,
     modelId,
     ...(metadataProvider ? { jawcodeProvider: metadataProvider } : {}),
-    cost4: overlay.cost4,
+    cost4: multiplyCursorFastCost(overlay.cost4, provider, modelId),
     source: "expected",
     sourceRef: overlay.source,
     verifiedAt: overlay.verifiedAt,
     status: overlay.status,
+    ...cursorFastPriceProvenance(provider, modelId),
   };
 }
 
-/** User-configured overlay match (all-zero rows fall through like any other source). */
+function multiplyCursorFastCost(cost4: Cost4, provider: string, modelId: string): Cost4 {
+  const multiplier = cursorFastPriceMultiplier(provider, modelId);
+  if (multiplier === 1) return cost4;
+  return {
+    input: cost4.input * multiplier,
+    output: cost4.output * multiplier,
+    cacheRead: cost4.cacheRead * multiplier,
+    cacheWrite: cost4.cacheWrite * multiplier,
+  };
+}
+
+function cursorFastPriceProvenance(provider: string, modelId: string): Pick<MatchedPrice, "sourceRef" | "status"> | Record<never, never> {
+  const sourceRef = cursorFastPriceSource(provider, modelId);
+  return sourceRef ? { sourceRef, status: "verified" } : {};
+}
+
+/** User-configured overlay match; explicit zero rates are authoritative too. */
 function userOverlayMatch(
   provider: string,
   modelId: string,
   userOverlays: readonly ExpectedPriceOverlay[],
 ): MatchedPrice | null {
   const overlay = findExpectedPriceOverlay(provider, modelId, userOverlays);
-  if (!overlay || !validCost4(overlay.cost4) || !hasNonZeroCost(overlay.cost4)) return null;
+  if (!overlay || !validCost4(overlay.cost4)) return null;
   return {
     provider,
     modelId,
     cost4: overlay.cost4,
     source: "user",
+    ...(overlay.promptLengthPricing ? { promptLengthPricing: overlay.promptLengthPricing } : {}),
     sourceRef: overlay.source,
     verifiedAt: overlay.verifiedAt,
     status: "verified",
@@ -372,6 +419,15 @@ function vendorPrefixedCost(modelId: string): ReturnType<typeof findVendorCostBy
   return normalize(found.provider) === normalize(claimedVendor) ? found : undefined;
 }
 
+/**
+ * Only measured usage is priced. An `unreported` or `unsupported` row can still carry tokens — a
+ * combo whose first leg failed without usage keeps the second leg's — and pricing them reports an
+ * understated cost as if it were complete.
+ */
+export function isMeasuredStatus(usageStatus: UsageStatus): boolean {
+  return usageStatus === "reported" || usageStatus === "estimated";
+}
+
 function isEstimated(usage: OcxUsage, usageStatus: UsageStatus, priceStatus: ExpectedPriceStatus | "verified"): boolean {
   return usage.estimated === true || usageStatus === "estimated" || priceStatus === "verified-derived";
 }
@@ -415,13 +471,16 @@ export function serviceTierContext(entry: ServiceTierContext): ServiceTierContex
 
 /** Convert one adapter-observed attempt outcome into the existing pricing provenance shape. */
 export function serviceTierContextFromOutcome(outcome: AttemptTierOutcome): ServiceTierContext {
-  if (outcome.canonical === "priority" && outcome.confirmation === "confirmed") {
+  const responseAuthoritative = outcome.responseTierAuthoritative !== false;
+  if (responseAuthoritative && outcome.canonical === "priority" && outcome.confirmation === "confirmed") {
     return { responseServiceTier: "priority" };
   }
-  if (outcome.responseServiceTier !== undefined) {
+  // Non-authoritative echoes remain in the log, but cannot become pricing confirmation either.
+  if (responseAuthoritative && outcome.responseServiceTier !== undefined) {
     return { responseServiceTier: outcome.responseServiceTier };
   }
-  if (outcome.canonical === "priority" && outcome.confirmation === "assumed") {
+  if (outcome.canonical === "priority"
+    && (outcome.confirmation === "assumed" || (!responseAuthoritative && outcome.confirmation === "confirmed"))) {
     return { requestedServiceTier: "priority" };
   }
   // An unclassified route makes no canonical Fast claim, but its adapter can still prove that
@@ -447,8 +506,8 @@ function isConfirmedFast(tier?: ServiceTierInput): boolean {
 }
 
 /**
- * Apply the published long-context rate when raw prompt size crosses the vendor
- * threshold. Returns [effectiveCost4, tierName].
+ * Select user prompt-length rates, or apply the published context rule in automatic mode.
+ * Returns [effectiveCost4, catalogTier, priorityLowerBound, customThresholdApplied].
  *
  * `rawInputTokens` MUST be `usage.inputTokens` (total prompt size), never the
  * normalized billable input — normalization subtracts cache read/write, so a
@@ -458,15 +517,29 @@ function isConfirmedFast(tier?: ServiceTierInput): boolean {
  * API rows can stack the bands. xAI publishes neither a combined rate nor an exclusion,
  * so its long-context rate remains the known lower bound instead of inventing a stacked multiplier.
  */
-function applyContextTier(
+function applyPromptLengthPricing(
   cost4: Cost4,
   provider: string,
   modelId: string,
   rawInputTokens: number | undefined,
   tier?: ServiceTierInput,
-): [Cost4, ContextTierName | undefined, boolean] {
+  policy?: PromptLengthPricing,
+): [Cost4, ContextTierName | undefined, boolean, true?] {
+  // A user policy replaces the catalog rule on BOTH sides of its threshold.
+  // Keep custom provenance separate while honoring the published Priority relation.
+  if (policy?.mode === "flat") return [cost4, undefined, false];
+  if (policy?.mode === "custom") {
+    const crossed = rawInputTokens !== undefined && Number.isFinite(rawInputTokens)
+      && (policy.comparison === "gte"
+        ? rawInputTokens >= policy.thresholdTokens : rawInputTokens > policy.thresholdTokens);
+    if (!crossed) return [cost4, undefined, false];
+    const relation = findContextTier(provider, modelId)?.confirmedPriorityRelation;
+    const confirmedFast = isConfirmedFast(tier);
+    if (confirmedFast && relation === "exclusive") return [cost4, undefined, false];
+    return [policy.rates, undefined, confirmedFast && relation === "lower-bound", true];
+  }
   if (rawInputTokens === undefined) return [cost4, undefined, false];
-  const rule = findContextTier(baseProviderLabel(provider), modelId);
+  const rule = findContextTier(provider, modelId);
   if (!rule || !isLongContext(rule, rawInputTokens)) return [cost4, undefined, false];
   const confirmedFast = isConfirmedFast(tier);
   if (confirmedFast && rule.confirmedPriorityRelation === "exclusive") {
@@ -492,11 +565,13 @@ function applyPriorityMultiplier(
   modelId: string,
   serviceTier?: ServiceTierInput,
   contextTier?: ContextTierName,
+  customThresholdApplied?: true,
 ): [Cost4, number] {
   if (canonicalFastTierMarker(tierScalar(serviceTier)) !== "priority") return [cost4, 1];
-  const base = baseProviderLabel(provider);
-  if (contextTier && findContextTier(base, modelId)?.confirmedPriorityRelation !== "stack") return [cost4, 1];
-  const rule = findPriorityPricingRule(base, modelId);
+  if (contextTier && findContextTier(provider, modelId)?.confirmedPriorityRelation !== "stack") return [cost4, 1];
+  if (customThresholdApplied && isConfirmedFast(serviceTier)
+    && findContextTier(provider, modelId)?.confirmedPriorityRelation === "lower-bound") return [cost4, 1];
+  const rule = findPriorityPricingRule(provider, modelId);
   if (rule?.requiresResponseConfirmation && !isConfirmedFast(serviceTier)) return [cost4, 1];
   const multiplier = rule?.multiplier ?? 1;
   if (multiplier === 1) return [cost4, 1];
@@ -524,7 +599,7 @@ function isOpenRouterPriorityLowerBound(
   provider: string,
   outcome: AttemptTierOutcome | undefined,
 ): boolean {
-  return baseProviderLabel(provider) === "openrouter"
+  return provider === "openrouter"
     && outcome?.canonical === "priority"
     && outcome.fastOutcome === "applied"
     && (outcome.confirmation === "confirmed" || outcome.confirmation === "assumed");
@@ -541,8 +616,7 @@ export function estimateAttemptCost(
   serviceTier?: ServiceTierInput,
   userOverlays: readonly ExpectedPriceOverlay[] = activeUserCostOverlays(),
 ): AttemptCostEstimate | null {
-  if (attempt.usageStatus !== "reported" && attempt.usageStatus !== "estimated") return null;
-  if (!attempt.usage) return null;
+  if (!isMeasuredStatus(attempt.usageStatus) || !attempt.usage) return null;
   const tokens = normalizeCostTokens(attempt.usage);
   if (!tokens) return null;
   const price = resolveMatchedPrice(attempt.provider, attempt.model, overlays, userOverlays, attempt);
@@ -550,14 +624,14 @@ export function estimateAttemptCost(
   const attemptServiceTier = attempt.tierOutcome
     ? serviceTierContextFromOutcome(attempt.tierOutcome)
     : serviceTier;
-  const [tieredCost4, contextTier, contextPriorityLowerBound] = applyContextTier(
-    price.cost4, attempt.provider, attempt.model, attempt.usage.inputTokens, attemptServiceTier,
+  const [tieredCost4, contextTier, contextPriorityLowerBound, customThresholdApplied] = applyPromptLengthPricing(
+    price.cost4, price.provider, attempt.model, attempt.usage.inputTokens, attemptServiceTier, price.promptLengthPricing,
   );
   const [effectiveCost4, multiplier] = applyPriorityMultiplier(
-    tieredCost4, attempt.provider, attempt.model, attemptServiceTier, contextTier,
+    tieredCost4, price.provider, attempt.model, attemptServiceTier, contextTier, customThresholdApplied,
   );
   const priorityLowerBound = contextPriorityLowerBound
-    || isOpenRouterPriorityLowerBound(attempt.provider, attempt.tierOutcome);
+    || isOpenRouterPriorityLowerBound(price.provider, attempt.tierOutcome);
   return {
     ordinal: attempt.ordinal,
     provider: attempt.provider,
@@ -568,6 +642,7 @@ export function estimateAttemptCost(
     estimated: isEstimated(attempt.usage, attempt.usageStatus, price.status),
     ...(multiplier !== 1 ? { priorityMultiplier: multiplier } : {}),
     ...(contextTier ? { contextTier } : {}),
+    ...(customThresholdApplied ? { customThresholdApplied } : {}),
     ...(priorityLowerBound ? { priorityLowerBound: true } : {}),
   };
 }
@@ -596,6 +671,7 @@ export function estimateComboCost(
     tokens.output += est.tokens.output;
     tokens.cacheRead += est.tokens.cacheRead;
     tokens.cacheWrite += est.tokens.cacheWrite;
+    if (est.tokens.cacheWrite1h) tokens.cacheWrite1h = (tokens.cacheWrite1h ?? 0) + est.tokens.cacheWrite1h;
     cost.input += est.cost.input;
     cost.output += est.cost.output;
     cost.cacheRead += est.cost.cacheRead;
@@ -611,6 +687,7 @@ export function estimateComboCost(
       ? { priorityMultiplier: estimates.find(est => est.priorityMultiplier)?.priorityMultiplier }
       : {}),
     ...(estimates.some(est => est.contextTier) ? { contextTier: "long" as const } : {}),
+    ...(estimates.some(est => est.customThresholdApplied) ? { customThresholdApplied: true as const } : {}),
     ...(estimates.every(est => est.priorityLowerBound === true)
       ? { priorityLowerBound: true as const }
       : {}),
@@ -630,20 +707,19 @@ export function estimateRequestCost(
   overlays: readonly ExpectedPriceOverlay[] = EXPECTED_PRICE_OVERLAYS,
   userOverlays: readonly ExpectedPriceOverlay[] = activeUserCostOverlays(),
 ): CostEstimate | null {
-  if (input.usageStatus !== "reported" && input.usageStatus !== "estimated") return null;
-  if (!input.usage) return null;
+  if (!isMeasuredStatus(input.usageStatus) || !input.usage) return null;
   const tokens = normalizeCostTokens(input.usage);
   if (!tokens) return null;
   const price = resolveMatchedPrice(input.provider, input.model, overlays, userOverlays, input);
   if (!price) return null;
-  const [tieredCost4, contextTier, contextPriorityLowerBound] = applyContextTier(
-    price.cost4, input.provider, input.model, input.usage.inputTokens, input.serviceTier,
+  const [tieredCost4, contextTier, contextPriorityLowerBound, customThresholdApplied] = applyPromptLengthPricing(
+    price.cost4, price.provider, input.model, input.usage.inputTokens, input.serviceTier, price.promptLengthPricing,
   );
   const [effectiveCost4, multiplier] = applyPriorityMultiplier(
-    tieredCost4, input.provider, input.model, input.serviceTier, contextTier,
+    tieredCost4, price.provider, input.model, input.serviceTier, contextTier, customThresholdApplied,
   );
   const priorityLowerBound = contextPriorityLowerBound || isOpenRouterPriorityLowerBound(
-    input.provider,
+    price.provider,
     typeof input.serviceTier === "object" ? input.serviceTier.tierOutcome : undefined,
   );
   return {
@@ -653,6 +729,7 @@ export function estimateRequestCost(
     estimated: isEstimated(input.usage, input.usageStatus, price.status),
     ...(multiplier !== 1 ? { priorityMultiplier: multiplier } : {}),
     ...(contextTier ? { contextTier } : {}),
+    ...(customThresholdApplied ? { customThresholdApplied } : {}),
     ...(priorityLowerBound ? { priorityLowerBound: true } : {}),
   };
 }

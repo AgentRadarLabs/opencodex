@@ -2,9 +2,9 @@
 //
 // Some routed models decorate the first and last lines as
 // `*** Begin Patch ***` / `*** End Patch ***`. Codex rejects those otherwise
-// valid custom-tool payloads. Repair is deliberately limited to a complete,
-// structurally recognizable top-level patch: arbitrary `exec` JavaScript is
-// caller-authored executable input and must remain byte-identical.
+// valid custom-tool payloads. Repair of executable bodies is deliberately limited to
+// unambiguous wrapper mistakes: one recognized alternate field or one complete outer
+// Markdown fence. Ordinary `exec` JavaScript remains byte-identical.
 //
 // This is the same intent boundary as `src/lib/tool-argument-integers.ts`:
 // repair the one faithful reading, leave genuine patch content alone.
@@ -22,20 +22,61 @@ const PATCH_BEGIN = "*** Begin Patch";
 const PATCH_END = "*** End Patch";
 const TOP_LEVEL_PATCH_ENVELOPE = /^(\*\*\* Begin Patch(?: \*\*\*)?)(\r?\n)([\s\S]*)(\r?\n)(\*\*\* End Patch(?: \*\*\*)?)(\r?\n)?$/;
 const PATCH_OPERATION_LINE = /^\*\*\* (?:Add|Update|Delete) File: .+$/m;
+const OUTER_MARKDOWN_CODE_FENCE = /^```[^\r\n]*\r?\n([\s\S]*?)\r?\n```$/;
+const FREEFORM_FALLBACK_KEYS: Readonly<Record<string, readonly string[]>> = {
+  exec: ["code", "script", "js", "javascript", "command", "cmd", "content"],
+  apply_patch: ["patch", "content"],
+};
+
+/** The field names a tool's freeform wrapper may unwrap through, besides canonical `input`. */
+export function freeformFallbackKeys(toolName: string): readonly string[] {
+  return FREEFORM_FALLBACK_KEYS[toolName] ?? [];
+}
+
+function stripMarkdownCodeFence(text: string, toolName: string): string {
+  if (toolName !== "exec" && toolName !== "apply_patch") return text;
+  const match = OUTER_MARKDOWN_CODE_FENCE.exec(text.trim());
+  return match ? match[1] : text;
+}
+
+/** Repair one extra canonical wrapper inside an already unwrapped executable body. */
+function repairUnwrappedBody(text: string, toolName: string): string {
+  if (toolName !== "exec" && toolName !== "apply_patch") return text;
+  try {
+    const nested: unknown = JSON.parse(text);
+    if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+      const record = nested as Record<string, unknown>;
+      const keys = Object.keys(record);
+      if (keys.length === 1 && keys[0] === "input" && typeof record.input === "string") text = record.input;
+    }
+  } catch {
+    // Ordinary JavaScript and patches are not JSON wrappers.
+  }
+  return stripMarkdownCodeFence(text, toolName);
+}
 
 /** Unwrap the `{input:string}` function-call wrapper used for freeform tools. */
-export function unwrapFreeformToolInput(argumentsText: unknown): string {
+export function unwrapFreeformToolInput(argumentsText: unknown, toolName = ""): string {
   if (typeof argumentsText !== "string") return "";
   try {
     const parsed: unknown = JSON.parse(argumentsText);
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      const input = (parsed as { input?: unknown }).input;
-      if (typeof input === "string") return input;
+      const record = parsed as Record<string, unknown>;
+      if (Object.prototype.hasOwnProperty.call(record, "input")) {
+        return typeof record.input === "string"
+          ? repairUnwrappedBody(record.input, toolName)
+          : argumentsText;
+      }
+      const fallbackKeys = freeformFallbackKeys(toolName);
+      const candidates = fallbackKeys.filter(key => typeof record[key] === "string");
+      if (candidates.length === 1) {
+        return repairUnwrappedBody(record[candidates[0]] as string, toolName);
+      }
     }
   } catch {
     // The string is the freeform body, not nested JSON.
   }
-  return argumentsText;
+  return stripMarkdownCodeFence(argumentsText, toolName);
 }
 
 /**
@@ -89,20 +130,66 @@ export function mayBecomePatchEnvelope(text: string): boolean {
   return text.startsWith(PATCH_BEGIN) || PATCH_BEGIN.startsWith(text);
 }
 
+/** Largest prefix of an exactly opened patch that completion cannot rewrite. */
+export function stableCanonicalPatchPrefix(
+  text: string,
+  boundedTail = text,
+  openingValidated = false,
+): string | null {
+  const lfOpening = `${PATCH_BEGIN}\n`;
+  const crlfOpening = `${PATCH_BEGIN}\r\n`;
+  if (!openingValidated && !text.startsWith(lfOpening) && !text.startsWith(crlfOpening)) {
+    return lfOpening.startsWith(text) || crlfOpening.startsWith(text) ? "" : null;
+  }
+
+  let coreLength = text.length;
+  let tail = boundedTail;
+  let trailingBreak = "";
+  if (tail.endsWith("\r\n")) {
+    coreLength -= 2;
+    tail = tail.slice(0, -2);
+    trailingBreak = "\r\n";
+  } else if (tail.endsWith("\n")) {
+    coreLength -= 1;
+    tail = tail.slice(0, -1);
+    trailingBreak = "\n";
+  } else if (tail.endsWith("\r")) {
+    // This may become the first byte of a CRLF. It is stable for a canonical
+    // closer, but must remain behind a decorated closer that may be rewritten.
+    coreLength -= 1;
+    tail = tail.slice(0, -1);
+    trailingBreak = "\r";
+  }
+  const decoration = " ***";
+  // Only a partial terminal decoration can be rewritten at completion. Match its
+  // bounded tail instead of searching the complete accumulated patch on every delta.
+  for (let suffixLength = decoration.length; suffixLength > 0; suffixLength--) {
+    const candidate = PATCH_END + decoration.slice(0, suffixLength);
+    if (!tail.endsWith(candidate)) continue;
+    const lineStart = coreLength - candidate.length;
+    const preceding = tail[tail.length - candidate.length - 1];
+    if (lineStart === 0 || preceding === "\n" || preceding === "\r") {
+      return text.slice(0, lineStart + PATCH_END.length);
+    }
+  }
+  return text;
+}
+
 /**
  * Repair freeform input before Codex sees it.
  *
- * Only a bare or reserved-`functions` `apply_patch` payload may receive delimiter
- * repair. Remote namespaces own their grammar; those bodies and every other
- * freeform input are unwrapped and left byte-exact.
+ * Only a bare or reserved-`functions` tool may receive fallback-field or outer-fence
+ * repair, and only `apply_patch` may receive delimiter repair. Remote namespaces own
+ * their grammar; those bodies and every other freeform input are unwrapped and left
+ * byte-exact.
  */
 export function repairFreeformToolInput(
   argumentsText: unknown,
   toolName = "",
   namespace?: string,
 ): string {
-  const unwrapped = unwrapFreeformToolInput(argumentsText);
   const ownsApplyPatchGrammar = namespace === undefined || namespace === "functions";
+  const unwrapped = unwrapFreeformToolInput(argumentsText, ownsApplyPatchGrammar ? toolName : "");
   return ownsApplyPatchGrammar && toolName === "apply_patch"
     ? normalizeApplyPatchDelimiters(unwrapped)
     : unwrapped;

@@ -34,6 +34,7 @@ async function collectSse(stream: ReadableStream<Uint8Array>): Promise<{ event?:
 }
 
 const REPLAY_SCOPE: OcxReasoningReplayScopeRef = {
+  clientPrincipalId: "principal-hidden-replay",
   clientThreadId: "hidden-replay-thread",
   current: {
     providerName: "routed",
@@ -45,6 +46,66 @@ const REPLAY_SCOPE: OcxReasoningReplayScopeRef = {
 };
 const GLOBAL_SCOPE: OcxReasoningReplayScopeRef = { ...REPLAY_SCOPE, clientThreadId: "global" };
 const sseOpts = (hide: boolean) => ({ hideThinkingSummary: hide, replayCacheScope: REPLAY_SCOPE });
+
+describe("hidden raw reasoning between text chunks", () => {
+  for (const options of [{ hideThinkingSummary: true }, { hideRawReasoning: true }]) {
+    const mode = "hideThinkingSummary" in options ? "summary-hidden" : "raw-hidden";
+    for (const failed of [false, true]) {
+      test(`${mode} separates message indexes around hidden raw, failed=${failed}`, async () => {
+        const frames = await collectSse(bridgeToResponsesSSE(replay([
+          { type: "text_delta", text: "before" },
+          { type: "reasoning_raw_delta", text: "private raw" },
+          { type: "text_delta", text: "after" },
+          failed ? { type: "error", code: "upstream_error", message: "synthetic failure" } : { type: "done" },
+        ]), "m", undefined, undefined, undefined, undefined, undefined, options));
+        const added = frames.filter(frame => frame.event === "response.output_item.added").map(frame => frame.data);
+        const done = frames.filter(frame => frame.event === "response.output_item.done").map(frame => frame.data);
+        expect(added.map(event => event.output_index)).toEqual([0, 1, 2]);
+        expect(done.map(event => event.output_index)).toEqual([0, 1, 2]);
+        const items = done.map(event => event.item as Record<string, unknown>);
+        expect(items.map(item => item.type)).toEqual(["message", "reasoning", "message"]);
+        expect(decodeReasoningEnvelope(items[1]!.encrypted_content as string)).toEqual({ txt: "private raw" });
+        const slots = new Map<number, { id: unknown; text: string }>();
+        for (const frame of frames) {
+          const event = frame.data;
+          const index = event.output_index as number;
+          if (frame.event === "response.output_item.added") slots.set(index, { id: (event.item as Record<string, unknown>).id, text: "" });
+          if (frame.event === "response.output_text.delta") {
+            expect(slots.get(index)?.id).toBe(event.item_id);
+            slots.get(index)!.text += event.delta as string;
+          }
+          if (frame.event === "response.output_item.done") {
+            const item = event.item as Record<string, unknown>;
+            expect(slots.get(index)?.id).toBe(item.id);
+            if (item.type === "message") {
+              expect(slots.get(index)?.text).toBe(index === 0 ? "before" : "after");
+              expect(item.content).toEqual([{ type: "output_text", text: index === 0 ? "before" : "after", annotations: [] }]);
+            }
+            slots.delete(index);
+          }
+        }
+        expect(slots.size).toBe(0);
+        expect(items[0]!.phase).toBe("commentary");
+        expect(frames.filter(frame => frame.event === "response.reasoning_text.delta")).toHaveLength(0);
+        expect(JSON.stringify(frames)).not.toContain("private raw");
+        const terminal = frames.filter(frame => frame.event === (failed ? "response.failed" : "response.completed"));
+        expect(terminal).toHaveLength(1);
+        expect((terminal[0]!.data.response as Record<string, unknown>).output).toEqual(items);
+      });
+    }
+    test(`${mode} keeps consecutive plain text chunks in one item`, async () => {
+      const frames = await collectSse(bridgeToResponsesSSE(replay([
+        { type: "text_delta", text: "before" }, { type: "text_delta", text: "after" }, { type: "done" },
+      ]), "m", undefined, undefined, undefined, undefined, undefined, options));
+      const added = frames.filter(frame => frame.event === "response.output_item.added");
+      expect(added).toHaveLength(1);
+      const item = frames.find(frame => frame.event === "response.output_item.done")!.data.item as Record<string, unknown>;
+      expect(item.content).toEqual([{ type: "output_text", text: "beforeafter", annotations: [] }]);
+      expect(frames.filter(frame => frame.event === "response.output_text.delta").map(frame => [frame.data.output_index, frame.data.item_id, frame.data.delta]))
+        .toEqual([[0, item.id, "before"], [0, item.id, "after"]]);
+    });
+  }
+});
 
 describe("hidden raw reasoning (hideThinkingSummary parity for reasoning_raw_delta)", () => {
   beforeEach(() => {
@@ -77,18 +138,19 @@ describe("hidden raw reasoning (hideThinkingSummary parity for reasoning_raw_del
     expect(fc).toMatchObject({ call_id: "call_1", name: "read_file" });
   });
 
-  test("streamed visible (flag off): raw reasoning rides the expandable summary channel (#2007)", async () => {
+  test("streamed visible (flag off): raw reasoning rides the content channel (#2007)", async () => {
     const frames = await collectSse(bridgeToResponsesSSE(replay([
       { type: "reasoning_raw_delta", text: "visible raw" },
       { type: "done" },
     ]), "routed/model"));
-    expect(frames.some(f => f.event === "response.reasoning_summary_text.delta")).toBe(true);
-    expect(frames.some(f => f.event === "response.reasoning_text.delta")).toBe(false);
+    expect(frames.some(f => f.event === "response.reasoning_text.delta")).toBe(true);
+    expect(frames.some(f => f.event === "response.reasoning_summary_text.delta")).toBe(false);
     const completed = frames.find(f => f.event === "response.completed")?.data.response as Record<string, unknown>;
     const output = completed.output as Record<string, unknown>[];
     expect(output[0]).toMatchObject({
       type: "reasoning",
-      summary: [{ type: "summary_text", text: "visible raw" }],
+      summary: [],
+      content: [{ type: "reasoning_text", text: "visible raw" }],
     });
   });
 
@@ -118,14 +180,15 @@ describe("hidden raw reasoning (hideThinkingSummary parity for reasoning_raw_del
     expect(decodeReasoningEnvelope(reasoning.encrypted_content as string)?.txt).toBe("quiet");
   });
 
-  test("non-streaming visible: raw reasoning lands in the summary channel (#2007)", () => {
+  test("non-streaming visible: raw reasoning lands on the content channel (#2007)", () => {
     const json = buildResponseJSON([
       { type: "reasoning_raw_delta", text: "loud" },
       { type: "done" },
     ], "routed/model", {});
     const output = (json as { output: Record<string, unknown>[] }).output;
     expect(output.find(o => o.type === "reasoning")).toMatchObject({
-      summary: [{ type: "summary_text", text: "loud" }],
+      summary: [],
+      content: [{ type: "reasoning_text", text: "loud" }],
     });
   });
 
@@ -211,5 +274,65 @@ describe("hidden raw reasoning (hideThinkingSummary parity for reasoning_raw_del
       { type: "done" },
     ]), "routed/model", undefined, undefined, undefined, undefined, undefined, sseOpts(true)));
     expect(peekReasoningForCall("call_after_thinking", REPLAY_SCOPE)).toBeUndefined();
+  });
+});
+
+describe("hideRawReasoning (provider policy: raw hidden, provider summaries visible)", () => {
+  beforeEach(() => {
+    clearReasoningReplayCacheForTests();
+  });
+  afterEach(() => {
+    clearReasoningReplayCacheForTests();
+  });
+
+  const rawHiddenOpts = { hideRawReasoning: true, replayCacheScope: REPLAY_SCOPE };
+
+  test("streamed: raw stays envelope-only while the summary channel still streams", async () => {
+    const frames = await collectSse(bridgeToResponsesSSE(replay([
+      { type: "reasoning_raw_delta", text: "raw cot" },
+      { type: "thinking_delta", thinking: "provider summary" },
+      { type: "text_delta", text: "answer" },
+      { type: "done" },
+    ]), "routed/model", undefined, undefined, undefined, undefined, undefined, rawHiddenOpts));
+
+    expect(frames.some(f => f.event === "response.reasoning_text.delta")).toBe(false);
+    expect(frames.filter(f => f.event === "response.reasoning_summary_text.delta").map(f => f.data.delta))
+      .toEqual(["provider summary"]);
+    const completed = frames.find(f => f.event === "response.completed")?.data.response as Record<string, unknown>;
+    const output = completed.output as Record<string, unknown>[];
+    const raw = output.find(o => o.type === "reasoning" && o.content === undefined) as Record<string, unknown>;
+    expect(decodeReasoningEnvelope(raw.encrypted_content as string)?.txt).toBe("raw cot");
+    const summary = output.filter(o => o.type === "reasoning")
+      .find(o => Array.isArray(o.summary) && (o.summary as unknown[]).length > 0) as Record<string, unknown>;
+    expect(summary.summary).toEqual([{ type: "summary_text", text: "provider summary" }]);
+    expect(output.find(o => o.type === "message")).toMatchObject({
+      content: [{ type: "output_text", text: "answer" }],
+    });
+  });
+
+  test("non-streaming: raw becomes an envelope-only item, summary stays a summary item", () => {
+    const json = buildResponseJSON([
+      { type: "reasoning_raw_delta", text: "raw cot" },
+      { type: "thinking_delta", thinking: "provider summary" },
+      { type: "done" },
+    ], "routed/model", { hideRawReasoning: true });
+    const output = (json as { output: Record<string, unknown>[] }).output;
+    const reasoning = output.filter(o => o.type === "reasoning");
+    expect(reasoning).toHaveLength(2);
+    expect(reasoning[0].content).toBeUndefined();
+    expect(decodeReasoningEnvelope(reasoning[0].encrypted_content as string)?.txt).toBe("raw cot");
+    expect(reasoning[1].summary).toEqual([{ type: "summary_text", text: "provider summary" }]);
+  });
+
+  test("streamed: hidden raw reasoning still reaches the replay cache for the next tool call", async () => {
+    await collectSse(bridgeToResponsesSSE(replay([
+      { type: "reasoning_raw_delta", text: "chain " },
+      { type: "reasoning_raw_delta", text: "of thought" },
+      { type: "tool_call_start", id: "call_hidden_raw", name: "read_file" },
+      { type: "tool_call_delta", arguments: "{\"path\":\"a.txt\"}" },
+      { type: "tool_call_end" },
+      { type: "done" },
+    ]), "routed/model", undefined, undefined, undefined, undefined, undefined, rawHiddenOpts));
+    expect(peekReasoningForCall("call_hidden_raw", REPLAY_SCOPE)).toBe("chain of thought");
   });
 });

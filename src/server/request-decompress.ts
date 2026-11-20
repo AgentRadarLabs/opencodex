@@ -1,5 +1,9 @@
+import { Buffer } from "node:buffer";
 import { gunzipSync, inflateRawSync, inflateSync, zstdDecompressSync } from "node:zlib";
 import type { TranslatorBudget } from "../lib/translator-budget";
+import { updateInboundBodyReservation } from "./inbound-body-budget";
+import { serializedJsonByteLength } from "./json-serialized-bytes";
+import { recordRequestBodyFacts } from "./request-body-facts";
 
 /**
  * Request-body decompression for the /v1/responses data plane.
@@ -21,20 +25,155 @@ import type { TranslatorBudget } from "../lib/translator-budget";
  */
 export const MAX_DECOMPRESSED_BODY_BYTES = 256 * 1024 * 1024;
 
+/**
+ * Hard ceiling on the opt-in `maxInboundBodyBytes` (#3573).
+ *
+ * The opt-in exists because a 922k-token session serializes past the 256 MiB default, and the
+ * request that crosses it is the compaction request itself — so the session can no longer
+ * shrink and is stuck. An UNBOUNDED inbound cap is not an acceptable answer: this admission
+ * limit is the only thing standing between one request and the process heap, and
+ * `readBoundedJsonRequestBody` materializes the body several times over (retained wire bytes,
+ * decoded bytes, the decoded string, the serialized measurement string, and the parsed object
+ * graph), so peak RSS is a MULTIPLE of whatever is admitted here. 512 MiB is the largest value
+ * that keeps that multiple survivable on an ordinary machine, and it is what #3573 asked for.
+ */
+export const MAX_CONFIGURABLE_INBOUND_BODY_BYTES = 512 * 1024 * 1024;
+
+/** Floor for the opt-in. Below this an ordinary multi-image turn cannot be admitted at all. */
+export const MIN_CONFIGURABLE_INBOUND_BODY_BYTES = 1024 * 1024;
+
+/**
+ * Resolve the configured inbound admission limit, clamped to the supported range.
+ *
+ * Pure and total on purpose: the schema in `src/config.ts` degrades an invalid hand edit to
+ * `undefined` rather than failing the parse, so the schema cannot be the place the ceiling is
+ * enforced. Every caller resolves through here, which makes this the single auditable bound
+ * regardless of how the config object was produced.
+ *
+ * Omitted, zero, or non-finite = the 256 MiB default, so an unconfigured proxy admits exactly
+ * what it admits today.
+ */
+export function resolveInboundBodyLimitBytes(configured: number | undefined): number {
+  if (configured === undefined || !Number.isFinite(configured) || configured <= 0) {
+    return MAX_DECOMPRESSED_BODY_BYTES;
+  }
+  return Math.min(
+    Math.max(Math.floor(configured), MIN_CONFIGURABLE_INBOUND_BODY_BYTES),
+    MAX_CONFIGURABLE_INBOUND_BODY_BYTES,
+  );
+}
+
+/**
+ * Render a byte count, or nothing at all. `DecompressedBodyTooLargeError` accepts non-finite
+ * and untyped values from legacy callers and deliberately keeps them out of its own message;
+ * the client-facing message inherits that rule rather than printing `NaN MB`.
+ */
+function megabytes(bytes: number): string | null {
+  return Number.isFinite(bytes) && bytes >= 0 && bytes <= Number.MAX_SAFE_INTEGER
+    ? (bytes / (1024 * 1024)).toFixed(1)
+    : null;
+}
+
+const INBOUND_CEILING_MB = (MAX_CONFIGURABLE_INBOUND_BODY_BYTES / (1024 * 1024)).toFixed(1);
+
+/**
+ * Compression-bomb bound (#3023). A zstd frame of about 8 KiB inflates to 256 MiB, and the
+ * concurrent inbound budget reserves only the bytes on the wire, so the absolute limit alone lets
+ * a few tiny requests allocate the whole budget many times over. Now that Remote Link Children send
+ * zstd bodies by default, every encoded body may decode to at most
+ * max(COMPRESSED_BODY_RATIO_FLOOR_BYTES, COMPRESSED_BODY_RATIO_LIMIT x its wire bytes), and never
+ * past the absolute limit. zlib stops inflating at that size, so memory and time are bounded by it.
+ * 200 follows Apache mod_deflate's DeflateInflateRatioLimit; agent request bodies measured about
+ * 2.5x, and a body that decodes to 8 MiB or less is never refused for its ratio.
+ */
+export const COMPRESSED_BODY_RATIO_LIMIT = 200;
+export const COMPRESSED_BODY_RATIO_FLOOR_BYTES = 8 * 1024 * 1024;
+
+/** The most an encoded body of `wireBytes` may decode to under `maxBytes`. */
+export function compressedBodyDecodeLimit(wireBytes: number, maxBytes: number): number {
+  return Math.min(maxBytes, Math.max(COMPRESSED_BODY_RATIO_FLOOR_BYTES, wireBytes * COMPRESSED_BODY_RATIO_LIMIT));
+}
+
+
 export class UnsupportedContentEncodingError extends Error {
   constructor(readonly encoding: string) {
     super(`Unsupported content-encoding: ${encoding}`);
   }
 }
 
+export type BodySizeMeasurement =
+  | "declared_wire"
+  | "observed_wire_lower_bound"
+  | "decoded_exact"
+  | "decoded_lower_bound";
+
 export class DecompressedBodyTooLargeError extends Error {
-  constructor(readonly bytes: number, limit: number = MAX_DECOMPRESSED_BODY_BYTES) {
-    super(`Decompressed request body exceeds ${limit} bytes`);
+  readonly measurement: BodySizeMeasurement | null;
+
+  constructor(
+    readonly bytes: number,
+    readonly limit: number = MAX_DECOMPRESSED_BODY_BYTES,
+    measurement: BodySizeMeasurement | null = null,
+  ) {
+    // Legacy callers supply no provenance. Only fixed categories and finite
+    // numbers may reach the public message, including calls from untyped code.
+    const category = measurement === "declared_wire" || measurement === "observed_wire_lower_bound"
+      || measurement === "decoded_exact" || measurement === "decoded_lower_bound"
+      ? measurement : null;
+    const suffix = category !== null && Number.isFinite(bytes) && bytes >= 0
+      && Number.isFinite(limit) && limit >= 0
+      ? ` [measurement=${category}; bytes=${bytes}]` : "";
+    super(`Decompressed request body exceeds ${Number.isFinite(limit) ? limit : "unknown"} bytes${suffix}`);
+    this.measurement = category;
   }
 }
 
-function assertBodySizeWithinLimit(body: Uint8Array, maxBytes: number): Uint8Array {
-  if (body.byteLength > maxBytes) throw new DecompressedBodyTooLargeError(body.byteLength, maxBytes);
+/**
+ * Name OpenCodex as the refuser, and name the lever.
+ *
+ * #4112 gave the UPSTREAM context refusal on `/v1/responses` its own HTTP 413 with
+ * `context_length_exceeded`. That makes the two 413s on this surface look alike to a client
+ * while having opposite remedies: the upstream one means the provider will not take the turn,
+ * this one means the proxy never read it and a config key would have let it through. The
+ * wording deliberately avoids "context window"/"context length", which `classifyError` treats
+ * as evidence of an upstream context verdict.
+ */
+export function describeInboundBodyRefusal(error: DecompressedBodyTooLargeError): string {
+  if (error instanceof CompressionRatioExceededError) return error.message;
+  // A lower-bound measurement stopped counting at the cap; reporting it as exact would be a lie.
+  const approximate = error.measurement === "declared_wire" || error.measurement === "decoded_exact"
+    ? "" : "at least ";
+  const observed = megabytes(error.bytes);
+  const limit = megabytes(error.limit);
+  const sizes = limit === null
+    ? "the body is above the inbound admission limit"
+    : observed === null
+      ? `the body is above the ${limit} MB inbound admission limit`
+      : `the body is ${approximate}${observed} MB, above the ${limit} MB inbound admission limit`;
+  return `OpenCodex refused this request before reading it: ${sizes}. `
+    + "This is a local proxy limit, not a provider refusal. Raise \"maxInboundBodyBytes\" in "
+    + `config.json (ceiling ${INBOUND_CEILING_MB} MB) and restart the proxy, or compact the `
+    + "conversation earlier.";
+}
+
+/** An encoded body that would decode past its ratio bound; inflation stopped there. */
+export class CompressionRatioExceededError extends DecompressedBodyTooLargeError {
+  constructor(readonly wireBytes: number, readonly ratioLimitBytes: number, limit: number) {
+    super(ratioLimitBytes + 1, limit, "decoded_lower_bound");
+    this.name = "CompressionRatioExceededError";
+    const decoded = megabytes(ratioLimitBytes) ?? "the";
+    this.message = `OpenCodex refused this request before reading it: its compressed body (${Number.isSafeInteger(wireBytes) ? wireBytes : "?"} bytes) `
+      + `expands past ${decoded} MB, more than ${COMPRESSED_BODY_RATIO_LIMIT} times its size. This is a local guard against `
+      + "compression bombs, not a provider refusal; send the body uncompressed or with less repeated content.";
+  }
+}
+
+function assertBodySizeWithinLimit(
+  body: Uint8Array,
+  maxBytes: number,
+  measurement: BodySizeMeasurement = "decoded_exact",
+): Uint8Array {
+  if (body.byteLength > maxBytes) throw new DecompressedBodyTooLargeError(body.byteLength, maxBytes, measurement);
   return body;
 }
 
@@ -112,7 +251,7 @@ async function readRequestBodyBytesCapped(
       if (!value || value.byteLength === 0) continue;
 
       if (value.byteLength > maxBytes - retainedBytes) {
-        const error = new DecompressedBodyTooLargeError(retainedBytes + value.byteLength, maxBytes);
+        const error = new DecompressedBodyTooLargeError(retainedBytes + value.byteLength, maxBytes, "observed_wire_lower_bound");
         cancel(error);
         throw error;
       }
@@ -162,8 +301,9 @@ export function decodeRequestBody(
   const compressed = raw as Uint8Array<ArrayBuffer>;
   // `maxOutputLength` makes zlib abort DURING inflation (ERR_BUFFER_TOO_LARGE), so a
   // decompression bomb never allocates beyond the cap — checking after the fact would
-  // already have paid the full allocation (review finding, PR #96).
-  const opts = { maxOutputLength: maxBytes };
+  // already have paid the full allocation (review finding, PR #96). The cap is the ratio bound.
+  const decodeLimit = compressedBodyDecodeLimit(raw.byteLength, maxBytes);
+  const opts = { maxOutputLength: decodeLimit };
   let decoded: Uint8Array;
   try {
     if (encoding === "zstd") decoded = zstdDecompressSync(compressed, opts);
@@ -173,7 +313,9 @@ export function decodeRequestBody(
     else throw new UnsupportedContentEncodingError(encoding);
   } catch (err) {
     if ((err as NodeJS.ErrnoException | null)?.code === "ERR_BUFFER_TOO_LARGE") {
-      throw new DecompressedBodyTooLargeError(maxBytes + 1, maxBytes);
+      if (decodeLimit < maxBytes) throw new CompressionRatioExceededError(raw.byteLength, decodeLimit, maxBytes);
+      // Inflation stopped at the cap; the full decoded size was never measured.
+      throw new DecompressedBodyTooLargeError(maxBytes + 1, maxBytes, "decoded_lower_bound");
     }
     throw err;
   }
@@ -198,7 +340,7 @@ export async function readBoundedJsonRequestBody(
   // Reject an honest oversized declaration before reading. Missing, malformed,
   // and dishonest declarations remain bounded by the streaming reader below.
   if (declaredLength !== null && declaredLength > maxBytes) {
-    const error = new DecompressedBodyTooLargeError(declaredLength, maxBytes);
+    const error = new DecompressedBodyTooLargeError(declaredLength, maxBytes, "declared_wire");
     cancelStreamWithoutWaiting(req.body, error);
     throw error;
   }
@@ -211,20 +353,27 @@ export async function readBoundedJsonRequestBody(
   } finally {
     releaseReservation?.();
   }
-  assertBodySizeWithinLimit(raw, maxBytes);
+  assertBodySizeWithinLimit(raw, maxBytes, "observed_wire_lower_bound");
   const releaseRaw = budget?.observeAcceptedRequestCopy(raw.byteLength);
   let releaseDecoded: (() => void) | undefined;
   let releaseText: (() => void) | undefined;
   try {
     const decoded = decodeRequestBody(raw, encoding, maxBytes);
+    recordRequestBodyFacts(req, raw.byteLength, encoding, decoded.byteLength);
     releaseDecoded = decoded === raw ? undefined : budget?.observeAcceptedRequestCopy(decoded.byteLength);
     const text = new TextDecoder().decode(decoded);
-    releaseText = budget?.observeAcceptedRequestCopy(new TextEncoder().encode(text).byteLength);
+    // Count UTF-8 without allocating another request-sized byte array for diagnostics.
+    releaseText = budget?.observeAcceptedRequestCopy(Buffer.byteLength(text, "utf8"));
     if (options && "emptyBodyFallback" in options && text.trim() === "") {
+      updateInboundBodyReservation(req, Math.max(raw.byteLength, decoded.byteLength));
       return options.emptyBodyFallback;
     }
     const parsed = JSON.parse(text);
-    budget?.observeAcceptedRequestCopy(new TextEncoder().encode(JSON.stringify(parsed)).byteLength);
+    // Keep the serialized-size contract: normalization can expand numeric literals. The
+    // measurement walks iteratively, so a deeply nested valid body cannot overflow the stack.
+    const parsedBytes = serializedJsonByteLength(parsed);
+    budget?.observeAcceptedRequestCopy(parsedBytes);
+    updateInboundBodyReservation(req, Math.max(raw.byteLength, decoded.byteLength, parsedBytes));
     return parsed;
   } finally {
     releaseText?.();
@@ -233,7 +382,44 @@ export async function readBoundedJsonRequestBody(
   }
 }
 
-/** Parse a JSON data-plane body using the shared 256 MiB admission cap. */
-export function readJsonRequestBody(req: Request, budget?: TranslatorBudget): Promise<unknown> {
-  return readBoundedJsonRequestBody(req, MAX_DECOMPRESSED_BODY_BYTES, budget);
+/**
+ * Parse a JSON data-plane body using the shared admission cap.
+ *
+ * `maxBytes` is the resolved per-deployment limit from `resolveInboundBodyLimitBytes()`;
+ * omitting it keeps the 256 MiB default for callers with no config in scope.
+ */
+export function readJsonRequestBody(
+  req: Request,
+  budget?: TranslatorBudget,
+  maxBytes: number = MAX_DECOMPRESSED_BODY_BYTES,
+): Promise<unknown> {
+  return readBoundedJsonRequestBody(req, maxBytes, budget);
+}
+
+/**
+ * Admit a body the caller already parsed (a Remote Link WebSocket create, #8600) as if it had been read: its serialized
+ * size is held to the same limit and observed by the same budget as the parse at the end of the bounded reader.
+ */
+export function admitParsedJsonRequestBody(body: unknown, maxBytes: number, budget?: TranslatorBudget): unknown {
+  const parsedBytes = serializedJsonByteLength(body);
+  if (parsedBytes > maxBytes) throw new DecompressedBodyTooLargeError(parsedBytes, maxBytes, "decoded_exact");
+  budget?.observeAcceptedRequestCopy(parsedBytes);
+  return body;
+}
+
+/**
+ * A parsed body bound to the one Request it stands for (#8600). It goes with that request alone: a request the pipeline
+ * builds for a combo child, a recovery or a retry is another Request and reads its own body. Taken once, like a body.
+ */
+const parsedBodies = new WeakMap<Request, unknown>();
+
+export function attachParsedRequestBody(req: Request, body: unknown): void {
+  parsedBodies.set(req, body);
+}
+
+export function takeParsedRequestBody(req: Request): { body: unknown } | undefined {
+  if (!parsedBodies.has(req)) return undefined;
+  const body = parsedBodies.get(req);
+  parsedBodies.delete(req);
+  return { body };
 }

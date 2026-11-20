@@ -1,4 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { saveConfig } from "../../src/config";
+import { startServer } from "../../src/server";
+import type { OcxConfig } from "../../src/types";
+import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
+import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   anthropicErrorBody,
   anthropicErrorType,
@@ -8,19 +16,19 @@ import {
   responsesSseToAnthropicSse as responsesSseToAnthropicSseProduction,
   sanitizeWebSearchInput,
 } from "../../src/claude/outbound";
+import { createTestTranslatorBudget } from "../helpers/translator-budget";
 import {
   TRANSLATOR_MAX_CALL_ARGUMENT_BYTES,
   type TranslatorBudget,
 } from "../../src/lib/translator-budget";
-import { encodeReasoningEnvelope } from "../../src/responses/reasoning-envelope";
-import { createTestTranslatorBudget } from "../helpers/translator-budget";
+import { decodeReasoningEnvelope, encodeReasoningEnvelope } from "../../src/responses/reasoning-envelope";
 
 const streamBudgets = new WeakMap<ReadableStream<Uint8Array>, TranslatorBudget>();
 
 function responsesSseToAnthropicSse(
   upstream: ReadableStream<Uint8Array>,
   model: string,
-  opts: { pingIntervalMs?: number; translatorBudget?: TranslatorBudget } = {},
+  opts: { pingIntervalMs?: number; translatorBudget?: TranslatorBudget; inputTokenFloor?: number } = {},
 ): ReadableStream<Uint8Array> {
   const translatorBudget = opts.translatorBudget ?? createTestTranslatorBudget();
   const stream = responsesSseToAnthropicSseProduction(upstream, model, {
@@ -197,6 +205,184 @@ describe("claude outbound SSE", () => {
     expect(unspacedBudget.snapshot().currentBytes).toBe(spacedBudget.snapshot().currentBytes);
   });
 
+  test("done-only function arguments reach Claude tool input", async () => {
+    const upstream = [
+      sse("response.created", { response: { id: "resp_done", status: "in_progress" } }),
+      sse("response.output_item.added", { output_index: 0, item: { type: "function_call", id: "fc_done", call_id: "toolu_done", name: "Bash", arguments: "", status: "in_progress" } }),
+      sse("response.function_call_arguments.done", { item_id: "fc_done", output_index: 0, arguments: "{\"command\":\"printf RHODIZ_TOOL_OK\"}" }),
+      sse("response.output_item.done", { output_index: 0, item: { type: "function_call", id: "fc_done", call_id: "toolu_done", name: "Bash", arguments: "{\"command\":\"printf RHODIZ_TOOL_OK\"}" } }),
+      sse("response.completed", { response: { status: "completed", usage: { input_tokens: 10, output_tokens: 5 } } }),
+    ].join("");
+    const events = await collectEvents(responsesSseToAnthropicSse(streamFrom(upstream), "claude-ocx-test"));
+    const argDeltas = events.filter(e => e.name === "content_block_delta" && e.data.delta?.type === "input_json_delta");
+    expect(argDeltas).toHaveLength(1);
+    expect(argDeltas[0].data.delta.partial_json).toBe("{\"command\":\"printf RHODIZ_TOOL_OK\"}");
+    expect(events.find(e => e.name === "content_block_start")?.data.content_block).toMatchObject({ type: "tool_use", name: "Bash", input: {} });
+  });
+
+  test("message_start uses confirmed pre-content usage without changing cumulative terminal usage", async () => {
+    const earlyUsage = {
+      input_tokens: 120,
+      output_tokens: 0,
+      input_tokens_details: { cached_tokens: 100, cache_write_tokens: 5 },
+    };
+    const terminalUsage = { ...earlyUsage, output_tokens: 30 };
+    const upstream = [
+      sse("response.created", { response: { id: "resp_early_usage", status: "in_progress", usage: null } }),
+      sse("response.in_progress", { response: { id: "resp_early_usage", status: "in_progress", usage: earlyUsage } }),
+      sse("response.output_text.delta", { delta: "ready" }),
+      sse("response.completed", { response: { status: "completed", usage: terminalUsage } }),
+    ].join("");
+
+    const events = await collectEvents(responsesSseToAnthropicSse(streamFrom(upstream), "claude-ocx-test"));
+    expect(events.find(event => event.name === "message_start")!.data.message.usage).toEqual({
+      input_tokens: 15,
+      output_tokens: 0,
+      cache_read_input_tokens: 100,
+      cache_creation_input_tokens: 5,
+    });
+   expect(events.find(event => event.name === "message_delta")!.data.usage).toEqual({
+     input_tokens: 15,
+     output_tokens: 30,
+     cache_read_input_tokens: 100,
+     cache_creation_input_tokens: 5,
+   });
+ });
+
+  test("a caller-counted prompt reaches message_start when the upstream reports none early", async () => {
+    // The path this report came from: the internal bridge attaches usage: null to its lifecycle
+    // frames, so #4891 has nothing to publish and the first frame used to claim an empty prompt.
+    const upstream = [
+      sse("response.created", { response: { id: "resp_floor", status: "in_progress", usage: null } }),
+      sse("response.in_progress", { response: { id: "resp_floor", status: "in_progress", usage: null } }),
+      sse("response.output_text.delta", { delta: "ready" }),
+      sse("response.completed", {
+        response: {
+          status: "completed",
+          usage: {
+            input_tokens: 120,
+            output_tokens: 30,
+            input_tokens_details: { cached_tokens: 100, cache_write_tokens: 5 },
+          },
+        },
+      }),
+    ].join("");
+
+    const events = await collectEvents(responsesSseToAnthropicSse(
+      streamFrom(upstream),
+      "claude-ocx-test",
+      { inputTokenFloor: 97_000 },
+    ));
+    expect(events.find(event => event.name === "message_start")!.data.message.usage).toEqual({
+      input_tokens: 97_000,
+      output_tokens: 0,
+    });
+    // The floor is a first-frame courtesy, never a claim about the upstream tokenizer: the
+    // terminal frame is still the authoritative count and is untouched by it.
+    expect(events.find(event => event.name === "message_delta")!.data.usage).toEqual({
+      input_tokens: 15,
+      output_tokens: 30,
+      cache_read_input_tokens: 100,
+      cache_creation_input_tokens: 5,
+    });
+  });
+
+  test("confirmed early usage outranks the caller floor", async () => {
+    // An upstream measurement beats the proxy counting its own outbound prompt, always. The
+    // floor exists for the destinations that report nothing before content, not beside them.
+    const earlyUsage = {
+      input_tokens: 120,
+      output_tokens: 0,
+      input_tokens_details: { cached_tokens: 100, cache_write_tokens: 5 },
+    };
+    const upstream = [
+      sse("response.in_progress", { response: { id: "resp_both", status: "in_progress", usage: earlyUsage } }),
+      sse("response.output_text.delta", { delta: "ready" }),
+      sse("response.completed", { response: { status: "completed", usage: { ...earlyUsage, output_tokens: 30 } } }),
+    ].join("");
+
+    const events = await collectEvents(responsesSseToAnthropicSse(
+      streamFrom(upstream),
+      "claude-ocx-test",
+      { inputTokenFloor: 97_000 },
+    ));
+    expect(events.find(event => event.name === "message_start")!.data.message.usage).toEqual({
+      input_tokens: 15,
+      output_tokens: 0,
+      cache_read_input_tokens: 100,
+      cache_creation_input_tokens: 5,
+    });
+  });
+
+  test("a floor that measures nothing is not published", async () => {
+    // Zero and negative are not measurements of a prompt, and a fractional token is not a token.
+    // A caller that cannot count must not be able to turn that into a number on the wire.
+    const upstream = [
+      sse("response.created", { response: { id: "resp_no_floor", status: "in_progress", usage: null } }),
+      sse("response.output_text.delta", { delta: "ready" }),
+      sse("response.completed", { response: { status: "completed", usage: { input_tokens: 5, output_tokens: 1 } } }),
+    ].join("");
+
+    for (const inputTokenFloor of [0, -1, Number.NaN]) {
+      const events = await collectEvents(responsesSseToAnthropicSse(
+        streamFrom(upstream),
+        "claude-ocx-test",
+        { inputTokenFloor },
+      ));
+      expect({ inputTokenFloor, usage: events.find(event => event.name === "message_start")!.data.message.usage })
+        .toEqual({ inputTokenFloor, usage: { input_tokens: 0, output_tokens: 0 } });
+    }
+
+    const fractional = await collectEvents(responsesSseToAnthropicSse(
+      streamFrom(upstream),
+      "claude-ocx-test",
+      { inputTokenFloor: 12.7 },
+    ));
+    expect(fractional.find(event => event.name === "message_start")!.data.message.usage)
+      .toEqual({ input_tokens: 12, output_tokens: 0 });
+  });
+
+
+  test("message_start reports zero only when the caller supplies no measurement either", async () => {
+    const upstream = [
+      sse("response.created", { response: { id: "resp_terminal_usage", status: "in_progress", usage: null } }),
+      sse("response.output_text.delta", { delta: "ready" }),
+      sse("response.completed", {
+        response: {
+          status: "completed",
+          usage: {
+            input_tokens: 120,
+            output_tokens: 30,
+            input_tokens_details: { cached_tokens: 100, cache_write_tokens: 5 },
+          },
+        },
+      }),
+    ].join("");
+
+    const events = await collectEvents(responsesSseToAnthropicSse(streamFrom(upstream), "claude-ocx-test"));
+    // No caller floor and no early upstream usage: there is nothing to report, and the
+    // Anthropic schema makes the field required, so zero is what goes out. This is the case the
+    // Lab conformance executor exercises, and it is unchanged.
+    //
+    // This case used to read "zero is the documented honest placeholder ... do not replace it
+    // with an estimate", and the position narrowed rather than reversed. Zero is not honest
+    // about a prompt that exists: it asserts an empty one, which is what showed a Paseo context
+    // ring at a few hundred tokens for a turn whose own context command reported ~97k (#4857).
+    // When the caller HAS counted the prompt it forwarded, publishing that count beats
+    // publishing a false one -- see the three floor cases in this file. What survives from the
+    // old position is its second half: the first content frame is never delayed to await usage.
+    expect(events.find(event => event.name === "message_start")!.data.message.usage).toEqual({
+      input_tokens: 0,
+      output_tokens: 0,
+    });
+    expect(events.find(event => event.name === "message_delta")!.data.usage).toEqual({
+      input_tokens: 15,
+      output_tokens: 30,
+      cache_read_input_tokens: 100,
+      cache_creation_input_tokens: 5,
+    });
+  });
+
   test("text + thinking + tool call + completed w/ usage -> exact Anthropic sequence", async () => {
     const upstream = [
       sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
@@ -255,6 +441,21 @@ describe("claude outbound SSE", () => {
     expect(startIndexes).toEqual([0, 1, 2]);
   });
 
+  test("done-only function-call arguments reach Claude tool input", async () => {
+    const args = JSON.stringify({ command: "printf RHODIZ_TOOL_OK" });
+    const upstream = [
+      sse("response.created", { response: { id: "resp_done_args", status: "in_progress" } }),
+      sse("response.output_item.added", { output_index: 0, item: { type: "function_call", id: "fc_done", call_id: "toolu_done", name: "Bash", arguments: "", status: "in_progress" } }),
+      sse("response.function_call_arguments.done", { item_id: "fc_done", output_index: 0, arguments: args }),
+      sse("response.output_item.done", { output_index: 0, item: { type: "function_call", id: "fc_done", call_id: "toolu_done", name: "Bash", arguments: args, status: "completed" } }),
+      sse("response.completed", { response: { status: "completed", usage: { input_tokens: 1, output_tokens: 1 } } }),
+    ].join("");
+    const events = await collectEvents(responsesSseToAnthropicSse(streamFrom(upstream), "claude-ocx-test"));
+    const deltas = events.filter(e => e.name === "content_block_delta" && e.data.delta?.type === "input_json_delta");
+    expect(deltas).toHaveLength(1);
+    expect(deltas[0].data.delta.partial_json).toBe(args);
+  });
+
   test("multi-part reasoning summaries keep the JSON path's part separator", async () => {
     const upstream = [
       sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
@@ -275,6 +476,8 @@ describe("claude outbound SSE", () => {
       "**A**\n\nOne.\n\n**B**\n\nTwo.",
       "Three.",
     ]);
+    expect(decodeReasoningEnvelope(thinkingBlocks[0].signature)?.txt)
+      .toBe("**A**\n\nOne.\n\n**B**\n\nTwo.");
 
     // Parity: the non-streaming translator joins the same summary parts identically.
     const json = responsesJsonToAnthropicMessage({
@@ -286,6 +489,152 @@ describe("claude outbound SSE", () => {
     const jsonThinking = json.content.find((b: Record<string, unknown>) => b.type === "thinking");
     expect(jsonThinking.thinking).toBe("**A**\n\nOne.\n\n**B**\n\nTwo.");
   });
+
+  test("reasoning fallback buffering is bounded and releases its retained budget", async () => {
+    const budget = createTestTranslatorBudget({ maxTurnBytes: 8 * 1024 });
+    let reasoningCommitted = 0;
+    let reasoningReleased = 0;
+    const trackedBudget: TranslatorBudget = {
+      openCall: id => budget.openCall(id),
+      closeCall: id => budget.closeCall(id),
+      reserveTransient(bytes, scope) {
+        const reservation = budget.reserveTransient(bytes, scope);
+        return {
+          commitRetained() {
+            reservation.commitRetained();
+            if (scope.kind === "reasoning") reasoningCommitted += bytes;
+          },
+          release: () => reservation.release(),
+        };
+      },
+      chargeRetained(bytes, scope) {
+        budget.chargeRetained(bytes, scope);
+        if (scope.kind === "reasoning") reasoningCommitted += bytes;
+      },
+      releaseRetained(bytes, scope) {
+        budget.releaseRetained(bytes, scope);
+        if (scope.kind === "reasoning") reasoningReleased += bytes;
+      },
+      observeAcceptedRequestCopy: bytes => budget.observeAcceptedRequestCopy(bytes),
+      observeExternallyCapped: (kind, bytes) => budget.observeExternallyCapped(kind, bytes),
+      snapshot: () => budget.snapshot(),
+      dispose: () => budget.dispose(),
+    };
+    const frames = [
+      sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+      ...Array.from({ length: 32 }, (_, index) => sse("response.reasoning_text.delta", {
+        item_id: "rs_1",
+        content_index: 0,
+        delta: `${index}:` + "x".repeat(512),
+      })),
+    ];
+    const events = await collectEvents(responsesSseToAnthropicSse(
+      streamFromChunks(frames),
+      "m",
+      { translatorBudget: trackedBudget },
+    ));
+
+    expect(events.at(-1)).toMatchObject({
+      name: "error",
+      data: { error: { type: "request_too_large", code: "translation_buffer_limit" } },
+    });
+    expect(budget.snapshot().overflows).toBe(1);
+    expect(reasoningCommitted).toBeGreaterThan(0);
+    expect(reasoningReleased).toBe(reasoningCommitted);
+  });
+
+  for (const terminal of ["eof", "failed", "completed", "incomplete"] as const) {
+    for (const buffered of [false, true]) {
+      test(`closure-only reasoning overflow: ${terminal}, ${buffered ? "collector" : "stream"}`, async () => {
+        // All small deltas fit, including replacement reservations. Closing needs
+        // the retained 32 KiB text PLUS its base64 signature frame. Capture the
+        // generated stream before collection: concurrent collector retention can
+        // exceed a shared budget during ingestion instead of exercising closure.
+        // Collection below reuses this SAME budget, without resetting it.
+        const budget = createTestTranslatorBudget({ maxTurnBytes: 70 * 1024 });
+        let reasoningBytes = 0;
+        let maxReasoningBytes = 0;
+        let reasoningBytesAtOverflow = -1;
+        const trackedBudget: TranslatorBudget = {
+          openCall: id => budget.openCall(id),
+          closeCall: id => budget.closeCall(id),
+          reserveTransient(bytes, scope) {
+            let reservation: ReturnType<TranslatorBudget["reserveTransient"]>;
+            try { reservation = budget.reserveTransient(bytes, scope); }
+            catch (error) { reasoningBytesAtOverflow = reasoningBytes; throw error; }
+            return {
+              commitRetained() {
+                reservation.commitRetained();
+                if (scope.kind === "reasoning") {
+                  reasoningBytes += bytes;
+                  maxReasoningBytes = Math.max(maxReasoningBytes, reasoningBytes);
+                }
+              },
+              release: () => reservation.release(),
+            };
+          },
+          chargeRetained: (bytes, scope) => budget.chargeRetained(bytes, scope),
+          releaseRetained(bytes, scope) {
+            if (scope.kind === "reasoning") reasoningBytes -= bytes;
+            budget.releaseRetained(bytes, scope);
+          },
+          observeAcceptedRequestCopy: bytes => budget.observeAcceptedRequestCopy(bytes),
+          observeExternallyCapped: (kind, bytes) => budget.observeExternallyCapped(kind, bytes),
+          snapshot: () => budget.snapshot(),
+          dispose: () => budget.dispose(),
+        };
+        const text = "x".repeat(32 * 1024);
+        const frames = Array.from({ length: 128 }, () => sse("response.reasoning_text.delta", {
+          item_id: "rs_closure", content_index: 0, delta: text.slice(0, 256),
+        }));
+        if (terminal !== "eof") {
+          frames.push(sse(`response.${terminal}`, { response: terminal === "failed"
+            ? { error: { message: "upstream failure", status: 502 } }
+            : terminal === "incomplete"
+              ? { status: "incomplete", incomplete_details: { reason: "max_output_tokens" }, usage: {} }
+              : { status: "completed", usage: {} } }));
+          // Neither a repeated completion nor a later failure may add a terminal.
+          frames.push(sse("response.completed", { response: { status: "completed", usage: {} } }));
+          frames.push(sse("response.failed", { response: { error: { message: "late failure" } } }));
+        }
+        const stream = responsesSseToAnthropicSse(streamFromChunks(frames), "m", {
+          translatorBudget: trackedBudget, pingIntervalMs: 0,
+        });
+        const captured = buffered ? await new Response(stream).text() : undefined;
+        const capturedFrames = captured?.split("\n\n").filter(Boolean).map(frame => `${frame}\n\n`);
+        const events = await collectEvents(capturedFrames ? streamFromChunks(capturedFrames) : stream);
+        const deltas = events.filter(event => event.data.delta?.type === "thinking_delta");
+        expect(deltas.map(event => event.data.delta.thinking).join("")).toBe(text);
+        expect(events.filter(event => event.name === "error")).toHaveLength(1);
+        expect(events.at(-1)).toMatchObject({ name: "error", data: { type: "error", error: {
+          type: "request_too_large", code: "translation_buffer_limit",
+        } } });
+        expect(JSON.stringify(events.at(-1)).length).toBeLessThan(1024);
+        expect(events.some(event => event.name === "message_stop" || event.name === "message_delta" || event.name === "content_block_stop")).toBe(false);
+        expect(events.some(event => event.data.delta?.type === "signature_delta")).toBe(false);
+        if (capturedFrames) {
+          expect(capturedFrames.join("")).toBe(captured);
+          expect(reasoningBytesAtOverflow).toBe(text.length);
+          expect(reasoningBytes).toBe(0);
+          expect(budget.snapshot().overflows).toBe(1);
+          // Feed the actual generated frames, without inventing an error event or
+          // collecting one huge chunk that introduces a different buffer limit.
+          const message = await collectAnthropicMessage(streamFromChunks(capturedFrames), "m", trackedBudget);
+          expect(message).toMatchObject({ type: "error", error: {
+            type: "request_too_large", code: "translation_buffer_limit",
+          } });
+          expect(message).not.toHaveProperty("content");
+          expect(message).not.toHaveProperty("stop_reason");
+        }
+        // These prove failure happened after all text was retained, not while
+        // ingesting a delta, and the error path released the thinking reservation.
+        expect(reasoningBytesAtOverflow).toBe(text.length);
+        expect(maxReasoningBytes).toBeGreaterThanOrEqual(text.length);
+        expect(reasoningBytes).toBe(0);
+        expect(budget.snapshot().overflows).toBe(1);
+      });
+    }
+  }
 
   test("same-part deltas and index-free reasoning frames never get a separator", async () => {
     const samePart = [
@@ -335,8 +684,8 @@ describe("claude outbound SSE", () => {
       responsesSseToAnthropicSse(streamFromChunks([upstream]), "m"),
       "m",
     ) as Record<string, any>;
-    expect(msg.content.find((b: Record<string, unknown>) => b.type === "thinking").thinking)
-      .toBe("AB\n\nC\n\nD");
+    expect(msg.content.filter((b: Record<string, unknown>) => b.type === "thinking")
+      .map((b: Record<string, unknown>) => b.thinking)).toEqual(["AB", "C\n\nD"]);
   });
 
   test("malformed array reasoning identities retain distinct boundaries", async () => {
@@ -357,8 +706,8 @@ describe("claude outbound SSE", () => {
       responsesSseToAnthropicSse(streamFromChunks([upstream]), "m"),
       "m",
     ) as Record<string, any>;
-    expect(msg.content.find((b: Record<string, unknown>) => b.type === "thinking").thinking)
-      .toBe("A\n\nB");
+    expect(msg.content.filter((b: Record<string, unknown>) => b.type === "thinking")
+      .map((b: Record<string, unknown>) => b.thinking)).toEqual(["A", "B"]);
   });
 
   test("data-only Responses frames infer event names from payload types", async () => {
@@ -478,7 +827,7 @@ describe("claude outbound SSE", () => {
     const names = events.map(e => e.name);
     // open text block is closed before the error event
     expect(names).toEqual(["message_start", "ping", "content_block_start", "content_block_delta", "content_block_stop", "error"]);
-    expect(events.at(-1)!.data).toEqual({ type: "error", error: { type: "rate_limit_error", message: "rate limited" } });
+    expect(events.at(-1)!.data).toEqual({ type: "error", error: { type: "rate_limit_error", message: "The provider rate limit was reached; retry later." } });
   });
 
   test("incomplete(max_output_tokens) -> max_tokens; EOF w/o terminal fails closed", async () => {
@@ -508,7 +857,7 @@ describe("claude outbound SSE", () => {
       sse("response.failed", { response: { status: "failed", error: { status: 502, message: "bad gateway" } } }),
     ].join("");
     const events = await collectEvents(responsesSseToAnthropicSse(streamFrom(upstream), "m"));
-    expect(events.at(-1)!.data).toEqual({ type: "error", error: { type: "overloaded_error", message: "bad gateway" } });
+    expect(events.at(-1)!.data).toEqual({ type: "error", error: { type: "overloaded_error", message: "The provider failed to complete the request." } });
   });
 
   test("pre-output heartbeat stays transport-only before an initial error", async () => {
@@ -520,7 +869,7 @@ describe("claude outbound SSE", () => {
     const events = await collectEvents(responsesSseToAnthropicSse(streamFrom(upstream), "m", { pingIntervalMs: 0 }));
     expect(events.map(event => event.name)).toEqual(["ping", "error"]);
     expect(events.some(event => event.name === "message_start")).toBe(false);
-    expect(events.at(-1)!.data).toEqual({ type: "error", error: { type: "overloaded_error", message: "bad gateway" } });
+    expect(events.at(-1)!.data).toEqual({ type: "error", error: { type: "overloaded_error", message: "The provider failed to complete the request." } });
   });
 
   test("failed with NO status (relaySseWithFailedTail synthetic tail) -> default 500 -> overloaded_error", async () => {
@@ -531,7 +880,7 @@ describe("claude outbound SSE", () => {
     const events = await collectEvents(responsesSseToAnthropicSse(streamFrom(upstream), "m"));
     expect(events.at(-1)!.data).toEqual({
       type: "error",
-      error: { type: "overloaded_error", message: "Upstream stream terminated unexpectedly" },
+      error: { type: "overloaded_error", message: "The provider failed to complete the request." },
     });
   });
 
@@ -553,7 +902,7 @@ describe("claude outbound SSE", () => {
     const events = await collectEvents(responsesSseToAnthropicSse(streamFrom(upstream), "m"));
     expect(events.at(-1)!.data).toEqual({
       type: "error",
-      error: { type: "rate_limit_error", message: "Cursor rate limit exceeded: quota exhausted" },
+      error: { type: "rate_limit_error", message: "The provider rate limit was reached; retry later." },
     });
   });
 
@@ -570,7 +919,7 @@ describe("claude outbound SSE", () => {
     const events = await collectEvents(responsesSseToAnthropicSse(streamFrom(upstream), "m"));
     expect(events.at(-1)!.data).toEqual({
       type: "error",
-      error: { type: "authentication_error", message: "Cursor authentication failed: expired token" },
+      error: { type: "authentication_error", message: "The provider rejected the configured credentials." },
     });
   });
 
@@ -587,7 +936,7 @@ describe("claude outbound SSE", () => {
     const events = await collectEvents(responsesSseToAnthropicSse(streamFrom(upstream), "m"));
     expect(events.at(-1)!.data).toEqual({
       type: "error",
-      error: { type: "invalid_request_error", message: "Cursor context limit exceeded" },
+      error: { type: "invalid_request_error", message: "prompt is too long: The request exceeds the model's context window.", code: "context_length_exceeded" },
     });
   });
 
@@ -604,7 +953,7 @@ describe("claude outbound SSE", () => {
     const events = await collectEvents(responsesSseToAnthropicSse(streamFrom(upstream), "m"));
     expect(events.at(-1)!.data).toEqual({
       type: "error",
-      error: { type: "overloaded_error", message: "Cursor server overloaded: unavailable" },
+      error: { type: "overloaded_error", message: "The provider is temporarily unavailable; retry later." },
     });
   });
 
@@ -635,7 +984,7 @@ describe("claude outbound SSE", () => {
       type: "error",
       error: {
         type: "overloaded_error",
-        message: "upstream stream produced malformed tool call arguments",
+        message: "The provider failed to complete the request.",
       },
     });
   });
@@ -650,7 +999,7 @@ describe("claude outbound SSE", () => {
       },
     });
     const events = await collectEvents(responsesSseToAnthropicSse(boom, "m"));
-    expect(events.at(-1)!.data).toMatchObject({ type: "error", error: { type: "api_error", message: "proxy-internal read failure" } });
+    expect(events.at(-1)!.data).toMatchObject({ type: "error", error: { type: "api_error", message: "The proxy could not reach or read the provider." } });
   });
 
   test("incomplete(content_filter) -> refusal stop_reason", async () => {
@@ -687,7 +1036,7 @@ describe("claude outbound SSE", () => {
         type: "error",
         error: {
           type: "overloaded_error",
-          message: "Kiro produced no final answer on its bounded completion retry",
+          message: "The provider stream ended before the request completed.",
         },
       },
     });
@@ -701,7 +1050,7 @@ describe("claude outbound SSE", () => {
       type: "error",
       error: {
         type: "overloaded_error",
-        message: "upstream response was incomplete (reasoning_only_kiro_fallback)",
+        message: "The provider stream ended before the request completed.",
       },
     });
   });
@@ -787,149 +1136,6 @@ describe("claude outbound SSE", () => {
     expect(snapshot.highWaterBytes).toBeLessThan(2 * 1024);
   });
 
-  test("canonical Anthropic metadata restores signed and redacted thinking plus pause_turn", async () => {
-    const signature = "original-anthropic-signature";
-    const upstream = [
-      sse("response.output_item.added", {
-        output_index: 0,
-        item: { type: "reasoning", id: "rs_1", summary: [] },
-      }),
-      sse("response.reasoning_summary_text.delta", {
-        item_id: "rs_1", output_index: 0, summary_index: 0, delta: "private thought",
-      }),
-      sse("response.output_item.done", {
-        output_index: 0,
-        item: {
-          type: "reasoning", id: "rs_1",
-          summary: [{ type: "summary_text", text: "private thought" }],
-          encrypted_content: encodeReasoningEnvelope({ sig: signature }),
-        },
-      }),
-      sse("response.output_item.done", {
-        output_index: 1,
-        item: {
-          type: "reasoning", id: "rs_2", summary: [],
-          encrypted_content: encodeReasoningEnvelope({ red: ["opaque-redacted"] }),
-        },
-      }),
-      sse("response.incomplete", {
-        response: {
-          status: "incomplete",
-          incomplete_details: { reason: "max_output_tokens" },
-          _ocx_anthropic_stop_reason: "pause_turn",
-          _ocx_anthropic_stop_sequence: null,
-          usage: {
-            input_tokens: 12,
-            output_tokens: 3,
-            anthropic_server_tool_use: { web_fetch_requests: 1 },
-          },
-        },
-      }),
-    ].join("");
-
-    const message = await collectAnthropicMessage(
-      responsesSseToAnthropicSse(streamFrom(upstream), "m"),
-      "m",
-    ) as Record<string, any>;
-    expect(message.content).toEqual([
-      { type: "thinking", thinking: "private thought", signature },
-      { type: "redacted_thinking", data: "opaque-redacted" },
-    ]);
-    expect(message.stop_reason).toBe("pause_turn");
-    expect(message.stop_sequence).toBeNull();
-    expect(message.usage.server_tool_use).toEqual({ web_fetch_requests: 1 });
-  });
-
-  test("canonical Anthropic metadata restores raw server blocks and stop_sequence", async () => {
-    const serverTool = {
-      type: "server_tool_use",
-      id: "srvtoolu_1",
-      name: "web_fetch",
-      input: { url: "https://example.test" },
-    };
-    const serverResult = {
-      type: "web_fetch_tool_result",
-      tool_use_id: "srvtoolu_1",
-      content: { type: "web_fetch_result", url: "https://example.test", content: "body" },
-    };
-    const upstream = [
-      sse("response.output_item.done", {
-        output_index: 0,
-        item: { type: "anthropic_server_block", id: "asb_1", block: serverTool },
-      }),
-      sse("response.output_item.done", {
-        output_index: 1,
-        item: { type: "anthropic_server_block", id: "asb_2", block: serverResult },
-      }),
-      sse("response.completed", {
-        response: {
-          status: "completed",
-          _ocx_anthropic_stop_reason: "stop_sequence",
-          _ocx_anthropic_stop_sequence: "DONE",
-        },
-      }),
-    ].join("");
-
-    const message = await collectAnthropicMessage(
-      responsesSseToAnthropicSse(streamFrom(upstream), "m"),
-      "m",
-    ) as Record<string, any>;
-    expect(message.content).toEqual([serverTool, serverResult]);
-    expect(message.stop_reason).toBe("stop_sequence");
-    expect(message.stop_sequence).toBe("DONE");
-  });
-
-  test("canonical Anthropic metadata restores citations in stream and collected message", async () => {
-    const citations = [
-      {
-        type: "web_search_result_location",
-        cited_text: "first source",
-        encrypted_index: "opaque-index",
-        title: "Example",
-        url: "https://example.test/one",
-      },
-      {
-        type: "char_location",
-        cited_text: "second source",
-        document_index: 0,
-        document_title: "Document",
-        start_char_index: 4,
-        end_char_index: 17,
-      },
-    ];
-    const upstream = () => streamFrom([
-      sse("response.output_text.delta", { delta: "Cited " }),
-      sse("response.anthropic_citation.delta", {
-        delta: { type: "citations_delta", citation: citations[0] },
-      }),
-      sse("response.output_text.delta", { delta: "answer" }),
-      sse("response.anthropic_citation.delta", {
-        delta: { type: "citations_delta", citation: citations[1] },
-      }),
-      sse("response.completed", { response: { status: "completed" } }),
-    ].join(""));
-
-    const events = await collectEvents(responsesSseToAnthropicSse(upstream(), "m"));
-    expect(events
-      .filter(event => event.name === "content_block_delta")
-      .map(event => event.data.delta)).toEqual([
-      { type: "text_delta", text: "Cited " },
-      { type: "citations_delta", citation: citations[0] },
-      { type: "text_delta", text: "answer" },
-      { type: "citations_delta", citation: citations[1] },
-    ]);
-
-    const message = await collectAnthropicMessage(
-      responsesSseToAnthropicSse(upstream(), "m"),
-      "m",
-    ) as Record<string, any>;
-    expect(message.content).toEqual([{
-      type: "text",
-      text: "Cited answer",
-      citations,
-    }]);
-  });
-
   test("no-output completed still emits a valid empty message", async () => {
     const upstream = sse("response.created", { response: {} }) + sse("response.completed", { response: { status: "completed" } });
     const events = await collectEvents(responsesSseToAnthropicSse(streamFrom(upstream), "m"));
@@ -958,101 +1164,6 @@ describe("claude outbound non-stream + helpers", () => {
     expect(msg.usage).toEqual({ input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 });
   });
 
-  test("Responses JSON restores canonical Anthropic private metadata without reconstruction", () => {
-    const signature = "original-signature";
-    const rawTool = {
-      type: "server_tool_use", id: "srvtoolu_1", name: "web_search",
-      input: { queries: ["first", "second"] },
-    };
-    const rawResult = {
-      type: "web_search_tool_result", tool_use_id: "srvtoolu_1",
-      content: [{ type: "web_search_result", url: "https://example.test", title: "Example", encrypted_content: "opaque" }],
-    };
-    const futureBlock = { type: "future_server_tool_result", id: "future_1", payload: { keep: true } };
-    const message = responsesJsonToAnthropicMessage({
-      status: "completed",
-      output: [
-        {
-          type: "reasoning", id: "rs_1",
-          summary: [{ type: "summary_text", text: "thought" }],
-          encrypted_content: encodeReasoningEnvelope({ sig: signature }),
-        },
-        {
-          type: "reasoning", id: "rs_2", summary: [],
-          encrypted_content: encodeReasoningEnvelope({ red: ["redacted"] }),
-        },
-        {
-          type: "web_search_call", status: "completed",
-          _ocx_anthropic_server_tool: rawTool,
-          _ocx_anthropic_server_tool_result: rawResult,
-        },
-        { type: "anthropic_server_block", block: futureBlock },
-      ],
-      _ocx_anthropic_stop_reason: "stop_sequence",
-      _ocx_anthropic_stop_sequence: "END",
-      usage: {
-        input_tokens: 10,
-        output_tokens: 2,
-        anthropic_server_tool_use: { web_search_requests: 7, code_execution_requests: 2 },
-      },
-    }, "m") as Record<string, any>;
-
-    expect(message.content).toEqual([
-      { type: "thinking", thinking: "thought", signature },
-      { type: "redacted_thinking", data: "redacted" },
-      rawTool,
-      rawResult,
-      futureBlock,
-    ]);
-    expect(message.stop_reason).toBe("stop_sequence");
-    expect(message.stop_sequence).toBe("END");
-    expect(message.usage.server_tool_use).toEqual({
-      web_search_requests: 7,
-      code_execution_requests: 2,
-    });
-  });
-
-  test("Responses JSON restores canonical Anthropic citations", () => {
-    const citations = [
-      {
-        type: "web_search_result_location",
-        cited_text: "source",
-        encrypted_index: "opaque",
-        title: "Example",
-        url: "https://example.test",
-      },
-      {
-        type: "page_location",
-        cited_text: "document",
-        document_index: 1,
-        document_title: "PDF",
-        start_page_number: 2,
-        end_page_number: 3,
-      },
-    ];
-    const message = responsesJsonToAnthropicMessage({
-      status: "completed",
-      output: [{
-        type: "message",
-        content: [{
-          type: "output_text",
-          text: "Cited answer",
-          _ocx_anthropic_citation_deltas: [
-            { type: "citations_delta", citation: citations[0] },
-            { type: "ignored", citation: { must_not_leak: true } },
-            { type: "citations_delta", citation: citations[1] },
-          ],
-        }],
-      }],
-    }, "m") as Record<string, any>;
-
-    expect(message.content).toEqual([{
-      type: "text",
-      text: "Cited answer",
-      citations,
-    }]);
-  });
-
   test("error taxonomy table", () => {
     expect(anthropicErrorType(400)).toBe("invalid_request_error");
     expect(anthropicErrorType(401)).toBe("authentication_error");
@@ -1073,6 +1184,18 @@ describe("claude outbound non-stream + helpers", () => {
   test("usage mapping tolerates missing fields", () => {
     expect(anthropicUsage(undefined)).toEqual({ input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 });
     expect(anthropicUsage({ input_tokens: 7, output_tokens: 2 })).toEqual({ input_tokens: 7, output_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 });
+  });
+
+  test("a 1-hour cache write survives the Responses round trip as the cache_creation split", async () => {
+    const { responsesUsage } = await import("../../src/bridge/internal");
+    const wire = responsesUsage({
+      inputTokens: 160, outputTokens: 10, cachedInputTokens: 40, cacheReadInputTokens: 40,
+      cacheCreationInputTokens: 20, cacheCreation1hInputTokens: 15,
+    });
+    expect(anthropicUsage(wire)).toEqual({
+      input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 40, cache_creation_input_tokens: 20,
+      cache_creation: { ephemeral_5m_input_tokens: 5, ephemeral_1h_input_tokens: 15 },
+    });
   });
 });
 
@@ -1348,4 +1471,478 @@ describe("sanitizeWebSearchInput (#381)", () => {
       data: { error: { type: "request_too_large", code: "translation_buffer_limit" } },
     });
   }, 60_000);
+
+  test("redacted-only reasoning emits a standalone redacted_thinking block", async () => {
+    const events = await collectEvents(responsesSseToAnthropicSse(streamFrom([
+      sse("response.output_item.done", {
+        item: { type: "reasoning", id: "rs_red", encrypted_content: encodeReasoningEnvelope({ red: ["opaque"] }) },
+      }),
+      sse("response.completed", { response: { status: "completed", usage: {} } }),
+    ].join("")), "m"));
+    expect(events.map(event => event.name)).toEqual([
+      "message_start", "ping", "content_block_start", "content_block_stop", "message_delta", "message_stop",
+    ]);
+    expect(events[2].data.content_block).toEqual({ type: "redacted_thinking", data: "opaque" });
+  });
+
+  test("redacted reasoning closes an open text block before opening its opaque block", async () => {
+    const events = await collectEvents(responsesSseToAnthropicSse(streamFrom([
+      sse("response.output_text.delta", { delta: "text" }),
+      sse("response.output_item.done", {
+        item: { type: "reasoning", id: "rs_red", encrypted_content: encodeReasoningEnvelope({ red: ["opaque"] }) },
+      }),
+      sse("response.completed", { response: { status: "completed", usage: {} } }),
+    ].join("")), "m"));
+    expect(events.filter(event => event.name === "content_block_start" || event.name === "content_block_stop")
+      .map(event => ({ name: event.name, index: event.data.index }))).toEqual([
+      { name: "content_block_start", index: 0 },
+      { name: "content_block_stop", index: 0 },
+      { name: "content_block_start", index: 1 },
+      { name: "content_block_stop", index: 1 },
+    ]);
+  });
+
+  test("signature-only reasoning emits an empty thinking block with the genuine signature", async () => {
+    const events = await collectEvents(responsesSseToAnthropicSse(streamFrom([
+      sse("response.output_item.done", {
+        item: { type: "reasoning", id: "rs_sig", encrypted_content: encodeReasoningEnvelope({ sig: "sig-only" }) },
+      }),
+      sse("response.completed", { response: { status: "completed", usage: {} } }),
+    ].join("")), "m"));
+    expect(events.map(event => event.name)).toEqual([
+      "message_start", "ping", "content_block_start", "content_block_delta", "content_block_stop",
+      "message_delta", "message_stop",
+    ]);
+    expect(events[2].data.content_block).toEqual({ type: "thinking", thinking: "", signature: "" });
+    expect(events[3].data.delta).toEqual({ type: "signature_delta", signature: "sig-only" });
+  });
+});
+
+describe("deferred Claude thinking order", () => {
+  const fixtures = [
+    {
+      name: "combined envelope with preceding multipart deltas",
+      envelope: { sig: "signed-visible", red: ["opaque-1", "opaque-2"], txt: "hidden-only" },
+      deltas: [
+        sse("response.reasoning_summary_text.delta", { item_id: "rs", summary_index: 0, delta: "Fir" }),
+        sse("response.reasoning_summary_text.delta", { item_id: "rs", summary_index: 0, delta: "st" }),
+        sse("response.reasoning_summary_text.delta", { item_id: "rs", summary_index: 1, delta: "Second" }),
+        sse("response.reasoning_text.delta", { item_id: "rs", content_index: 0, delta: "Third" }),
+      ],
+      summary: [{ text: "First" }, { text: "Second" }],
+      content: [{ text: "Third" }],
+      expected: [
+        { type: "text", text: "prefix" },
+        { type: "redacted_thinking", data: "opaque-1" },
+        { type: "redacted_thinking", data: "opaque-2" },
+        { type: "thinking", thinking: "First\n\nSecond\n\nThird", signature: "signed-visible" },
+      ],
+    },
+    {
+      name: "combined envelope without deltas keeps signed thinking empty",
+      envelope: { sig: "signed-empty", red: ["opaque-1", "opaque-2"], txt: "hidden-only" },
+      deltas: [], summary: [], content: [],
+      expected: [
+        { type: "text", text: "prefix" },
+        { type: "redacted_thinking", data: "opaque-1" },
+        { type: "redacted_thinking", data: "opaque-2" },
+        { type: "thinking", thinking: "", signature: "signed-empty" },
+      ],
+    },
+    {
+      name: "signed-only envelope",
+      envelope: { sig: "signed-only", txt: "hidden-only" },
+      deltas: [], summary: [], content: [],
+      expected: [
+        { type: "text", text: "prefix" },
+        { type: "thinking", thinking: "", signature: "signed-only" },
+      ],
+    },
+    {
+      name: "red-only envelope",
+      envelope: { red: ["opaque-1", "opaque-2"], txt: "hidden-only" },
+      deltas: [], summary: [], content: [],
+      expected: [
+        { type: "text", text: "prefix" },
+        { type: "redacted_thinking", data: "opaque-1" },
+        { type: "redacted_thinking", data: "opaque-2" },
+      ],
+    },
+  ];
+
+  for (const fixture of fixtures) {
+    test(`${fixture.name}: JSON and collected SSE match literal content`, async () => {
+      const item = {
+        type: "reasoning", id: "rs", summary: fixture.summary, content: fixture.content,
+        encrypted_content: encodeReasoningEnvelope(fixture.envelope),
+      };
+      const frames = [
+        sse("response.output_text.delta", { delta: "prefix" }),
+        ...fixture.deltas,
+        sse("response.output_item.done", { item }),
+        sse("response.completed", { response: { status: "completed" } }),
+      ];
+      const json = responsesJsonToAnthropicMessage({ status: "completed", output: [
+        { type: "message", content: [{ type: "output_text", text: "prefix" }] }, item,
+      ] }, "m");
+      const message = await collectAnthropicMessage(
+        responsesSseToAnthropicSse(streamFromChunks(frames), "m", { pingIntervalMs: 0 }), "m",
+      );
+      expect(json.content).toEqual(fixture.expected);
+      expect(message.content).toEqual(fixture.expected);
+      expect(JSON.stringify(message)).not.toContain("hidden-only");
+      expect(message.stop_reason).toBe("end_turn");
+
+      const events = await collectEvents(responsesSseToAnthropicSse(streamFromChunks(frames), "m", { pingIntervalMs: 0 }));
+      let active: number | null = null;
+      let next = 0;
+      for (const event of events) {
+        if (event.name === "content_block_start") {
+          expect(active).toBeNull();
+          expect(event.data.index).toBe(next);
+          active = next++;
+        } else if (event.name === "content_block_delta" || event.name === "content_block_stop") {
+          expect(active).not.toBeNull();
+          expect(event.data.index).toBe(active);
+          if (event.name === "content_block_stop") active = null;
+        }
+      }
+      expect(active).toBeNull();
+      expect(next).toBe(fixture.expected.length);
+      expect(events.at(-1)?.name).toBe("message_stop");
+    });
+  }
+
+  for (const [deltaId, doneId, matching] of [
+    ["a", "a", true], ["a", "b", false],
+    [undefined, undefined, true], ["a", undefined, false], [undefined, "b", false],
+  ] as const) {
+    test(`done item boundary ${String(deltaId)} -> ${String(doneId)}`, async () => {
+      const message = await collectAnthropicMessage(responsesSseToAnthropicSse(streamFromChunks([
+        sse("response.reasoning_text.delta", { item_id: deltaId, delta: "A" }),
+        sse("response.output_item.done", { item: {
+          type: "reasoning", id: doneId,
+          encrypted_content: encodeReasoningEnvelope({ sig: "done-signature", red: ["done-red"] }),
+        } }),
+        sse("response.completed", { response: { status: "completed" } }),
+      ]), "m", { pingIntervalMs: 0 }), "m");
+      expect(message.content).toEqual(matching ? [
+        { type: "redacted_thinking", data: "done-red" },
+        { type: "thinking", thinking: "A", signature: "done-signature" },
+      ] : [
+        { type: "thinking", thinking: "A", signature: "ocxr1:eyJ0eHQiOiJBIn0=" },
+        { type: "redacted_thinking", data: "done-red" },
+        { type: "thinking", thinking: "", signature: "done-signature" },
+      ]);
+    });
+  }
+
+  for (const [firstId, secondId] of [["a", "b"], ["a", undefined], [undefined, "b"]] as const) {
+    test(`delta item boundary ${String(firstId)} -> ${String(secondId)} flushes first`, async () => {
+      const message = await collectAnthropicMessage(responsesSseToAnthropicSse(streamFromChunks([
+        sse("response.reasoning_text.delta", { item_id: firstId, delta: "A" }),
+        sse("response.reasoning_text.delta", { item_id: secondId, delta: "B" }),
+        sse("response.output_item.done", { item: {
+          type: "reasoning", id: secondId,
+          encrypted_content: encodeReasoningEnvelope({ sig: "second-signature", red: ["second-red"] }),
+        } }),
+        sse("response.completed", { response: { status: "completed" } }),
+      ]), "m", { pingIntervalMs: 0 }), "m");
+      expect(message.content).toEqual([
+        { type: "thinking", thinking: "A", signature: "ocxr1:eyJ0eHQiOiJBIn0=" },
+        { type: "redacted_thinking", data: "second-red" },
+        { type: "thinking", thinking: "B", signature: "second-signature" },
+      ]);
+    });
+  }
+
+  test("separate red and signed items preserve their stream order", async () => {
+    const items = [
+      { type: "reasoning", id: "red", encrypted_content: encodeReasoningEnvelope({ red: ["first-red"] }) },
+      { type: "reasoning", id: "signed", summary: [{ text: "A" }], encrypted_content: encodeReasoningEnvelope({ sig: "sig-A" }) },
+      { type: "reasoning", id: "red-last", encrypted_content: encodeReasoningEnvelope({ red: ["last-red"] }) },
+    ];
+    const message = await collectAnthropicMessage(responsesSseToAnthropicSse(streamFromChunks([
+      sse("response.output_item.done", { item: items[0] }),
+      sse("response.reasoning_text.delta", { item_id: "signed", delta: "A" }),
+      sse("response.output_item.done", { item: items[1] }),
+      sse("response.output_item.done", { item: items[2] }),
+      sse("response.completed", { response: { status: "completed" } }),
+    ]), "m", { pingIntervalMs: 0 }), "m");
+    const expected = [
+      { type: "redacted_thinking", data: "first-red" },
+      { type: "thinking", thinking: "A", signature: "sig-A" },
+      { type: "redacted_thinking", data: "last-red" },
+    ];
+    expect(message.content).toEqual(expected);
+    expect(responsesJsonToAnthropicMessage({ output: items }, "m").content).toEqual(expected);
+  });
+
+  for (const genuineSignature of [false, true]) {
+    for (const buffered of [false, true]) {
+      test(`near-limit valid thinking: ${genuineSignature ? "genuine" : "fallback"}, ${buffered ? "shared collector" : "stream"}`, async () => {
+        // The live collector also retains the emitted content/signature, unlike
+        // the stream-only near-limit control. Both use one budget throughout.
+        // Shared encoding admission needs ~254 KiB for the 20 KiB fallback
+        // including source and queued text; genuine signatures bypass encoding.
+        const maxTurnBytes = (genuineSignature ? (buffered ? 128 : 70) : (buffered ? 320 : 280)) * 1024;
+        const budget = createTestTranslatorBudget({ maxTurnBytes });
+        const text = "x".repeat((genuineSignature ? 32 : 20) * 1024);
+        const frames = Array.from({ length: text.length / 256 }, () => sse("response.reasoning_text.delta", {
+          item_id: "rs_control", content_index: 0, delta: text.slice(0, 256),
+        }));
+        frames.push(sse("response.output_item.done", { item: {
+          type: "reasoning", id: "rs_control",
+          ...(genuineSignature ? { encrypted_content: encodeReasoningEnvelope({ sig: "control-signature", red: ["control-red"] }) } : {}),
+        } }));
+        frames.push(sse("response.completed", { response: { status: "completed" } }));
+        const stream = responsesSseToAnthropicSse(streamFromChunks(frames), "m", {
+          translatorBudget: budget, pingIntervalMs: 0,
+        });
+        if (buffered) {
+          // Collect live with the exact translator budget; no capture/reset/new budget.
+          const message = await collectAnthropicMessage(stream, "m", budget);
+          expect(message.type).toBe("message");
+          const content = message.content as Record<string, unknown>[];
+          expect(content.map(block => block.type)).toEqual(genuineSignature
+            ? ["redacted_thinking", "thinking"] : ["thinking"]);
+          const thinking = content.at(-1)!;
+          expect(thinking.thinking).toBe(text);
+          if (genuineSignature) expect(thinking.signature).toBe("control-signature");
+          else expect(decodeReasoningEnvelope(thinking.signature as string)?.txt).toBe(text);
+          expect(message.stop_reason).toBe("end_turn");
+        } else {
+          const events = await collectEvents(stream);
+          expect(events.filter(event => event.data.delta?.type === "thinking_delta")
+            .map(event => event.data.delta.thinking).join("")).toBe(text);
+          const signature = events.find(event => event.data.delta?.type === "signature_delta")?.data.delta.signature;
+          if (genuineSignature) expect(signature).toBe("control-signature");
+          else expect(decodeReasoningEnvelope(signature)?.txt).toBe(text);
+          expect(events.at(-1)?.name).toBe("message_stop");
+          expect(events.some(event => event.name === "error")).toBe(false);
+        }
+        expect(budget.snapshot().overflows).toBe(0);
+        expect(budget.snapshot().highWaterBytes).toBeGreaterThan(60 * 1024);
+        expect(budget.snapshot().highWaterBytes).toBeLessThanOrEqual(maxTurnBytes);
+      });
+    }
+  }
+
+  test("cancelling deferred thinking releases its buffer and cancels upstream", async () => {
+    const budget = createTestTranslatorBudget();
+    const text = "pending".repeat(1024);
+    let signalConsumed!: () => void;
+    const consumed = new Promise<void>(resolve => { signalConsumed = resolve; });
+    let sent = false;
+    let cancelReason: unknown;
+    const upstream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent) {
+          // A second read proves the first delta has passed through handleFrame.
+          signalConsumed();
+          return;
+        }
+        sent = true;
+        controller.enqueue(new TextEncoder().encode(sse("response.reasoning_text.delta", {
+          item_id: "pending", delta: text,
+        })));
+      },
+      cancel(reason) { cancelReason = reason; },
+    }, { highWaterMark: 0 });
+    const stream = responsesSseToAnthropicSse(upstream, "m", { translatorBudget: budget, pingIntervalMs: 0 });
+    await consumed;
+    expect(budget.snapshot().currentBytes).toBeGreaterThanOrEqual(text.length);
+    await stream.cancel("client cancelled");
+    expect(cancelReason).toBe("client cancelled");
+    expect(budget.snapshot().currentBytes).toBe(0);
+    expect(budget.snapshot().overflows).toBe(0);
+  });
+
+  test("thinking waits for closure while text and tool arguments remain incremental; late done stays late", async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const upstream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
+    const reader = responsesSseToAnthropicSse(upstream, "m", { pingIntervalMs: 0 }).getReader();
+    const send = (name: string, data: Record<string, unknown>) => controller.enqueue(new TextEncoder().encode(sse(name, data)));
+    const next = async () => {
+      const { done, value } = await reader.read();
+      expect(done).toBe(false);
+      return JSON.parse(new TextDecoder().decode(value).split("\ndata: ")[1]!.trim()) as Record<string, unknown>;
+    };
+    try {
+      send("response.reasoning_text.delta", { item_id: "early", delta: "A" });
+      expect(await next()).toMatchObject({ type: "message_start" });
+      expect(await next()).toEqual({ type: "ping" });
+      // An explicit transport checkpoint proves no thinking start/index/text escaped.
+      send("response.heartbeat", {});
+      expect(await next()).toEqual({ type: "ping" });
+
+      send("response.output_text.delta", { delta: "live-1" });
+      expect(await next()).toMatchObject({ type: "content_block_start", index: 0, content_block: { type: "thinking" } });
+      expect(await next()).toEqual({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "A" } });
+      expect(await next()).toEqual({ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "ocxr1:eyJ0eHQiOiJBIn0=" } });
+      expect(await next()).toEqual({ type: "content_block_stop", index: 0 });
+      expect(await next()).toMatchObject({ type: "content_block_start", index: 1, content_block: { type: "text" } });
+      expect(await next()).toEqual({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "live-1" } });
+      send("response.output_text.delta", { delta: "live-2" });
+      expect(await next()).toEqual({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "live-2" } });
+
+      send("response.output_item.added", { item: { type: "function_call", id: "fc", call_id: "call", name: "Read" } });
+      expect(await next()).toEqual({ type: "content_block_stop", index: 1 });
+      expect(await next()).toMatchObject({ type: "content_block_start", index: 2, content_block: { type: "tool_use", name: "Read" } });
+      for (const fragment of ['{"path":', '"/x"}']) {
+        send("response.function_call_arguments.delta", { item_id: "fc", delta: fragment });
+        expect(await next()).toEqual({ type: "content_block_delta", index: 2, delta: { type: "input_json_delta", partial_json: fragment } });
+      }
+      send("response.output_item.done", { item: { type: "function_call", id: "fc" } });
+      expect(await next()).toEqual({ type: "content_block_stop", index: 2 });
+
+      send("response.output_item.done", { item: {
+        type: "reasoning", id: "early", encrypted_content: encodeReasoningEnvelope({ sig: "late-sig", red: ["late-red"] }),
+      } });
+      expect(await next()).toEqual({ type: "content_block_start", index: 3, content_block: { type: "redacted_thinking", data: "late-red" } });
+      expect(await next()).toEqual({ type: "content_block_stop", index: 3 });
+      expect(await next()).toEqual({ type: "content_block_start", index: 4, content_block: { type: "thinking", thinking: "", signature: "" } });
+      expect(await next()).toEqual({ type: "content_block_delta", index: 4, delta: { type: "signature_delta", signature: "late-sig" } });
+      expect(await next()).toEqual({ type: "content_block_stop", index: 4 });
+      send("response.completed", { response: { status: "completed" } });
+      controller.close();
+      expect(await next()).toMatchObject({ type: "message_delta", delta: { stop_reason: "tool_use" } });
+      expect(await next()).toEqual({ type: "message_stop" });
+      expect((await reader.read()).done).toBe(true);
+    } finally {
+      await reader.cancel();
+      reader.releaseLock();
+    }
+  });
+});
+
+describe("Messages ingress context errors", () => {
+  let home: string;
+  let previousHome: string | undefined;
+  let isolated: IsolatedCodexHome;
+  const originalFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    previousHome = process.env.OPENCODEX_HOME;
+    home = mkdtempSync(join(tmpdir(), "ocx-messages-context-"));
+    process.env.OPENCODEX_HOME = home;
+    isolated = installIsolatedCodexHome("ocx-messages-context-codex-");
+  });
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    isolated.restore();
+    if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+    else process.env.OPENCODEX_HOME = previousHome;
+    removeTreeWithRetry(home);
+  });
+
+  const contextError = {
+    type: "invalid_request_error", code: "context_length_exceeded", message: "Synthetic input context limit exceeded",
+  };
+  function failedSse(error: Record<string, unknown>): Response {
+    const frame = { type: "response.failed", response: { status: "failed", error } };
+    return new Response(`event: response.failed\ndata: ${JSON.stringify(frame)}\n\n`, {
+      headers: { "Content-Type": "text/event-stream" },
+    });
+  }
+
+  async function withMessages(upstreamResponse: () => Response, stream: boolean, check: (response: Response, hits: () => number) => Promise<void>, canonical = false) {
+    let hits = 0;
+    const upstream = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() { hits++; return upstreamResponse(); } });
+    let server: ReturnType<typeof startServer> | undefined;
+    try {
+      let canonicalSends = 0;
+      const config = { port: 0, hostname: "127.0.0.1", defaultProvider: "native", providers: {
+        native: { adapter: "openai-responses", baseUrl: `${upstream.url.origin}/v1`, authMode: "forward", allowPrivateNetwork: true },
+      } } as OcxConfig;
+      if (canonical) {
+        config.providers.native!.baseUrl = "https://chatgpt.com/backend-api/codex";
+        globalThis.fetch = ((input, init) => {
+          const url = input instanceof Request ? input.url : String(input);
+          if (url === "https://chatgpt.com/backend-api/codex/responses") {
+            canonicalSends++;
+            return originalFetch(new URL("/v1/responses", upstream.url), init);
+          }
+          // A fixture must never make an unmocked external call.
+          if (!url.startsWith("http://127.0.0.1:") && !url.startsWith("http://localhost:")) {
+            throw new Error("unexpected external request in context fixture");
+          }
+          return originalFetch(input, init);
+        }) as typeof fetch;
+      }
+      saveConfig(config);
+      server = startServer(0);
+      const response = await fetch(new URL("/v1/messages", server.url), {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "native/gpt-test", stream, max_tokens: 32, messages: [{ role: "user", content: "synthetic input" }] }),
+      });
+      await check(response, () => hits);
+      if (canonical) expect(canonicalSends).toBe(1);
+    } finally {
+      try { await server?.stop(true); }
+      finally { await upstream.stop(true); }
+    }
+  }
+
+  async function expectContext(response: Response, stream: boolean) {
+    expect(response.headers.has("retry-after")).toBe(false);
+    const text = await response.text();
+    expect(text).not.toContain("private-413-marker");
+    if (stream && response.headers.get("content-type")?.includes("text/event-stream")) {
+      expect(response.status).toBe(200);
+      const frames = text.split("\n\n").filter(frame => frame.includes("event: error"));
+      expect(frames).toHaveLength(1);
+      expect(text).not.toContain("event: message_start");
+      expect(text).not.toContain("event: message_stop");
+      const line = frames[0]!.split("\n").find(line => line.startsWith("data:"))!;
+      expect(JSON.parse(line.slice(5))).toMatchObject({ type: "error", error: { type: "invalid_request_error", code: "context_length_exceeded" } });
+    } else {
+      expect(response.status, text).toBe(400);
+      expect(JSON.parse(text)).toMatchObject({ type: "error", error: { type: "invalid_request_error", code: "context_length_exceeded" } });
+    }
+  }
+
+  describe("Messages context failures preserve terminal semantics", () => {
+    for (const stream of [false, true]) {
+      test(`canonical native terminal reaches the Messages wire (stream=${stream})`, async () => {
+        await withMessages(() => failedSse(contextError), stream, async (response, hits) => {
+          await expectContext(response, stream);
+          expect(hits()).toBe(1);
+        }, true);
+      });
+      test(`classified terminal SSE stays terminal (stream=${stream})`, async () => {
+        await withMessages(() => failedSse(contextError), stream, async (response, hits) => {
+          await expectContext(response, stream);
+          expect(hits()).toBe(1);
+        });
+      });
+      test(`provider 413 becomes a safe context error (stream=${stream})`, async () => {
+        await withMessages(() => Response.json({ message: "private-413-marker" }, { status: 413 }), stream, async (response, hits) => {
+          await expectContext(response, stream);
+          expect(hits()).toBe(1);
+        });
+      });
+      test(`non-2xx context error preserves code and suppresses retry hint (stream=${stream})`, async () => {
+        await withMessages(() => Response.json({ error: contextError }, { status: 400, headers: { "Retry-After": "7" } }), stream, async (response, hits) => {
+          await expectContext(response, stream);
+          expect(hits()).toBe(1);
+        });
+      });
+      test(`failed Responses JSON retains context identity (stream=${stream})`, async () => {
+        await withMessages(() => Response.json({ id: "resp_context", object: "response", status: "failed", error: contextError, output: [] }), stream, async (response, hits) => {
+          await expectContext(response, stream);
+          expect(hits()).toBe(1);
+        });
+      });
+    }
+    test("unknown collected failure remains 502 and does not gain context identity", async () => {
+      await withMessages(() => failedSse({ type: "server_error", code: "upstream_server_error", message: "synthetic upstream failure" }), false, async (response, hits) => {
+        expect(response.status).toBe(502);
+        const body = await response.json();
+        expect(body.error.type).toBe("overloaded_error");
+        expect(body.error.code).toBeUndefined();
+        expect(hits()).toBe(1);
+      });
+    });
+  });
 });

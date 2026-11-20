@@ -81,7 +81,7 @@ Grok Build は Responses API 経由で opencodex と通信します。ルート�
 
 Grok Build では、ループバックでもカスタム モデルに対して空ではない API キーが必要です。挿入されたエントリにはプレースホルダー (`opencodex-loopback`) が含まれます。opencodex はループバック接続のアドミッション キーを無視するため、実際の秘密は関係しません。
 
-**自動登録はループバックのみです。** opencodex が非ループバック ホスト (すべてのインターフェイスを公開するワイルドカード `0.0.0.0` および `::` を含む) をバインドする場合、リクエストには実際のアドミッション トークンが必要であり、マネージド ブロックはそれを安全に運ぶことができません。リテラルトークンを書き込むと、シークレットが `~/.grok/config.toml` に設定され、そこで設定した内容が次の `ocx start`/`ensure`/`restart` に上書きされます。したがって、その場合、opencodex は何も書き込みません (そして、以前のループバック バインドで残ったブロックはすべて削除します)。また、管理対象マーカーの外側でモデルを自分で設定します。opencodex が何をしてもモデルを破壊することはありません。正確なテーブルについては [マニュアルレシピ](#manual-recipe-without-auto-registration) を参照し、`base_url` (`grok` を実行する場所から実際に到達可能なホスト) と `api_key` (`OPENCODEX_API_AUTH_TOKEN`) の両方を設定します。
+**自動登録はループバックのみです。** opencodex が非ループバック ホスト (すべてのインターフェイスを公開するワイルドカード `0.0.0.0` および `::` を含む) をバインドする場合、リクエストには実際のアドミッション トークンが必要であり、マネージド ブロックはそれを安全に運ぶことができません。リテラルトークンを書き込むと、シークレットが `~/.grok/config.toml` に設定され、そこで設定した内容が次の `ocx start`/`ensure`/`restart` に上書きされます。したがって、その場合、opencodex は何も書き込みません (そして、以前のループバック バインドで残ったブロックはすべて削除します)。また、管理対象マーカーの外側でモデルを自分で設定します。opencodex が何をしてもモデルを破壊することはありません。正確なテーブルについては [マニュアルレシピ](#手動レシピ自動登録なし) を参照し、`base_url` (`grok` を実行する場所から実際に到達可能なホスト) と `api_key` (`OPENCODEX_API_AUTH_TOKEN`) の両方を設定します。
 
 ここで `api_key` を `env_key` に置き換えないでください。解決に失敗した `env_key` はリクエストを停止しません。Grok は xAI セッション トークンに到達し、それをエントリ名が `base_url` に送信します。LAN デプロイメントの場合、これは xAI ではないプレーンテキスト HTTP エンドポイントです。
 
@@ -102,11 +102,11 @@ model = "anthropic/claude-opus-4-8"
 model_provider = "opencodex"
 ```
 
-ネットワーク経由で到達可能なプロキシの場合は、`grok` が実際にダイヤルしてアドミッション トークンを使用できるアドレスに `base_url` を指定します。
+トークンを設定する前に TLS フロントエンドを構成し、その HTTPS URL を使ってください。代わりにローカルトンネルのループバックアドレスも使えます。Grok は `api_key` の値を `~/.grok/config.toml` に保存するため、アクセス権を制限し、バージョン管理や共有バックアップに含めないでください。
 
 ```toml
 [model_providers.opencodex]
-base_url = "http://192.168.1.10:10100/v1"   # the reachable host, not 127.0.0.1
+base_url = "https://proxy.example.com/v1"   # configured TLS frontend
 api_backend = "responses"
 api_key = "your-OPENCODEX_API_AUTH_TOKEN"
 

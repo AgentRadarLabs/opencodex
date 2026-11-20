@@ -12,6 +12,11 @@ const provider: OcxProviderConfig = {
   baseUrl: "https://example.test/v1",
   apiKey: "sk-test",
   authMode: "key",
+  // These cases assert where a developer barrier lands relative to a pending tool call, not
+  // which role carries it. The wire role folds to `system` unless a destination records that
+  // it accepts `developer`, so the destination is declared here and the assertions keep
+  // reading the role they were written against.
+  foldDeveloperRoleToSystem: false,
 };
 
 interface ChatMsg {
@@ -90,7 +95,7 @@ function assertWireInvariants(messages: ChatMsg[]): void {
 }
 
 describe("openai-chat dangling tool_calls hardening", () => {
-  test("T1 incident: developer guidance is hoisted while the real result reattaches to the original call", () => {
+  test("T1 incident: developer guidance lands after the result while the result reattaches to the original call", () => {
     const messages = wire([
       user("hi"),
       assistantWithCalls([{ id: "call_x", name: "request_user_input" }]),
@@ -100,14 +105,14 @@ describe("openai-chat dangling tool_calls hardening", () => {
     ]);
     assertWireInvariants(messages);
     const roles = messages.map(m => m.role);
-    expect(messages[0]).toEqual({ role: "system", content: "[injected guidance]" });
-    // canonical history order: assistant, tool(real), user; no in-history system barrier
+    expect(messages[0]).toEqual({ role: "user", content: "hi" });
+    // canonical history order: assistant, tool(real), then the barrier in its own slot (#5213)
     const aIdx = roles.indexOf("assistant");
     expect(roles[aIdx + 1]).toBe("tool");
     expect(messages[aIdx + 1].tool_call_id).toBe("call_x");
     expect(messages[aIdx + 1].content).toBe('{"answers":{}}');
-    expect(roles[aIdx + 2]).toBe("user");
-    expect(messages.slice(1).some(m => m.role === "system")).toBe(false);
+    expect(messages[aIdx + 2]).toEqual({ role: "developer", content: "[injected guidance]" });
+    expect(roles[aIdx + 3]).toBe("user");
     // no synthetic result fabricated for an answered call
     expect(messages.some(m => typeof m.content === "string" && m.content.includes("no tool result was recorded"))).toBe(false);
   });
@@ -166,9 +171,9 @@ describe("openai-chat dangling tool_calls hardening", () => {
     expect(String(synth?.content)).toContain("no tool result was recorded");
     const real = block.find(m => m.tool_call_id === "call_2");
     expect(real?.content).toBe("img-ok");
-    expect(messages[0]).toEqual({ role: "system", content: "barrier while call_1 pending" });
-    expect(messages[aIdx + 3].role).toBe("assistant");
-    expect(messages.slice(1).some(m => m.role === "system")).toBe(false);
+    expect(messages[0]).toEqual({ role: "user", content: "hi" });
+    expect(messages[aIdx + 3]).toEqual({ role: "developer", content: "barrier while call_1 pending" });
+    expect(messages[aIdx + 4].role).toBe("assistant");
   });
 
   test("T6 mismatched result while calls pending: round closes synthetically, then orphan pair", () => {
@@ -183,9 +188,9 @@ describe("openai-chat dangling tool_calls hardening", () => {
     expect(messages[aIdx + 1].role).toBe("tool");
     expect(messages[aIdx + 1].tool_call_id).toBe("call_p");
     expect(String(messages[aIdx + 1].content)).toContain("no tool result was recorded");
-    expect(messages[0]).toEqual({ role: "system", content: "deferred barrier" });
-    expect(messages[aIdx + 2].role).toBe("assistant");
-    expect(messages.slice(1).some(m => m.role === "system")).toBe(false);
+    expect(messages[0]).toEqual({ role: "user", content: "hi" });
+    expect(messages[aIdx + 2]).toEqual({ role: "developer", content: "deferred barrier" });
+    expect(messages[aIdx + 3].role).toBe("assistant");
     const orphanIdx = messages.findIndex((m, i) => i > aIdx && m.role === "assistant");
     expect(messages[orphanIdx].tool_calls?.[0].id).toBe("call_unknown");
     expect(messages[orphanIdx + 1].tool_call_id).toBe("call_unknown");
@@ -226,5 +231,50 @@ describe("openai-chat dangling tool_calls hardening", () => {
     expect(text).toContain("execution status unknown");
     expect(text).toContain("user-provided input");
     expect(text).not.toContain("interrupted");
+  });
+
+  test("T11 repeated results for one call fold into the answer the call already got", () => {
+    const messages = wire([
+      user("continue"),
+      assistantWithCalls([{ id: "toolu_exec", name: "exec" }]),
+      toolResult("toolu_exec", "exec", "Script running with cell ID 108\n"),
+      toolResult("toolu_exec", "exec", "row 1"),
+      toolResult("toolu_exec", "exec", "row 2"),
+    ]);
+    assertWireInvariants(messages);
+    const answers = messages.filter(m => m.role === "tool");
+    expect(answers).toHaveLength(1);
+    expect(answers[0]!.tool_call_id).toBe("toolu_exec");
+    expect(answers[0]!.content).toBe("Script running with cell ID 108\n\n\nrow 1\n\nrow 2");
+  });
+
+  test("T12 a repeated result for call A after call B was answered does not split B's round", () => {
+    const messages = wire([
+      user("continue"),
+      assistantWithCalls([{ id: "call_a", name: "exec" }, { id: "call_b", name: "wait" }]),
+      toolResult("call_a", "exec", "first"),
+      toolResult("call_b", "wait", "waited"),
+      toolResult("call_a", "exec", "late"),
+    ]);
+    assertWireInvariants(messages);
+    const answers = messages.filter(m => m.role === "tool");
+    expect(answers.map(m => m.tool_call_id)).toEqual(["call_a", "call_b"]);
+    expect(answers[0]!.content).toBe("first");
+    expect(messages.at(-1)?.content).toEqual([{ type: "text", text: "[ocx] additional output for tool call call_a:\nlate" }]);
+  });
+
+  test("repeated orphan results share one synthetic call and preserve both outputs", () => {
+    const messages = wire([
+      user("continue"),
+      toolResult("call_ghost", "exec", "first"),
+      toolResult("call_other", "wait", "other"),
+      toolResult("call_ghost", "exec", "late"),
+    ]);
+    assertWireInvariants(messages);
+    const answers = messages.filter(m => m.role === "tool");
+    expect(answers.map(m => m.tool_call_id)).toEqual(["call_ghost", "call_other"]);
+    expect(answers[0]!.content).toBe("first");
+    expect(answers[1]!.content).toBe("other");
+    expect(messages.at(-1)?.content).toEqual([{ type: "text", text: "[ocx] additional output for tool call call_ghost:\nlate" }]);
   });
 });

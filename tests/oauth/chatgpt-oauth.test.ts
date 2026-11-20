@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { decodeJwtPayload, extractAccountId, extractEmail } from "../../src/oauth/chatgpt";
+import { decodeJwtPayload, extractAccountId, extractAccountIdClaims, extractEmail } from "../../src/oauth/chatgpt";
 
 function fakeJwt(payload: Record<string, unknown>): string {
   const header = Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url");
@@ -63,6 +63,39 @@ describe("ChatGPT OAuth JWT helpers", () => {
     expect(extractAccountId(undefined, undefined)).toBeUndefined();
   });
 
+  test("extractAccountIdClaims accepts agreeing account-id encodings", () => {
+    const jwt = fakeJwt({
+      chatgpt_account_id: "acct_same",
+      "https://api.openai.com/auth": { chatgpt_account_id: "acct_same" },
+    });
+    expect(extractAccountIdClaims(jwt)).toEqual({ accountId: "acct_same", conflict: false });
+  });
+
+  test("extractAccountIdClaims flags conflicting account-id encodings", () => {
+    const jwt = fakeJwt({
+      chatgpt_account_id: "acct_top",
+      "https://api.openai.com/auth": { chatgpt_account_id: "acct_ns_other" },
+    });
+    expect(extractAccountIdClaims(jwt)).toEqual({ accountId: "acct_top", conflict: true });
+  });
+
+  test("extractAccountIdClaims treats organizations as membership, never as a conflict", () => {
+    // id_token_add_organizations makes org ids legitimately differ from the account id.
+    const jwt = fakeJwt({
+      chatgpt_account_id: "acct_main",
+      organizations: [{ id: "org_member" }, { id: "org_other" }],
+    });
+    expect(extractAccountIdClaims(jwt)).toEqual({ accountId: "acct_main", conflict: false });
+    const orgOnly = fakeJwt({ organizations: [{ id: "org_fallback" }, { id: "org_second" }] });
+    expect(extractAccountIdClaims(orgOnly)).toEqual({ accountId: "org_fallback", conflict: false });
+  });
+
+  test("extractAccountIdClaims reads nothing from a claim-free or malformed token", () => {
+    expect(extractAccountIdClaims(fakeJwt({ sub: "user" }))).toEqual({ accountId: undefined, conflict: false });
+    expect(extractAccountIdClaims(undefined)).toEqual({ accountId: undefined, conflict: false });
+    expect(extractAccountIdClaims("not-a-jwt")).toEqual({ accountId: undefined, conflict: false });
+  });
+
   test("extractEmail extracts and lowercases email", () => {
     const jwt = fakeJwt({ email: "User@Example.COM" });
     expect(extractEmail(jwt)).toBe("user@example.com");
@@ -78,26 +111,44 @@ describe("ChatGPT OAuth JWT helpers", () => {
     const access = fakeJwt({ email: "access@test.com" });
     expect(extractEmail(id, access)).toBe("id@test.com");
   });
+
+  test("extractEmail extracts and lowercases email from profile claim", () => {
+    const jwt = fakeJwt({
+      "https://api.openai.com/profile": { email: " ProfileUser@Example.COM " },
+    });
+    expect(extractEmail(jwt)).toBe("profileuser@example.com");
+  });
+
+  test("extractEmail falls back to access_token profile claim if id_token has no email", () => {
+    const id = fakeJwt({ sub: "id-without-email" });
+    const access = fakeJwt({
+      "https://api.openai.com/profile": { email: "access-profile@example.com" },
+    });
+    expect(extractEmail(id, access)).toBe("access-profile@example.com");
+  });
 });
 
 describe("ChatGPT OAuth constants", () => {
   test("uses auth.openai.com endpoints (not auth0.openai.com)", async () => {
-    const source = await Bun.file("src/oauth/chatgpt.ts").text();
+    const source = await Bun.file("src/oauth/chatgpt.ts").text()
+      + await Bun.file("src/oauth/chatgpt-shared.ts").text();
     expect(source).toContain('auth.openai.com/oauth/authorize');
     expect(source).toContain('auth.openai.com/oauth/token');
     expect(source).not.toContain("auth0.openai.com");
   });
 
   test("uses official Codex client_id", async () => {
-    const source = await Bun.file("src/oauth/chatgpt.ts").text();
+    const source = await Bun.file("src/oauth/chatgpt.ts").text()
+      + await Bun.file("src/oauth/chatgpt-shared.ts").text();
     expect(source).toContain("app_EMoamEEZ73f0CkXaXp7hrann");
     expect(source).not.toContain("DRivsnm2Mu42T3KOpqdtwB3NYviHYzwD");
   });
 
-  test("uses form-urlencoded content-type (not JSON)", async () => {
+  test("uses JSON content-type for token refresh and form-urlencoded for code exchange with codex_cli_rs originator", async () => {
     const source = await Bun.file("src/oauth/chatgpt.ts").text();
     expect(source).toContain("application/x-www-form-urlencoded");
-    expect(source).not.toContain('"Content-Type": "application/json"');
+    expect(source).toContain('"application/json"');
+    expect(source).toContain('const ORIGINATOR = "codex_cli_rs"');
   });
 
   test("includes codex_cli_simplified_flow parameter", async () => {
@@ -119,8 +170,10 @@ describe("codex-account-store constants sync", () => {
     expect(source).not.toContain("DRivsnm2Mu42T3KOpqdtwB3NYviHYzwD");
   });
 
-  test("uses form-urlencoded for refresh", async () => {
+  test("uses official JSON contract for pool and main refresh", async () => {
     const source = await Bun.file("src/codex/account-store.ts").text();
-    expect(source).toContain("application/x-www-form-urlencoded");
+    const mainSource = await Bun.file("src/codex/main-account.ts").text();
+    expect(source).toContain('"Content-Type": "application/json"');
+    expect(mainSource).toContain('"Content-Type": "application/json"');
   });
 });

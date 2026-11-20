@@ -52,11 +52,32 @@ function successfulDeps() {
       findLive: async () => target,
       createChallenge: () => challenge,
       now: () => 1_000,
+      // Matches the /healthz fixture version below so the skew guard stays out of the way;
+      // the dedicated skew tests override it explicitly.
+      cliVersion: "test",
+      readUpdateHome: () => ({ config: { path: "/test/ocx", dev: 1, ino: 2, fileId: "1:2" }, codex: { path: "/test/codex", dev: 1, ino: 3, fileId: "1:3" }, revision: 0, serviceRecord: { schema: 1 as const, digest: "a".repeat(64) }, diagnosedHostname: "127.0.0.1" }),
     },
   };
 }
 
 describe("bound system restart client", () => {
+  test("rejects a changed diagnosed hostname after asynchronous discovery", async () => {
+    const setup = successfulDeps();
+    const home = setup.deps.readUpdateHome();
+    let changed = false;
+    setup.deps.readUpdateHome = () => ({ ...home, diagnosedHostname: changed ? "::1" : "127.0.0.1" });
+    setup.deps.findLive = async () => { changed = true; return target; };
+    setup.deps.cliVersion = "2.77.0";
+    setup.deps.fetchImpl = (async () => {
+      const response = successfulDepsResponse(setup.secret, setup.challenge);
+      const body = await response.json() as Record<string, unknown>;
+      body.version = "2.76.0";
+      return new Response(JSON.stringify(body), { status: 200, headers: response.headers });
+    }) as typeof fetch;
+    const result = await requestBoundSystemRestart(target, 10_000, setup.deps);
+    expect(result.accepted).toBe(false);
+    if (!result.accepted) expect((result.error as Error).message).toBe("update_restart_home_changed");
+  });
   test("rejects an unattested discovery result without network access", async () => {
     let fetches = 0;
     const outcome = await requestBoundSystemRestart(
@@ -142,6 +163,103 @@ describe("bound system restart client", () => {
     expect(outcome.accepted ? "" : (outcome.error as Error).message)
       .toBe("restart_capability_unsupported");
     expect(setup.requests).toHaveLength(1);
+  });
+
+  test("refuses a restart through a CLI whose version differs from the attested proxy", async () => {
+    for (const [proxyVersion, cliVersion, expected] of [
+      ["2.49.0", "2.53.0", "restart_version_skew_cli_newer"],
+      ["2.53.0", "2.49.0", "restart_version_skew"],
+      ["test", "2.53.0", "restart_version_skew"],
+    ] as const) {
+      const setup = successfulDeps();
+      setup.deps.cliVersion = cliVersion;
+      setup.deps.fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        setup.requests.push({ url, init });
+        if (url.endsWith("/healthz")) {
+          const response = successfulDepsResponse(setup.secret, setup.challenge);
+          const body = await response.json() as Record<string, unknown>;
+          body.version = proxyVersion;
+          return new Response(JSON.stringify(body), {
+            status: 200,
+            headers: response.headers,
+          });
+        }
+        throw new Error("POST must not be attempted");
+      }) as typeof fetch;
+
+      const outcome = await requestBoundSystemRestart(target, 10_000, setup.deps);
+      expect(outcome).toMatchObject({ accepted: false, uncertain: false });
+      expect(outcome.accepted ? "" : (outcome.error as Error).message)
+        .toBe(expected);
+      expect(setup.requests).toHaveLength(1);
+    }
+  });
+
+  test("allows a restart when the invoking CLI matches the attested proxy version", async () => {
+    const setup = successfulDeps();
+    setup.deps.cliVersion = "2.53.0";
+    setup.deps.fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      setup.requests.push({ url, init });
+      if (url.endsWith("/healthz")) {
+        const response = successfulDepsResponse(setup.secret, setup.challenge);
+        const body = await response.json() as Record<string, unknown>;
+        body.version = "2.53.0";
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: response.headers,
+        });
+      }
+      return new Response(JSON.stringify({ success: true }), { status: 202 });
+    }) as typeof fetch;
+
+    expect(await requestBoundSystemRestart(target, 10_000, setup.deps)).toEqual({ accepted: true });
+    expect(setup.requests).toHaveLength(2);
+  });
+
+  test("treats a placeholder proxy version as incomparable and keeps the restart path", async () => {
+    const setup = successfulDeps();
+    setup.deps.cliVersion = "2.53.0";
+    setup.deps.fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      setup.requests.push({ url, init });
+      if (url.endsWith("/healthz")) {
+        const response = successfulDepsResponse(setup.secret, setup.challenge);
+        const body = await response.json() as Record<string, unknown>;
+        body.version = "0.0.0";
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: response.headers,
+        });
+      }
+      return new Response(JSON.stringify({ success: true }), { status: 202 });
+    }) as typeof fetch;
+
+    expect(await requestBoundSystemRestart(target, 10_000, setup.deps)).toEqual({ accepted: true });
+    expect(setup.requests).toHaveLength(2);
+  });
+
+  test("treats an unknown proxy version as incomparable and keeps the restart path", async () => {
+    const setup = successfulDeps();
+    setup.deps.cliVersion = "2.53.0";
+    setup.deps.fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      setup.requests.push({ url, init });
+      if (url.endsWith("/healthz")) {
+        const response = successfulDepsResponse(setup.secret, setup.challenge);
+        const body = await response.json() as Record<string, unknown>;
+        body.version = "unknown";
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: response.headers,
+        });
+      }
+      return new Response(JSON.stringify({ success: true }), { status: 202 });
+    }) as typeof fetch;
+
+    expect(await requestBoundSystemRestart(target, 10_000, setup.deps)).toEqual({ accepted: true });
+    expect(setup.requests).toHaveLength(2);
   });
 
   test("refuses to POST when the live target changes after attestation", async () => {

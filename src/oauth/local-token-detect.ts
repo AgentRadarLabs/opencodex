@@ -3,14 +3,13 @@
  * Read-only: never writes to external credential stores.
  * Ported from jawcode packages/ai/src/utils/oauth/local-token-detect.ts (xAI portion).
  */
-import { execSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { claudeKeychainReader } from "./claude-keychain-read";
 import type { OAuthCredentials } from "./types";
 
 const XAI_AUTH_KEY_PREFIX = "https://auth.x.ai::";
-const CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials";
 
 export function detectGrokCliToken(): OAuthCredentials | null {
   const authPath = join(process.env.HOME ?? homedir(), ".grok", "auth.json");
@@ -73,18 +72,6 @@ function claudeConfigDir(): string {
   return explicit ? explicit : join(homedir(), ".claude");
 }
 
-/** Read the Claude Code OAuth credential from the macOS Keychain (darwin only). */
-function readClaudeKeychain(): string | null {
-  if (process.platform !== "darwin") return null;
-  try {
-    return execSync(`security find-generic-password -s "${CLAUDE_KEYCHAIN_SERVICE}" -w`, {
-      encoding: "utf8", timeout: 5000, stdio: ["pipe", "pipe", "pipe"],
-    }).trim();
-  } catch {
-    return null;
-  }
-}
-
 /**
  * Read the Claude Code credential file (`<config-dir>/.credentials.json`).
  * Claude Code writes this on Linux/Windows (and on macOS when the Keychain is
@@ -101,12 +88,27 @@ export function readClaudeCredentialsFile(): string | null {
   }
 }
 
-/** Keychain first on macOS, then the cross-platform credentials file. */
-function readClaudeSecureStorage(): string | null {
-  // An explicit config-dir override identifies a separate Claude installation/profile.
-  // Do not let the default macOS Keychain entry shadow that requested credential file.
-  if (process.env.CLAUDE_CONFIG_DIR?.trim()) return readClaudeCredentialsFile() ?? readClaudeKeychain();
-  return readClaudeKeychain() ?? readClaudeCredentialsFile();
+/**
+ * The Claude Code OAuth credential from the macOS Keychain (darwin only). There is no synchronous
+ * variant: a synchronous read cannot time out without killing `security`, which can crash
+ * `securityd` while an unlock prompt is pending (#8161). A timed-out child is left to exit on its
+ * own, concurrent reads share one child, and a timeout backs off before the next spawn
+ * (`claude-keychain-read.ts`).
+ */
+function readClaudeKeychainAsync(): Promise<string | null> {
+  return claudeKeychainReader.readAsync();
+}
+
+/**
+ * The Claude Code sign-in: Keychain first on macOS, then the cross-platform credentials file. An
+ * explicit `CLAUDE_CONFIG_DIR` names a separate Claude profile, so its credentials file wins and
+ * the default Keychain entry cannot shadow it.
+ */
+export async function detectClaudeCodeTokenAsync(): Promise<OAuthCredentials | null> {
+  const raw = process.env.CLAUDE_CONFIG_DIR?.trim()
+    ? readClaudeCredentialsFile() ?? await readClaudeKeychainAsync()
+    : await readClaudeKeychainAsync() ?? readClaudeCredentialsFile();
+  return raw ? parseClaudeOauthPayload(raw) : null;
 }
 
 export function parseClaudeOauthPayload(raw: string): OAuthCredentials | null {
@@ -123,8 +125,9 @@ export function parseClaudeOauthPayload(raw: string): OAuthCredentials | null {
   }
 }
 
-export function detectClaudeCodeToken(): OAuthCredentials | null {
-  const raw = readClaudeSecureStorage();
-  if (!raw) return null;
-  return parseClaudeOauthPayload(raw);
+/** Shared-token continuity for opaque Claude tokens; fully rotated pairs need authenticated account proof. */
+export function hasClaudeCredentialContinuity(stored: OAuthCredentials, disk: OAuthCredentials): boolean {
+  const sameToken = (left: string, right: string): boolean =>
+    typeof left === "string" && left.trim().length > 0 && left === right;
+  return sameToken(stored.refresh, disk.refresh) || sameToken(stored.access, disk.access);
 }

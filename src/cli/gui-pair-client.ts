@@ -1,5 +1,6 @@
 import { readRuntimePort, type RuntimePortState } from "../config/process-state";
 import { timingSafeEqual } from "node:crypto";
+import { createGuiPairIntent, GUI_PAIR_INTENT_HEADER, type GuiPairIntent } from "../lib/gui-pair-intent";
 import {
   LOCAL_ATTESTATION_CHALLENGE_HEADER,
   LOCAL_ATTESTATION_PROOF_HEADER,
@@ -16,7 +17,9 @@ import {
   GUI_PAIR_METHOD,
   GUI_PAIR_NONCE_HEADER,
   GUI_PAIR_PATH,
+  DESKTOP_GUI_PAIR_PATH,
   canonicalGuiBrowserOrigin,
+  canonicalHttpOrigin,
   createGuiPairCapability,
 } from "../lib/gui-pair-capability";
 import { directLocalHttpFetch } from "../server/direct-local-http";
@@ -29,14 +32,18 @@ import {
 
 export type GuiPairRequestResult =
   | { kind: "created"; grant: string; browserOrigin: string; serverOrigin: string; expiresAt: number }
-  | { kind: "unavailable"; reason: "unattested-target" | "runtime-mismatch" | "attestation" | "capability" | "transport" | "rejected" };
+  | { kind: "unavailable"; reason: "unattested-target" | "runtime-mismatch" | "attestation" | "capability" | "transport" | "rejected" | "local-intent" | "origin-refused" | "rate-limited" };
 
 export interface GuiPairClientDeps {
+  desktopPurpose?: boolean;
   fetchImpl?: typeof fetch;
   readRuntime?: (pid: number) => RuntimePortState | null;
   createChallenge?: () => string;
   now?: () => number;
   timeoutMs?: number;
+  /** Hub invitation policy is unchanged; standalone commands require local write intent. */
+  requireLocalIntent?: boolean;
+  createIntent?: typeof createGuiPairIntent;
 }
 
 const GUI_PAIR_REQUEST_TIMEOUT_MS = 10_000;
@@ -52,16 +59,25 @@ function sameRuntime(left: RuntimePortState, right: RuntimePortState | null): bo
     && timingSafeEqual(leftSecret, rightSecret);
 }
 
-function canonicalHttpOrigin(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  try {
-    const parsed = new URL(value);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
-    if (parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) return null;
-    return parsed.origin;
-  } catch {
-    return null;
-  }
+/**
+ * Which refusal the grant route sent, as one fixed word; the body itself never surfaces.
+ *
+ * Only the route's plain 403 "GUI pairing grant refused" (no `code`) means its loaded config did not
+ * admit this origin, the one case an allow-list edit or a restart can cure (#8319). Its 429 is the
+ * per-minute grant limit. A coded refusal, a capability refusal and anything else stay `rejected`,
+ * so the caller does not send an operator to edit a correct allow-list (#8495 review).
+ *
+ * This is a heuristic: the route answers the same uncoded 403 for any unexpected failure inside
+ * grant creation, not only for a refused origin. Those are rare and the advice (check the two origin
+ * settings, restart) is harmless there; an explicit server code would make it exact.
+ */
+async function refusalReason(response: Response): Promise<"origin-refused" | "rate-limited" | "rejected"> {
+  if (response.status === 429) return "rate-limited";
+  if (response.status !== 403) return "rejected";
+  const body: unknown = await response.json().catch(() => null);
+  if (!body || typeof body !== "object" || Array.isArray(body)) return "rejected";
+  const record = body as Record<string, unknown>;
+  return record.error === "GUI pairing grant refused" && record.code === undefined ? "origin-refused" : "rejected";
 }
 
 function parseCreatedResult(value: unknown, browserOrigin: string): GuiPairRequestResult | null {
@@ -136,20 +152,24 @@ export async function requestBoundGuiPairingGrant(
     return { kind: "unavailable", reason: "runtime-mismatch" };
   }
   const expiresAt = (deps.now ?? Date.now)() + GUI_PAIR_CAPABILITY_TTL_MS;
+  const path = deps.desktopPurpose ? DESKTOP_GUI_PAIR_PATH : GUI_PAIR_PATH;
   const capability = createGuiPairCapability(
     runtime.attestationSecret,
     challenge,
     GUI_PAIR_METHOD,
-    GUI_PAIR_PATH,
+    path,
     browserOrigin,
     target.pid,
     target.port,
     expiresAt,
   );
   if (!capability) return { kind: "unavailable", reason: "capability" };
-  let response: Response;
+  let intent: GuiPairIntent | undefined;
   try {
-    response = await fetchImpl(`${baseUrl}${GUI_PAIR_PATH}`, {
+    if (deps.desktopPurpose || deps.requireLocalIntent !== false) intent = (deps.createIntent ?? createGuiPairIntent)(capability);
+  } catch { return { kind: "unavailable", reason: "local-intent" }; }
+  try {
+    const response = await fetchImpl(`${baseUrl}${path}`, {
       method: GUI_PAIR_METHOD,
       headers: {
         "Content-Length": "0",
@@ -158,13 +178,14 @@ export async function requestBoundGuiPairingGrant(
         [GUI_PAIR_EXPIRES_AT_HEADER]: String(expiresAt),
         [GUI_PAIR_BROWSER_ORIGIN_HEADER]: browserOrigin,
         [GUI_PAIR_CAPABILITY_HEADER]: capability,
+        ...(intent ? { [GUI_PAIR_INTENT_HEADER]: intent.proof } : {}),
       },
       signal: AbortSignal.timeout(timeoutMs),
     });
+    if (!response.ok) return { kind: "unavailable", reason: await refusalReason(response) };
+    const result = parseCreatedResult(await response.json().catch(() => null), browserOrigin);
+    return result ?? { kind: "unavailable", reason: "rejected" };
   } catch {
     return { kind: "unavailable", reason: "transport" };
-  }
-  if (!response.ok) return { kind: "unavailable", reason: "rejected" };
-  const result = parseCreatedResult(await response.json().catch(() => null), browserOrigin);
-  return result ?? { kind: "unavailable", reason: "rejected" };
+  } finally { intent?.dispose(); }
 }

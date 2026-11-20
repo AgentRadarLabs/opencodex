@@ -2,7 +2,7 @@ import { type ReactNode } from "react";
 import { IconAlert } from "../icons";
 import { Trans } from "../i18n/provider";
 import { navigateHash } from "../hash-routing";
-import { EmptyState } from "../ui";
+import { EmptyState, Notice } from "../ui";
 import { DashboardDialogs } from "./dashboard-dialogs";
 import { DashboardModelsSection } from "./dashboard-models-section";
 import { DashboardOverviewSection } from "./dashboard-overview-section";
@@ -18,24 +18,30 @@ function selectDashboardTab(next: DashboardSection) {
   navigateHash(dashboardHashForSection(next));
 }
 
-export default function Dashboard({ apiBase }: { apiBase: string }) {
-  const d = useDashboardData(apiBase);
+export default function Dashboard({ apiBase, targetKey, readOnly = false, connected = false, authenticationPending = false, refreshEpoch = 0 }: {
+  apiBase: string; targetKey?: string; readOnly?: boolean; connected?: boolean; authenticationPending?: boolean; refreshEpoch?: number;
+}) {
+  const d = useDashboardData(apiBase, refreshEpoch, targetKey);
   const {
     t, error, selectedSection,
     providers, models, modelsLoading, modelQuery, setModelQuery,
     filteredGroups, expandedProviders, setExpandedProviders,
   } = d;
 
-  if (error) {
+  if (authenticationPending) return null;
+  const accessFailure = d.connectionFailure === "auth" || d.connectionFailure === "denied";
+  if (error && (accessFailure || !d.health)) {
     return (
       <EmptyState style={{ marginTop: 40 }} icon={<IconAlert />}
-        title={<span style={{ color: "var(--red)" }}>{t("dash.cannotConnect")}</span>}>
-        <Trans k="dash.runStart" cmd="ocx start" />
+        title={<span style={{ color: "var(--red)" }}>{t(d.connectionFailure === "denied"
+          ? "dash.permissionDenied" : d.connectionFailure === "auth" ? "dash.authRequired" : "dash.dataUnavailable")}</span>}>
+        {!connected && d.connectionFailure === "unavailable" && <Trans k="dash.runStart" cmd="ocx start" />}
+        <button className="btn btn-ghost" type="button" onClick={() => d.refreshDashboard()}>{t("common.retry")}</button>
       </EmptyState>
     );
   }
 
-  const overviewSection = <DashboardOverviewSection {...d} />;
+  const overviewSection = <DashboardOverviewSection {...d} readOnly={readOnly} />;
   const providersSection = <DashboardProvidersSection t={t} providers={providers} />;
   const modelsSection = (
     <DashboardModelsSection
@@ -74,10 +80,14 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
 
   return (
     <div className="dashboard-workspace-shell">
-      <div className="page-head">
-        <h2>{t("nav.dashboard")}</h2>
-      </div>
-      <p className="page-sub">{t("dash.subtitle")}</p>
+      {error && <Notice tone="warn">{t("dash.staleData")} <button className="btn btn-ghost" type="button"
+        onClick={() => d.refreshDashboard()}>{t("common.retry")}</button></Notice>}
+      <header className="mb-5 flex flex-col gap-1.5">
+        <h2 className="m-0 text-title font-semibold tracking-[-0.025em] text-fg">{t("shellV2.pageProxyDetails")}</h2>
+        <p className="m-0 max-w-[68ch] text-[14px] leading-[1.55] text-fg-muted">
+          {selectedSection === "overview" ? t("proxyV2.pageLede") : t("dash.subtitle")}
+        </p>
+      </header>
       <div className="page-tabs" role="tablist" aria-label={t("dash.workspace.sections")}>
         {sections.map(s => (
           <button

@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { markSiblingStart, resetSiblingStartForTests } from "../../src/codex/sibling-start";
 import { mkdtempSync, readdirSync, readFileSync} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -16,7 +17,81 @@ const config = (claudeCode: OcxConfig["claudeCode"] = {}): OcxConfig => ({
   claudeCode,
 } as OcxConfig);
 
+afterEach(() => resetSiblingStartForTests());
+
 describe("Claude agent roster proxy-start synchronization (#2200)", () => {
+  test("a sibling skips both roster injection and OFF pruning", async () => {
+    markSiblingStart(10101);
+    for (const claudeCode of [{}, { injectAgents: false }]) {
+      let writes = 0;
+      const result = await syncClaudeAgentDefsAtProxyStartup(config(claudeCode), 10102, {
+        fetchContextWindows: async () => { throw new Error("sibling fetched roster"); },
+        injectAgentDefs: () => { writes++; return []; },
+      });
+      expect(result).toBeNull();
+      expect(writes).toBe(0);
+    }
+  });
+  test("keeps readiness pending until the fourth registry callback settles", async () => {
+    const gate = createReadinessGate();
+    let releaseRegistry!: () => void;
+    let enterRegistry!: () => void;
+    const entered = new Promise<void>(resolve => { enterRegistry = resolve; });
+    const pending = new Promise<void>(resolve => { releaseRegistry = resolve; });
+    const result = { ran: true };
+    const startup = reconcileClientStartupBeforeReady(
+      gate,
+      async deferred => { deferred.markReady(); return result; },
+      async () => undefined,
+      async () => { enterRegistry(); await pending; },
+    );
+    await entered;
+    expect(gate.getStatus()).toBe("pending");
+    releaseRegistry();
+    expect(await startup).toBe(result);
+    expect(gate.getStatus()).toBe("ready");
+  });
+
+  test("registry initialization cannot reverse a failed Codex readiness verdict", async () => {
+    const gate = createReadinessGate();
+    let registryRan = false;
+    await reconcileClientStartupBeforeReady(
+      gate,
+      async deferred => { deferred.markFailed(); return { ran: true }; },
+      async () => undefined,
+      async () => { expect(gate.getStatus()).toBe("failed"); registryRan = true; },
+    );
+    expect(registryRan).toBe(true);
+    expect(gate.getStatus()).toBe("failed");
+  });
+
+  test("a best-effort registry callback can handle failure before readiness opens", async () => {
+    const gate = createReadinessGate();
+    let handled = false;
+    await reconcileClientStartupBeforeReady(
+      gate,
+      async deferred => { deferred.markReady(); },
+      async () => undefined,
+      async () => {
+        try { throw new Error("registry unavailable"); }
+        catch { handled = true; expect(gate.getStatus()).toBe("pending"); }
+      },
+    );
+    expect(handled).toBe(true);
+    expect(gate.getStatus()).toBe("ready");
+  });
+
+  test("an unhandled registry callback error remains visible and cannot mark ready", async () => {
+    const gate = createReadinessGate();
+    await expect(reconcileClientStartupBeforeReady(
+      gate,
+      async deferred => { deferred.markReady(); },
+      async () => undefined,
+      async () => { throw new Error("unexpected registry failure"); },
+    )).rejects.toThrow("unexpected registry failure");
+    expect(gate.getStatus()).toBe("pending");
+  });
+
   test("keeps readiness pending until the best-effort roster fence settles", async () => {
     const gate = createReadinessGate();
     let releaseRoster!: () => void;

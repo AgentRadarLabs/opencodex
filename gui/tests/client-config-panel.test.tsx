@@ -40,7 +40,7 @@ const OPENCODE_ENVELOPE_BASE = {
         npm: "@ai-sdk/openai-compatible",
         name: "OpenCodex",
         options: { baseURL: "http://127.0.0.1:10100/v1", apiKey: "{env:OPENCODEX_OPENCODE_API_KEY}" },
-        models: { "gpt-5.4": { name: "gpt-5.4 (native)" } },
+        models: { "gpt-5.5": { name: "gpt-5.5 (native)" } },
       },
     },
   },
@@ -57,7 +57,7 @@ const PI_ENVELOPE_BASE = {
   format: "json",
   mediaType: "application/json",
   // Pi keys its models as an ARRAY — the shape swap is what proves a real refetch.
-  config: { providers: { opencodex: { models: [{ id: "gpt-5.4" }, { id: "claude-sonnet-4-6" }] } } },
+  config: { providers: { opencodex: { models: [{ id: "gpt-5.5" }, { id: "claude-sonnet-4-6" }] } } },
 };
 
 /**
@@ -170,12 +170,15 @@ function rowButton(container: HTMLElement, name: string, label: string): HTMLBut
     .find(el => el.textContent?.trim() === label)!;
 }
 
-test("the API download surface includes DSH, MiniMax Code and Aside as clients", () => {
-  expect(CLIENTS).toEqual(["opencode", "pi", "omp", "hermes", "openclaw", "kimi", "gajae", "dsh", "mcode", "zcode", "prime", "aside"]);
+test("the API download surface includes DSH, MiniMax Code, Aside, Raycast and omo as clients", () => {
+  expect(CLIENTS).toEqual(["qoder", "qoder-cn", "workbuddy", "workbuddy-ai", "opencode", "pi", "omp", "hermes", "openclaw", "kimi", "gajae", "dsh", "mcode", "zcode", "commandcode", "prime", "aside", "raycast", "omo", "cline", "kilo", "droid", "gentle-shell", "t3code"]);
+  expect(CLIENT_LABEL_KEYS["gentle-shell"]).toBe("integrations.tab.gentleShell");
   expect(CLIENT_LABEL_KEYS.dsh).toBe("api.clientConfig.clientDsh");
   expect(CLIENT_LABEL_KEYS.mcode).toBe("api.clientConfig.clientMcode");
   expect(CLIENT_LABEL_KEYS.zcode).toBe("api.clientConfig.clientZcode");
+  expect(CLIENT_LABEL_KEYS.commandcode).toBe("api.clientConfig.clientCommandCode");
   expect(CLIENT_LABEL_KEYS.aside).toBe("api.clientConfig.clientAside");
+  expect(CLIENT_LABEL_KEYS.omo).toBe("api.clientConfig.clientOmo");
 });
 
 test("each row fetches its own client and its dialog renders that client's exact bytes", async () => {
@@ -219,6 +222,27 @@ test("the config bytes are not rendered at rest", async () => {
   await act(async () => { root.unmount(); });
 });
 
+test("Cline details explain the two-file bundle instead of a single-file merge", async () => {
+  const config = { settings: { version: 1, providers: {} }, catalog: { version: 1, providers: {} } };
+  const envelope = {
+    ...OPENCODE_ENVELOPE,
+    client: "cline", filename: "cline-config-bundle.json",
+    destination: "/home/dev/.cline/data/settings/providers.json", apiKeyEnv: "",
+    exportHint: "Cline CLI bundle", config, text: JSON.stringify(config),
+  };
+  stubRoute(client => Response.json(client === "cline" ? envelope : OPENCODE_ENVELOPE));
+  const { root, container } = await mountPanel({ hasKeys: false });
+  await act(async () => { rowButton(container, "Cline CLI", "Details").click(); });
+  const dialog = container.querySelector("dialog")!;
+  expect(dialog.textContent).toContain("two-file bundle");
+  expect(dialog.textContent).toContain("Stop Cline");
+  expect(dialog.textContent).not.toContain("Merge this into the destination file.");
+  expect(dialog.textContent).not.toContain("Set the key before launching");
+  expect(dialog.querySelector(".awi-clientconfig-nokey")).toBeNull();
+  expect(JSON.parse(dialog.querySelector("pre")!.textContent!)).toEqual(config);
+  await act(async () => { root.unmount(); });
+});
+
 test("clients render as rows, not a switch", async () => {
   stubRoute(client => Response.json(client === "pi" ? PI_ENVELOPE : OPENCODE_ENVELOPE));
   const { root, container } = await mountPanel();
@@ -228,7 +252,7 @@ test("clients render as rows, not a switch", async () => {
   expect(container.querySelector(".awi-clientconfig-segmented")).toBeNull();
   const names = [...container.querySelectorAll(".awi-clientconfig-name")].map(el => el.textContent);
   // Row order follows the registry, so a new client appears without a code change here.
-  expect(names?.slice(0, 2)).toEqual(["OpenCode", "Pi"]);
+  expect(names?.slice(0, 5)).toEqual(["Qoder", "Qoder CN", "WorkBuddy (CN)", "WorkBuddy AI", "OpenCode"]);
   expect(names).toHaveLength(CLIENTS.length);
   // Each row states where its file goes; a Download with no destination is the
   // ambiguity the announcement text works to prevent.
@@ -307,7 +331,8 @@ test("each client row shows its own brand mark, never a borrowed one", async () 
   const sources = [...imgSources, ...maskSources]
     .filter((src): src is string => src !== null && src !== "");
   expect(sources.length).toBeGreaterThan(1);
-  expect(new Set(sources).size).toBe(sources.length);
+  // Global and CN editions share Qoder's own brand asset.
+  expect(new Set(sources).size).toBe(sources.length - 1);
   // Marks are decoration: the row already names its client in text.
   for (const img of container.querySelectorAll("img")) {
     expect(img.getAttribute("alt")).toBe("");
@@ -509,6 +534,32 @@ test("no-key state is informational and leaves copy and download enabled", async
   await act(async () => { rowButton(container, "OpenCode", "Details").click(); });
   expect(container.querySelector(".awi-clientconfig-nokey")?.textContent)
     .toContain("OPENCODEX_OPENCODE_API_KEY has no key behind it yet");
+
+  await act(async () => { root.unmount(); });
+});
+
+test("keyless Gajae details do not ask users to generate an admission key", async () => {
+  const config = { providers: { opencodex: { apiKey: "opencodex-loopback", models: [] } } };
+  const envelope = {
+    ...OPENCODE_ENVELOPE,
+    client: "gajae",
+    apiKeyEnv: "",
+    exportHint: "No environment variable is required for the loopback-only Gajae integration.",
+    config,
+    text: JSON.stringify(config),
+  };
+  stubRoute(client => Response.json(client === "gajae" ? envelope : OPENCODE_ENVELOPE));
+  const { root, container } = await mountPanel({ hasKeys: false });
+
+  await act(async () => { rowButton(container, "gjc", "Details").click(); });
+  const dialog = container.querySelector("dialog")!;
+  expect(dialog.querySelector(".awi-clientconfig-nokey")).toBeNull();
+  expect(dialog.textContent).toContain(envelope.exportHint);
+  expect(dialog.textContent).not.toContain("Set the key before launching");
+  expect(dialog.textContent).not.toContain("environment variable named in the config");
+  expect(JSON.parse(dialog.querySelector("pre")!.textContent!)).toEqual(config);
+  expect(button(dialog, "Copy config").disabled).toBe(false);
+  expect(button(dialog, "Download").disabled).toBe(false);
 
   await act(async () => { root.unmount(); });
 });

@@ -10,6 +10,8 @@ import { reconcileModelCacheGeneration } from "../codex/model-cache";
 import { reconcilePoolRotationState } from "../codex/pool-rotation";
 import { reconcileCodexQuotaAccounts } from "../codex/quota";
 import { reconcileQuotaRecovery, sweepExpiredQuotaRecovery } from "../codex/quota-401-recovery";
+import { bindUpstreamRequestCompressionConfig } from "../server/responses/request-compression";
+import { bindWorkflowBudgetConfig } from "./workflow-budget-config";
 import {
   listLiveCodexAccountIds,
   reconcileCodexRoutingHealth,
@@ -21,6 +23,8 @@ import {
 } from "../combos/failover";
 import { reconcileComboWarningMemos } from "../combos/request";
 import { reconcileComboRotationState } from "../combos/resolve";
+import { reconcileComboRecall, sweepExpiredComboRecall } from "../server/responses/combo-session-recall";
+import { reconcileProviderCacheAffinity, sweepExpiredProviderCacheAffinity } from "../providers/cache-affinity";
 import { listLiveComboTargetKeys } from "../combos/types";
 import {
   listLiveConfigOwnershipRoots,
@@ -31,15 +35,20 @@ import {
   reconcileOAuthFlowState,
   sweepExpiredXaiPermanentFailureVerdicts,
 } from "../oauth";
-import { sweepExpiredAnthropicRoutingHealth } from "../oauth/anthropic-routing";
+import { sweepAllAnthropicRoutingHealth, reconcileAnthropicRoutingState } from "../oauth/anthropic-routing";
+import { reconcileAllAnthropicFamilyQuota } from "../oauth/anthropic-model-quota";
+import { reconcileAllAnthropicRatePauses, sweepExpiredAllAnthropicRatePauses } from "../oauth/anthropic-rate-limit-policy";
+import { reconcileAllAnthropicCooldownGenerations } from "../providers/quota/anthropic-cooldown-recovery";
+import { configuredAnthropicInstance } from "../providers/anthropic-instance";
 import { listLiveOAuthAccountKeys, reconcileOAuthReauthState } from "../oauth/store";
 import { reconcileGuardianBackoff } from "../oauth/token-guardian";
 import { sweepExpiredApiKeyCooldowns } from "../providers/key-failover";
 import { reconcileProviderRequestPacing } from "../providers/request-pacing";
-import { sweepAbandonedResponseStateTemps, sweepExpiredResponseStates } from "../responses/state";
+import { sweepAbandonedResponseStateTemps, sweepExpiredResponseStates, sweepOrphanedResponseSpills } from "../responses/state";
 import { sweepExpiredAntigravityReplay } from "../adapters/google-antigravity-replay";
 import { reconcileProviderAccountQuotaRows } from "../providers/quota";
 import { reconcileRouterWarningMemos } from "../router";
+import { configureSharedSpendLedger, spendPolicyFromConfig } from "./spend-reservation-ledger";
 import type { OcxConfig } from "../types";
 import {
   type GenerationContext,
@@ -51,25 +60,63 @@ import {
 
 let liveServerConfig: OcxConfig | null = null;
 
+const liveConfigObservers = new Map<string, (config: OcxConfig) => void>();
+
+/**
+ * Core-owned slot for optional subsystems that follow the adopted live config (for example JEV
+ * advisory quota activation). Keyed; the returned detach removes only this registration.
+ * Detached config reads never notify: only live adoption and live reconciliation do.
+ */
+export function registerLiveConfigObserver(key: string, observer: (config: OcxConfig) => void): () => void {
+  liveConfigObservers.set(key, observer);
+  return () => { if (liveConfigObservers.get(key) === observer) liveConfigObservers.delete(key); };
+}
+
+/** Notify live-config observers; never throws. Also used where a published write skips reconciliation. */
+export function notifyLiveConfigObservers(config: OcxConfig): void {
+  for (const observer of [...liveConfigObservers.values()]) {
+    try { observer(config); } catch { /* an optional observer never alters live adoption */ }
+  }
+}
+
 export function setLiveStateStoreConfig(config: OcxConfig): void {
   liveServerConfig = config;
+  // The one place the server's live config object is installed; detached configs (catalog sync)
+  // never come through here, so the outbound compression opt-in follows the running server only.
+  bindUpstreamRequestCompressionConfig(config);
+  bindWorkflowBudgetConfig(config);
+  notifyLiveConfigObservers(config);
 }
 
 export function reconcileLiveStateStores() {
   if (!liveServerConfig) return { storesVisited: 0, rowsRemoved: 0 };
+  notifyLiveConfigObservers(liveServerConfig);
+  // Only adopted live providers own canonical pools; detached disk snapshots may
+  // contain providers the routing instance deliberately has not activated yet.
+  configureSharedSpendLedger(spendPolicyFromConfig(liveServerConfig.spend,
+    liveServerConfig.spendPoolAliases, Object.keys(liveServerConfig.providers)));
   return reconcileStateGeneration(buildGenerationContext());
 }
 
 export function buildGenerationContext(): GenerationContext {
   if (!liveServerConfig) throw new Error("live server config is not installed");
   const providerNames = new Set(Object.keys(liveServerConfig.providers));
+  const oauthAccountKeys = new Set(listLiveOAuthAccountKeys(providerNames));
+  if (configuredAnthropicInstance(liveServerConfig, "anthropic2") !== "anthropic2") {
+    for (const key of oauthAccountKeys) if (key.startsWith("anthropic2\0")) oauthAccountKeys.delete(key);
+  }
   return {
     generation: 0,
     providerNames,
+    disabledProviderNames: new Set(Object.entries(liveServerConfig.providers)
+      .filter(([, provider]) => provider.disabled === true)
+      .map(([name]) => name)),
+    providerKeyEntryIds: new Map(Object.entries(liveServerConfig.providers)
+      .map(([name, provider]) => [name, new Set((provider.apiKeyPool ?? []).map(entry => entry.id))] as const)),
     comboIds: new Set(Object.keys(liveServerConfig.combos ?? {})),
     comboTargets: listLiveComboTargetKeys(liveServerConfig),
     codexAccountIds: listLiveCodexAccountIds(liveServerConfig),
-    oauthAccountKeys: listLiveOAuthAccountKeys(providerNames),
+    oauthAccountKeys,
     configRoots: listLiveConfigOwnershipRoots(getConfigDir()),
   };
 }
@@ -83,7 +130,11 @@ export const STATE_STORE_REGISTRATIONS = [
     sweepExpired: sweepExpiredComboTargetCooldowns,
     reconcileGeneration: reconcileComboTargetCooldowns,
   },
-  { name: "anthropic-routing-health", sweepExpired: sweepExpiredAnthropicRoutingHealth },
+  { name: "anthropic-routing-health", sweepExpired: sweepAllAnthropicRoutingHealth,
+    reconcileGeneration: context => reconcileAnthropicRoutingState(context, liveServerConfig ?? undefined) },
+  { name: "anthropic-family-quota", reconcileGeneration: reconcileAllAnthropicFamilyQuota },
+  { name: "anthropic-rate-pauses", sweepExpired: sweepExpiredAllAnthropicRatePauses, reconcileGeneration: reconcileAllAnthropicRatePauses },
+  { name: "anthropic-cooldown-generations", reconcileGeneration: reconcileAllAnthropicCooldownGenerations },
   { name: "xai-refresh-verdicts", sweepExpired: sweepExpiredXaiPermanentFailureVerdicts },
   {
     name: "codex-quota-401-recovery",
@@ -97,7 +148,7 @@ export const STATE_STORE_REGISTRATIONS = [
     sweepExpired: sweepExpiredResponseStates,
     // Disk reclaim rides the liveness tick, not the TTL tick: sweepExpiredOnWrite puts
     // sweepExpired on hot write paths, where a directory scan does not belong.
-    sweepLiveness: sweepAbandonedResponseStateTemps,
+    sweepLiveness: () => sweepAbandonedResponseStateTemps() + sweepOrphanedResponseSpills(),
   },
   { name: "antigravity-replay", sweepExpired: sweepExpiredAntigravityReplay },
   { name: "config-warning-memos", reconcileGeneration: (context: GenerationContext) => reconcileConfigWarningMemos(context.generation) },
@@ -111,6 +162,16 @@ export const STATE_STORE_REGISTRATIONS = [
   { name: "model-cache-history", reconcileGeneration: reconcileModelCacheGeneration },
   { name: "pool-rotation", reconcileGeneration: reconcilePoolRotationState },
   { name: "combo-rotation", reconcileGeneration: reconcileComboRotationState },
+  {
+    name: "combo-session-recall",
+    sweepExpired: sweepExpiredComboRecall,
+    reconcileGeneration: reconcileComboRecall,
+  },
+  {
+    name: "provider-cache-affinity",
+    sweepExpired: sweepExpiredProviderCacheAffinity,
+    reconcileGeneration: context => reconcileProviderCacheAffinity(context, liveServerConfig?.providers),
+  },
   { name: "guardian-backoff", reconcileGeneration: reconcileGuardianBackoff },
   { name: "codex-reauth", reconcileGeneration: reconcileCodexReauthState },
   { name: "oauth-reauth", reconcileGeneration: reconcileOAuthReauthState },

@@ -46,6 +46,7 @@ import type { OcxConfig } from "../../src/types";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 
 const HOMES: string[] = [];
+const previousHome = process.env.OPENCODEX_HOME;
 
 function tempHome(): string {
   const dir = join(tmpdir(), `ocx-lab-cl04-${process.pid}-${Math.random().toString(16).slice(2)}`);
@@ -62,7 +63,8 @@ afterEach(() => {
       /* ignore */
     }
   }
-  delete process.env.OPENCODEX_HOME;
+  if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+  else process.env.OPENCODEX_HOME = previousHome;
 });
 
 function withHome<T>(fn: (home: string) => T): T {
@@ -137,7 +139,8 @@ describe("CL-04 query layer", () => {
       seedProjection(home);
       const sqlitePath = join(home, "lab", "compatibility.sqlite");
       const db = new Database(sqlitePath);
-      db.prepare("UPDATE schema_meta SET value = ? WHERE key = ?").run("999", "schema_version");
+      // query() statements are released by close(); an unfinalized prepare() keeps the file open on Windows.
+      db.query("UPDATE schema_meta SET value = ? WHERE key = ?").run("999", "schema_version");
       db.close();
       expect(() => openLabReadConnection(home)).toThrow(LabProjectionIncompatibleError);
       const status = queryLabStatus(home);
@@ -436,7 +439,7 @@ describe("CL-04 privacy boundary", () => {
       const eventId = queryLabEvents({}, undefined, 1, home).items[0]!.eventId;
       const sqlitePath = join(home, "lab", "compatibility.sqlite");
       const db = new Database(sqlitePath);
-      const corruptionInsert = db.prepare(
+      const corruptionInsert = db.query(
         "INSERT INTO corruption(kind, line_number, event_id, detail) VALUES (?, ?, ?, ?)",
       ).run(
         "malformed_line",
@@ -445,11 +448,11 @@ describe("CL-04 privacy boundary", () => {
         "Bearer access-token-value-REDTEST https://user:pw@chatgpt.com C:\\Users\\example\\secret\\path",
       );
       expect(corruptionInsert.changes).toBe(1);
-      const artifactUpdate = db.prepare("UPDATE artifacts SET last_error = ? WHERE rowid = 1").run(
+      const artifactUpdate = db.query("UPDATE artifacts SET last_error = ? WHERE rowid = 1").run(
         "sk-test-1234567890abcdef",
       );
       expect(artifactUpdate.changes).toBe(1);
-      const eventUpdate = db.prepare("UPDATE events SET exclusion_reason = ? WHERE event_id = ?").run(
+      const eventUpdate = db.query("UPDATE events SET exclusion_reason = ? WHERE event_id = ?").run(
         "Bearer detail-event-token C:\\Users\\detail\\secret",
         eventId,
       );

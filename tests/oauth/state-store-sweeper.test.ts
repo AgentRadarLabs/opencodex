@@ -7,6 +7,7 @@ import {
   reconcileStateGeneration,
   registerStateStore,
   registerStateSweepAfterTick,
+  stateSweepAfterTickRegistrationCountForTests,
   resetStateStoreSweeperForTests,
   setGenerationContextBuilder,
   startStateStoreSweeper,
@@ -22,7 +23,8 @@ import {
   setOcxStartProcessProbeForTests,
   sweepDeadOcxStartProcessCache,
 } from "../../src/config";
-import { STATE_STORE_REGISTRATIONS } from "../../src/lib/state-store-registrations";
+import { STATE_STORE_REGISTRATIONS, setLiveStateStoreConfig, reconcileLiveStateStores } from "../../src/lib/state-store-registrations";
+import { clearComboRecallForTests, recallComboForLane, rememberComboForLane } from "../../src/server/responses/combo-session-recall";
 import { getAccountSet, saveCredential } from "../../src/oauth/store";
 import {
   clearAccountQuotaCache,
@@ -42,6 +44,7 @@ import {
   clearResponseStateMemoryForTests,
   rememberResponseState,
   responseStateMetrics,
+  RESPONSE_TTL_MS,
 } from "../../src/responses/state";
 import {
   __resetAntigravityReplayCache,
@@ -78,12 +81,14 @@ beforeEach(() => {
   sweeperHome = mkdtempSync(join(tmpdir(), "ocx-sweeper-home-"));
   process.env.OPENCODEX_HOME = sweeperHome;
   resetStateStoreSweeperForTests();
+  clearComboRecallForTests();
   resetAppOwnedMemoryForTests();
   clearResponseStateMemoryForTests();
   __resetAntigravityReplayCache();
 });
 afterEach(() => {
   resetStateStoreSweeperForTests();
+  clearComboRecallForTests();
   resetAppOwnedMemoryForTests();
   clearResponseStateMemoryForTests();
   __resetAntigravityReplayCache();
@@ -129,6 +134,9 @@ describe("state-store sweeper", () => {
       "provider-request-pacing",
       "combo-target-cooldowns",
       "anthropic-routing-health",
+      "anthropic-family-quota",
+      "anthropic-rate-pauses",
+      "anthropic-cooldown-generations",
       "xai-refresh-verdicts",
       // #3019: the WHAM 401 recovery budget. Registered here deliberately — the inventory
       // is hand-maintained so a new store cannot be added without someone deciding it has
@@ -147,6 +155,8 @@ describe("state-store sweeper", () => {
       "model-cache-history",
       "pool-rotation",
       "combo-rotation",
+      "combo-session-recall",
+      "provider-cache-affinity",
       "guardian-backoff",
       "codex-reauth",
       "oauth-reauth",
@@ -155,6 +165,125 @@ describe("state-store sweeper", () => {
       "oauth-flow-state",
       "ocx-start-process-cache",
     ]);
+  });
+
+  test("registered combo recall cleanup rejects an old completion after delete and recreate while retaining another owner", () => {
+    registerStateStore(STATE_STORE_REGISTRATIONS.find(row => row.name === "combo-session-recall")!);
+    const config: OcxConfig = {
+      port: 0, defaultProvider: "a",
+      providers: { a: { adapter: "openai-chat", baseUrl: "https://a.example/v1" } },
+      combos: {
+        first: { targets: [{ provider: "a", model: "m1" }] },
+        other: { targets: [{ provider: "a", model: "m2" }] },
+      },
+    };
+    setLiveStateStoreConfig(config);
+    const staleGeneration = captureConfigGeneration();
+    rememberComboForLane("first-lane", "first", { provider: "a", model: "m1" }, "visible-first", staleGeneration);
+    rememberComboForLane("other-lane", "other", { provider: "a", model: "m2" }, "visible-other", staleGeneration);
+    delete config.combos!.first;
+    expect(reconcileLiveStateStores()).toEqual({ storesVisited: 1, rowsRemoved: 1 });
+    config.combos!.first = { targets: [{ provider: "a", model: "m1" }] };
+    expect(reconcileLiveStateStores()).toEqual({ storesVisited: 1, rowsRemoved: 0 });
+    rememberComboForLane("first-lane", "first", { provider: "a", model: "m1" }, "visible-first", staleGeneration);
+    expect(recallComboForLane(config, "first-lane", "visible-first")).toBeUndefined();
+    expect(recallComboForLane(config, "other-lane", "visible-other")).toBe("other");
+    rememberComboForLane("first-lane", "first", { provider: "a", model: "m1" }, "visible-new", captureConfigGeneration());
+    expect(recallComboForLane(config, "first-lane", "visible-new")).toBe("first");
+    delete config.providers.a;
+    expect(reconcileLiveStateStores()).toEqual({ storesVisited: 1, rowsRemoved: 2 });
+  });
+
+  test("combo recall watermark rejects writers after a partially failed generation", () => {
+    registerStateStore(STATE_STORE_REGISTRATIONS.find(row => row.name === "combo-session-recall")!);
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    const unregisterFailure = registerStateStore({ name: "failed-owner", reconcileGeneration: () => { throw new Error("retry"); } });
+    const owners = context(0, {
+      comboIds: new Set(["first"]), comboTargets: new Set(["first::a/m1"]), providerNames: new Set(["a"]),
+    });
+    const config: OcxConfig = {
+      port: 0, defaultProvider: "a", providers: { a: { adapter: "openai-chat", baseUrl: "https://a.example/v1" } },
+      combos: { first: { targets: [{ provider: "a", model: "m1" }] } },
+    };
+    try {
+      reconcileStateGeneration(owners);
+      expect(captureConfigGeneration()).toBe(0);
+      rememberComboForLane("lane", "first", { provider: "a", model: "m1" }, "m1", 0);
+      expect(recallComboForLane(config, "lane", "m1")).toBeUndefined();
+      unregisterFailure();
+      reconcileStateGeneration(owners);
+      rememberComboForLane("lane", "first", { provider: "a", model: "m1" }, "m1", captureConfigGeneration());
+      expect(recallComboForLane(config, "lane", "m1")).toBe("first");
+    } finally {
+      unregisterFailure();
+      warning.mockRestore();
+    }
+  });
+
+  describe("bounded combo recall retention", () => {
+    const config: OcxConfig = {
+      port: 0, defaultProvider: "a",
+      providers: { a: { adapter: "openai-chat", baseUrl: "https://a.example/v1" } },
+      combos: { first: { targets: [{ provider: "a", model: "m1" }] } },
+    };
+    const remember = (lane: string, responseModel: string) =>
+      rememberComboForLane(lane, "first", { provider: "a", model: "m1" }, responseModel, captureConfigGeneration());
+    /** A distinct model id of exactly 1 KiB, the largest this store will retain. */
+    const fullModel = (index: number) => `${index}-`.padEnd(1024, "m");
+
+    test("an unretainable model id declines the write instead of clearing the lane", () => {
+      remember("lane", "kept-model");
+      // A model id is provider-reported and arrives on the response, so its length is not
+      // bounded upstream of here. Refusing to retain it must not also destroy what is there:
+      // this callback carries a config generation, not a request order, so it cannot know its
+      // own result is newer than the entry it would be erasing.
+      remember("lane", "x".repeat(1025));
+      expect(recallComboForLane(config, "lane", "kept-model")).toBe("first");
+
+      // Measured in UTF-8 bytes, not code units: 600 three-byte characters is 1,800 bytes.
+      remember("lane", "가".repeat(600));
+      expect(recallComboForLane(config, "lane", "kept-model")).toBe("first");
+
+      // And an oversized id never establishes a lane of its own.
+      remember("fresh", "x".repeat(4096));
+      expect(recallComboForLane(config, "fresh", "x".repeat(4096))).toBeUndefined();
+    });
+
+    test("the aggregate byte budget evicts the least recently written lane", () => {
+      // 64 KiB holds exactly 64 maximum-size entries, well inside the 256-lane cap, so this
+      // isolates the byte budget from the lane count.
+      for (let i = 0; i < 64; i += 1) remember(`lane-${i}`, fullModel(i));
+      expect(recallComboForLane(config, "lane-0", fullModel(0))).toBe("first");
+
+      remember("lane-64", fullModel(64));
+      expect(recallComboForLane(config, "lane-0", fullModel(0))).toBeUndefined();
+      expect(recallComboForLane(config, "lane-1", fullModel(1))).toBe("first");
+      expect(recallComboForLane(config, "lane-64", fullModel(64))).toBe("first");
+    });
+
+    test("a rewritten lane is charged once, not once per write", () => {
+      // Replacing a lane must release the old entry's bytes. If it did not, 64 rewrites of one
+      // lane would exhaust the whole budget and start evicting unrelated lanes.
+      remember("stable", "stable-model");
+      for (let i = 0; i < 64; i += 1) remember("churn", fullModel(i));
+      expect(recallComboForLane(config, "stable", "stable-model")).toBe("first");
+      expect(recallComboForLane(config, "churn", fullModel(63))).toBe("first");
+    });
+
+    test("a periodic tick expires a lane that is never read again and releases its bytes", () => {
+      registerStateStore(STATE_STORE_REGISTRATIONS.find(row => row.name === "combo-session-recall")!);
+      for (let i = 0; i < 64; i += 1) remember(`stale-${i}`, fullModel(i));
+
+      // Before this the TTL was only evaluated on read or on a generation change, so a lane
+      // nobody reads again held its entry for the life of the process.
+      expect(sweepExpired(Date.now() + 30 * 60 * 1_000)).toEqual({ storesVisited: 1, rowsRemoved: 64 });
+      expect(recallComboForLane(config, "stale-0", fullModel(0))).toBeUndefined();
+
+      // The budget is genuinely free again: a full refill keeps its own oldest lane, which
+      // could not happen if the swept entries had left their bytes behind.
+      for (let i = 0; i < 64; i += 1) remember(`fresh-${i}`, fullModel(i));
+      expect(recallComboForLane(config, "fresh-0", fullModel(0))).toBe("first");
+    });
   });
 
   test("a sweeper tick expires continuation and Antigravity rows without store traffic", () => {
@@ -169,7 +298,9 @@ describe("state-store sweeper", () => {
     for (const name of ["responses-continuation", "antigravity-replay"]) {
       registerStateStore(STATE_STORE_REGISTRATIONS.find(registration => registration.name === name)!);
     }
-    const result = sweepExpired(Date.now() + 60 * 60 * 1_000 + 1);
+    // Past both retentions: the Antigravity replay cache expires after an hour, the responses
+    // continuation store after RESPONSE_TTL_MS. One tick has to clear both rows.
+    const result = sweepExpired(Date.now() + RESPONSE_TTL_MS + 60 * 60 * 1_000);
     expect(result.rowsRemoved).toBe(2);
     expect(responseStateMetrics().count).toBe(0);
     expect(antigravityReplayMetrics().sessions).toBe(0);
@@ -551,5 +682,108 @@ describe("state-store sweeper", () => {
     expect(sweepDeadOcxStartProcessCache()).toBe(3);
     expect(probed).toEqual([42]);
     expect(ocxStartProcessCacheSizeForTests()).toBe(1);
+  });
+});
+
+describe("sweeper registration and timer ownership", () => {
+  function withClock(run: (timers: Array<{ tick(): void }>, cleared: unknown[]) => void) {
+    const timers: Array<{ tick(): void; unref(): void }> = [];
+    const cleared: unknown[] = [];
+    const setSpy = spyOn(globalThis, "setInterval").mockImplementation(((tick: () => void) => {
+      const timer = { tick, unref() {} };
+      timers.push(timer);
+      return timer;
+    }) as typeof setInterval);
+    const clearSpy = spyOn(globalThis, "clearInterval").mockImplementation((timer => {
+      cleared.push(timer);
+    }) as typeof clearInterval);
+    try { run(timers, cleared); }
+    finally {
+      stopStateStoreSweeper();
+      setSpy.mockRestore();
+      clearSpy.mockRestore();
+    }
+  }
+
+  test("an obsolete stop handle cannot stop the replacement sweep timer", () => {
+    withClock((timers, cleared) => {
+      const first = startStateStoreSweeper();
+      const second = startStateStoreSweeper();
+      expect(cleared).toEqual([timers[0]]);
+      first.stop();
+      first.stop();
+      expect(cleared).toEqual([timers[0]]);
+      second.stop();
+      second.stop();
+      expect(cleared).toEqual([timers[0], timers[1]]);
+    });
+  });
+
+  test("out-of-order detach unlinks displaced hooks and preserves the live predecessor", () => {
+    withClock(timers => {
+      const seen: string[] = [];
+      const older = registerStateSweepAfterTick({ name: "owner", afterTick: () => { seen.push("older"); } });
+      const middle = registerStateSweepAfterTick({ name: "owner", afterTick: () => { seen.push("middle"); } });
+      const newer = registerStateSweepAfterTick({ name: "owner", afterTick: () => { seen.push("newer"); } });
+      startStateStoreSweeper();
+      middle(); middle();
+      expect(stateSweepAfterTickRegistrationCountForTests()).toBe(2);
+      timers[0]!.tick();
+      newer();
+      expect(stateSweepAfterTickRegistrationCountForTests()).toBe(1);
+      timers[0]!.tick();
+      older(); newer(); middle();
+      expect(stateSweepAfterTickRegistrationCountForTests()).toBe(0);
+      timers[0]!.tick();
+      expect(seen).toEqual(["newer", "older"]);
+    });
+  });
+
+  test("replacement churn retains only the live owners, not historical tombstones", () => {
+    const older = registerStateSweepAfterTick({ name: "churn", afterTick() {} });
+    const detached: Array<() => void> = [];
+    let previous: (() => void) | undefined;
+    for (let index = 0; index < 256; index++) {
+      const current = registerStateSweepAfterTick({ name: "churn", afterTick() {} });
+      if (previous) { previous(); detached.push(previous); }
+      previous = current;
+      expect(stateSweepAfterTickRegistrationCountForTests()).toBe(2);
+    }
+    previous!();
+    expect(stateSweepAfterTickRegistrationCountForTests()).toBe(1);
+    for (const detach of detached) detach();
+    expect(stateSweepAfterTickRegistrationCountForTests()).toBe(1);
+    older();
+    expect(stateSweepAfterTickRegistrationCountForTests()).toBe(0);
+  });
+
+  test("self-detach restores the previous owner without preventing sibling callbacks", () => {
+    withClock(timers => {
+      const seen: string[] = [];
+      const older = registerStateSweepAfterTick({ name: "self", afterTick: () => { seen.push("older"); } });
+      const newer = registerStateSweepAfterTick({ name: "self", afterTick() { newer(); seen.push("newer"); } });
+      const sibling = registerStateSweepAfterTick({ name: "sibling", afterTick: () => { seen.push("sibling"); } });
+      startStateStoreSweeper();
+      timers[0]!.tick(); timers[0]!.tick();
+      expect(seen).toEqual(["newer", "sibling", "older", "sibling"]);
+      older(); sibling();
+      expect(stateSweepAfterTickRegistrationCountForTests()).toBe(0);
+    });
+  });
+
+  test("old detach handles after reset cannot resurrect hooks or detach a fresh owner", () => {
+    withClock(timers => {
+      const seen: string[] = [];
+      const older = registerStateSweepAfterTick({ name: "reset", afterTick: () => { seen.push("older"); } });
+      const newer = registerStateSweepAfterTick({ name: "reset", afterTick: () => { seen.push("newer"); } });
+      resetStateStoreSweeperForTests();
+      const fresh = registerStateSweepAfterTick({ name: "reset", afterTick: () => { seen.push("fresh"); } });
+      older(); newer(); older();
+      expect(stateSweepAfterTickRegistrationCountForTests()).toBe(1);
+      startStateStoreSweeper(); timers[0]!.tick();
+      expect(seen).toEqual(["fresh"]);
+      fresh();
+      expect(stateSweepAfterTickRegistrationCountForTests()).toBe(0);
+    });
   });
 });

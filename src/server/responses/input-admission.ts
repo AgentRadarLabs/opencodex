@@ -1,3 +1,4 @@
+import { clientFacingModelText, type ClientFacingModelLabel } from "../../lib/error-destination";
 /**
  * Pre-dispatch input admission (#1412).
  *
@@ -10,11 +11,18 @@
  * catches the pathological case and stays out of the way otherwise. Every uncertainty
  * resolves toward admitting.
  */
-import { nativeOpenAiContextWindow, nativeOpenAiMaxInputTokens, type NativeContextLimitsInput } from "../../codex/catalog/metadata";
+import { collapseDevinModelUid, DEVIN_MODEL_CONTEXT_WINDOWS } from "../../adapters/devin/live-models";
+import {
+  nativeOpenAiContextWindow,
+  nativeOpenAiMaxInputTokens,
+  nativeOpenAiMaxOutputTokens,
+  type NativeContextLimitsInput,
+} from "../../codex/catalog/metadata";
+import { getModelMetadata } from "../../generated/model-metadata";
 import { estimateTokens } from "../../lib/token-estimate";
 import { isCanonicalOpenAiForwardProvider, OPENAI_CODEX_PROVIDER_ID } from "../../providers/openai-tiers";
 import { modelRecordValue } from "../../reasoning-effort";
-import type { OcxContentPart, OcxParsedRequest, OcxProviderConfig } from "../../types";
+import { modelInList, type OcxContentPart, type OcxParsedRequest, type OcxProviderConfig } from "../../types";
 
 /**
  * Multiplier applied to the ceiling before refusing.
@@ -49,11 +57,18 @@ const REMOTE_IMAGE_TOKENS = 850;
 /** Decoded image bytes per token. Coarse tile-count proxy, not a provider formula. */
 const IMAGE_BYTES_PER_TOKEN = 750;
 
+/** Compressed-audio bytes per token. More conservative than the image proxy. */
+const AUDIO_BYTES_PER_TOKEN = 256;
+
 export interface InputAdmissionResult {
   admitted: boolean;
   estimatedTokens: number;
   /** Resolved ceiling, or null when nothing could be resolved (=> always admitted). */
   ceiling: number | null;
+  /** Actual shared context window when an input-only ceiling differs. */
+  contextWindow?: number | null;
+  /** Output space reserved by the combo preflight; absent on the loose direct gate. */
+  requiredOutputHeadroom?: number;
 }
 
 function positive(value: unknown): number | null {
@@ -77,7 +92,18 @@ function imageTokens(imageUrl: string): number {
 function contentPartTokens(part: OcxContentPart, modelId: string): number {
   if (part.type === "image") return imageTokens(part.imageUrl);
   if (part.type === "video") return imageTokens(part.videoUrl);
+  if (part.type === "audio") return base64PayloadTokens(part.data, AUDIO_BYTES_PER_TOKEN);
+  // An inline document is a base64 payload, not a sentence: estimating it from its marker would
+  // admit a request whose real input is orders of magnitude larger. Counted arithmetically —
+  // rebuilding the data URL here would materialize a second request-sized string just to measure it.
+  if (part.type === "document") return base64PayloadTokens(part.data);
   return estimateTokens(part.text, modelId);
+}
+
+function base64PayloadTokens(base64: string, bytesPerToken = IMAGE_BYTES_PER_TOKEN): number {
+  if (base64.length === 0) return 0;
+  const decoded = Math.floor((base64.length * 3) / 4);
+  return Math.max(1, Math.ceil(decoded / bytesPerToken));
 }
 
 function contentTokens(content: string | readonly OcxContentPart[], modelId: string): number {
@@ -94,10 +120,12 @@ function contentTokens(content: string | readonly OcxContentPart[], modelId: str
  * their content as `OcxAssistantContentPart[]` — text, thinking blocks, and tool calls whose
  * JSON arguments are frequently the largest single item in an agent conversation. A walk
  * that counted only `{type:"text"}` would undercount exactly the turns that trigger this
- * gate.
+ * gate. The routed provider determines whether replayed thinking reaches the wire.
  */
-export function estimateInputTokens(parsed: OcxParsedRequest, modelId: string): number {
+export function estimateInputTokens(parsed: OcxParsedRequest, modelId: string, provider?: OcxProviderConfig): number {
   const { context } = parsed;
+  const countThinking = provider?.adapter !== "openai-chat"
+    || modelInList(provider.preserveReasoningContentModels, parsed.modelId);
   let total = 0;
 
   for (const prompt of context.systemPrompt ?? []) total += estimateTokens(prompt, modelId);
@@ -106,7 +134,9 @@ export function estimateInputTokens(parsed: OcxParsedRequest, modelId: string): 
     if (message.role === "assistant") {
       for (const part of message.content) {
         if (part.type === "text") total += estimateTokens(part.text, modelId);
-        else if (part.type === "thinking") total += estimateTokens(part.thinking, modelId);
+        else if (part.type === "thinking") {
+          if (countThinking) total += estimateTokens(part.thinking, modelId);
+        }
         else total += estimateTokens(part.name, modelId) + estimateTokens(JSON.stringify(part.arguments), modelId);
       }
       // Opaque provider blob replayed verbatim upstream, so it costs real input tokens.
@@ -135,18 +165,55 @@ export function estimateInputTokens(parsed: OcxParsedRequest, modelId: string): 
  * reject a user-defined provider that merely shares a built-in name using limits that
  * belong to a different service.
  */
-export function resolveInputCeiling(
+interface ResolvedContextLimits {
+  /** The target's total context window: input and output share it. */
+  window: number | null;
+  /** Largest admissible input, which input-only caps may tighten below the window. */
+  ceiling: number | null;
+}
+
+/**
+ * Devin spells one model dotted in catalog families (`swe-1.7`) and hyphenated in uids
+ * (`swe-1-7`), with optional effort suffixes (`swe-2-flash-medium`). A per-model record is
+ * matched on the exact id first, then the effort-collapsed id, then both hyphenated forms, and
+ * finally on record keys folded the same way (`swe-1.7` serves a `swe-1-7-medium` request), so
+ * an operator override on any of those spellings binds before a provider-wide default.
+ */
+function devinRecordValue(record: Record<string, number> | undefined, modelId: string): number | null {
+  const normalized = modelId.replace(/\./g, "-");
+  // Lower-case before collapsing so an upper-case effort suffix (SWE-1-7-MEDIUM) is removed too.
+  const collapsed = collapseDevinModelUid(normalized.toLowerCase());
+  for (const key of new Set([modelId, collapseDevinModelUid(modelId), normalized, collapsed])) {
+    const value = positive(modelRecordValue(record, key));
+    if (value !== null) return value;
+  }
+  if (!record) return null;
+  // Exact spellings missed; fold dotted record keys only now so an exact key always wins.
+  for (const target of new Set([normalized, collapsed])) {
+    // Fold case too, like modelRecordValue's exact-spelling lookup.
+    const folded = target.toLowerCase();
+    for (const [key, raw] of Object.entries(record)) {
+      if (key.replace(/\./g, "-").toLowerCase() !== folded) continue;
+      const value = positive(raw);
+      if (value !== null) return value;
+    }
+  }
+  return null;
+}
+
+function resolveContextLimits(
   provider: OcxProviderConfig,
   providerName: string,
   modelId: string,
-  // Operator cap for the canonical native provider. Passed in rather than read from a
-  // config here so this stays pure: no filesystem, no catalog, no registry scan.
   nativeContextCap?: NativeContextLimitsInput,
-): number | null {
+): ResolvedContextLimits {
   // `modelRecordValue`, not a bare lookup: the catalog resolves these same two maps that
   // way, so a `gpt-oss` entry covers `gpt-oss:120b`. Reading raw here made the gate fall
   // back to the provider-wide window and refuse turns the model can plainly hold.
-  const configured = positive(modelRecordValue(provider.modelContextWindows, modelId))
+  const devin = provider.adapter === "devin";
+  const configured = (devin
+    ? devinRecordValue(provider.modelContextWindows, modelId)
+    : positive(modelRecordValue(provider.modelContextWindows, modelId)))
     ?? positive(provider.contextWindow);
 
   // The canonical `openai` registry entry declares no context fields, so without this the
@@ -168,11 +235,124 @@ export function resolveInputCeiling(
     : null;
   const nativeMaxInput = canonicalNativeBare ? positive(nativeOpenAiMaxInputTokens(modelId, nativeLimits)) : null;
 
-  const window = canonicalNativeBare ? native : configured;
+  // Devin's live catalog windows reach the Codex model list but never `provider.modelContextWindows`;
+  // without the adapter table every devin combo target resolved no window and the strict gate stayed open.
+  const window = canonicalNativeBare ? (native ?? generatedNativeWindow(modelId, configured, nativeContextCap))
+    : (configured ?? (devin ? devinRecordValue(DEVIN_MODEL_CONTEXT_WINDOWS, modelId) : null));
   // modelMaxInputTokens is an input-only cap, so it can only tighten the window.
-  const configuredMaxInput = positive(modelRecordValue(provider.modelMaxInputTokens, modelId));
+  const configuredMaxInput = devin
+    ? devinRecordValue(provider.modelMaxInputTokens, modelId)
+    : positive(modelRecordValue(provider.modelMaxInputTokens, modelId));
   const limits = [window, configuredMaxInput, nativeMaxInput].filter((v): v is number => v !== null);
+  return { window, ceiling: limits.length === 0 ? null : Math.min(...limits) };
+}
+
+/**
+ * Generated-catalog keys, not routing provider names. `OPENAI_CODEX_PROVIDER_ID` is the string
+ * `"openai"` -- the canonical Codex forward route -- so using it to index the generated bundle
+ * would silently skip the native Codex rows and read the public API rows instead.
+ */
+const NATIVE_METADATA_CATALOGS = ["openai-codex", "openai"] as const;
+
+/**
+ * Static in-tree metadata for a canonical native slug the narrower override and pinned-native
+ * tables do not carry. Falling through to null made input admission completely blind for
+ * exactly those models, which is how a 128k target accepted a turn it could not finish.
+ *
+ * This deliberately covers slugs that are no longer offered in the picker: a retired slug is
+ * still dispatchable when an operator names it explicitly in a combo target, and that is the
+ * configuration where the gate was inert. This is a generated bundle compiled into the binary,
+ * not a live catalog read, so it adds no I/O. Explicit provider and operator caps may only
+ * narrow the result, never widen it.
+ */
+function generatedNativeWindow(
+  modelId: string,
+  configured: number | null,
+  nativeContextCap: NativeContextLimitsInput | undefined,
+): number | null {
+  let generated: number | null = null;
+  for (const catalog of NATIVE_METADATA_CATALOGS) {
+    generated = positive(getModelMetadata(catalog, modelId)?.contextWindow);
+    if (generated !== null) break;
+  }
+  if (generated === null) return null;
+  const cap = typeof nativeContextCap === "number"
+    ? positive(nativeContextCap)
+    : positive(nativeContextCap?.cap);
+  return Math.min(generated, configured ?? generated, cap ?? generated);
+}
+
+export function resolveInputCeiling(
+  provider: OcxProviderConfig,
+  providerName: string,
+  modelId: string,
+  // Operator cap for the canonical native provider. Passed in rather than read from a
+  // config here so this stays pure: no filesystem, no catalog, no registry scan.
+  nativeContextCap?: NativeContextLimitsInput,
+): number | null {
+  return resolveContextLimits(provider, providerName, modelId, nativeContextCap).ceiling;
+}
+
+/**
+ * Largest output the concrete target can emit. Used only to avoid reserving MORE than the
+ * target could ever produce when a client asks for a bigger allowance than the model has.
+ * Unknown stays unknown rather than inventing a capability.
+ */
+export function resolveOutputCeiling(
+  provider: OcxProviderConfig,
+  providerName: string,
+  modelId: string,
+): number | null {
+  const configured = positive(modelRecordValue(provider.modelMaxOutputTokens, modelId))
+    ?? positive(provider.defaultMaxOutputTokens);
+  const canonicalNativeBare = providerName === OPENAI_CODEX_PROVIDER_ID
+    && isCanonicalOpenAiForwardProvider(provider)
+    && !modelId.includes("/");
+  const native = canonicalNativeBare ? positive(nativeOpenAiMaxOutputTokens(modelId)) : null;
+  const limits = [configured, native].filter((v): v is number => v !== null);
   return limits.length === 0 ? null : Math.min(...limits);
+}
+
+/**
+ * Combo-only admission. A fallback must be able to satisfy the caller's declared output
+ * allowance inside its OWN context window. Otherwise it returns 200, emits a few hundred
+ * tokens, and terminates on `finish_reason: length` — which the Anthropic surface renders as
+ * "response exceeded the output token maximum" even though the real cause was the total
+ * window. By then the next target cannot be tried, because output has already committed.
+ *
+ * Two budgets are checked separately so the reserve is counted exactly once. `ceiling` is an
+ * input-only budget once `modelMaxInputTokens` tightens it below the window, so the output
+ * reserve belongs against `window`, not against `ceiling`.
+ *
+ * Direct and single-target requests keep the deliberately loose 2.5x pathological-input gate.
+ * This stricter rule applies only to synthetic combo children, where skipping one known-small
+ * target is safe and the ladder continues before any upstream bytes are sent. Unknown context
+ * stays fail-open, and a caller that declared no output allowance is unaffected.
+ */
+export function checkComboTargetInputAdmission(
+  parsed: OcxParsedRequest,
+  provider: OcxProviderConfig,
+  providerName: string,
+  modelId: string,
+  nativeContextCap?: NativeContextLimitsInput,
+): InputAdmissionResult {
+  const { window, ceiling } = resolveContextLimits(provider, providerName, modelId, nativeContextCap);
+  const requestedOutput = positive(parsed.options.maxOutputTokens);
+  if (window === null || ceiling === null || requestedOutput === null) {
+    return checkInputAdmission(parsed, provider, providerName, modelId, nativeContextCap);
+  }
+  const targetOutput = resolveOutputCeiling(provider, providerName, modelId);
+  const requiredOutputHeadroom = targetOutput === null
+    ? requestedOutput
+    : Math.min(requestedOutput, targetOutput);
+  const estimatedTokens = estimateInputTokens(parsed, modelId, provider);
+  return {
+    admitted: estimatedTokens <= ceiling && estimatedTokens + requiredOutputHeadroom <= window,
+    estimatedTokens,
+    ceiling,
+    requiredOutputHeadroom,
+    ...(window !== ceiling ? { contextWindow: window } : {}),
+  };
 }
 
 /**
@@ -187,8 +367,30 @@ export function checkInputAdmission(
   modelId: string,
   nativeContextCap?: NativeContextLimitsInput,
 ): InputAdmissionResult {
-  const ceiling = resolveInputCeiling(provider, providerName, modelId, nativeContextCap);
+  const { window, ceiling } = resolveContextLimits(provider, providerName, modelId, nativeContextCap);
   if (ceiling === null) return { admitted: true, estimatedTokens: 0, ceiling: null };
-  const estimatedTokens = estimateInputTokens(parsed, modelId);
-  return { admitted: estimatedTokens <= ceiling * ADMISSION_TOLERANCE, estimatedTokens, ceiling };
+  const estimatedTokens = estimateInputTokens(parsed, modelId, provider);
+  return { admitted: estimatedTokens <= ceiling * ADMISSION_TOLERANCE, estimatedTokens, ceiling,
+    ...(window !== ceiling ? { contextWindow: window } : {}) };
+}
+
+export function inputAdmissionRefusalMessage(input: InputAdmissionResult, model: ClientFacingModelLabel): string {
+  const count = (value: number | null) => value !== null && Number.isFinite(value) && value >= 0 ? Math.trunc(value) : 0;
+  const label = clientFacingModelText(model);
+  const estimate = count(input.estimatedTokens);
+  const ceiling = count(input.ceiling);
+  if (input.contextWindow !== undefined && input.estimatedTokens > ceiling) {
+    const window = input.contextWindow === null ? "" : `; context window: ${count(input.contextWindow)} tokens`;
+    return `Estimated input (~${estimate} tokens) exceeds the input limit of ${label} (${ceiling} tokens${window}). `
+      + "Start a new session or choose a model with a larger input limit.";
+  }
+  const window = count(input.contextWindow ?? input.ceiling);
+  const inputLimit = input.contextWindow !== undefined ? `; input limit: ${ceiling} tokens` : "";
+  return input.requiredOutputHeadroom !== undefined
+    ? `Estimated input (~${estimate} tokens) plus ${count(input.requiredOutputHeadroom)} `
+      + `tokens of requested output headroom cannot fit the context window of ${label} `
+      + `(${window} tokens${inputLimit}).`
+    : `Estimated input (~${estimate} tokens) is far past the context window `
+      + `of ${label} (${window} tokens${inputLimit}). Start a new session or choose a `
+      + `model with a larger context window.`;
 }
