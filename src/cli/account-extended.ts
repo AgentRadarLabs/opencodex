@@ -4,6 +4,7 @@ import { anthropicProviderIdentityError, cmdAnthropicAccountThreshold } from "./
 import { isReservedCodexAccountWord, reportCodexAccountTargetError, resolveCodexAccountTarget } from "./account-target";
 import { hasPassiveAccountQuota } from "../providers/quota";
 import { isWeeklyAllowancePercent } from "../providers/quota-types";
+import { claudeCreditsText } from "./account-key-quota";
 import { readSecretLine, terminalSafeText } from "./runtime-api";
 import {
   ANTIGRAVITY_RISK_ACK_FIELD,
@@ -58,7 +59,7 @@ const EXTENDED_USAGE = `Usage:
   ocx account pause <provider> <id|alias|main> [--json]
   ocx account resume <provider> <id|alias|main> [--if-healthy] [--json]
   ocx account pause-exhausted <provider> [--json]
-  ocx account strategy <provider> [<quota|round-robin|fill-first|least-loaded|reset-first>] [--json]
+  ocx account strategy <provider> [<quota|round-robin|fill-first|reset-near-weighted|least-loaded|reset-first>] [--json]
   ocx account sticky <provider> [<1-100>] [--json]
   ocx account routes <anthropic|anthropic2> [--file <json-file>|--clear] [--json]
   ocx account remove <provider> <id|alias|main> --yes [--json]
@@ -307,6 +308,8 @@ function quotaParts(quota: ProviderQuotaDto): string[] {
     const reset = resetIso(window.resetAt);
     if (reset) parts.push(`resets ${reset}`);
   }
+  const credits = claudeCreditsText(quota.claudeUsageCredits);
+  if (credits) parts.push(credits);
   return parts;
 }
 
