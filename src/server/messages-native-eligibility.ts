@@ -5,7 +5,8 @@
  * `count_tokens` and the protocol planner (`src/protocols/plan-snapshot.ts`) all ask here;
  * previews and counts remain conservative when runtime availability is unknown.
  */
-import { advisorServerToolDestination, isAdvisorServerToolType } from "../adapters/anthropic/advisor-tool";
+import { ADVISOR_SERVER_TOOL_NAME, advisorServerToolDestination, isAdvisorServerToolType } from "../adapters/anthropic/advisor-tool";
+import { spendCeilingsConfigured, type SpendAdmissionPolicy } from "../lib/spend-reservation-ledger";
 import { anthropicBodyElidesBlockedSkill } from "../claude/inbound";
 import { isClaudeWebSearchToolName } from "../claude/outbound";
 import type { ProtocolReasonCode } from "../protocols/contract";
@@ -52,6 +53,13 @@ export interface NativeMessagesSelector {
   oauthFailoverQuorum?: boolean;
   /** Runtime sidecar plan availability; absent for config-only callers. */
   webSearchBackendAvailable?: boolean;
+  /**
+   * The spend ceilings the request was admitted under (hosted ingress only). The hosted Advisor
+   * rule reads these, so a later config reload cannot move an admitted request, or its retries,
+   * between the bridge and the native lane. Absent for count_tokens and the planner, which judge
+   * against the live policy.
+   */
+  spendCeilings?: SpendAdmissionPolicy;
 }
 
 type Rec = Record<string, unknown>;
@@ -95,7 +103,17 @@ function bridgeOnlyPolicyApplies(
   // An operator who keeps the Advisor off this provider is obeyed by the bridge; exact replay would send it.
   if (hostedCanonical(route) && !advisorServerToolDestination(route.provider) && Array.isArray(body.tools)
     && body.tools.some(tool => isRec(tool) && isAdvisorServerToolType(tool.type))) return true;
+  // Under a token spend ceiling the bridge withholds or refuses the hosted Advisor (#8815); exact replay would send it.
+  if (hostedCanonical(route) && spendCeilingsConfigured(selector.spendCeilings) && carriesAdvisor(body)) return true;
   return selector.webSearchBackendAvailable !== false && webSearchSidecarMayEngage(body, config);
+}
+
+/** A declared hosted Advisor or a replayed Advisor exchange anywhere in the caller body. */
+function carriesAdvisor(body: Readonly<Rec>): boolean {
+  if (Array.isArray(body.tools) && body.tools.some(tool => isRec(tool) && isAdvisorServerToolType(tool.type))) return true;
+  return Array.isArray(body.messages) && body.messages.some(message => isRec(message) && Array.isArray(message.content)
+    && message.content.some(block => isRec(block) && (block.type === "advisor_tool_result"
+      || (block.type === "server_tool_use" && block.name === ADVISOR_SERVER_TOOL_NAME))));
 }
 
 /** AgentRadar hosted gateways send canonical Anthropic routes natively whatever the rollout says (.27 source replay). */

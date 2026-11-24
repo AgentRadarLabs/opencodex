@@ -1020,6 +1020,18 @@ describe("priority (Fast) service tier multiplier", () => {
     expect(fast!.priorityMultiplier).toBe(2);
   });
 
+  test.each(["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6.2-sol", "gpt-6.2-astra"])(
+    "P1d. Fast mode prices %s at 2x standard (openai.com/api-fast-mode)", model => {
+      for (const provider of ["openai", "openai-apikey"]) {
+        const base = estimateRequestCost({ provider, model, usageStatus: "reported", usage });
+        const fast = estimateRequestCost({ provider, model, usageStatus: "reported", usage, serviceTier: "priority" });
+        expect(base).not.toBeNull();
+        expect(fast!.cost.total).toBeCloseTo(2 * base!.cost.total, 9);
+        expect(fast!.priorityMultiplier).toBe(2);
+        expect(findPriorityPricingRule(provider, model)?.multiplier).toBe(2);
+      }
+    });
+
   test("P2. priority tier applies 2.5x multiplier for gpt-5.5", () => {
     const base = estimateRequestCost({ provider: "openai", model: "gpt-5.5", usageStatus: "reported", usage }, overlays);
     const fast = estimateRequestCost({ provider: "openai", model: "gpt-5.5", usageStatus: "reported", usage, serviceTier: "priority" }, overlays);
@@ -1086,7 +1098,7 @@ describe("priority (Fast) service tier multiplier", () => {
   });
 
   test("P9. PRIORITY_MULTIPLIERS table has expected entries", () => {
-    expect(Object.keys(PRIORITY_MULTIPLIERS)).toHaveLength(10); // incl. gpt-6.1-terra (gpt61-terra-pricing.test.ts)
+    expect(Object.keys(PRIORITY_MULTIPLIERS)).toHaveLength(13); // incl. gpt-6.1-terra, gpt-6.1-sol, gpt-6-sol, gpt-6-luna (P1d)
     expect(PRIORITY_MULTIPLIERS["gpt-5.6-sol"]).toBe(2);
     expect(PRIORITY_MULTIPLIERS["gpt-daybreak-blue-latest"]).toBe(2);
     expect(PRIORITY_MULTIPLIERS["daybreak-blue-latest"]).toBe(2);

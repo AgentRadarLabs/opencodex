@@ -92,6 +92,8 @@ export interface PassthroughBodyGuard {
   reqSignal?: AbortSignal;
   /** The .27 strict relay (validated frames, first terminal ends it). Production callers set it; tests default to the flag. */
   strictRelay?: boolean;
+  /** Lets an observer before frame buffering refresh the tap's pending-read deadline. */
+  rawActivity?: { refresh?: () => void };
   /**
    * The routed provider opted into anthropicEofTolerance: a content-only clean EOF (no
    * message_stop, no stop_reason, nothing cut) stays a completed turn, as it always was.
@@ -329,6 +331,7 @@ export function tapAnthropicSseForLog(
       `anthropic passthrough body stalled: no upstream bytes for ${Math.round((guard?.stallMs ?? 0) / 1000)}s`,
     );
   });
+  const rawActivity = guard?.rawActivity;
   // Deterministic client-cancel classification: Bun may surface a client abort as a
   // reader.read() rejection OR a resolved done (src/lib/abort.ts cancelBodyOnAbort
   // rationale), so the listener performs first-wins settlement itself instead of
@@ -416,7 +419,9 @@ export function tapAnthropicSseForLog(
             continue;
           }
           idle.reset();
+          if (rawActivity) rawActivity.refresh = idle.reset;
           const { done, value } = await reader.read();
+          if (rawActivity) rawActivity.refresh = undefined;
           idle.pause();
           if (settled) return; // stall/overflow/abort won the race while we awaited
           if (done) {
@@ -499,6 +504,7 @@ export function tapAnthropicSseForLog(
           }
         }
       } catch (err) {
+        if (rawActivity) rawActivity.refresh = undefined;
         if (settled) return;
         // Bun can settle a fetch body read before it dispatches the abort listeners
         // (consumeForInspection in relay.ts): read the signal itself before calling this

@@ -18,7 +18,10 @@ test("usage-bearing translator overflow reaches request and wire without sidecar
   const adapter: ProviderAdapter = {
     name: "overflow",
     buildRequest: () => ({ url: "https://routed.test/v1", method: "POST", headers: {}, body: "{}" }),
-    fetchResponse: async () => new Response("wire", { status: 200 }),
+    fetchResponse: async (_request, options) => {
+      options?.onPhysicalSend?.({ ordinal: 1 });
+      return new Response("wire", { status: 200 });
+    },
     async *parseStream() {
       yield { type: "tool_call_start", id: "ws1", name: "web_search" };
       yield { type: "tool_call_delta", arguments: '{"q":"docs"}' };

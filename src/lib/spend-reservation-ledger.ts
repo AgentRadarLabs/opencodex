@@ -1524,7 +1524,7 @@ let sharedLedger: SpendReservationLedger | undefined;
 let sharedPolicy: SpendReservationPolicy = DEFAULT_SPEND_RESERVATION_POLICY;
 
 /** Whether any scope carries a ceiling -- that is, whether anything at all can be refused. */
-export function spendCeilingsConfigured(policy: SpendReservationPolicy = sharedPolicy): boolean {
+export function spendCeilingsConfigured(policy: SpendAdmissionPolicy = sharedPolicy): boolean {
   return policy.root.maxTokens !== undefined
     || policy.identity.maxTokens !== undefined
     || policy.pool.maxTokens !== undefined;
