@@ -71,22 +71,7 @@ export interface ProviderQuotaCreditsUsd {
   unlimited?: boolean;
 }
 
-/** Claude usage credits ("extra usage") in major currency units. Display only; never a routing window. */
-export interface ClaudeUsageCredits {
-  currency: string;
-  used: number;
-  /** Monthly spend cap; absent when the account has none. */
-  limit?: number;
-  /** Prepaid credit balance; absent when Anthropic reports none. */
-  balance?: number;
-  enabled: boolean;
-  /** Anthropic's reason code, e.g. `out_of_credits`, `org_level_disabled_until`. */
-  disabledReason?: string;
-}
-
 export interface ProviderQuota {
-  /** Display-only Claude usage credits from the OAuth usage endpoint. */
-  claudeUsageCredits?: ClaudeUsageCredits;
   /** Display-only budget windows for which the upstream did not provide a usable entitlement. */
   unknownBudgetWindows?: { label: string; resetAt?: number }[];
   /** Claude CLI extra-usage entitlement/cap only; enabled does not prove wallet funds. */

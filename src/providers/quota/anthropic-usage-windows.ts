@@ -79,47 +79,6 @@ export function parseAnthropicExtraUsage(value: unknown): {
   return { state, ...(monthlyPercent !== undefined ? { monthlyPercent } : {}) };
 }
 
-/** A minor-unit amount (`{amount_minor, exponent}`) in major units, or undefined when malformed. */
-function moneyAmount(value: unknown, fallbackExponent?: number): number | undefined {
-  const money = asRecord(value);
-  const minor = toFiniteNumber(money?.amount_minor);
-  const exponent = toFiniteNumber(money?.exponent ?? fallbackExponent);
-  if (minor === undefined || exponent === undefined || exponent < 0 || exponent > 6 || !Number.isInteger(exponent)) return undefined;
-  return minor / 10 ** exponent;
-}
-
-/**
- * Usage credits as the account owner sees them: spent, monthly cap and prepaid balance. Prefers the
- * `spend` row and falls back to `extra_usage`. Values are display-only and never reach routing.
- */
-export function parseClaudeUsageCredits(body: Record<string, unknown>): import("../quota-types").ClaudeUsageCredits | undefined {
-  const spend = asRecord(body.spend);
-  const extra = asRecord(body.extra_usage);
-  const reasonOf = (v: unknown) => typeof v === "string" && /^[a-z0-9_]{1,64}$/.test(v) ? v : undefined;
-  const currencyOf = (v: unknown) => typeof v === "string" && /^[A-Z]{3}$/.test(v) ? v : undefined;
-  if (spend && typeof spend.enabled === "boolean") {
-    const used = moneyAmount(spend.used);
-    const currency = currencyOf(asRecord(spend.used)?.currency);
-    if (used !== undefined && currency) {
-      const limit = moneyAmount(spend.limit);
-      const balance = moneyAmount(spend.balance);
-      const disabledReason = reasonOf(spend.disabled_reason);
-      return { currency, used, enabled: spend.enabled,
-        ...(limit !== undefined ? { limit } : {}), ...(balance !== undefined ? { balance } : {}),
-        ...(disabledReason ? { disabledReason } : {}) };
-    }
-  }
-  if (!extra || typeof extra.is_enabled !== "boolean") return undefined;
-  const currency = currencyOf(extra.currency);
-  const places = toFiniteNumber(extra.decimal_places);
-  const used = moneyAmount({ amount_minor: extra.used_credits }, places);
-  if (!currency || used === undefined) return undefined;
-  const limit = moneyAmount({ amount_minor: extra.monthly_limit }, places);
-  const disabledReason = reasonOf(extra.disabled_reason);
-  return { currency, used, enabled: extra.is_enabled,
-    ...(limit !== undefined ? { limit } : {}), ...(disabledReason ? { disabledReason } : {}) };
-}
-
 /** Undated fallback for seats without any reported plan windows, such as usage-based Enterprise. */
 export function anthropicExtraUsageMonthlyPercent(
   body: Record<string, unknown>,

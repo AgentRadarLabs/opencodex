@@ -1,6 +1,6 @@
 import { markAnthropicFamilyEnumeration } from "./quota/anthropic-family-headers";
 import { rawAnthropicUsageWindows } from "./quota/anthropic-decision-windows";
-import { anthropicExtraUsageMonthlyPercent, anthropicUsageBuckets, parseAnthropicExtraUsage, parseClaudeUsageCredits, type AnthropicUsageBucket } from "./quota/anthropic-usage-windows";
+import { anthropicExtraUsageMonthlyPercent, anthropicUsageBuckets, parseAnthropicExtraUsage, type AnthropicUsageBucket } from "./quota/anthropic-usage-windows";
 import { bindRawDecisionWindows } from "./quota-decision-publication";
 import { decisionQuotaSinkActive } from "../lib/decision-quota-sink";
 import { CLAUDE_CLI_USER_AGENT } from "./claude-cli-identity";
@@ -83,13 +83,11 @@ export async function probeAnthropicUsageQuota(
   }
   const displayWindows = displayBuckets.flatMap(bucket => familyWindow(bucket) ?? []);
   const paidUsage = parseAnthropicExtraUsage(body.extra_usage)?.state;
-  const claudeUsageCredits = parseClaudeUsageCredits(body);
   const monthlyPercent = anthropicExtraUsageMonthlyPercent(body, windows);
   if (monthlyPercent !== undefined) shared.monthlyPercent = monthlyPercent;
   const quota: ProviderQuota = {
     ...shared,
     ...(includeClaudeExtraUsage && paidUsage !== undefined ? { claudeExtraUsage: paidUsage } : {}),
-    ...(claudeUsageCredits ? { claudeUsageCredits } : {}),
     ...(customWindows.length > 0 ? { customWindows } : {}),
     ...(displayWindows.length > 0 ? { displayWindows } : {}),
     updatedAt: Date.now(),

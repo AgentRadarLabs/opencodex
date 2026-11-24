@@ -168,20 +168,3 @@ export function apiKeyQuotaText(row: AccountRow): string {
   if (quota.kiroCreditsUsed !== undefined || quota.kiroCreditsLimit !== undefined) parts.push(`credits ${quota.kiroCreditsUsed ?? "?"}/${quota.kiroCreditsLimit ?? "?"}`);
   return `${mode}: ${parts.join("; ") || "not measured"}${read}`;
 }
-
-/** Claude usage credits for the account table, e.g. "credits $17.30 of $100.00 off (out_of_credits)"; "" when absent or malformed. */
-export function claudeCreditsText(value: unknown): string {
-  const c = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-  const num = (v: unknown) => typeof v === "number" && Number.isFinite(v) ? v : undefined;
-  const used = num(c?.used);
-  if (!c || used === undefined || typeof c.currency !== "string" || !/^[A-Z]{3}$/.test(c.currency)) return "";
-  const money = new Intl.NumberFormat("en-US", { style: "currency", currency: c.currency }).format;
-  const limit = num(c.limit);
-  const balance = num(c.balance);
-  const reason = typeof c.disabledReason === "string" ? terminalSafeText(c.disabledReason) : "";
-  return [
-    `credits ${money(used)}${limit !== undefined ? ` of ${money(limit)}` : ""}`,
-    balance !== undefined ? `balance ${money(balance)}` : "",
-    c.enabled === true ? "on" : `off${reason ? ` (${reason})` : ""}`,
-  ].filter(Boolean).join(" ");
-}

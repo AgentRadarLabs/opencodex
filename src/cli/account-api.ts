@@ -336,8 +336,6 @@ export interface ProviderQuotaDto extends CodexQuotaDto {
   /** Readings upstream reports as not in effect; shown, never routed on. */
   displayWindows?: ProviderQuotaWindowDto[];
   unknownBudgetWindows?: { label: string; resetAt?: number }[];
-  /** Display-only; rendered by `claudeCreditsText`, which re-validates the shape. */
-  claudeUsageCredits?: unknown;
   updatedAt?: number;
 }
 
