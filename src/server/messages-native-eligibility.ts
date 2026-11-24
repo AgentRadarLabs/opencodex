@@ -6,7 +6,7 @@
  * previews and counts remain conservative when runtime availability is unknown.
  */
 import { ADVISOR_SERVER_TOOL_NAME, advisorServerToolDestination, isAdvisorServerToolType } from "../adapters/anthropic/advisor-tool";
-import { spendCeilingsConfigured } from "../lib/spend-reservation-ledger";
+import { spendCeilingsConfigured, type SpendAdmissionPolicy } from "../lib/spend-reservation-ledger";
 import { anthropicBodyElidesBlockedSkill } from "../claude/inbound";
 import { isClaudeWebSearchToolName } from "../claude/outbound";
 import type { ProtocolReasonCode } from "../protocols/contract";
@@ -53,6 +53,13 @@ export interface NativeMessagesSelector {
   oauthFailoverQuorum?: boolean;
   /** Runtime sidecar plan availability; absent for config-only callers. */
   webSearchBackendAvailable?: boolean;
+  /**
+   * The spend ceilings the request was admitted under (hosted ingress only). The hosted Advisor
+   * rule reads these, so a later config reload cannot move an admitted request, or its retries,
+   * between the bridge and the native lane. Absent for count_tokens and the planner, which judge
+   * against the live policy.
+   */
+  spendCeilings?: SpendAdmissionPolicy;
 }
 
 type Rec = Record<string, unknown>;
@@ -97,7 +104,7 @@ function bridgeOnlyPolicyApplies(
   if (hostedCanonical(route) && !advisorServerToolDestination(route.provider) && Array.isArray(body.tools)
     && body.tools.some(tool => isRec(tool) && isAdvisorServerToolType(tool.type))) return true;
   // Under a token spend ceiling the bridge withholds or refuses the hosted Advisor (#8815); exact replay would send it.
-  if (hostedCanonical(route) && spendCeilingsConfigured() && carriesAdvisor(body)) return true;
+  if (hostedCanonical(route) && spendCeilingsConfigured(selector.spendCeilings) && carriesAdvisor(body)) return true;
   return selector.webSearchBackendAvailable !== false && webSearchSidecarMayEngage(body, config);
 }
 

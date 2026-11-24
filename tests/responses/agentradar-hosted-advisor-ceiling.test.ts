@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { nativeMessagesDeclineReason } from "../../src/server/messages-native-eligibility";
 import { configureSharedSpendLedger, resetSharedSpendLedgerForTest } from "../../src/lib/spend-reservation-ledger";
+import { captureRequestSpendPolicy } from "../../src/server/responses/request-spend";
 import type { RouteResult } from "../../src/router";
 import type { OcxConfig } from "../../src/types";
 
@@ -33,4 +34,25 @@ test("under a spend ceiling a declared or replayed hosted Advisor takes the brid
   expect(nativeMessagesDeclineReason(route, declared, config)).toBe("bridge-only-policy");
   expect(nativeMessagesDeclineReason(route, replayed, config)).toBe("bridge-only-policy");
   expect(nativeMessagesDeclineReason(route, { messages: [{ role: "user", content: "hi" }] }, config)).toBeUndefined();
+});
+
+// The ingress snapshots the ceilings once at admission and carries them on the selector, which the
+// native lane re-applies on every retry; a config reload mid-request must not move the request.
+test("admitted under a ceiling, a reload that removes it keeps the request and its retry on the bridge", () => {
+  configureSharedSpendLedger({ root: {}, identity: {}, pool: { maxTokens: 1000 } });
+  const selector = { spendCeilings: captureRequestSpendPolicy() };
+  expect(nativeMessagesDeclineReason(route, declared, config, selector)).toBe("bridge-only-policy");
+  configureSharedSpendLedger({ root: {}, identity: {}, pool: {} });
+  expect(nativeMessagesDeclineReason(route, declared, config, selector)).toBe("bridge-only-policy");
+  expect(nativeMessagesDeclineReason(route, replayed, config, selector)).toBe("bridge-only-policy");
+  // Without the snapshot the same retry reads the live policy and flips to native.
+  expect(nativeMessagesDeclineReason(route, declared, config, {})).toBeUndefined();
+});
+
+test("admitted without a ceiling, a reload that adds one leaves the retry on the native lane", () => {
+  const selector = { spendCeilings: captureRequestSpendPolicy() };
+  expect(nativeMessagesDeclineReason(route, declared, config, selector)).toBeUndefined();
+  configureSharedSpendLedger({ root: {}, identity: {}, pool: { maxTokens: 1000 } });
+  expect(nativeMessagesDeclineReason(route, declared, config, selector)).toBeUndefined();
+  expect(nativeMessagesDeclineReason(route, declared, config, {})).toBe("bridge-only-policy");
 });

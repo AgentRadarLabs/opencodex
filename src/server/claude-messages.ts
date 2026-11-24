@@ -100,6 +100,7 @@ import { clientWireOf } from "./inference/client-wire";
 import { directEncodersApply } from "./inference/client-encoder-delivery";
 import type { ClientEncoderOption } from "./responses/core-options";
 import { handleResponses } from "./responses";
+import { captureRequestSpendPolicy } from "./responses/request-spend";
 import { agentRadarAccountPin, agentRadarPinnedConfig } from "../lib/agentradar-account-pin";
 import { isCanonicalOpenAiForwardProvider } from "../providers/openai-tiers-destination";
 import { logTranslationBufferLimit } from "../lib/upstream-refusal-log";
@@ -709,6 +710,9 @@ async function handleClaudeMessagesWithBudget(
   let messagesFeatures: () => Iterable<ProtocolFeature> = () => [];
   // The Advisor caller policy is the admitted snapshot: capture it before the first await (#7859).
   const advisorAdmissionPolicy = logIds?.advisorAdmissionPolicy ?? captureAdmissionPolicy(config, logIds?.admission);
+  // Hosted only: the spend ceilings this request is admitted under, read once before the first await.
+  // The native-lane choice and its retries use this snapshot, not the live policy (#8815).
+  const admittedSpendCeilings = process.env.OPENCODEX_AGENTRADAR === "1" ? captureRequestSpendPolicy() : undefined;
   try {
     anthropicBody = await readAnthropicBody(req, translatorBudget, resolveInboundBodyLimitBytes(config.maxInboundBodyBytes));
     clientModelLabel = clientFacingModelLabel(isRec(anthropicBody) ? anthropicBody.model : undefined);
@@ -1100,6 +1104,7 @@ async function handleClaudeMessagesWithBudget(
     // PF-10: a stored second OAuth account turns on the bridge's rotation, so it stays there.
     ...(settledRoute?.provider.authMode === "oauth" && settledInstance
       ? { oauthFailoverQuorum: anthropicRoutingFor(settledInstance).hasAnthropicFailoverQuorum() } : {}),
+    ...(admittedSpendCeilings ? { spendCeilings: admittedSpendCeilings } : {}),
   };
   if (!agentRadarAccount && settledRoute && isRec(anthropicBody)
     && nativeMessagesDeclineReason(settledRoute, anthropicBody, config, nativeSelector) === "bridge-only-policy"
