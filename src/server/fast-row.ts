@@ -8,7 +8,7 @@ import { comboModelId, comboPublicModelId } from "../combos/types";
 import { policyModelId, policyPublicModelId } from "../routing/profile";
 import { getProviderRegistryEntry, type InboundWire } from "../providers/registry";
 import { fastPolicyForModel } from "../providers/service-tier";
-import type { OcxConfig, OcxProviderConfig } from "../types";
+import type { OcxConfig } from "../types";
 import {
   isKnownId,
   knownEffortRowIds,
@@ -66,7 +66,7 @@ export function fastRowEligible(
  * `providers.openai` row (the hosted gateway runs Codex on native accounts). Same shape
  * `providerConfigSeed` derives for this entry, so fast policy resolves from the registry default.
  */
-function registryOpenAiProvider(): OcxProviderConfig | undefined {
+function registryOpenAiProvider(): Parameters<typeof fastPolicyForModel>[0] | undefined {
   const entry = getProviderRegistryEntry("openai");
   return entry === undefined
     ? undefined
@@ -86,7 +86,8 @@ export function catalogFastRowEligible(
   if (model.native) {
     const id = model.id.slice(model.id.lastIndexOf("/") + 1);
     const tiers = UPSTREAM_NATIVE_ENTRIES.get(id)?.additional_speed_tiers;
-    const provider = config.providers.openai ?? registryOpenAiProvider();
+    // Only where ingress takes a bare native base too, so a listed --fast row always parses.
+    const provider = config.providers.openai ?? (shouldIncludeNativeOpenAi(config) ? registryOpenAiProvider() : undefined);
     return Array.isArray(tiers) && tiers.includes("fast") && provider !== undefined
       && fastRowEligible(provider, id, "openai");
   }

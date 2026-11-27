@@ -412,8 +412,10 @@ describe("native Fast listing without a providers.openai row (hosted gateway)", 
 
   test("a native model with the fast tier lists --fast with no providers.openai", () => {
     expect(catalogFastRowEligible(configWith({}, { fastRows: undefined }), sol)).toBe(true);
-    expect(catalogFastRowEligible(configWith({ fixture: provider() }), sol)).toBe(true);
-    expect(catalogFastRowEligible(configWith({}), { ...sol, id: "account/gpt-6.2-sol" })).toBe(true);
+  });
+
+  test("no registry fallback where ingress would not take a bare native base", () => {
+    expect(catalogFastRowEligible(configWith({ fixture: provider() }), sol)).toBe(false);
   });
 
   test("fastRows false still opts out", () => {
