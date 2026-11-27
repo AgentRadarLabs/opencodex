@@ -123,7 +123,7 @@ jobs:
   # fires `push`, and its dependencies and postinstall hooks then run here.
   select-windows-runner:
     name: select windows runner
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_MODE == 'own' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","hz-burst","hz-ephemeral"]' || '"ubuntu-latest"') }}
     timeout-minutes: 2
     outputs:
       runner: ${{ steps.pick.outputs.runner }}
@@ -168,7 +168,7 @@ jobs:
   # in the `on:` block above.
   changes:
     name: changes
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_MODE == 'own' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","hz-burst","hz-ephemeral"]' || '"ubuntu-latest"') }}
     timeout-minutes: 5
     # The workflow grants only `contents: read`, and specifying any permission
     # sets every unspecified one to `none`. paths-filter reads the PR's file list
@@ -385,6 +385,7 @@ jobs:
         shell: bash
         env:
           NATIVE_SELECTED: ${{ steps.filter.outputs.native }}
+          RUNNER_MODE: ${{ vars.CI_RUNNER_MODE }}
         run: |
           set -euo pipefail
           case "$NATIVE_SELECTED" in
@@ -424,6 +425,13 @@ jobs:
             'type == "array" and length >= 2 and any(.[]; .name == "ubuntu") and any(.[]; .name == "windows")'
           assert_matrix npm-global "$npm_global_matrix" \
             'type == "array" and length >= 2 and any(.[]; .os == "ubuntu-latest") and any(.[]; .os == "windows-latest")'
+
+          # CI_RUNNER_MODE=own: our own runners are Linux only, keep the ubuntu legs.
+          # Runs after the checks above, which still demand the stock shape.
+          if [ "${RUNNER_MODE:-}" = "own" ]; then
+            keyring_matrix='[{"name":"ubuntu","runner":"ubuntu-latest"}]'
+            npm_global_matrix='[{"os":"ubuntu-latest"}]'
+          fi
 
           printf 'keyring_matrix=%s\n' "$keyring_matrix" >> "$GITHUB_OUTPUT"
           printf 'npm_global_matrix=%s\n' "$npm_global_matrix" >> "$GITHUB_OUTPUT"
@@ -470,7 +478,7 @@ jobs:
     name: test ${{ matrix.shard }}/4
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.ci == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_MODE == 'own' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","hz-burst","hz-ephemeral"]' || '"ubuntu-latest"') }}
     # A quarter of the suite. A shard that needs longer than this is wedged, not
     # slow — the old 30-minute ceiling was margin for the Windows leg, which no
     # longer runs here (see platform-windows).
@@ -536,7 +544,7 @@ jobs:
     name: storage policy
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.ci == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_MODE == 'own' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","hz-burst","hz-ephemeral"]' || '"ubuntu-latest"') }}
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -575,7 +583,7 @@ jobs:
     name: api usage
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.ci == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_MODE == 'own' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","hz-burst","hz-ephemeral"]' || '"ubuntu-latest"') }}
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -607,7 +615,7 @@ jobs:
     name: gates
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.ci == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_MODE == 'own' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","hz-burst","hz-ephemeral"]' || '"ubuntu-latest"') }}
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -684,7 +692,7 @@ jobs:
     # Native-gated: these legs only run when the changes job's `native` filter
     # says the macOS suite's inputs could have changed, so an ordinary source
     # pull request stops paying for two macOS runners.
-    if: github.event_name != 'pull_request' || (needs.changes.outputs.ci == 'true' && needs.changes.outputs.native == 'true')
+    if: vars.CI_RUNNER_MODE != 'own' && (github.event_name != 'pull_request' || (needs.changes.outputs.ci == 'true' && needs.changes.outputs.native == 'true'))
     runs-on: macos-latest
     # Two shards. Unsharded, this job was the critical path on every green dev
     # push (mean 14.9 min against a 4.7 min Linux maximum; devlog
@@ -756,7 +764,7 @@ jobs:
     # Diagnostic-only lanes stay off the ordinary release gates: list every lane
     # that should run this job, so a new lane defaults to skipping the diagnostic.
     if: >-
-      github.event_name == 'workflow_dispatch' && (github.event.inputs.lane == '' || github.event.inputs.lane == 'all' || github.event.inputs.lane == 'macos-control')
+      vars.CI_RUNNER_MODE != 'own' && github.event_name == 'workflow_dispatch' && (github.event.inputs.lane == '' || github.event.inputs.lane == 'all' || github.event.inputs.lane == 'macos-control')
     runs-on: macos-latest
     # Unsharded full-membership control, one worker in sequential fresh batches.
     # Long-lived Bun isolate pools repeatedly wedged while synchronously reaping
@@ -837,7 +845,7 @@ jobs:
     name: windows ${{ matrix.shard }}/9
     needs: select-windows-runner
     if: >-
-      github.event_name == 'workflow_dispatch' && (github.event.inputs.lane == '' || github.event.inputs.lane == 'all')
+      vars.CI_RUNNER_MODE != 'own' && github.event_name == 'workflow_dispatch' && (github.event.inputs.lane == '' || github.event.inputs.lane == 'all')
     runs-on: ${{ fromJSON(needs.select-windows-runner.outputs.runner) }}
     # Sharded like the Linux legs. The single-leg run reached 30 minutes on a
     # green suite and was killed in cleanup; four shards put each leg inside the
@@ -973,7 +981,7 @@ jobs:
     name: keyring ${{ matrix.name }}
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.ci == 'true'
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_MODE == 'own' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","hz-burst","hz-ephemeral"]' || toJSON(matrix.runner)) }}
     timeout-minutes: 8
     strategy:
       fail-fast: false
@@ -1035,7 +1043,7 @@ jobs:
     name: docker smoke
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.ci == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_MODE == 'own' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","hz-burst","hz-ephemeral"]' || '"ubuntu-latest"') }}
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -1064,7 +1072,7 @@ jobs:
     name: docs site build
     needs: changes
     if: needs.changes.outputs.docs == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_MODE == 'own' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","hz-burst","hz-ephemeral"]' || '"ubuntu-latest"') }}
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -1100,7 +1108,7 @@ jobs:
     name: structure gate
     needs: changes
     if: needs.changes.outputs.structure == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_MODE == 'own' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","hz-burst","hz-ephemeral"]' || '"ubuntu-latest"') }}
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -1124,12 +1132,12 @@ jobs:
     name: setup action ${{ matrix.os }}
     needs: changes
     if: needs.changes.outputs.setup_action == 'true'
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_MODE == 'own' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","hz-burst","hz-ephemeral"]' || toJSON(matrix.os)) }}
     timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(vars.CI_RUNNER_MODE == 'own' && '["ubuntu-latest"]' || '["ubuntu-latest","windows-latest","macos-latest"]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -1161,12 +1169,12 @@ jobs:
     name: remote helper ${{ matrix.os }}
     needs: changes
     if: needs.changes.outputs.remote_helper == 'true'
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_MODE == 'own' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","hz-burst","hz-ephemeral"]' || toJSON(matrix.os)) }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(vars.CI_RUNNER_MODE == 'own' && '["ubuntu-latest"]' || '["ubuntu-latest","macos-latest","windows-latest"]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -1198,7 +1206,7 @@ jobs:
     name: privacy gate
     needs: changes
     if: github.event_name == 'pull_request' && needs.changes.outputs.ci != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_MODE == 'own' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","hz-burst","hz-ephemeral"]' || '"ubuntu-latest"') }}
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -1219,7 +1227,7 @@ jobs:
     name: npm-global ${{ matrix.os }}
     needs: changes
     if: needs.changes.outputs.packaging == 'true'
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_MODE == 'own' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","hz-burst","hz-ephemeral"]' || toJSON(matrix.os)) }}
     # 8 minutes was too tight for the Windows leg: dependency installation alone takes
     # about 7 there, leaving under a minute for pack, verify, global install, and the
     # help smoke. The job was cancelled at the wall rather than failing, so whichever
@@ -1296,7 +1304,7 @@ jobs:
     needs: [changes, gates]
     # Native-gated like platform-macos: the widget extension and app bundle
     # are rebuilt only when native-capable paths changed.
-    if: github.event_name != 'pull_request' || (needs.changes.outputs.ci == 'true' && needs.changes.outputs.native == 'true')
+    if: vars.CI_RUNNER_MODE != 'own' && (github.event_name != 'pull_request' || (needs.changes.outputs.ci == 'true' && needs.changes.outputs.native == 'true'))
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -1374,7 +1382,7 @@ jobs:
     # Native shell changes run the Rust checks; package-affecting changes also run the real Linux
     # bundle acceptance. The aggregate gate below mirrors this union exactly.
     if: github.event_name != 'pull_request' || (needs.changes.outputs.ci == 'true' && (needs.changes.outputs.native == 'true' || needs.changes.outputs.desktop == 'true'))
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_MODE == 'own' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","hz-burst","hz-ephemeral"]' || '"ubuntu-latest"') }}
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -1496,7 +1504,7 @@ jobs:
     # otherwise reach this gate as nothing at all while its dependents report
     # `skipped`, which is the shape the step below is written to catch.
     needs: [changes, select-windows-runner, test, storage-policy, api-usage, gates, platform-macos, macos-control, platform-windows, keyring-smoke, docker-smoke, docs-site-build, structure-gate, privacy-gate, npm-global-smoke, widget, desktop-shell, setup-action, remote-helper]
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_MODE == 'own' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","hz-burst","hz-ephemeral"]' || '"ubuntu-latest"') }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -1519,6 +1527,7 @@ jobs:
           CHANGES_NATIVE: ${{ needs.changes.outputs.native }}
           CHANGES_DESKTOP: ${{ needs.changes.outputs.desktop }}
           GH_TOKEN: ${{ github.token }}
+          RUNNER_MODE: ${{ vars.CI_RUNNER_MODE }}
         run: |
           set -euo pipefail
           echo "$RESULTS" | jq .
@@ -1592,6 +1601,12 @@ jobs:
             fi
           fi
 
+          # CI_RUNNER_MODE=own: the macOS and Windows jobs carry `vars.CI_RUNNER_MODE != 'own'`
+          # in their `if:`, so this run did not request them; `skipped` is the right result.
+          if [ "${RUNNER_MODE:-}" = "own" ]; then
+            windows=not-requested
+          fi
+
           # One line per job, mirroring that job's own `if:`. Adding a job to this workflow
           # without adding it here fails the gate by name rather than passing unnoticed.
           GATED_JOBS="changes select-windows-runner test storage-policy api-usage gates"
@@ -1603,6 +1618,11 @@ jobs:
           GATED_JOBS="$GATED_JOBS privacy-gate"
 
           expected_for() {
+            if [ "${RUNNER_MODE:-}" = "own" ]; then
+              case "$1" in
+                platform-macos|widget|macos-control|platform-windows) echo not-requested; return ;;
+              esac
+            fi
             case "$1" in
               changes|select-windows-runner) echo requested ;;
               test|storage-policy|api-usage|gates|keyring-smoke|docker-smoke)
