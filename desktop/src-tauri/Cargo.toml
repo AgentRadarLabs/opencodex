@@ -1,6 +1,6 @@
 [package]
 name = "opencodex-desktop"
-version = "2.65.0-vadymhimself.27"
+version = "2.65.0-vadymhimself.28"
 description = "OpenCodex desktop shell"
 authors = ["OpenCodex contributors"]
 license = "MIT"
