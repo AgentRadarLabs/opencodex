@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { UPSTREAM_NATIVE_ENTRIES } from "../../src/codex/catalog/metadata";
 import { clearModelCache, setCached } from "../../src/codex/model-cache";
 import { knownEffortRowIds, parseEffortRowId, parseRequestEffortRowId } from "../../src/server/effort-row";
 import {
@@ -402,4 +403,44 @@ test("Fast discovery agrees with ingress for configured and live-only suffix-sha
   config.providers.fixture.models = ["ordinary"];
   expect(catalogFastRowEligible(config, row)).toBe(false);
   expect(parseSyntheticRowId("fixture/model--fast--fast", config).fastRow).toBeNull();
+});
+
+describe("native Fast listing without a providers.openai row (hosted gateway)", () => {
+  // The hosted gateway runs Codex on native accounts, so its config has no `openai` provider.
+  // The registry default for the built-in openai provider must decide, not an absent row.
+  const sol = { provider: "openai", id: "gpt-6.2-sol", native: true };
+
+  test("a native model with the fast tier lists --fast with no providers.openai", () => {
+    expect(catalogFastRowEligible(configWith({}, { fastRows: undefined }), sol)).toBe(true);
+  });
+
+  test("no registry fallback where ingress would not take a bare native base", () => {
+    expect(catalogFastRowEligible(configWith({ fixture: provider() }), sol)).toBe(false);
+  });
+
+  test("fastRows false still opts out", () => {
+    expect(catalogFastRowEligible(configWith({}, { fastRows: false }), sol)).toBe(false);
+  });
+
+  test("a native slug without the fast tier stays ineligible", () => {
+    const config = configWith({});
+    expect(catalogFastRowEligible(config, { ...sol, id: "unknown-native" })).toBe(false);
+    UPSTREAM_NATIVE_ENTRIES.set("fixture-native-no-fast", { slug: "fixture-native-no-fast", additional_speed_tiers: [] } as never);
+    try {
+      expect(catalogFastRowEligible(config, { ...sol, id: "fixture-native-no-fast" })).toBe(false);
+    } finally {
+      UPSTREAM_NATIVE_ENTRIES.delete("fixture-native-no-fast");
+    }
+  });
+
+  test("a configured openai row still decides over the registry default", () => {
+    const config = configWith({ openai: provider({ supportsServiceTier: false }) });
+    expect(catalogFastRowEligible(config, sol)).toBe(false);
+  });
+
+  test("the published selector parses back to the same base", () => {
+    const config = configWith({});
+    expect(catalogFastRowEligible(config, sol)).toBe(true);
+    expect(parseSyntheticRowId("gpt-6.2-sol--fast", config).fastRow).toEqual({ baseId: "gpt-6.2-sol" });
+  });
 });
