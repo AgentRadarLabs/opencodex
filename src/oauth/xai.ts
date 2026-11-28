@@ -290,7 +290,7 @@ export class XaiOAuthFlow extends OAuthCallbackFlow {
       preferredPort: XAI_OAUTH_CALLBACK_PORT,
       callbackPath: XAI_OAUTH_CALLBACK_PATH,
       callbackHostname: "127.0.0.1",
-      callbackBindHostname: "127.0.0.1",
+      callbackBindHostname: "127.0.0.1", timeoutMs: 20 * 60_000, // AGE-219: 20 min for the redirect (shared default 5)
       redirectUri: `http://127.0.0.1:${XAI_OAUTH_CALLBACK_PORT}${XAI_OAUTH_CALLBACK_PATH}`,
     } satisfies OAuthCallbackFlowOptions);
   }
